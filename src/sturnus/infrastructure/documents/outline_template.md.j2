@@ -1,0 +1,14 @@
+## Participants
+
+{% for speaker in participants %}
+- {% if speaker.external_user_id %}@[{{ speaker.external_display_name | md }}](mention://user/{{ speaker.external_user_id | md }}) ([{{ speaker.discord_display_name | md }}](https://discord.com/users/{{ speaker.discord_user_id }})){% else %}[{{ speaker.discord_display_name | md }}](https://discord.com/users/{{ speaker.discord_user_id }}){% endif %}
+
+{% endfor %}
+## Transcript
+
+{% for block in blocks %}
+**{{ block.time }}** · {% if block.speaker.external_user_id %}@[{{ block.speaker.external_display_name | md }}](mention://user/{{ block.speaker.external_user_id | md }}) ([{{ block.speaker.discord_display_name | md }}](https://discord.com/users/{{ block.speaker.discord_user_id }})){% else %}[{{ block.speaker.discord_display_name | md }}](https://discord.com/users/{{ block.speaker.discord_user_id }}){% endif %}
+
+{{ block.text | md }}
+
+{% endfor %}

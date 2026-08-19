@@ -1,0 +1,228 @@
+"""The Discord client: wires cogs, voice capture, the tick loop and shutdown.
+
+Every decision already lives elsewhere -- the session state machine and the
+encrypt-upload-enqueue sequence in `RecordingService`, consent policy in
+`consent_flow`, per-guild configuration in `ConfigStore`. This class only
+turns Discord events into calls against those, and turns their results back
+into Discord actions: joining or leaving a voice channel, syncing the
+command tree, logging a guild that hasn't been configured yet.
+
+The bot does **not** run Alembic migrations on start -- the worker owns the
+schema (Spec 13.1) -- so `main()` (`sturnus.entrypoints.bot`) waits for the
+expected tables to exist and fails loudly if they don't, before this class
+is ever constructed.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+
+import discord
+from discord.ext import commands
+
+from sturnus.application.ports import AudioStore, AudioWriterFactory, Clock, Encryptor
+from sturnus.application.recording import RecordingService
+from sturnus.domain import settings
+from sturnus.domain.session import EndReason
+from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.repositories import (
+    ConsentRepository,
+    JobRepository,
+    SessionRepository,
+)
+from sturnus.infrastructure.discord.config_cog import ConfigCog
+from sturnus.infrastructure.discord.consent_cog import ConsentCog
+from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter
+from sturnus.infrastructure.health import ReadinessState
+
+log = logging.getLogger(__name__)
+
+#: How often the background loop checks every guild's session for a timeout.
+TICK_INTERVAL_SECONDS = 10.0
+
+# No `EndReason` models "the process was asked to shut down" -- its three
+# members all describe a timeout the state machine itself observed. A
+# SIGTERM is an external event the machine never sees, so this records the
+# closest available approximation instead of inventing a value the domain
+# doesn't define. Worth revisiting if `EndReason` grows a reason of its own
+# for an externally triggered close.
+SHUTDOWN_END_REASON = EndReason.IDLE_TIMEOUT
+
+
+@dataclass
+class _GuildRecording:
+    """Everything the client needs to act on one guild's configured channel."""
+
+    channel_id: int
+    role_id: int
+    service: RecordingService
+    voice: VoiceReceiveAdapter
+
+
+class SturnusClient(commands.Bot):
+    """The bot process's single Discord connection."""
+
+    def __init__(
+        self,
+        *,
+        clock: Clock,
+        config_store: ConfigStore,
+        consent_repo: ConsentRepository,
+        session_repo: SessionRepository,
+        job_repo: JobRepository,
+        audio_store: AudioStore,
+        writer_factory: AudioWriterFactory,
+        encryptor: Encryptor,
+        readiness: ReadinessState,
+        database_ping: Callable[[], Awaitable[bool]],
+        tick_interval_seconds: float = TICK_INTERVAL_SECONDS,
+    ) -> None:
+        intents = discord.Intents.default()
+        # Both are privileged intents that must also be turned on for this
+        # application in the Discord developer portal, or the gateway
+        # rejects the connection outright.
+        intents.members = True
+        intents.voice_states = True
+        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+
+        self._clock = clock
+        self._config_store = config_store
+        self._consent_repo = consent_repo
+        self._session_repo = session_repo
+        self._job_repo = job_repo
+        self._audio_store = audio_store
+        self._writer_factory = writer_factory
+        self._encryptor = encryptor
+        self._readiness = readiness
+        self._database_ping = database_ping
+        self._tick_interval_seconds = tick_interval_seconds
+
+        self._guilds: dict[int, _GuildRecording] = {}
+        self._tick_task: asyncio.Task[None] | None = None
+
+    async def setup_hook(self) -> None:
+        """Loads the cogs and syncs the command tree; runs once before login completes."""
+        await self.add_cog(ConsentCog(self._consent_repo, self._config_store, self._clock))
+        await self.add_cog(ConfigCog(self._config_store))
+        await self.tree.sync()
+        self._tick_task = asyncio.create_task(self._tick_loop())
+
+    async def on_ready(self) -> None:
+        for guild in self.guilds:
+            await self._configure_guild(guild)
+        self._readiness.discord_connected = True
+        log.info("Connected to Discord; configured for %d guild(s)", len(self._guilds))
+
+    async def _configure_guild(self, guild: discord.Guild) -> None:
+        """Builds this guild's recording pipeline, or skips it if unconfigured.
+
+        A guild missing either key cannot record at all -- there is no
+        channel to join or no way to tell who has consented -- so it is
+        skipped with a log line naming the command an administrator needs
+        to run, rather than the bot guessing at a default.
+        """
+        voice_channel_id = await self._config_store.get(guild.id, settings.VOICE_CHANNEL_ID)
+        consent_role_id = await self._config_store.get(guild.id, settings.CONSENT_ROLE_ID)
+        if voice_channel_id is None or consent_role_id is None:
+            log.warning(
+                "Guild %d is missing voice_channel_id and/or consent_role_id; "
+                "an administrator must run /config show to see what's missing.",
+                guild.id,
+            )
+            return
+
+        timeouts = await self._config_store.timeouts(guild.id)
+        retention = await self._config_store.get(guild.id, settings.AUDIO_RETENTION_DAYS)
+        assert retention is not None, "audio_retention_days has a default and is never unset"
+
+        service = RecordingService(
+            guild_id=guild.id,
+            channel_id=int(voice_channel_id),
+            timeouts=timeouts,
+            sessions=self._session_repo,
+            jobs=self._job_repo,
+            store=self._audio_store,
+            writers=self._writer_factory,
+            encryptor=self._encryptor,
+            retention_days=int(retention),
+        )
+        voice = VoiceReceiveAdapter(self, service, self._config_store, self._clock)
+        self._guilds[guild.id] = _GuildRecording(
+            channel_id=int(voice_channel_id),
+            role_id=int(consent_role_id),
+            service=service,
+            voice=voice,
+        )
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Recomputes the consenting headcount and drives the session machine.
+
+        Counts members carrying the consent role, never everyone present:
+        an administrator can be in the channel without the role and must
+        not, by their presence alone, start a recording nobody consented
+        to (Spec 3.1).
+        """
+        recording = self._guilds.get(member.guild.id)
+        if recording is None:
+            return
+
+        touched_channel_ids = {
+            channel.id for channel in (before.channel, after.channel) if channel is not None
+        }
+        if recording.channel_id not in touched_channel_ids:
+            return
+
+        channel = member.guild.get_channel(recording.channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            return
+
+        consented_count = sum(
+            1
+            for participant in channel.members
+            if any(role.id == recording.role_id for role in participant.roles)
+        )
+
+        was_recording = recording.service.is_recording
+        await recording.service.participants_changed(consented_count, self._clock.now())
+        if recording.service.is_recording and not was_recording:
+            await recording.voice.join(recording.channel_id)
+
+    async def _tick_loop(self) -> None:
+        """Checks every guild's session for a timeout roughly every 10 seconds.
+
+        Also the readiness heartbeat: the database is polled here, once per
+        tick, rather than on every request to `/readyz`.
+        """
+        try:
+            while True:
+                await asyncio.sleep(self._tick_interval_seconds)
+                self._readiness.database_reachable = await self._database_ping()
+                for recording in list(self._guilds.values()):
+                    reason = await recording.service.tick(self._clock.now())
+                    if reason is not None:
+                        await recording.voice.leave()
+        except asyncio.CancelledError:
+            pass
+
+    async def graceful_shutdown(self) -> None:
+        """Closes every active session before the connection is torn down.
+
+        Stops receiving, closes the writers, encrypts, uploads, enqueues,
+        then disconnects -- in that order, because a routine deploy sends
+        SIGTERM and this is the only thing standing between it and losing
+        every session still in progress (Spec 6.4).
+        """
+        if self._tick_task is not None:
+            self._tick_task.cancel()
+        for recording in list(self._guilds.values()):
+            if recording.service.is_recording:
+                await recording.service.close(SHUTDOWN_END_REASON, self._clock.now())
+            await recording.voice.leave()
