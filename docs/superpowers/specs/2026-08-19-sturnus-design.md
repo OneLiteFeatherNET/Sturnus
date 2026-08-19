@@ -252,15 +252,30 @@ gepflegt, und jede neue SSRC erhält einen eigenen Referenzpunkt.
 
 ### 6.3 Chunking
 
-Alle `chunk_interval_minutes` (Default 10) wird pro Nutzer der Puffer als WAV
+Alle `chunk_interval_minutes` (Default 30) wird pro Nutzer der Puffer als WAV
 nach S3 geschrieben und ein Chunk-Job eingereiht.
 
-Der Grund ist die Auto-Join-Charakteristik: ein Channel, in dem abends jemand
-sechs Stunden verbringt, ergäbe bei durchgehendem Padding mehrere Gigabyte im
-Pod. Chunking hält den Pod-Speicher konstant, begrenzt das Padding pro Chunk auf
-wenige Dutzend Megabyte und lässt die Transkription **parallel zur laufenden
-Session** arbeiten — das Dokument ist Minuten nach Session-Ende fertig statt
-Stunden später.
+Chunking existiert wegen der Auto-Join-Charakteristik: ein Channel, in dem abends
+jemand sechs Stunden verbringt, ergäbe bei einem einzigen Durchlauf ein
+mehrstündiges Audio je Sprecher, dessen Transkription erst lange nach
+Session-Ende beginnt. Chunking lässt die Transkription **parallel zur laufenden
+Session** arbeiten — das Dokument ist Minuten nach Session-Ende fertig.
+
+**Die Chunk-Länge ist bewusst großzügig gewählt.** Jede Chunk-Grenze ist eine
+Stelle, an der Whisper seinen Kontext verliert: Sätze über die Grenze hinweg
+werden schlechter erkannt, und die Sprachdetektion (Abschnitt 7) braucht
+zusammenhängendes Material. Wenige lange Chunks liefern deshalb bessere
+Transkripte als viele kurze. Die Untergrenze setzt allein die gewünschte Latenz
+bis zum fertigen Dokument.
+
+Damit die Chunk-Länge nicht zum Speicherproblem wird, puffert der Bot **nicht im
+Arbeitsspeicher, sondern schreibt fortlaufend in eine temporäre Datei auf einem
+`emptyDir`-Volume**. Der RAM-Bedarf ist dadurch von der Chunk-Länge entkoppelt;
+ein 30-Minuten-Chunk belegt rund 57 MB Datenträger je Sprecher statt 57 MB RAM.
+
+Als Gegengewicht zum längeren Intervall **flusht ein SIGTERM-Handler den
+laufenden Chunk vor dem Beenden**. Ohne diese Absicherung würde ein regulärer
+Deploy bis zu ein volles Chunk-Intervall an Audio verlieren.
 
 **Chunk-Grenzen respektieren Sprechpausen.** Eine harte Grenze mitten im Wort
 zerschneidet die Transkription. Der Flush wird deshalb bis zur nächsten
@@ -274,11 +289,28 @@ destillierter Decoder, läuft auf 4 Kernen bei etwa 1× Realtime bei rund 1,6 GB
 RAM und liefert für Deutsch deutlich bessere Ergebnisse als `small`. `small`
 bleibt als konfigurierbarer Fallback, falls das Sizing im Betrieb nicht aufgeht.
 
-Sprache wird auf Deutsch gepinnt (`language="de"`), nicht automatisch erkannt —
-Autodetektion auf kurzen Segmenten ist unzuverlässig und kann innerhalb einer
-Session zwischen Sprachen springen.
+**Die Sprache wird automatisch erkannt, aber nur einmal je Sprecher und
+Session.** Whisper bestimmt die Sprache anhand der ersten 30 Sekunden eines
+Durchlaufs — bei Silence-Padding wäre das unter Umständen Stille. Die Detektion
+läuft deshalb auf dem ersten Chunk eines Sprechers, der substantielle Sprache
+enthält, und zwar auf dessen erstem VAD-Segment statt auf dem Chunk-Anfang. Das
+Ergebnis wird in `session_participant` festgehalten und für alle weiteren Chunks
+dieses Sprechers als `language` gesetzt.
+
+Detektion je Chunk wäre die schlechtere Wahl: ein einzelner schwach belegter
+Chunk ließe einen Sprecher mitten im Protokoll die Sprache wechseln. Erkennt die
+Detektion gar nichts Belastbares, greift eine konfigurierbare Standardsprache.
 
 `vad_filter=True` überspringt die aufgefüllte Stille.
+
+**Halluzinationsrisiko bei langen Durchläufen.** Whisper trägt über
+`condition_on_previous_text` Kontext zwischen seinen 30-Sekunden-Fenstern weiter,
+was die Qualität hebt — aber bei langem Audio zu Kaskaden führen kann, in denen
+sich ein einmal abgedrifteter Text selbst verstärkt. Mit den nun längeren Chunks
+steigt diese Gefahr. Die Schwellen für `compression_ratio_threshold` und
+`no_speech_threshold` bleiben deshalb aktiv, und das Abschalten von
+`condition_on_previous_text` ist der Rückfallweg, falls sich Wiederholungsartefakte
+im Betrieb zeigen.
 
 Jeder Nutzer-Stream wird einzeln transkribiert. Die resultierenden Segmente
 tragen Offsets relativ zum Chunk-Start, die über die Chunk-Startzeit in absolute
@@ -373,7 +405,7 @@ DDL. Der RAG-Bot hat keine Migrationen; das ist eine Lücke, kein zu
 | `consent` | `discord_user_id`, `guild_id`, `granted_at`, `revoked_at`, `policy_version`, `source` |
 | `oauth_state` | `state` (PK), `discord_user_id`, `created_at`, `expires_at` |
 | `session` | `id`, `guild_id`, `channel_id`, `started_at`, `ended_at`, `end_reason`, `status`, `outline_document_id` |
-| `session_participant` | `session_id`, `discord_user_id`, `discord_display_name` (zum Session-Zeitpunkt eingefroren), `first_seen_at` |
+| `session_participant` | `session_id`, `discord_user_id`, `discord_display_name` (zum Session-Zeitpunkt eingefroren), `detected_language`, `first_seen_at` |
 | `chunk_job` | `id`, `session_id`, `discord_user_id`, `seq`, `starts_at`, `s3_key`, `status`, `attempts`, `error`, `transcript` |
 
 Die Queue ist `chunk_job`, konsumiert über
@@ -408,14 +440,14 @@ Laufzeit-konfigurierbar über die `/config`-Gruppe, gespeichert in
 | `empty_grace_seconds` | 60 | Bot |
 | `idle_timeout_minutes` | 15 | Bot |
 | `max_session_hours` | 4 | Bot |
-| `chunk_interval_minutes` | 10 | Bot |
+| `chunk_interval_minutes` | 30 | Bot |
 | `outline_collection_id` | — | Worker |
 | `policy_version` | — | beide |
 | `policy_url` | — | beide |
 
 Nicht laufzeit-konfigurierbar, sondern über Umgebungsvariablen: Whisper-Modell,
-Sprache, maximale Fehlversuche je Chunk-Job (Default 3), Datenbank- und
-S3-Verbindung, Tokens.
+Standardsprache als Rückfall der Autodetektion, maximale Fehlversuche je
+Chunk-Job (Default 3), Datenbank- und S3-Verbindung, Tokens.
 
 ## 12. Löschkonzept
 
@@ -467,6 +499,7 @@ beziehungsweise Klassen geschnitten:
   Abschnitt 5.1
 - Zeitrekonstruktion aus RTP-Timestamps, einschließlich SSRC-Wechsel
 - Chunk-Grenzen an Sprechpausen
+- Sprachdetektion: Festschreibung je Sprecher, Rückfall auf die Standardsprache
 - Zusammenführung der Segmente über Sprecher und Chunks hinweg
 - Markdown- und Mention-Rendering, inklusive Sprecherzeile mit und ohne
   verknüpften Outline-Account
@@ -496,9 +529,11 @@ liegt bewusst außerhalb.
 - **Das Sizing des Workers ist geschätzt.** Die Angabe von rund 1× Realtime für
   `large-v3-turbo` auf 4 Kernen ist vor dem Rollout an echtem Material zu messen;
   der Fallback auf `small` ist eingeplant.
-- **Der Bot ist ein Singleton ohne Übernahme.** Ein Neustart während einer
-  laufenden Session verliert den noch nicht geflushten Puffer, also bis zu ein
-  Chunk-Intervall. Bereits hochgeladene Chunks bleiben erhalten. Ein PodDisruptionBudget
-  begrenzt ungewollte Evictions, verhindert aber keinen Deploy.
+- **Der Bot ist ein Singleton ohne Übernahme.** Bei einem geordneten Neustart
+  flusht der SIGTERM-Handler den laufenden Chunk (Abschnitt 6.3); verloren geht
+  nur, was ein hartes Kill oder ein Absturz unterbricht — dann bis zu ein
+  Chunk-Intervall, das mit dem größeren Default entsprechend schwerer wiegt.
+  Bereits hochgeladene Chunks bleiben erhalten. Ein PodDisruptionBudget begrenzt
+  ungewollte Evictions, verhindert aber keinen Deploy.
 - **Die Outline-OAuth-Details sind unverifiziert** (siehe Abschnitt 8.1) und vor
   der Implementierung des Link-Flows gegen die laufende Instanz zu prüfen.
