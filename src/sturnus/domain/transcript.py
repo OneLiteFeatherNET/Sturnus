@@ -71,8 +71,22 @@ def build_transcript(
         open_speaker, open_start, open_end, open_parts = None, None, None, []
 
     for segment in usable:
-        if segment.speaker not in participants:
+        # Track participants by discord_user_id; prefer richer variants (with external fields).
+        participant_idx = next(
+            (
+                i
+                for i, p in enumerate(participants)
+                if p.discord_user_id == segment.speaker.discord_user_id
+            ),
+            None,
+        )
+        if participant_idx is None:
             participants.append(segment.speaker)
+        elif (
+            segment.speaker.external_user_id is not None
+            and participants[participant_idx].external_user_id is None
+        ):
+            participants[participant_idx] = segment.speaker
 
         continues = (
             open_speaker == segment.speaker
@@ -85,7 +99,7 @@ def build_transcript(
             open_start = segment.start
 
         open_parts.append(segment.text.strip())
-        open_end = segment.end
+        open_end = max(open_end, segment.end) if open_end is not None else segment.end
 
     flush()
 
