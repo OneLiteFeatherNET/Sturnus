@@ -9,6 +9,7 @@ and are out of scope.
 """
 
 import ast
+import sys
 from pathlib import Path
 
 import pytest
@@ -16,19 +17,21 @@ import pytest
 DOMAIN = Path(__file__).parent.parent / "src" / "sturnus" / "domain"
 SRC = Path(__file__).parent.parent / "src"
 
-FORBIDDEN_PREFIXES = (
-    "sturnus.application",
-    "sturnus.infrastructure",
-    "discord",
-    "sqlalchemy",
-    "alembic",
-    "asyncpg",
-    "boto3",
-    "botocore",
-    "jinja2",
-    "faster_whisper",
-    "aiohttp",
-)
+DOMAIN_PACKAGE = "sturnus.domain"
+
+
+def _is_stdlib_or_domain(module: str) -> bool:
+    """Allowlist for domain imports: standard library, or within sturnus.domain.
+
+    This is deliberately an allowlist rather than a denylist: a new
+    third-party dependency landing in pyproject.toml is safe by default
+    instead of silently passing the check until someone remembers to add
+    it to a forbidden-list.
+    """
+    root = module.split(".", 1)[0]
+    if root in sys.stdlib_module_names:
+        return True
+    return module == DOMAIN_PACKAGE or module.startswith(f"{DOMAIN_PACKAGE}.")
 
 
 def _get_package_name(file_path: Path, src_path: Path) -> str:
@@ -114,17 +117,17 @@ def _resolve_imports_in_module(tree: ast.Module, file_path: Path) -> set[str]:
     return found
 
 
-def _imported_modules(path: Path, src_path: Path = SRC) -> set[str]:
+def _imported_modules(path: Path) -> set[str]:
     """Extract all module paths reachable by imports in a file."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     return _resolve_imports_in_module(tree, path)
 
 
-def _check_violations(source: str, file_path: Path = DOMAIN / "session.py") -> set[str]:
+def _check_violations(source: str, file_path: Path) -> set[str]:
     """Parse source and return any resolved modules that violate the rule."""
     tree = ast.parse(source, filename=str(file_path))
     all_modules = _resolve_imports_in_module(tree, file_path)
-    return {m for m in all_modules if m.startswith(FORBIDDEN_PREFIXES)}
+    return {m for m in all_modules if not _is_stdlib_or_domain(m)}
 
 
 def test_domain_has_no_outward_imports() -> None:
@@ -136,7 +139,7 @@ def test_domain_has_no_outward_imports() -> None:
     for path in DOMAIN.rglob("*.py"):
         files_checked += 1
         for module in _imported_modules(path):
-            if module.startswith(FORBIDDEN_PREFIXES):
+            if not _is_stdlib_or_domain(module):
                 violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
 
     assert files_checked > 0, f"No Python files found in {DOMAIN}"
@@ -277,7 +280,7 @@ def test_directory_walk_detects_real_violation() -> None:
         violations: list[str] = []
         for path in DOMAIN.rglob("*.py"):
             for module in _imported_modules(path):
-                if module.startswith(FORBIDDEN_PREFIXES):
+                if not _is_stdlib_or_domain(module):
                     violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
 
         # Verify the violation was caught by the directory walk

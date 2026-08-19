@@ -42,7 +42,7 @@ target-version = "py312"
 extend-exclude = ["docs", "migrations/versions"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM"]
+select = ["E", "F", "I", "UP", "B", "SIM", "ARG"]
 
 [tool.mypy]
 python_version = "3.12"
