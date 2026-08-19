@@ -46,9 +46,7 @@ def test_sandbox_escapes_are_refused(source: str) -> None:
     except SecurityError:
         return
     for marker in _LEAK_MARKERS:
-        assert marker not in rendered, (
-            f"{source!r} rendered {rendered!r}, which leaks {marker!r}"
-        )
+        assert marker not in rendered, f"{source!r} rendered {rendered!r}, which leaks {marker!r}"
 
 
 def test_display_names_cannot_inject_a_link() -> None:

@@ -561,10 +561,34 @@ doesn't justify an additional operational component.
 | `/link remove` | everyone | Delete link |
 | `/audio delete` | everyone | Delete own audio recordings immediately, regardless of the retention period |
 | `/audio purge` | Admin | Delete a named user's recordings (Art. 17 GDPR) |
+| `/setup` | Admin | Guided first-run setup (Section 10.1) |
 | `/config …` | Admin | Read and set runtime configuration |
 
 All replies are ephemeral. Admin commands adopt the existing
 `require_admin()` pattern from the RAG bot.
+
+### 10.1 First-run setup
+
+Setting the required keys one by one through `/config set` means typing a channel
+id and a role id, which requires developer mode and copying ids by hand. `/setup`
+takes them as **typed command parameters** (`discord.VoiceChannel`,
+`discord.Role`) instead, so the client offers native pickers: no ids, no typos,
+and the bot receives real objects rather than numbers it must first validate.
+
+`/setup` also **configures the channel permissions itself** — `Speak` denied for
+`@everyone`, allowed for the consent role — and offers to create that role if it
+does not exist. This is deliberate. Those permissions are the primary layer of
+the legal protection in Section 3.1, and leaving them to prose in an operations
+guide puts the one step nobody may get wrong into the hands of whoever reads it
+least carefully. Getting it wrong means recording people who never consented.
+
+The command reports what it changed, what it left alone, and which required keys
+remain unset. It is re-runnable: run against an already configured guild it
+reports differences rather than failing.
+
+Where the bot lacks the permission to change the channel or create the role, it
+says so plainly and names what a human must do instead. A half-applied setup
+that claims success is worse than one that admits it stopped.
 
 ## 11. Configuration
 
@@ -579,11 +603,21 @@ The bot and worker share the store.
 | `idle_timeout_minutes` | 15 | Bot |
 | `max_session_hours` | 4 | Bot |
 | `publish_poll_seconds` | 30 | Bot |
+| `admin_role_id` | — | Bot |
+| `merge_gap_seconds` | 15 | Worker |
 | `document_provider` | `outline` | Worker |
 | `document_target` | — | Worker |
 | `audio_retention_days` | 30 | Worker |
 | `policy_version` | — | both |
 | `policy_url` | — | both |
+
+`admin_role_id` names the role whose members may use the administrative
+commands, alongside anyone holding Discord's own administrator permission. It is
+stored as an id rather than a name: names change, and two roles may share one.
+
+`merge_gap_seconds` is how long a pause may be before consecutive segments from
+one speaker become separate blocks. That is a judgement about readability rather
+than a fact about the system, which is why it belongs here and not in the code.
 
 Not configurable at runtime, but via environment variables instead: the
 Whisper model, the default language used as a fallback for auto-detection,
