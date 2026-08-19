@@ -312,12 +312,43 @@ nach absoluter Zeit zusammen und rendert Markdown:
 
 - Ein Dokument pro Session in der konfigurierten Collection
   (`outline_collection_id`), Titel mit Datum und Uhrzeit.
-- Sprecher mit verknüpftem Account erscheinen als
-  `@[Anzeigename](mention://user/<outline_user_id>)`, alle übrigen mit ihrem
-  Discord-Anzeigenamen als Klartext.
 - Aufeinanderfolgende Segmente desselben Sprechers werden zu einem Block
   zusammengefasst, statt jedes Segment einzeln zu listen.
 - Kein H1 am Dokumentanfang — der Titel ist in Outline ein eigenes Feld.
+
+**Sprecherzeile.** Jeder Block wird mit Zeitstempel und Sprecher eingeleitet.
+Verknüpfte Nutzer werden als echte Outline-Mention gerendert und dadurch
+benachrichtigt; dahinter steht in Klammern der Discord-Anzeigename, verlinkt auf
+das Discord-Profil über die Discord-ID:
+
+```markdown
+**14:32:05** · @[Max Mustermann](mention://user/9c8b…) ([maxm](https://discord.com/users/1234…))
+
+Der gesprochene Text dieses Blocks.
+```
+
+Ist kein Outline-Account verknüpft, entfällt allein die Mention; die verlinkte
+Discord-Identität bleibt:
+
+```markdown
+**14:33:11** · [gastnutzer](https://discord.com/users/9876…)
+```
+
+Die Discord-ID ist der stabile Anker: Anzeigenamen ändern sich, die ID nicht.
+Ein Protokoll bleibt dadurch auch dann zuordenbar, wenn jemand sich umbenannt
+oder den Server verlassen hat.
+
+**Anzeigenamen werden zum Session-Zeitpunkt eingefroren.** Der Worker schlägt sie
+nicht beim Rendern nach, sondern liest sie aus `session_participant` — sonst
+zeigte ein altes Protokoll die heutigen Namen. Aus derselben Tabelle wird eine
+Teilnehmerliste an den Dokumentkopf gerendert.
+
+> **Bei der Implementierung zu verifizieren:** Ob Outline eine Benachrichtigung
+> je Mention oder je Dokument und Nutzer erzeugt. Bei einem langen Protokoll
+> nennt dieselbe Person unter Umständen hunderte Blöcke — wird pro Mention
+> benachrichtigt, ist das unbrauchbar. Fallback in diesem Fall: nur die erste
+> Nennung eines Sprechers als Mention rendern, alle weiteren als Klartext mit
+> Discord-Link.
 
 ## 9. Datenmodell
 
@@ -342,6 +373,7 @@ DDL. Der RAG-Bot hat keine Migrationen; das ist eine Lücke, kein zu
 | `consent` | `discord_user_id`, `guild_id`, `granted_at`, `revoked_at`, `policy_version`, `source` |
 | `oauth_state` | `state` (PK), `discord_user_id`, `created_at`, `expires_at` |
 | `session` | `id`, `guild_id`, `channel_id`, `started_at`, `ended_at`, `end_reason`, `status`, `outline_document_id` |
+| `session_participant` | `session_id`, `discord_user_id`, `discord_display_name` (zum Session-Zeitpunkt eingefroren), `first_seen_at` |
 | `chunk_job` | `id`, `session_id`, `discord_user_id`, `seq`, `starts_at`, `s3_key`, `status`, `attempts`, `error`, `transcript` |
 
 Die Queue ist `chunk_job`, konsumiert über
@@ -436,7 +468,8 @@ beziehungsweise Klassen geschnitten:
 - Zeitrekonstruktion aus RTP-Timestamps, einschließlich SSRC-Wechsel
 - Chunk-Grenzen an Sprechpausen
 - Zusammenführung der Segmente über Sprecher und Chunks hinweg
-- Markdown- und Mention-Rendering
+- Markdown- und Mention-Rendering, inklusive Sprecherzeile mit und ohne
+  verknüpften Outline-Account
 - Consent-Auflösung einschließlich des Administrator-Bypass-Falls
 
 PostgreSQL über Testcontainers — die Repositories werden gegen eine echte
