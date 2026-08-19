@@ -66,6 +66,44 @@ def _resolve_relative_import(module: str | None, level: int, file_package: str) 
     return ".".join(base_parts)
 
 
+def _resolve_relative_names(
+    names: list[ast.alias], level: int, file_package: str
+) -> set[str]:
+    """Resolve names imported from a relative package (from .. import x, y, z).
+
+    When level >= 2, these imports can escape the current package.
+    When level == 1, imports stay within the package.
+
+    Args:
+        names: The imported names from the from...import statement
+        level: The relative level (1 for '.', 2 for '..', etc.)
+        file_package: The package the importing file belongs to
+
+    Returns:
+        Set of absolute module names, or empty set if imports stay local (level == 1).
+    """
+    if level < 2:
+        # from . import x stays within the package
+        return set()
+
+    parts = file_package.split(".")
+    levels_up = level - 1
+
+    if levels_up >= len(parts):
+        # Can't go up that many levels
+        return set()
+
+    base_parts = list(parts[: len(parts) - levels_up])
+    result = set()
+
+    for alias in names:
+        name = alias.name
+        submodule = ".".join(base_parts + [name])
+        result.add(submodule)
+
+    return result
+
+
 def _imported_modules(path: Path, src_path: Path = SRC) -> set[str]:
     """Extract all imported modules from a file, resolving relative imports."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -85,9 +123,15 @@ def _imported_modules(path: Path, src_path: Path = SRC) -> set[str]:
                     found.add(node.module)
             else:
                 # Relative import: from .x import y or from ..x import y
-                resolved = _resolve_relative_import(node.module, node.level, file_package)
-                if resolved:
-                    found.add(resolved)
+                if node.module:
+                    # from .x import y or from ..x import y
+                    resolved = _resolve_relative_import(node.module, node.level, file_package)
+                    if resolved:
+                        found.add(resolved)
+                else:
+                    # from . import x, y or from .. import x, y
+                    resolved_names = _resolve_relative_names(node.names, node.level, file_package)
+                    found.update(resolved_names)
 
     return found
 
@@ -145,12 +189,19 @@ def test_domain_rejects_relative_imports_escaping_domain_layer() -> None:
         probe_file.unlink(missing_ok=True)
 
 
-def test_domain_allows_relative_imports_within_domain_layer() -> None:
-    """Verify the test allows relative imports that stay within the domain package."""
-    probe_file = DOMAIN / "_probe_local.py"
+def test_domain_rejects_name_list_relative_imports_escaping_domain_layer() -> None:
+    """Verify the test catches 'from .. import name' syntax for escaping imports."""
+    probe_file = DOMAIN / "_probe_escape_names.py"
     try:
-        # These imports stay within domain - should NOT violate
-        probe_file.write_text("from . import models\nfrom .session import Session\n")
+        # This probe uses the name-list syntax: from .. import infrastructure
+        # Both this and 'from ..infrastructure import db' should escape to sturnus.infrastructure
+        probe_file.write_text("from .. import infrastructure\n")
+
+        modules = _imported_modules(probe_file)
+
+        # Verify it resolved to the forbidden module
+        assert "sturnus.infrastructure" in modules, \
+            f"Expected sturnus.infrastructure in resolved modules, got: {modules}"
 
         violations: list[str] = []
         for path in DOMAIN.rglob("*.py"):
@@ -158,8 +209,31 @@ def test_domain_allows_relative_imports_within_domain_layer() -> None:
                 if module.startswith(FORBIDDEN_PREFIXES):
                     violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
 
-        # No violations should be detected for this probe file
-        assert not any("_probe_local.py" in v for v in violations), \
-            f"Unexpected violations for local relative imports: {violations}"
+        # The violation must be caught
+        found = any(
+            "_probe_escape_names.py" in v and "sturnus.infrastructure" in v
+            for v in violations
+        )
+        assert found, f"Expected violation not detected. Got violations: {violations}"
+    finally:
+        probe_file.unlink(missing_ok=True)
+
+
+def test_domain_allows_relative_imports_within_domain_layer() -> None:
+    """Verify relative imports within domain are allowed and resolve correctly."""
+    probe_file = DOMAIN / "_probe_local.py"
+    try:
+        # These imports stay within domain - should NOT violate
+        probe_file.write_text("from .models import Session\n")
+
+        modules = _imported_modules(probe_file)
+
+        # Verify the import resolved correctly to a domain-internal module
+        assert "sturnus.domain.models" in modules, \
+            f"Expected sturnus.domain.models in resolved modules, got: {modules}"
+
+        # Verify no violations
+        violations = [m for m in modules if m.startswith(FORBIDDEN_PREFIXES)]
+        assert not violations, f"Unexpected violations: {violations}"
     finally:
         probe_file.unlink(missing_ok=True)
