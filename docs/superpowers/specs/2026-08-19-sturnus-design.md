@@ -1,423 +1,423 @@
 # Sturnus — Design
 
-Discord-Voice-Transkription mit Outline-Ablage für OneLiteFeather.
+Discord voice transcription with Outline storage for OneLiteFeather.
 
-Status: Entwurf zur Review · Datum: 2026-08-19
+Status: Draft for review · Date: 2026-08-19
 
-## 1. Ziel
+## 1. Goal
 
-Ein dedizierter Discord-Voice-Channel wird automatisch aufgezeichnet und als
-chronologisches Transkript in einem Dokumentsystem abgelegt — in dieser Phase
-Outline, über einen austauschbaren Adapter (Abschnitt 8). Sprecher erscheinen
-darin als echte Nutzer des Zielsystems, sofern sie ihren Discord-Account
-einmalig damit verknüpft haben.
+A dedicated Discord voice channel is recorded automatically and stored as a
+chronological transcript in a document system — in this phase, Outline,
+through a swappable adapter (Section 8). Speakers appear in it as real users
+of the target system, provided they have linked their Discord account to it
+once.
 
-Der Name folgt der Vogel-Konvention der Organisation (Falco, Otis, Ducula, Pica,
-Guira, Aves): *Sturnus vulgaris*, der Star, ist für seine Stimmen-Imitation
-bekannt.
+The name follows the organization's bird-naming convention (Falco, Otis,
+Ducula, Pica, Guira, Aves): *Sturnus vulgaris*, the common starling, is known
+for its vocal mimicry.
 
-## 2. Umfang dieser Phase
+## 2. Scope of this phase
 
-Ziel ist ein MVP auf der Strecke **Discord → Outline**, das im echten Betrieb
-erprobt werden kann. Alles, was diese Strecke nicht zum Laufen bringt, ist
-verschoben.
+The goal is an MVP on the **Discord → Outline** path that can be tested in
+real operation. Anything that doesn't get this path working is deferred.
 
-Bewusst außerhalb dieser Phase:
+Deliberately outside this phase:
 
-- **Keine LLM-Zusammenfassung.** Das Dokument enthält ausschließlich das
-  Roh-Transkript. Eine Zusammenfassungsstufe über die bestehende Ollama-Instanz
-  ist eine mögliche spätere Phase, kein Teil dieses Entwurfs.
-- **Keine Speaker-Diarization.** Discord liefert getrennte Audio-Streams pro
-  Nutzer; die Sprechertrennung ist damit ein gelöstes Problem und benötigt weder
-  pyannote noch WhisperX.
-- **Keine Per-Nutzer-OAuth-Token.** Der Bot schreibt mit einem einzigen
-  Service-Token nach Outline. Der OAuth-Flow dient allein der einmaligen
-  Identitätsfeststellung.
-- **Kein Live-Transkript.** Die Transkription beginnt erst, wenn die Session
-  beendet ist, und läuft über die vollständige Aufnahme.
-- **Nur der Outline-Adapter.** Der Port für die Dokumentablage wird gezogen,
-  aber allein Outline dahinter implementiert. Confluence, Notion und Markdown-
-  Dateien sind vorgesehene Erweiterungen, kein Lieferumfang dieser Phase.
-- **Templates sind mitgeliefert, nicht konfigurierbar.** Die Jinja2-Vorlagen für
-  Dokument und Discord-Nachrichten stammen aus dem Abbild; ein Admin-Befehl zum
-  Setzen eigener Vorlagen kommt später. Das spart Bedienoberfläche und entschärft
-  zugleich das größte Sicherheitsrisiko des Entwurfs (Abschnitt 8.2), weil im MVP
-  keine von außen eingebrachte Vorlage ausgeführt wird.
-- **Nur ein Aufnahme-Channel pro Guild.** Das Datenmodell ist auf mehrere
-  vorbereitet, die Konfiguration in dieser Phase nicht.
+- **No LLM summarization.** The document contains only the raw transcript. A
+  summarization stage built on the existing Ollama instance is a possible
+  later phase, not part of this design.
+- **No speaker diarization.** Discord delivers separate audio streams per
+  user, which means speaker separation is already a solved problem here and
+  needs neither pyannote nor WhisperX.
+- **No per-user OAuth tokens.** The bot writes to Outline with a single
+  service token. The OAuth flow serves only to establish identity once.
+- **No live transcript.** Transcription only begins once the session has
+  ended, and runs over the complete recording.
+- **Only the Outline adapter.** The port for document storage is drawn, but
+  only Outline is implemented behind it. Confluence, Notion, and Markdown
+  files are planned extensions, not part of this phase's deliverable.
+- **Templates ship with the image, they are not configurable.** The Jinja2
+  templates for the document and for Discord messages come from the image; an
+  admin command for setting custom templates comes later. This saves on UI
+  surface and at the same time defuses the design's biggest security risk
+  (Section 8.2), because in the MVP no externally supplied template is ever
+  executed.
+- **Only one recording channel per guild.** The data model is prepared for
+  multiple channels; the configuration in this phase is not.
 
-## 3. Rechtlicher Rahmen
+## 3. Legal framework
 
-Die Aufzeichnung des nicht-öffentlich gesprochenen Wortes ohne Einwilligung ist
-nach § 201 StGB strafbar. Das Design behandelt Einwilligung deshalb nicht als
-Feature, sondern als Vorbedingung jeder Audio-Verarbeitung.
+Recording non-publicly spoken words without consent is a criminal offense
+under § 201 StGB. This design therefore treats consent not as a feature, but
+as a precondition for any audio processing.
 
-### 3.1 Zweistufiger Schutz
+### 3.1 Two-tier protection
 
-**Primär — Discord-Permissions.** Im Aufnahme-Channel erhält `@everyone` die
-Berechtigung `Speak: deny`, die Consent-Rolle `Speak: allow`. Wer nicht
-eingewilligt hat, kann technisch kein Audio senden.
+**Primary — Discord permissions.** In the recording channel, `@everyone` gets
+`Speak: deny`, and the consent role gets `Speak: allow`. Anyone who has not
+consented technically cannot send audio.
 
-**Sekundär — Bot-seitiger SSRC-Filter.** Nutzer mit `Administrator`-Berechtigung
-umgehen Channel-Overrides und können unabhängig von der Rolle sprechen. Der Bot
-prüft deshalb bei jedem eingehenden Stream, ob der zugeordnete Nutzer die
-Consent-Rolle trägt, und verwirft die Pakete andernfalls, bevor sie einen Puffer
-erreichen. Dieser Filter ist nicht redundant, sondern deckt einen real
-existierenden Bypass ab.
+**Secondary — bot-side SSRC filter.** Users with `Administrator` permission
+bypass channel overrides and can speak regardless of role. The bot therefore
+checks, for every incoming stream, whether the associated user holds the
+consent role, and discards the packets otherwise — before they reach any
+buffer. This filter is not redundant; it covers a real, existing bypass.
 
-Die Prüfung erfolgt fortlaufend, nicht einmalig beim Session-Start. Widerruft
-jemand seine Einwilligung während einer laufenden Session, wird sein Stream ab
-diesem Moment verworfen; bereits aufgezeichnetes Audio bleibt unberührt, da der
-Widerruf nach Art. 7 Abs. 3 DSGVO nur in die Zukunft wirkt.
+The check happens continuously, not once at session start. If someone revokes
+their consent during a running session, their stream is discarded from that
+moment on; audio already recorded remains untouched, since under Art. 7(3)
+GDPR a revocation only takes effect going forward.
 
-### 3.2 Deployment-Voraussetzungen
+### 3.2 Deployment prerequisites
 
-Diese Punkte sind nicht optional, sondern Bedingung für den Betrieb:
+These points are not optional — they are a condition for operation:
 
-- Es müssen **nicht-aufgezeichnete Voice-Channels** als Alternative existieren.
-  Ist die Einwilligung die einzige Möglichkeit zur Teilnahme am Sprachbetrieb,
-  ist ihre Freiwilligkeit nach Art. 7 Abs. 4 DSGVO (Kopplungsverbot) angreifbar.
-- **Channel-Name und Channel-Topic benennen die Aufzeichnung.** Da der Bot ohne
-  expliziten Startbefehl automatisch joint, existiert kein Moment, in dem jemand
-  die Aufnahme bewusst auslöst — die Kennzeichnung muss den Channel selbst
-  tragen.
-- Der Bot postet bei jedem Join eine sichtbare Ankündigung in den Text-Teil des
-  Channels.
-- **Die Datenschutzerklärung benennt die Aufbewahrungsdauer der Audioaufnahmen
-  und deren Zweck.** Da Aufnahmen die Transkription überdauern (Abschnitt 12),
-  ist das kein Detail der Umsetzung, sondern Bestandteil dessen, worin
-  eingewilligt wird. Ändert sich die Dauer, ändert sich `policy_version` und die
-  Einwilligung ist neu einzuholen.
+- **Non-recorded voice channels** must exist as an alternative. If consent is
+  the only way to take part in voice at all, its voluntariness is open to
+  challenge under Art. 7(4) GDPR (the prohibition on tying).
+- **The channel name and channel topic name the recording.** Because the bot
+  joins automatically, without an explicit start command, there is no moment
+  at which someone consciously triggers the recording — the labeling has to
+  live on the channel itself.
+- The bot posts a visible announcement in the channel's text part on every
+  join.
+- **The privacy policy states the retention period for the audio recordings
+  and their purpose.** Because recordings outlive the transcription
+  (Section 12), this is not an implementation detail but part of what
+  consent is actually given to. If the duration changes, `policy_version`
+  changes and consent has to be obtained anew.
 
-### 3.3 Widerruf
+### 3.3 Revocation
 
-`/consent revoke` entzieht die Rolle und setzt `revoked_at` (Art. 7 Abs. 3,
-jederzeitiger Widerruf). Bereits erstellte Transkripte bleiben bestehen; der
-Widerruf wirkt ab dem Zeitpunkt seiner Erteilung.
+`/consent revoke` withdraws the role and sets `revoked_at` (Art. 7(3) —
+revocable at any time). Transcripts already created remain in place; the
+revocation takes effect from the moment it is issued.
 
-## 4. Architektur
+## 4. Architecture
 
-Drei Deployments, eine gemeinsame PostgreSQL-Datenbank, ein S3-Bucket.
+Three deployments, one shared PostgreSQL database, one S3 bucket.
 
 ### 4.1 `bot`
 
-Python 3.12, `discord.py` 2.x mit `discord-ext-voice-recv`. 1 CPU,
-`replicas: 1` fix, keine HPA — eine einzelne Gateway-Verbindung ist nicht
-horizontal skalierbar. Kein Ingress.
+Python 3.12, `discord.py` 2.x with `discord-ext-voice-recv`. 1 CPU,
+`replicas: 1` fixed, no HPA — a single gateway connection is not horizontally
+scalable. No ingress.
 
-Zur Bibliothekswahl: `discord.py` unterstützt kein Voice-Receive. Die
-Alternative wäre `py-cord`, dessen `WaveSink` die Pakete pro Nutzer jedoch nur
-aneinanderhängt, ohne Stille aufzufüllen — die Streams driften auseinander und
-die Chronologie des Protokolls wird unbrauchbar. `discord-ext-voice-recv`
-gewährt Zugriff auf die RTP-Timestamps, aus denen sich die absolute Position
-jedes Segments rekonstruieren lässt. Das ist der Grund für die Wahl.
+On the choice of library: `discord.py` does not support voice receive. The
+alternative would be `py-cord`, whose `WaveSink` simply concatenates packets
+per user without padding in silence — the streams drift apart and the
+transcript's chronology becomes unusable. `discord-ext-voice-recv` grants
+access to the RTP timestamps, from which the absolute position of every
+segment can be reconstructed. That is the reason for the choice.
 
-Aufgaben: Slash-Commands, Session-State-Machine, Voice-Receive, Consent-Filter,
-Aufzeichnung, S3-Upload bei Session-Ende, Job-Enqueue, Veröffentlichung des
-Dokument-Links. Health- und Metrics-Endpunkte auf einem
-internen Port (`/healthz`, `/readyz`, `/metrics`, `/version`).
+Responsibilities: slash commands, the session state machine, voice receive,
+the consent filter, recording, S3 upload on session end, job enqueueing,
+publishing the document link. Health and metrics endpoints on an internal
+port (`/healthz`, `/readyz`, `/metrics`, `/version`).
 
 ### 4.2 `link-service`
 
-Python 3.12, kleiner HTTP-Service. Einziges Deployment mit Ingress (über
-Cloudflare Tunnel, analog zur Outline-Installation).
+Python 3.12, a small HTTP service. The only deployment with ingress (via
+Cloudflare Tunnel, analogous to the Outline installation).
 
-Aufgaben: OAuth-Callback für die Account-Verknüpfung. Getrennt vom Bot, weil der
-Bot-Pod sowohl das Discord- als auch das Outline-Service-Token hält und nicht
-öffentlich erreichbar sein soll — und weil ein Deploy am Link-Flow sonst einen
-Bot-Neustart erzwingen würde, der jede laufende Aufnahme verliert.
+Responsibilities: the OAuth callback for account linking. Kept separate from
+the bot because the bot pod holds both the Discord and the Outline service
+token and should not be publicly reachable — and because a deploy to the link
+flow would otherwise force a bot restart, which would lose every recording in
+progress.
 
 ### 4.3 `worker`
 
-Python 3.12, `faster-whisper`. 4 CPU. Kein Ingress.
+Python 3.12, `faster-whisper`. 4 CPU. No ingress.
 
-Aufgaben: Transkriptions-Jobs aus der Queue ziehen, den vollständigen
-Sprecher-Stream transkribieren, das Audio löschen; sind alle Sprecher einer
-Session fertig, die Transkripte zusammenführen und das Outline-Dokument anlegen.
+Responsibilities: pull transcription jobs from the queue, transcribe the
+complete speaker stream, delete the audio; once every speaker in a session is
+done, merge the transcripts and create the Outline document.
 
-### 4.4 Code-Struktur
+### 4.4 Code structure
 
-Alle drei Deployments teilen sich ein Paket mit einer nach innen gerichteten
-Abhängigkeitsregel:
+All three deployments share one package with an inward-facing dependency
+rule:
 
 ```
 src/sturnus/
-  domain/          reine Logik, keine I/O
-    session.py       Session-State-Machine
-    timeline.py      RTP-Zeitrekonstruktion, Segment-Merge
-    transcript.py    Markdown- und Mention-Rendering
-    consent.py       Consent-Auflösung
-  application/     Use-Cases, orchestrieren Ports
-    ports.py         Protocol-Definitionen
+  domain/          pure logic, no I/O
+    session.py       session state machine
+    timeline.py      RTP time reconstruction, segment merge
+    transcript.py    Markdown and mention rendering
+    consent.py       consent resolution
+  application/     use cases, orchestrate ports
+    ports.py         Protocol definitions
     record_session.py
     transcribe_speaker.py
     publish_document.py
     link_account.py
-  infrastructure/  Adapter auf konkrete Technik
-    discord/         Voice-Receive-Adapter, Cogs
-    db/              ORM-Modelle, Repositories, Migrationen
-    objectstore/     S3, Verschlüsselung
+  infrastructure/  adapters to concrete tech
+    discord/         voice-receive adapter, cogs
+    db/              ORM models, repositories, migrations
+    objectstore/     S3, encryption
     whisper/         faster-whisper
-    documents/       DocumentSink-Adapter, aktuell Outline
-    templates/       Jinja2-Umgebung und mitgelieferte Standard-Templates
+    documents/       DocumentSink adapters, currently Outline
+    templates/       Jinja2 environment and bundled default templates
 ```
 
-**Die Abhängigkeitsregel:** `domain` importiert weder `application` noch
-`infrastructure` und keine Fremdbibliothek mit I/O — kein `discord`, kein
-`sqlalchemy`, kein `boto3`. `application` kennt nur `domain` und die eigenen
-Ports, niemals einen konkreten Adapter.
+**The dependency rule:** `domain` imports neither `application` nor
+`infrastructure`, and no third-party library that does I/O — no `discord`, no
+`sqlalchemy`, no `boto3`. `application` knows only `domain` and its own
+ports, never a concrete adapter.
 
-Das ist kein Selbstzweck. Die gesamte Logik, die dieses Projekt schwierig macht
-— Zeitrekonstruktion, Session-Übergänge, Segment-Merge — liegt damit in Code, der
-ohne Discord-Verbindung, ohne Datenbank und ohne Audiodatei testbar ist. Und der
-Adapter, der laut Abschnitt 15 das größte Fremdrisiko trägt, ist austauschbar,
-ohne die Kernlogik zu berühren.
+This is not an end in itself. All the logic that makes this project difficult
+— time reconstruction, session transitions, segment merging — ends up in
+code that is testable without a Discord connection, without a database, and
+without an audio file. And the adapter that, per Section 15, carries the
+biggest third-party risk, is swappable without touching the core logic.
 
-Damit die Regel nicht mit der Zeit verfällt, wird sie **als Test durchgesetzt**
-(Abschnitt 14), nicht als Konvention dokumentiert.
+So the rule doesn't erode over time, it is **enforced as a test**
+(Section 14), not documented as a convention.
 
-### 4.5 Ports und ihre Grenze
+### 4.5 Ports and their boundary
 
-Als Protocol abstrahiert werden die Systeme, die in Tests durch Fakes ersetzt
-werden müssen oder deren Implementierung wechseln kann:
+Abstracted as a Protocol are the systems that have to be replaced by fakes in
+tests, or whose implementation may change:
 
-| Port | Begründung |
+| Port | Rationale |
 |---|---|
-| `TranscriptionEngine` | In Unit-Tests gefaked; Wechsel zwischen `large-v3-turbo` und `small` |
-| `AudioStore` | S3 in Unit-Tests durch In-Memory-Fake ersetzt |
-| `DocumentSink` | Der eigentliche Erweiterungspunkt (Abschnitt 8): Outline heute, Confluence, Notion oder Dateiablage später |
-| `VoiceReceiver` | Kapselt `discord-ext-voice-recv`, hält den Bibliothekswechsel lokal |
+| `TranscriptionEngine` | Faked in unit tests; switched between `large-v3-turbo` and `small` |
+| `AudioStore` | S3 replaced by an in-memory fake in unit tests |
+| `DocumentSink` | The actual extension point (Section 8): Outline today, Confluence, Notion, or file storage later |
+| `VoiceReceiver` | Encapsulates `discord-ext-voice-recv`, keeps a library swap local |
 
-**Für Repositories werden bewusst keine Interfaces definiert.** Die
-Datenzugriffsschicht wird gegen eine echte PostgreSQL-Instanz über Testcontainers
-getestet (Abschnitt 14); ein Interface mit genau einer Implementierung und einem
-echten Datenbanktest dahinter wäre Zeremonie ohne Nutzen. SOLID verlangt
-Abstraktion dort, wo Implementierungen variieren — nicht überall. Diese Grenze
-ist Teil des Entwurfs und keine Nachlässigkeit.
+**Repositories deliberately have no interfaces defined for them.** The data
+access layer is tested against a real PostgreSQL instance via Testcontainers
+(Section 14); an interface with exactly one implementation and a real
+database test behind it would be ceremony without benefit. SOLID calls for
+abstraction where implementations vary — not everywhere. This boundary is
+part of the design, not negligence.
 
-## 5. Session-Lebenszyklus
+## 5. Session lifecycle
 
-Der Bot beobachtet `on_voice_state_update` für den konfigurierten Channel.
+The bot observes `on_voice_state_update` for the configured channel.
 
-### 5.1 Zustandsübergänge
+### 5.1 State transitions
 
-| Auslöser | Übergang |
+| Trigger | Transition |
 |---|---|
-| Erster Nutzer **mit Consent-Rolle** betritt den Channel | `IDLE` → `RECORDING`, Bot joint, Ankündigung wird gepostet |
-| Nutzer ohne Consent-Rolle betritt den leeren Channel | kein Übergang — niemand kann sprechen |
-| Letzter berechtigter Nutzer verlässt den Channel | `RECORDING` → `GRACE` |
-| Berechtigter Nutzer kehrt während `GRACE` zurück | `GRACE` → `RECORDING`, dieselbe Session läuft weiter |
-| `empty_grace_seconds` läuft ab | `GRACE` → `CLOSING` |
-| `idle_timeout_minutes` ohne jedes Audio | `RECORDING` → `CLOSING` |
-| `max_session_hours` erreicht | `RECORDING` → `CLOSING` |
+| First user **with the consent role** joins the channel | `IDLE` → `RECORDING`, the bot joins, an announcement is posted |
+| A user without the consent role joins the empty channel | no transition — nobody can speak |
+| Last eligible user leaves the channel | `RECORDING` → `GRACE` |
+| An eligible user returns during `GRACE` | `GRACE` → `RECORDING`, the same session continues |
+| `empty_grace_seconds` elapses | `GRACE` → `CLOSING` |
+| `idle_timeout_minutes` with no audio at all | `RECORDING` → `CLOSING` |
+| `max_session_hours` reached | `RECORDING` → `CLOSING` |
 
-`CLOSING` schließt die Aufnahmedateien, lädt sie nach S3, reiht je Sprecher einen
-Transkriptions-Job ein, setzt die Session auf `closed` und verlässt den Channel.
+`CLOSING` closes the recording files, uploads them to S3, enqueues one
+transcription job per speaker, sets the session to `closed`, and leaves the
+channel.
 
-Eine Session entspricht genau einem Outline-Dokument.
+One session corresponds to exactly one Outline document.
 
-### 5.2 Testbarkeit
+### 5.2 Testability
 
-Die State-Machine ist als reine Klasse mit **injizierter Uhr** implementiert und
-kennt weder Discord noch Datenbank. Genau der Teil, der sich sonst nur mit
-echten Personen in einem Voice-Channel prüfen ließe, wird damit deterministisch
-unit-testbar.
+The state machine is implemented as a pure class with an **injected clock**
+and knows neither Discord nor the database. Exactly the part that would
+otherwise only be verifiable with real people in a voice channel becomes
+deterministically unit-testable this way.
 
-### 5.3 Abschluss und Dokumenterstellung
+### 5.3 Completion and document creation
 
-Je Sprecher entsteht ein Transkriptions-Job. Der Worker prüft nach jedem
-erfolgreich abgeschlossenen Job, ob für dessen Session noch ein weiterer Job
-offen ist; ist keiner mehr offen, führt derselbe Durchlauf den Merge aus und legt
-das Dokument an. Die Prüfung läuft in derselben Transaktion wie der Statuswechsel
-des Jobs, damit bei gleichzeitig endenden Jobs nicht zwei Dokumente entstehen.
+One transcription job is created per speaker. After every successfully
+completed job, the worker checks whether another job is still open for that
+job's session; if none remains open, the same run performs the merge and
+creates the document. The check runs in the same transaction as the job's
+status change, so that two jobs ending at the same time don't produce two
+documents.
 
-Ein Job je Sprecher statt einem je Session hat zwei Gründe: ein Fehlversuch
-wiederholt nur den betroffenen Sprecher statt der gesamten Session, und der
-Fortschritt einer mehrstündigen Aufnahme ist beobachtbar. Die Jobs werden
-nacheinander abgearbeitet — `faster-whisper` nutzt bereits alle Kerne des
-Workers, parallele Jobs würden sich gegenseitig ausbremsen.
+A job per speaker instead of one per session has two reasons: a failed
+attempt only retries the affected speaker instead of the entire session, and
+progress on a multi-hour recording is observable. Jobs are worked through
+sequentially — `faster-whisper` already uses all of the worker's cores, so
+parallel jobs would just slow each other down.
 
-## 6. Audio-Pipeline
+## 6. Audio pipeline
 
-### 6.1 Erfassung
+### 6.1 Capture
 
-Eingehende Opus-Pakete werden pro Nutzer **sofort beim Empfang auf 16 kHz Mono
-PCM** dekodiert — das Zielformat von Whisper. Ein späteres Resampling entfällt.
+Incoming Opus packets are decoded per user **to 16 kHz mono PCM immediately
+on receipt** — Whisper's target format. That eliminates a later resampling
+step.
 
-Stille wird anhand der RTP-Timestamps **aufgefüllt**. Alle Sprecher-Puffer eines
-Sprecher-Streams sind dadurch gleich lang und exakt synchron, was das Zusammenführen zu
-einer trivialen Operation auf gemeinsamen Zeitachsen macht statt zu einer
-fehleranfälligen Heuristik. Das Padding kostet Speicher, aber keine Rechenzeit:
-`vad_filter=True` lässt Whisper die Stille überspringen.
+Silence is **padded in** based on the RTP timestamps. This keeps all of a
+speaker stream's buffers the same length and exactly in sync, which turns
+merging into a trivial operation on a shared timeline instead of an
+error-prone heuristic. The padding costs memory, but no compute time:
+`vad_filter=True` lets Whisper skip over the silence.
 
-### 6.2 Zeitrekonstruktion
+### 6.2 Time reconstruction
 
-RTP-Timestamps laufen bei Opus/48 kHz mit 48000 Ticks pro Sekunde. Der
-Startwert ist pro SSRC zufällig, weshalb absolute Zeit über einen Referenzpunkt
-bestimmt wird:
+RTP timestamps run at 48000 ticks per second for Opus/48 kHz. The starting
+value is random per SSRC, which is why absolute time is determined via a
+reference point:
 
-Beim **ersten Paket eines SSRC** wird das Paar `(wall_clock_now, rtp_ts_first)`
-festgehalten. Für jedes weitere Paket gilt:
+On the **first packet of an SSRC**, the pair `(wall_clock_now, rtp_ts_first)`
+is recorded. For every subsequent packet:
 
 ```
 absolute_time = wall_clock_first + (rtp_ts - rtp_ts_first) / 48000
 ```
 
-Das ergibt sample-genaues Timing innerhalb eines Nutzer-Streams und
-Wanduhr-Genauigkeit für die Ausrichtung zwischen Nutzern; die Abweichung
-entspricht dem Netzwerk-Jitter des jeweils ersten Pakets und liegt typischerweise
-unter 100 ms — für ein lesbares Protokoll ausreichend.
+This gives sample-accurate timing within a single user's stream and
+wall-clock accuracy for aligning between users; the deviation corresponds to
+the network jitter of each stream's first packet and is typically under
+100 ms — enough for a readable transcript.
 
-**Fallstrick:** Bei einem Reconnect wechselt die SSRC eines Nutzers. Die
-Zuordnung SSRC → Discord-User wird deshalb laufend über die Speaking-Events
-gepflegt, und jede neue SSRC erhält einen eigenen Referenzpunkt.
+**Pitfall:** a user's SSRC changes on reconnect. The SSRC → Discord-user
+mapping is therefore continuously maintained via the speaking events, and
+every new SSRC gets its own reference point.
 
-### 6.3 Aufzeichnung und Übergabe
+### 6.3 Recording and hand-off
 
-Die Aufnahme läuft über die gesamte Session als **ein durchgehender Strom je
-Sprecher**, ohne Unterteilung. Erst wenn die Session in `CLOSING` wechselt, werden
-die Dateien geschlossen, nach S3 geladen und je Sprecher ein Transkriptions-Job
-eingereiht.
+The recording runs across the entire session as **one continuous stream per
+speaker**, with no segmentation. Only once the session transitions to
+`CLOSING` are the files closed, uploaded to S3, and one transcription job
+enqueued per speaker.
 
-Der Grund ist Qualität: jede Schnittstelle im Audio ist eine Stelle, an der
-Whisper seinen Kontext verliert, Sätze über die Grenze hinweg schlechter erkannt
-werden und die Sprachdetektion auf weniger Material arbeitet. Ein einziger
-Durchlauf über die vollständige Aufnahme liefert die bestmögliche Transkription,
-die dieses Modell hergibt.
+The reason is quality: every cut in the audio is a place where Whisper loses
+its context, sentences spanning the cut get recognized worse, and language
+detection has less material to work with. A single pass over the complete
+recording delivers the best transcription this model can produce.
 
-Der Preis ist Latenz. Die Transkription beginnt erst nach Session-Ende und
-braucht bei etwa 1× Realtime ungefähr so lange wie die reine Redezeit: eine
-vierstündige Session mit zwei Stunden tatsächlicher Sprache ist rund zwei Stunden
-nach ihrem Ende als Dokument verfügbar. Deshalb wird der Dokument-Link
-anschließend in den Channel gestellt (Abschnitt 8.5) — wer die Sitzung verlassen
-hat, erfährt sonst nie, dass das Protokoll fertig ist.
+The price is latency. Transcription only begins after the session ends and,
+at roughly 1× realtime, takes about as long as the actual speaking time: a
+four-hour session with two hours of actual speech is available as a document
+roughly two hours after it ends. That's why the document link is
+subsequently posted to the channel (Section 8.5) — otherwise, anyone who has
+left the session would never learn that the transcript is ready.
 
-**Der Bot puffert nicht im Arbeitsspeicher, sondern schreibt fortlaufend auf ein
-Volume.** Die Aufnahmelänge ist dadurch vom RAM entkoppelt. Bei 16 kHz Mono
-belegt eine Stunde je Sprecher rund 115 MB; die Obergrenze `max_session_hours`
-begrenzt den ungünstigsten Fall, und die Volume-Größe wird auf
-`max_session_hours × erwartete Sprecherzahl` ausgelegt.
+**The bot does not buffer in memory; it writes continuously to a volume.**
+This decouples recording length from RAM. At 16 kHz mono, one hour per
+speaker takes up roughly 115 MB; the `max_session_hours` cap bounds the worst
+case, and the volume is sized for `max_session_hours × expected number of
+speakers`.
 
-**Das Volume ist ein PVC, kein `emptyDir`.** Ohne Unterteilung hängt eine ganze
-Session an dieser einen Datei — ein `emptyDir` verliert sie bei jedem
-Reschedule. Ein SIGTERM-Handler schließt die Dateien geordnet und reiht die Jobs
-ein; kommt der Bot einem harten Kill nicht zuvor, findet er die verwaisten
-Aufnahmen beim nächsten Start auf dem PVC, lädt sie hoch und reiht sie nach. Bei
-`replicas: 1` ist ein RWO-PVC dafür ausreichend.
+**The volume is a PVC, not an `emptyDir`.** Since the recording is not
+segmented, an entire session hangs on this one file — an `emptyDir` would
+lose it on every reschedule. A SIGTERM handler closes the files cleanly and
+enqueues the jobs; if the bot can't get ahead of a hard kill, it finds the
+orphaned recordings on the PVC at its next start, uploads them, and enqueues
+them after the fact. At `replicas: 1`, an RWO PVC is sufficient for this.
 
-Ohne diese beiden Vorkehrungen würde ein einzelner Deploy eine mehrstündige
-Aufnahme vernichten — bei Unterteilung in Abschnitte wäre der Verlust auf einen
-Abschnitt begrenzt gewesen, hier ist er es nicht.
+Without these two precautions, a single deploy would destroy a multi-hour
+recording — with segmentation into sections, the loss would have been
+limited to one section; here, it is not.
 
-## 7. Transkription
+## 7. Transcription
 
-`faster-whisper` mit `large-v3-turbo` in int8 als Default. Turbo ist ein
-destillierter Decoder, läuft auf 4 Kernen bei etwa 1× Realtime bei rund 1,6 GB
-RAM und liefert für Deutsch deutlich bessere Ergebnisse als `small`. `small`
-bleibt als konfigurierbarer Fallback, falls das Sizing im Betrieb nicht aufgeht.
+`faster-whisper` with `large-v3-turbo` in int8 as the default. Turbo is a
+distilled decoder, runs on 4 cores at roughly 1× realtime with about 1.6 GB
+of RAM, and delivers noticeably better results for German than `small`.
+`small` remains a configurable fallback in case the sizing doesn't work out
+in production.
 
-**Die Sprache wird automatisch erkannt, aber nur einmal je Sprecher und
-Session.** Whisper bestimmt die Sprache anhand der ersten 30 Sekunden eines
-Durchlaufs — bei Silence-Padding wäre das unter Umständen Stille. Die Detektion
-läuft deshalb auf dem **ersten VAD-Segment mit substantieller Sprache**, nicht
-auf dem Anfang der Datei. Das Ergebnis wird in `session_participant` festgehalten
-und für den gesamten Durchlauf dieses Sprechers als `language` gesetzt.
+**Language is detected automatically, but only once per speaker and
+session.** Whisper determines the language from the first 30 seconds of a
+run — with silence padding, that could well be silence. Detection therefore
+runs on the **first VAD segment with substantial speech**, not on the start
+of the file. The result is recorded in `session_participant` and set as
+`language` for that speaker's entire run.
 
-Erkennt die Detektion nichts Belastbares — etwa bei einem Sprecher mit nur
-wenigen Wortmeldungen —, greift eine konfigurierbare Standardsprache.
+If detection doesn't find anything solid to go on — for example for a
+speaker with only a few utterances — a configurable default language kicks
+in.
 
-`vad_filter=True` überspringt die aufgefüllte Stille.
+`vad_filter=True` skips the padded-in silence.
 
-**Halluzinationsrisiko bei langen Durchläufen.** Whisper trägt über
-`condition_on_previous_text` Kontext zwischen seinen 30-Sekunden-Fenstern weiter,
-was die Qualität hebt — aber bei langem Audio zu Kaskaden führen kann, in denen
-sich ein einmal abgedrifteter Text selbst verstärkt. Bei einem Durchlauf über
-eine vollständige Session ist diese Gefahr am größten, weil keine Schnittstelle
-den Kontext zurücksetzt. Die Schwellen für `compression_ratio_threshold` und
-`no_speech_threshold` bleiben deshalb aktiv, und das Abschalten von
-`condition_on_previous_text` ist der Rückfallweg, falls sich Wiederholungsartefakte
-im Betrieb zeigen.
+**Hallucination risk on long runs.** Whisper carries context between its
+30-second windows via `condition_on_previous_text`, which improves quality —
+but on long audio it can lead to cascades in which text that has once
+drifted off reinforces itself. This risk is greatest on a run over a
+complete session, because no cut ever resets the context. The
+`compression_ratio_threshold` and `no_speech_threshold` thresholds therefore
+stay active, and turning off `condition_on_previous_text` is the fallback if
+repetition artifacts show up in production.
 
-Jeder Nutzer-Stream wird einzeln transkribiert. Die resultierenden Segmente
-tragen Offsets relativ zum Aufnahmebeginn des Sprechers, die über dessen
-Referenzzeitpunkt (Abschnitt 6.2) in absolute Zeit umgerechnet werden.
+Each user stream is transcribed individually. The resulting segments carry
+offsets relative to that speaker's recording start, which are converted to
+absolute time via that speaker's reference point (Section 6.2).
 
-## 8. Dokumentablage
+## 8. Document storage
 
-Das Ziel der Transkripte ist austauschbar. Outline ist der erste und einzige in
-dieser Phase gebaute Adapter; Confluence, Notion oder das Ablegen als
-Markdown-Dateien sollen später ohne Eingriff in die Kernlogik ergänzt werden
-können.
+The transcripts' destination is swappable. Outline is the first, and in this
+phase the only, adapter built; Confluence, Notion, or storing as Markdown
+files should be addable later without touching the core logic.
 
-Umgesetzt wird deshalb **die Naht, nicht der Vorrat**: der Port wird sauber
-gezogen und Outline dahinter implementiert. Weitere Adapter jetzt schon zu bauen,
-ohne dass ein Ziel feststeht, würde Annahmen zementieren, die sich am zweiten
-realen Adapter als falsch erweisen.
+What gets built, then, is **the seam, not the stock**: the port is drawn
+cleanly and Outline is implemented behind it. Building further adapters now,
+before a real target exists, would cement assumptions that would turn out
+wrong the moment a second real adapter arrives.
 
-### 8.1 Der Port
+### 8.1 The port
 
-`domain` erzeugt ein **zielneutrales Transkript-Modell**: eine Liste von Blöcken
-aus Zeitpunkt, Sprecheridentität und Text, dazu Session-Metadaten und die
-Teilnehmerliste. Es enthält keinerlei Markup.
+`domain` produces a **target-neutral transcript model**: a list of blocks
+made of a timestamp, a speaker identity, and text, plus session metadata and
+the participant list. It contains no markup whatsoever.
 
-Die Sprecheridentität trägt alle bekannten Bestandteile — Discord-ID,
-eingefrorener Discord-Anzeigename und, falls verknüpft, die Kennung beim
-Zielsystem. Welche davon im Ergebnis auftauchen und in welcher Form, entscheidet
-allein der Adapter.
+The speaker identity carries every known component — Discord ID, the frozen
+Discord display name, and, if linked, the identifier at the target system.
+Which of these show up in the result, and in what form, is decided by the
+adapter alone.
 
-Der `DocumentSink`-Port umfasst das Anlegen eines Dokuments aus diesem Modell und
-die Rückgabe einer aufrufbaren URL. Er kennt weder Collections noch Spaces noch
-Dateipfade — diese Begriffe leben in der Konfiguration des jeweiligen Adapters.
+The `DocumentSink` port covers creating a document from this model and
+returning a callable URL. It knows nothing of collections, spaces, or file
+paths — those concepts live in the configuration of the respective adapter.
 
-### 8.2 Rendering über Jinja2
+### 8.2 Rendering via Jinja2
 
-Jeder Adapter rendert das Transkript-Modell über ein **Jinja2-Template**. Der
-Grund ist nicht Konfigurierbarkeit um ihrer selbst willen, sondern dass die
-Zielformate keine gemeinsame Darstellung haben: Outline nutzt
-`@[Name](mention://user/<id>)`, Confluence `<ac:link><ri:user/></ac:link>`,
-Notion strukturiertes JSON, und einfaches Markdown kennt überhaupt keine
-Erwähnungen. Ein einziger fest verdrahteter Renderer könnte nur den kleinsten
-gemeinsamen Nenner bedienen.
+Every adapter renders the transcript model via a **Jinja2 template**. The
+reason is not configurability for its own sake, but that the target formats
+have no shared representation: Outline uses `@[Name](mention://user/<id>)`,
+Confluence `<ac:link><ri:user/></ac:link>`, Notion structured JSON, and plain
+Markdown has no concept of mentions at all. A single hard-wired renderer
+could only serve the lowest common denominator.
 
-Jeder Adapter bringt ein Standard-Template mit. Das Auflösen einer abweichenden,
-in der Konfiguration hinterlegten Vorlage ist im Modell vorgesehen, im MVP aber
-nicht bedienbar (Abschnitt 2).
+Every adapter ships with a default template. Resolving a different template
+stored in the configuration is provided for in the model, but not usable in
+the MVP (Section 2).
 
-Dieselbe Engine rendert die Discord-Nachrichten — Aufnahme-Ankündigung,
-Consent-Hinweis, Fertigstellungsmeldung mit Dokument-Link —, sodass Wortlaut und
-Sprache dieser Texte ohne Codeänderung anpassbar sind.
+The same engine renders the Discord messages — the recording announcement,
+the consent notice, the completion message with the document link — so that
+the wording and language of these texts can be adjusted without a code
+change.
 
-**Templates laufen in einer `SandboxedEnvironment`.** Jinja2 ist im
-Auslieferungszustand keine Sandbox: ein Ausdruck wie `{{ ''.__class__.__mro__ }}`
-öffnet den Weg zu beliebiger Codeausführung. Die Umgebung erhält deshalb
-ausschließlich das Transkript-Modell und eine feste Menge an Filtern; nichts, was
-I/O ausführt.
+**Templates run inside a `SandboxedEnvironment`.** Jinja2 is not a sandbox
+out of the box: an expression like `{{ ''.__class__.__mro__ }}` opens a path
+to arbitrary code execution. The environment is therefore given only the
+transcript model and a fixed set of filters — nothing that performs I/O.
 
-Im MVP stammen alle Vorlagen aus dem Abbild, womit diese Absicherung noch keine
-Angriffsfläche abdeckt, sondern eine vorbereitet: sobald Vorlagen per Befehl
-gesetzt werden können, wäre eine ungeschützte Umgebung gleichbedeutend mit einer
-Shell im Bot-Pod für jeden Guild-Administrator. Die Sandbox jetzt einzuziehen
-kostet nichts und verhindert, dass diese Erweiterung später an einer Stelle
-ansetzt, die sie nicht trägt.
+In the MVP, all templates come from the image, so this safeguard doesn't yet
+cover an actual attack surface — it prepares for one: as soon as templates
+can be set via a command, an unprotected environment would be equivalent to
+handing every guild administrator a shell in the bot pod. Putting the sandbox
+in place now costs nothing and prevents that later extension from landing on
+ground that can't bear it.
 
-**Eingesetzte Werte werden zielformat-spezifisch escaped.** Discord-Anzeigenamen
-und Transkripttext sind nicht vertrauenswürdig — wer sich `[hier klicken](https://…)`
-nennt, injiziert andernfalls einen Link in jedes Protokoll, in dem er auftaucht,
-oder bricht mit `](` aus dem umgebenden Markup aus. Jeder Adapter stellt einen
-Escape-Filter für sein Format bereit; die Templates verwenden ihn für jeden Wert
-aus dem Modell. HTML-Autoescape ist dafür kein Ersatz, weil das Zielformat in
-den meisten Fällen kein HTML ist.
+**Values inserted into a template are escaped specifically for the target
+format.** Discord display names and transcript text are not trustworthy —
+anyone who names themselves `[hier klicken](https://…)` would otherwise
+inject a link into every transcript they appear in, or break out of the
+surrounding markup with `](`. Every adapter provides an escaping filter for
+its format; the templates use it for every value drawn from the model. HTML
+autoescaping is no substitute for this, because the target format is not
+HTML in most cases.
 
-### 8.3 Der Outline-Adapter
+### 8.3 The Outline adapter
 
-Ein Dokument pro Session in der konfigurierten Collection, Titel mit Datum und
-Uhrzeit, kein H1 am Anfang — der Titel ist in Outline ein eigenes Feld.
-Aufeinanderfolgende Segmente desselben Sprechers werden zu einem Block
-zusammengefasst.
+One document per session in the configured collection, a title with date and
+time, no H1 at the top — in Outline the title is its own field. Consecutive
+segments from the same speaker are merged into a single block.
 
-Verknüpfte Nutzer werden als echte Outline-Erwähnung gerendert und dadurch
-benachrichtigt; dahinter steht in Klammern der Discord-Anzeigename, verlinkt auf
-das Discord-Profil über die Discord-ID:
+Linked users are rendered as a real Outline mention, which notifies them;
+behind it, in parentheses, sits the Discord display name, linked to the
+Discord profile via the Discord ID:
 
 ```markdown
 **14:32:05** · @[Max Mustermann](mention://user/9c8b…) ([maxm](https://discord.com/users/1234…))
@@ -425,122 +425,124 @@ das Discord-Profil über die Discord-ID:
 Der gesprochene Text dieses Blocks.
 ```
 
-Ist kein Outline-Account verknüpft, entfällt allein die Erwähnung; die verlinkte
-Discord-Identität bleibt:
+If no Outline account is linked, only the mention is omitted; the linked
+Discord identity remains:
 
 ```markdown
 **14:33:11** · [gastnutzer](https://discord.com/users/9876…)
 ```
 
-Die Discord-ID ist der stabile Anker: Anzeigenamen ändern sich, die ID nicht.
-Ein Protokoll bleibt dadurch auch dann zuordenbar, wenn jemand sich umbenannt
-oder den Server verlassen hat. Die Namen stammen aus `session_participant` und
-sind zum Session-Zeitpunkt eingefroren; aus derselben Quelle entsteht die
-Teilnehmerliste am Dokumentkopf.
+The Discord ID is the stable anchor: display names change, the ID doesn't. A
+transcript therefore stays attributable even after someone has renamed
+themselves or left the server. The names come from `session_participant` and
+are frozen at the time of the session; the participant list at the top of the
+document is built from the same source.
 
-> **Bei der Implementierung zu verifizieren:** Ob Outline eine Benachrichtigung
-> je Erwähnung oder je Dokument und Nutzer erzeugt. Bei einem langen Protokoll
-> nennt dieselbe Person unter Umständen hunderte Blöcke — wird pro Erwähnung
-> benachrichtigt, ist das unbrauchbar. Fallback in diesem Fall: nur die erste
-> Nennung eines Sprechers als Erwähnung rendern, alle weiteren als Klartext mit
-> Discord-Link.
+> **To verify during implementation:** whether Outline generates a
+> notification per mention or per document and user. In a long transcript,
+> the same person may be named in hundreds of blocks — if notification
+> happens per mention, that's unusable. Fallback in that case: render only a
+> speaker's first mention as an actual mention, and all subsequent ones as
+> plain text with a Discord link.
 
-### 8.4 Account-Verknüpfung
+### 8.4 Account linking
 
-`/link` erzeugt einen kurzlebigen, signierten State und antwortet ephemeral mit
-einer Autorisierungs-URL. Nach Zustimmung ruft der `link-service` den Callback
-ab, tauscht den Code gegen ein Token, fragt damit **einmalig** die Identität des
-Nutzers ab, speichert die Kennung des Zielsystems samt Anzeigename — und
-verwirft das Token.
+`/link` generates a short-lived, signed state and replies ephemerally with an
+authorization URL. After the user consents, the `link-service` receives the
+callback, exchanges the code for a token, uses it to query the user's
+identity **once**, stores the target system's identifier along with the
+display name — and discards the token.
 
-Es wird kein Zugriffstoken persistiert. Damit entfallen Token-Verschlüsselung,
-Refresh-Handling und Revocation vollständig.
+No access token is ever persisted. That eliminates token encryption, refresh
+handling, and revocation entirely.
 
-Die Verknüpfung ist **je Zielsystem** abgelegt (`provider` in `account_link`),
-nicht global. Ein späterer Confluence-Adapter braucht eine eigene Zuordnung; die
-Outline-Verknüpfung taugt dafür nicht.
+The link is stored **per target system** (`provider` in `account_link`), not
+globally. A future Confluence adapter needs its own mapping; the Outline link
+is no good for that.
 
-`/link remove` löscht die Zuordnung.
+`/link remove` deletes the mapping.
 
-> **Bei der Implementierung zu verifizieren:** Outline läuft in Version 1.9.1 und
-> unterstützt OAuth-Applications als Provider. Die exakten Endpunkt-Pfade, die
-> Scope-Bezeichnungen und der Endpunkt zur Abfrage der eigenen Identität sind
-> gegen die laufende Instanz zu prüfen, statt aus der Dokumentation angenommen zu
-> werden.
+> **To verify during implementation:** Outline runs on version 1.9.1 and
+> supports OAuth applications as a provider. The exact endpoint paths, the
+> scope names, and the endpoint for querying one's own identity need to be
+> checked against the running instance, rather than assumed from the
+> documentation.
 
-### 8.5 Veröffentlichung des Links
+### 8.5 Publishing the link
 
-Weil die Transkription erst nach Session-Ende beginnt und je nach Redezeit
-Stunden dauern kann, hat der Channel sich längst geleert, wenn das Dokument
-entsteht. Der Bot postet deshalb den Link auf das fertige Dokument in den
-Text-Teil des Aufnahme-Channels, sobald es vorliegt — Wortlaut über ein
-Jinja2-Template.
+Because transcription only begins after the session ends, and can take hours
+depending on speaking time, the channel has long since emptied out by the
+time the document exists. The bot therefore posts the link to the finished
+document in the text part of the recording channel as soon as it's ready —
+the wording comes from a Jinja2 template.
 
-Der Worker selbst postet nicht. Er hält weder eine Gateway-Verbindung noch soll
-er das Discord-Token besitzen; er setzt die Session auf `documented` und
-hinterlegt `document_url`. Der Bot fragt diesen Zustand alle
-`publish_poll_seconds` (Default 30) ab, postet die Nachricht und setzt
-`announced_at` — das Feld verhindert doppelte Ankündigungen nach einem Neustart.
+The worker itself does not post. It holds no gateway connection, and it
+shouldn't own the Discord token either; it sets the session to `documented`
+and stores `document_url`. The bot polls this state every
+`publish_poll_seconds` (default 30), posts the message, and sets
+`announced_at` — this field prevents duplicate announcements after a
+restart.
 
-Abfrage statt `LISTEN`/`NOTIFY`: Die Datenbank wird über PgBouncer erreicht, und
-im Transaction-Pooling-Modus werden Benachrichtigungen nicht durchgereicht. Bei
-wenigen Sessions pro Tag ist eine Abfrage im 30-Sekunden-Takt die robustere Wahl
-gegenüber einer Direktverbindung am Pooler vorbei.
+Polling instead of `LISTEN`/`NOTIFY`: the database is reached through
+PgBouncer, and in transaction pooling mode, notifications don't get passed
+through. With only a handful of sessions per day, polling every 30 seconds is
+the more robust choice compared to a direct connection that bypasses the
+pooler.
 
-## 9. Datenmodell
+## 9. Data model
 
-PostgreSQL über CloudNativePG, eigene Datenbank nach dem bestehenden
-`database/`-Muster des Clusters.
+PostgreSQL via CloudNativePG, its own database following the cluster's
+existing `database/` pattern.
 
-Zugriff ausschließlich über **SQLAlchemy 2.0 im async-Modus** (`DeclarativeBase`,
-`Mapped[...]`, `async_sessionmaker`) mit `asyncpg` als Treiber. Roher SQL-Zugriff
-neben dem ORM ist ausgeschlossen: im RAG-Bot existieren ORM-Modelle und direkte
-`asyncpg`-Zugriffe nebeneinander, was zu zwei parallelen Datenzugriffswegen für
-dieselbe Datenbank führt. Sturnus hat genau einen.
+Access is exclusively through **SQLAlchemy 2.0 in async mode**
+(`DeclarativeBase`, `Mapped[...]`, `async_sessionmaker`) with `asyncpg` as
+the driver. Raw SQL access alongside the ORM is ruled out: in the RAG bot,
+ORM models and direct `asyncpg` access exist side by side, which results in
+two parallel data-access paths to the same database. Sturnus has exactly
+one.
 
-Schema-Änderungen laufen über **Alembic**-Migrationen, die beim Start des
-`worker` angewandt werden — nicht durch `create_all()` und nicht durch manuelles
-DDL. Der RAG-Bot hat keine Migrationen; das ist eine Lücke, kein zu
-übernehmendes Muster.
+Schema changes go through **Alembic** migrations, applied when `worker`
+starts up — not via `create_all()` and not via manual DDL. The RAG bot has no
+migrations; that's a gap, not a pattern to adopt.
 
-| Tabelle | Inhalt |
+| Table | Contents |
 |---|---|
-| `guild_config` | Laufzeit-Konfiguration je Guild (Abschnitt 10) |
-| `account_link` | `discord_user_id` + `provider` (zusammengesetzter PK), `external_user_id`, `display_name`, `linked_at` |
+| `guild_config` | Runtime configuration per guild (Section 11) |
+| `account_link` | `discord_user_id` + `provider` (composite PK), `external_user_id`, `display_name`, `linked_at` |
 | `consent` | `discord_user_id`, `guild_id`, `granted_at`, `revoked_at`, `policy_version`, `source` |
 | `oauth_state` | `state` (PK), `discord_user_id`, `created_at`, `expires_at` |
 | `session` | `id`, `guild_id`, `channel_id`, `started_at`, `ended_at`, `end_reason`, `status`, `document_provider`, `document_id`, `document_url`, `announced_at` |
-| `session_participant` | `session_id`, `discord_user_id`, `discord_display_name` (zum Session-Zeitpunkt eingefroren), `detected_language`, `first_seen_at` |
+| `session_participant` | `session_id`, `discord_user_id`, `discord_display_name` (frozen at session time), `detected_language`, `first_seen_at` |
 | `transcription_job` | `id`, `session_id`, `discord_user_id`, `s3_key`, `encryption_key_id`, `retention_until`, `audio_deleted_at`, `status`, `attempts`, `error`, `transcript` |
 
-Die Queue ist `transcription_job`, konsumiert über
+The queue is `transcription_job`, consumed via
 `select(TranscriptionJob).with_for_update(skip_locked=True)`.
-Ein Message-Broker wird bewusst nicht eingesetzt: PostgreSQL wird für das
-Mapping ohnehin benötigt, und das erwartete Volumen von wenigen Sessions pro Tag
-rechtfertigt keine zusätzliche Betriebskomponente.
+A message broker is deliberately not used: PostgreSQL is needed for the
+mapping regardless, and the expected volume of a handful of sessions per day
+doesn't justify an additional operational component.
 
-## 10. Slash-Commands
+## 10. Slash commands
 
-| Command | Berechtigung | Wirkung |
+| Command | Permission | Effect |
 |---|---|---|
-| `/consent` | alle | Ephemeral-Embed mit Datenschutzhinweis und Buttons *Zustimmen* / *Ablehnen*. Bei Zustimmung: Rolle vergeben, Eintrag mit aktueller `policy_version` |
-| `/consent revoke` | alle | Rolle entziehen, `revoked_at` setzen |
-| `/consent status` | alle | Eigener Einwilligungs- und Verknüpfungsstand |
-| `/link` | alle | Ephemeral-Antwort mit Autorisierungs-URL |
-| `/link remove` | alle | Verknüpfung löschen |
-| `/audio delete` | alle | Eigene Audioaufnahmen sofort löschen, unabhängig von der Aufbewahrungsfrist |
-| `/audio purge` | Admin | Aufnahmen eines benannten Nutzers löschen (Art. 17 DSGVO) |
-| `/config …` | Admin | Laufzeit-Konfiguration lesen und setzen |
+| `/consent` | everyone | Ephemeral embed with a privacy notice and *Accept* / *Decline* buttons. On acceptance: role granted, entry created with the current `policy_version` |
+| `/consent revoke` | everyone | Withdraw role, set `revoked_at` |
+| `/consent status` | everyone | Own consent and linking status |
+| `/link` | everyone | Ephemeral reply with authorization URL |
+| `/link remove` | everyone | Delete link |
+| `/audio delete` | everyone | Delete own audio recordings immediately, regardless of the retention period |
+| `/audio purge` | Admin | Delete a named user's recordings (Art. 17 GDPR) |
+| `/config …` | Admin | Read and set runtime configuration |
 
-Alle Antworten sind ephemeral. Für Admin-Commands wird das bestehende
-`require_admin()`-Muster aus dem RAG-Bot übernommen.
+All replies are ephemeral. Admin commands adopt the existing
+`require_admin()` pattern from the RAG bot.
 
-## 11. Konfiguration
+## 11. Configuration
 
-Laufzeit-konfigurierbar über die `/config`-Gruppe, gespeichert in
-`guild_config`. Bot und Worker teilen sich den Store.
+Configurable at runtime via the `/config` group, stored in `guild_config`.
+The bot and worker share the store.
 
-| Schlüssel | Default | Konsument |
+| Key | Default | Consumer |
 |---|---|---|
 | `voice_channel_id` | — | Bot |
 | `consent_role_id` | — | Bot |
@@ -551,264 +553,265 @@ Laufzeit-konfigurierbar über die `/config`-Gruppe, gespeichert in
 | `document_provider` | `outline` | Worker |
 | `document_target` | — | Worker |
 | `audio_retention_days` | 30 | Worker |
-| `policy_version` | — | beide |
-| `policy_url` | — | beide |
+| `policy_version` | — | both |
+| `policy_url` | — | both |
 
-Nicht laufzeit-konfigurierbar, sondern über Umgebungsvariablen: Whisper-Modell,
-Standardsprache als Rückfall der Autodetektion, maximale Fehlversuche je
-Transkriptions-Job (Default 3), Datenbank- und S3-Verbindung, Tokens sowie der
-Hauptschlüssel für die Audio-Verschlüsselung.
+Not configurable at runtime, but via environment variables instead: the
+Whisper model, the default language used as a fallback for auto-detection,
+the maximum number of retries per transcription job (default 3), the
+database and S3 connection, tokens, and the master key for audio encryption.
 
-`document_target` ist bewusst allgemein benannt: beim Outline-Adapter ist es eine
-Collection-ID, bei einem künftigen Confluence-Adapter ein Space-Key, bei einer
-Dateiablage ein Pfad. Die Auslegung obliegt dem Adapter.
+`document_target` is deliberately named generically: for the Outline adapter
+it's a collection ID, for a future Confluence adapter a space key, for file
+storage a path. Its interpretation is up to the adapter.
 
-## 12. Aufbewahrung und Schutz der Aufnahmen
+## 12. Retention and protection of the recordings
 
-Audioaufnahmen werden **nicht sofort nach der Transkription gelöscht**, sondern
-für `audio_retention_days` aufbewahrt (Default 30). Der Zweck ist die erneute
-Verarbeitung: eine fehlgeschlagene oder erkennbar schlechte Transkription lässt
-sich sonst nicht wiederholen, und ein verbessertes Modell kann nicht auf
-Bestandsmaterial angewandt werden.
+Audio recordings are **not deleted immediately after transcription**;
+instead they are kept for `audio_retention_days` (default 30). The purpose
+is reprocessing: without it, a failed or noticeably bad transcription
+couldn't be retried, and an improved model couldn't be applied to existing
+material.
 
-Diese Verlängerung ist der sicherheitskritischste Teil des Systems. Rohes Audio
-aus privaten Gesprächen ist erheblich sensibler als das daraus erzeugte
-Transkript, und es liegt nun über Wochen statt Minuten.
+This extension is the most security-critical part of the system. Raw audio
+from private conversations is considerably more sensitive than the
+transcript produced from it, and it now sits around for weeks instead of
+minutes.
 
-### 12.1 Schutzmaßnahmen
+### 12.1 Protective measures
 
-- **Verschlüsselung vor dem Upload.** Der Bot verschlüsselt jede Aufnahme lokal
-  mit AES-256-GCM, bevor sie den Pod verlässt. Wer Zugriff auf den Objektspeicher
-  erlangt, erhält damit keine hörbaren Daten. Serverseitige Verschlüsselung
-  allein wäre dafür unzureichend, weil sie gegenüber dem Speicherbetreiber und
-  einem gestohlenen Zugangsschlüssel nicht schützt.
-- **Umschlagverfahren.** Je Session wird ein eigener Datenschlüssel erzeugt und
-  mit dem Hauptschlüssel aus SOPS verschlüsselt neben dem Job abgelegt;
-  `encryption_key_id` verweist auf den verwendeten Hauptschlüssel. Ein Wechsel
-  des Hauptschlüssels erfordert dadurch keine Neuverschlüsselung des
-  Bestandsmaterials.
-- **Eigener Bucket mit eigenen Zugangsdaten**, getrennt von allen übrigen
-  Anwendungen, ohne öffentlichen Zugriff. Der Bot schreibt, der Worker liest und
-  löscht; niemand sonst besitzt die Zugangsdaten.
-- **Kein Object Lock.** Eine Unveränderlichkeitssperre stünde im Widerspruch zur
-  Löschpflicht aus Art. 17 DSGVO — sie würde genau die Löschung verhindern, die
-  auf Anfrage möglich sein muss.
+- **Encryption before upload.** The bot encrypts every recording locally with
+  AES-256-GCM before it leaves the pod. Anyone gaining access to the object
+  store therefore gets no audible data. Server-side encryption alone would be
+  insufficient here, because it offers no protection against the storage
+  operator or against a stolen access key.
+- **Envelope encryption.** A dedicated data key is generated per session and
+  stored alongside the job, encrypted with the master key from SOPS;
+  `encryption_key_id` points to the master key that was used. This means
+  rotating the master key doesn't require re-encrypting existing material.
+- **A dedicated bucket with its own credentials**, separate from every other
+  application, with no public access. The bot writes, the worker reads and
+  deletes; nobody else holds the credentials.
+- **No object lock.** An immutability lock would conflict with the deletion
+  obligation under Art. 17 GDPR — it would prevent exactly the deletion that
+  must be possible on request.
 
-### 12.2 Durchsetzung der Aufbewahrungsfrist
+### 12.2 Enforcing the retention period
 
-Beim Anlegen eines Jobs wird `retention_until` gesetzt. Ein periodischer Lauf im
-Worker löscht abgelaufene Objekte und vermerkt `audio_deleted_at`. Eine
-Lebenszyklusregel des Buckets greift zusätzlich als zweite Ebene, damit ein
-dauerhaft ausgefallener Worker nicht zu unbegrenzter Aufbewahrung führt.
+`retention_until` is set when a job is created. A periodic run in the worker
+deletes expired objects and records `audio_deleted_at`. A bucket lifecycle
+rule additionally acts as a second layer, so that a permanently failed worker
+doesn't lead to unbounded retention.
 
-Die Regel allein genügt nicht: Aufbewahrung muss auch in der Datenbank
-nachvollziehbar sein, und `audio_deleted_at` ist der Nachweis, dass gelöscht
-wurde.
+The rule alone is not enough: retention also has to be traceable in the
+database, and `audio_deleted_at` is the proof that deletion actually
+happened.
 
-### 12.3 Löschung auf Anfrage
+### 12.3 Deletion on request
 
-`/audio delete` löscht die eigenen Aufnahmen aller Sessions unmittelbar,
-unabhängig von der Frist. Für Administratoren erledigt `/audio purge` dasselbe
-für einen benannten Nutzer, um Auskunfts- und Löschersuchen nach Art. 17 DSGVO
-bedienen zu können.
+`/audio delete` deletes a user's own recordings from every session
+immediately, regardless of the retention period. For administrators,
+`/audio purge` does the same for a named user, so that information and
+erasure requests under Art. 17 GDPR can be handled.
 
-Bereits erstellte Transkripte bleiben davon unberührt — sie sind ein eigenes
-Verarbeitungsergebnis und liegen im Dokumentsystem, nicht bei Sturnus.
+Transcripts already created are unaffected by this — they are a separate
+processing result and live in the document system, not with Sturnus.
 
-### 12.4 Übrige Daten
+### 12.4 Remaining data
 
-- Die lokale Aufnahmedatei auf dem PVC wird nach erfolgreichem Upload entfernt.
-- **`consent`-Einträge bleiben dauerhaft erhalten**, auch nach Widerruf — das ist
-  die Nachweispflicht aus Art. 7 Abs. 1 DSGVO; `revoked_at` dokumentiert den
-  Widerruf, statt den Nachweis zu löschen.
-- `account_link` ist auf Nutzerwunsch löschbar.
-- Weder Audiodaten noch Transkriptinhalte erscheinen in Logs.
-- Fertige Transkripte unterliegen dem Lebenszyklus des Zielsystems und werden von
-  Sturnus nicht weiter verwaltet.
+- The local recording file on the PVC is removed after a successful upload.
+- **`consent` entries are kept permanently**, even after revocation — this is
+  the record-keeping obligation under Art. 7(1) GDPR; `revoked_at` documents
+  the revocation instead of deleting the record.
+- `account_link` can be deleted at the user's request.
+- Neither audio data nor transcript content appears in logs.
+- Finished transcripts are subject to the target system's lifecycle and are
+  not managed by Sturnus beyond that.
 
-## 13. Repository, Auslieferung und Betrieb
+## 13. Repository, delivery, and operations
 
-### 13.1 Versionierung und Release
+### 13.1 Versioning and release
 
-**Release Please** nach OLF-Standard, gespeist aus Conventional Commits. Kein
-`@semantic-release`, kein manuelles Tagging — der RAG-Bot nutzt noch
-`.releaserc.json`, das ist Altbestand und kein Vorbild.
+**Release Please**, per OLF standard, fed from Conventional Commits. No
+`@semantic-release`, no manual tagging — the RAG bot still uses
+`.releaserc.json`, but that's legacy, not a model to follow.
 
-Die drei Standarddateien liegen im Repositorywurzelverzeichnis:
-`release-please-config.json` mit `release-type: "simple"`,
-`.release-please-manifest.json` und ein zunächst leeres `CHANGELOG.md`.
+The three standard files live at the repository root:
+`release-please-config.json` with `release-type: "simple"`,
+`.release-please-manifest.json`, and an initially empty `CHANGELOG.md`.
 
-Der Versionsmarker sitzt bei einem Python-Projekt in `pyproject.toml` statt in
-`build.gradle.kts`; der `generic`-Updater von Release Please arbeitet auf
-beliebigen Textdateien und findet ihn dort ebenso:
+For a Python project, the version marker sits in `pyproject.toml` instead of
+`build.gradle.kts`; Release Please's `generic` updater works on arbitrary
+text files and finds it there just as well:
 
 ```toml
 version = "0.1.0" # x-release-please-version
 ```
 
-**Chart und Anwendung werden gemeinsam versioniert.** `extra-files` verweist
-zusätzlich auf `charts/sturnus/Chart.yaml`, dessen `version` und `appVersion`
-denselben Marker tragen. Getrennte Versionsstränge wären für ein Chart, das
-ausschließlich diese eine Anwendung ausliefert, Aufwand ohne Gegenwert.
+**The chart and the application are versioned together.** `extra-files`
+additionally points at `charts/sturnus/Chart.yaml`, whose `version` and
+`appVersion` carry the same marker. Separate version streams would be effort
+without payoff for a chart that ships exactly this one application.
 
-Der `publish`-Auftrag hängt über `needs`/`if` am Release-Please-Auftrag. Ein
-zusätzlicher, per Tag ausgelöster Ablauf wird ausdrücklich **nicht** eingerichtet:
-Release Please taggt mit dem Standard-`GITHUB_TOKEN`, das im selben Repository
-keine Tag-Abläufe erneut auslöst — ein solcher Ablauf liefe entweder nie oder
-liefe sich mit dem verketteten Auftrag gegenseitig in die Quere.
+The `publish` job hangs off the Release Please job via `needs`/`if`. An
+additional, tag-triggered workflow is explicitly **not** set up: Release
+Please tags with the default `GITHUB_TOKEN`, which doesn't re-trigger tag
+workflows within the same repository — such a workflow would either never
+run, or would collide with the chained job.
 
 ### 13.2 Container
 
-Alle drei Prozesse teilen sich **ein Abbild mit drei Einsprungpunkten**
-(`sturnus-bot`, `sturnus-link`, `sturnus-worker` als Konsolenskripte). Drei
-Abbilder aus derselben Codebasis zu bauen verdreifachte Bauzeit, Prüfung und
-Registrierungsspeicher, ohne etwas zu trennen, was nicht ohnehin getrennt ist —
-das übernimmt das Deployment.
+All three processes share **one image with three entry points**
+(`sturnus-bot`, `sturnus-link`, `sturnus-worker` as console scripts).
+Building three images from the same codebase would triple build time, review
+effort, and registry storage, without separating anything that isn't already
+separated — that job belongs to the deployment.
 
-`faster-whisper` setzt auf CTranslate2 statt PyTorch auf und fällt damit
-moderat aus; die Modellgewichte liegen **nicht im Abbild**, sondern werden beim
-Start geladen und auf einem Volume zwischengespeichert — dasselbe Muster, das die
-Ollama-Installation im Cluster bereits verwendet.
+`faster-whisper` builds on CTranslate2 instead of PyTorch, which keeps it
+moderately sized; the model weights are **not part of the image** — they are
+downloaded on startup and cached on a volume, the same pattern the cluster's
+Ollama installation already uses.
 
-Veröffentlicht wird über `docker-publish.yml` aus
-`OneLiteFeatherNET/workflows`, angebunden mit einem vollständigen SemVer-Pin
-(`@v2.4.0`, niemals `@main` oder ein bloßer Major-Alias). Der Ablauf ist
-werkzeugunabhängig und benötigt lediglich Kontext und Dockerfile — dass hier
-kein Gradle beteiligt ist, spielt keine Rolle. **Ziel ist die Harbor-Registrierung
-der Organisation, nicht GHCR.**
+Publishing goes through `docker-publish.yml` from
+`OneLiteFeatherNET/workflows`, pinned with a full SemVer tag (`@v2.4.0`,
+never `@main` or a bare major alias). The workflow is tool-agnostic and needs
+only a build context and a Dockerfile — the fact that no Gradle is involved
+here doesn't matter. **The target is the organization's Harbor registry, not
+GHCR.**
 
-### 13.3 Prüfung auf Pull Requests
+### 13.3 Checks on pull requests
 
-Der zentrale Katalog enthält `gradle-build-pr.yml`, aber **kein Gegenstück für
-Python**. Linting, Typprüfung und Tests laufen deshalb zunächst als
-repositoryeigener Auftrag: `uv sync`, `ruff`, `mypy`, `pytest`.
+The central catalog contains `gradle-build-pr.yml`, but **no counterpart for
+Python**. Linting, type checking, and tests therefore initially run as a job
+owned by this repository: `uv sync`, `ruff`, `mypy`, `pytest`.
 
-Ein wiederverwendbarer `python-build-pr.yml` wäre der sauberere Ort — mit dem
-RAG-Bot existiert bereits ein zweiter Python-Verbraucher. Eine gemeinsame
-Abstraktion aus einem einzigen, noch nicht erprobten Verbraucher zu ziehen hieße
-allerdings raten statt belegen. Die Auslagerung ist deshalb als Folgearbeit
-vorgesehen, sobald sich das Muster hier bewährt hat, und betrifft dann ein
-anderes Repository.
+A reusable `python-build-pr.yml` would be the cleaner place for this — with
+the RAG bot, a second Python consumer already exists. But drawing a shared
+abstraction from a single, as-yet-unproven consumer would mean guessing
+rather than working from evidence. Extracting it is therefore planned as
+follow-up work, once the pattern has proven itself here, and it will then
+touch a different repository.
 
-Ergänzend aus dem Katalog: `markdown-lint.yml` für die Dokumentation und
+Also drawn from the catalog: `markdown-lint.yml` for the documentation, and
 `close-invalid-prs.yml`.
 
-### 13.4 Abhängigkeiten
+### 13.4 Dependencies
 
-Zentrales Renovate-Preset der Organisation. Die genaue Einbindung folgt dem
-`renovate`-Skill und ist beim Aufsetzen dort nachzuschlagen, statt sie zu raten.
-Renovate hält auch den Versions-Pin der wiederverwendbaren Abläufe aktuell —
-weshalb dieser als vollständiger Tag und nicht als Alias gesetzt wird.
+The organization's central Renovate preset. The exact wiring follows the
+`renovate` skill and should be looked up there at setup time rather than
+guessed. Renovate also keeps the version pin of the reusable workflows
+current — which is why that pin is set as a full tag rather than an alias.
 
-Jinja2 zählt zu den sicherheitsrelevanten Abhängigkeiten (Abschnitt 15).
+Jinja2 counts among the security-relevant dependencies (Section 15).
 
 ### 13.5 Cluster
 
-Im Kubernetes-FLUX-Repository:
+In the Kubernetes FLUX repository:
 
-- `apps/base/sturnus/` und `apps/clusters/feathre-core/base-apps/sturnus/`
-- CloudNativePG-Datenbank nach dem bestehenden `database/`-Muster
-- `ObjectBucketClaim` für den Audio-Bucket nach dem Muster von `outline.yaml`,
-  mit eigenen Zugangsdaten (Abschnitt 12.1)
-- Geheimnisse über SOPS: Discord-Token, Outline-Dienstschlüssel,
-  OAuth-Client-Geheimnis, Hauptschlüssel für die Audio-Verschlüsselung
-- Eingehender Verkehr ausschließlich für `link-service`, über Cloudflare Tunnel
+- `apps/base/sturnus/` and `apps/clusters/feathre-core/base-apps/sturnus/`
+- A CloudNativePG database following the existing `database/` pattern
+- An `ObjectBucketClaim` for the audio bucket, following the pattern of
+  `outline.yaml`, with its own credentials (Section 12.1)
+- Secrets via SOPS: the Discord token, the Outline service key, the OAuth
+  client secret, the master key for audio encryption
+- Inbound traffic only for `link-service`, via Cloudflare Tunnel
 
-Für `bot` wird ein PodDisruptionBudget gesetzt, das ungewollte Evictions während
-laufender Sessions begrenzt, sowie ein **RWO-PVC für die laufende Aufnahme**
-(Abschnitt 6.3). Dessen Größe folgt aus `max_session_hours` und der erwarteten
-Sprecherzahl — bei vier Stunden und zehn Sprechern rund 5 GB. Da das PVC den Pod
-an eine Zone bindet, wird `bot` per Node-Affinität an die Region gepinnt, wie es
-die übrigen zustandsbehafteten Anwendungen im Cluster ebenfalls tun.
+For `bot`, a PodDisruptionBudget is set that limits unwanted evictions during
+active sessions, along with an **RWO PVC for the recording in progress**
+(Section 6.3). Its size follows from `max_session_hours` and the expected
+number of speakers — roughly 5 GB at four hours and ten speakers. Because the
+PVC ties the pod to a zone, `bot` is pinned to the region via node affinity,
+the same way the cluster's other stateful applications are.
 
-Ressourcen: `bot` 1 CPU, `link-service` minimal, `worker` 4 CPU mit
-Speicheranforderung passend zum gewählten Modell (rund 2 GB für
-`large-v3-turbo` in int8, zuzüglich Puffer) und einem Volume für die
-Modellgewichte.
+Resources: `bot` 1 CPU, `link-service` minimal, `worker` 4 CPU with a memory
+request matching the chosen model (roughly 2 GB for `large-v3-turbo` in int8,
+plus buffer) and a volume for the model weights.
 
-### 13.6 Entwicklungsablauf
+### 13.6 Development workflow
 
-Trunk-Based Development mit Conventional Commits, wie in der übrigen
-Organisation. Die Commit-Form ist nicht Kosmetik, sondern die Eingabe, aus der
-Release Please Version und Changelog ableitet.
+Trunk-Based Development with Conventional Commits, as elsewhere in the
+organization. The commit format is not cosmetic — it's the input Release
+Please derives version and changelog from.
 
-## 14. Teststrategie
+## 14. Test strategy
 
-`pytest` mit `pytest-asyncio`, analog zum RAG-Bot.
+`pytest` with `pytest-asyncio`, mirroring the RAG bot.
 
-Ohne Discord-Abhängigkeit unit-testbar und entsprechend als reine Funktionen
-beziehungsweise Klassen geschnitten:
+Unit-testable without a Discord dependency, and cut accordingly as pure
+functions or classes:
 
-- Session-State-Machine mit injizierter Uhr — sämtliche Übergänge aus
-  Abschnitt 5.1
-- Zeitrekonstruktion aus RTP-Timestamps, einschließlich SSRC-Wechsel
-- Sprachdetektion: Festschreibung je Sprecher, Rückfall auf die Standardsprache
-- Wiederaufnahme verwaister Aufnahmen vom PVC nach einem Absturz
-- Einmaligkeit der Link-Ankündigung über `announced_at`
-- Zusammenführung der Segmente über alle Sprecher hinweg
-- Rendering des Transkript-Modells über Jinja2, inklusive Sprecherzeile mit und
-  ohne verknüpften Account
-- **Sandbox-Ausbruch:** ein Template mit `{{ ''.__class__… }}` und verwandten
-  Ausdrücken muss fehlschlagen, nicht ausgeführt werden
-- **Escaping:** ein Anzeigename wie `[klick](https://boese.example)` darf im
-  erzeugten Dokument keinen Link ergeben
-- Verschlüsselung und Entschlüsselung einer Aufnahme im Umschlagverfahren
-- Aufbewahrungslauf: löscht abgelaufene Objekte, lässt laufende unberührt, setzt
-  `audio_deleted_at`
-- Consent-Auflösung einschließlich des Administrator-Bypass-Falls
+- The session state machine with an injected clock — every transition from
+  Section 5.1
+- Time reconstruction from RTP timestamps, including SSRC changes
+- Language detection: locking in per speaker, falling back to the default
+  language
+- Recovery of orphaned recordings from the PVC after a crash
+- Uniqueness of the link announcement via `announced_at`
+- Merging segments across all speakers
+- Rendering the transcript model via Jinja2, including the speaker line with
+  and without a linked account
+- **Sandbox escape:** a template with `{{ ''.__class__… }}` and related
+  expressions must fail, not execute
+- **Escaping:** a display name like `[klick](https://boese.example)` must not
+  produce a link in the generated document
+- Encryption and decryption of a recording under the envelope scheme
+- The retention run: deletes expired objects, leaves running ones untouched,
+  sets `audio_deleted_at`
+- Consent resolution, including the administrator-bypass case
 
-PostgreSQL über Testcontainers — die Repositories werden gegen eine echte
-Datenbank geprüft, nicht gegen Fakes. Whisper in Unit-Tests über den
-`TranscriptionEngine`-Port gefaked, ergänzt um einen Integrationstest mit einer
-kurzen echten Audiodatei, damit die Modellanbindung nicht nur theoretisch
-funktioniert.
+PostgreSQL via Testcontainers — repositories are verified against a real
+database, not against fakes. Whisper is faked in unit tests via the
+`TranscriptionEngine` port, supplemented by one integration test with a
+short, real audio file, so the model integration works in practice and not
+only in theory.
 
-**Ein Architektur-Test setzt die Abhängigkeitsregel aus Abschnitt 4.4 durch:** er
-prüft die Import-Graphen und schlägt fehl, sobald `domain` etwas aus
-`application`, `infrastructure` oder einer I/O-Bibliothek importiert. Eine
-Schichtungsregel, die nur in der Dokumentation steht, wird nach wenigen Monaten
-verletzt sein; als Test ist sie eine Zusicherung.
+**An architecture test enforces the dependency rule from Section 4.4:** it
+inspects the import graph and fails the moment `domain` imports anything from
+`application`, `infrastructure`, or an I/O library. A layering rule that only
+lives in documentation will be violated within a few months; as a test, it's
+an assertion.
 
-Voice-Receive selbst bleibt ein dünner Adapter ohne eigene Tests — die Logik
-liegt bewusst außerhalb.
+Voice receive itself stays a thin adapter with no tests of its own — the
+logic deliberately lives outside it.
 
-## 15. Offene Risiken
+## 15. Open risks
 
-- **`discord-ext-voice-recv` ist eine Community-Extension** ohne offizielle
-  Unterstützung durch discord.py. Bricht Discord das Voice-Protokoll, hängt die
-  Behebung an einem Drittprojekt. Der Adapter wird deshalb bewusst dünn gehalten,
-  damit ein Wechsel der Bibliothek die Kernlogik nicht berührt.
-- **Das Sizing des Workers ist geschätzt.** Die Angabe von rund 1× Realtime für
-  `large-v3-turbo` auf 4 Kernen ist vor dem Rollout an echtem Material zu messen;
-  der Fallback auf `small` ist eingeplant.
-- **Der Bot ist ein Singleton ohne Übernahme, und eine Session ist unteilbar.**
-  Bei geordnetem Neustart schließt der SIGTERM-Handler die Aufnahme; bei einem
-  harten Kill übernimmt die Wiederaufnahme vom PVC beim nächsten Start
-  (Abschnitt 6.3). Fällt beides aus — etwa bei Verlust des Volumes — ist die
-  gesamte Session verloren, nicht nur ein Ausschnitt. Das ist der bewusst
-  akzeptierte Preis dafür, die Aufnahme nicht zu unterteilen. Ein
-  PodDisruptionBudget begrenzt ungewollte Evictions, verhindert aber keinen Deploy.
-- **Die Latenz ist erheblich und wächst mit der Redezeit.** Ein langer Abend im
-  Voice-Channel liefert sein Protokoll erst Stunden später. Sollte sich das im
-  Betrieb als untragbar erweisen, ist die Unterteilung der Aufnahme in Abschnitte
-  der Weg zurück — sie kostet Transkriptionsqualität an jeder Schnittstelle.
-- **Die Outline-OAuth-Details sind unverifiziert** (siehe Abschnitt 8.4) und vor
-  der Implementierung des Link-Flows gegen die laufende Instanz zu prüfen.
-- **Die Jinja2-Sandbox ist eine Hürde, keine Garantie.** Für
-  `SandboxedEnvironment` sind in der Vergangenheit Ausbrüche bekannt geworden. Im
-  MVP ist das folgenlos, weil alle Vorlagen aus dem Abbild stammen. Wird das
-  Setzen eigener Vorlagen nachgereicht, muss es auf Administratoren beschränkt
-  bleiben und protokolliert werden; die Jinja2-Version zählt dann zu den
-  sicherheitsrelevanten Abhängigkeiten, die Renovate zeitnah aktualisiert.
-- **Die verlängerte Aufbewahrung vergrößert den Schaden einer Kompromittierung.**
-  Wochenlang vorgehaltenes Rohaudio privater Gespräche wiegt schwerer als jedes
-  andere Datum in diesem System. Die Verschlüsselung vor dem Upload begrenzt das
-  auf die Fälle, in denen zugleich der Hauptschlüssel abfließt — womit dessen
-  Handhabung zum eigentlichen Schutzgut wird. Eine kürzere Frist bleibt jederzeit
-  die wirksamste Gegenmaßnahme.
-- **Ein zweiter Adapter wird die Portgrenze prüfen.** Der Zuschnitt von
-  `DocumentSink` beruht bislang auf einer einzigen Implementierung; Confluence
-  oder Notion können Anforderungen mitbringen — Blockstrukturen statt Text,
-  Pflichtfelder, andere Erwähnungsmodelle —, die eine Anpassung des
-  Transkript-Modells nötig machen. Das ist erwartbar und der Grund, jetzt nicht
-  mehr als einen Adapter zu bauen.
+- **`discord-ext-voice-recv` is a community extension** with no official
+  support from discord.py. If Discord breaks the voice protocol, the fix
+  depends on a third-party project. The adapter is therefore deliberately
+  kept thin, so that swapping the library doesn't touch the core logic.
+- **The worker's sizing is an estimate.** The figure of roughly 1× realtime
+  for `large-v3-turbo` on 4 cores needs to be measured against real material
+  before rollout; the fallback to `small` is planned for.
+- **The bot is a singleton with no takeover, and a session is indivisible.**
+  On an orderly restart, the SIGTERM handler closes the recording; on a hard
+  kill, recovery from the PVC takes over at the next start (Section 6.3). If
+  both fail — say, on loss of the volume — the entire session is lost, not
+  just a portion. That is the deliberately accepted price for not segmenting
+  the recording. A PodDisruptionBudget limits unwanted evictions, but it
+  doesn't prevent a deploy.
+- **The latency is significant and grows with speaking time.** A long
+  evening in the voice channel delivers its transcript only hours later.
+  Should this prove untenable in production, segmenting the recording into
+  sections is the way back — it costs transcription quality at every cut.
+- **The Outline OAuth details are unverified** (see Section 8.4) and need to
+  be checked against the running instance before the link flow is
+  implemented.
+- **The Jinja2 sandbox is a hurdle, not a guarantee.** Escapes from
+  `SandboxedEnvironment` have become known in the past. In the MVP this has
+  no consequences, because every template comes from the image. If setting
+  custom templates is added later, it must stay restricted to administrators
+  and be logged; the Jinja2 version then counts among the security-relevant
+  dependencies that Renovate keeps promptly updated.
+- **The extended retention period increases the damage from a compromise.**
+  Raw audio of private conversations, kept around for weeks, outweighs any
+  other piece of data in this system. Encryption before upload limits this to
+  the cases where the master key also leaks — which makes handling of that
+  key the actual asset to protect. A shorter retention period remains the
+  most effective countermeasure at any time.
+- **A second adapter will test the port boundary.** The shape of
+  `DocumentSink` so far rests on a single implementation; Confluence or
+  Notion may bring requirements — block structures instead of text,
+  mandatory fields, different mention models — that require adjusting the
+  transcript model. That's expected, and it's the reason not to build more
+  than one adapter right now.
