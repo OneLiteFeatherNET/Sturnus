@@ -29,7 +29,20 @@ class ConfigStore:
         return settings.DEFAULTS.get(key)
 
     async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None:
-        """Sets a value; `None` removes it and restores the default."""
+        """Sets a value; `None` removes it and restores the default.
+
+        For a known integer key, the value must parse as a positive integer.
+        Rejecting a bad value here keeps the read path (`_int`) reachable
+        only with data that is already known to be sane.
+        """
+        if value is not None and key in settings.INTEGER_KEYS:
+            try:
+                parsed = int(value)
+            except ValueError as exc:
+                raise ValueError(f"{key!r} must be an integer, got {value!r}") from exc
+            if parsed <= 0:
+                raise ValueError(f"{key!r} must be positive, got {parsed}")
+
         async with self._session_factory() as session:
             if value is None:
                 await session.execute(

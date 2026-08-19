@@ -38,3 +38,12 @@ def test_recording_requires_both_role_and_consent() -> None:
 def test_revoked_user_with_stale_role_may_not_be_recorded() -> None:
     record = ConsentRecord(granted_at=T0, revoked_at=T0, policy_version=POLICY)
     assert may_record(record, POLICY, has_consent_role=True) is False
+
+
+def test_blank_current_policy_version_is_never_active() -> None:
+    # A record with policy_version=None is forbidden by the schema, and the
+    # type signature forbids passing None as current_policy_version - but an
+    # empty string satisfies both and must not be treated as "no policy set
+    # yet equals no policy required".
+    record = ConsentRecord(granted_at=T0, revoked_at=None, policy_version="")
+    assert is_consent_active(record, "") is False

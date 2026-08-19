@@ -55,3 +55,22 @@ async def test_timeouts_are_assembled_from_config(store: ConfigStore) -> None:
     assert timeouts.empty_grace_seconds == 90
     assert timeouts.idle_timeout_minutes == 15  # default value
     assert timeouts.max_session_hours == 4
+
+
+async def test_set_rejects_a_non_numeric_value_for_an_integer_key(store: ConfigStore) -> None:
+    with pytest.raises(ValueError, match="must be an integer"):
+        await store.set(GUILD, settings.MAX_SESSION_HOURS, "not-a-number", T0)
+
+
+async def test_set_rejects_a_non_positive_value_for_an_integer_key(store: ConfigStore) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        await store.set(GUILD, settings.MAX_SESSION_HOURS, "0", T0)
+    with pytest.raises(ValueError, match="must be positive"):
+        await store.set(GUILD, settings.IDLE_TIMEOUT_MINUTES, "-5", T0)
+
+
+async def test_rejected_set_does_not_change_the_stored_value(store: ConfigStore) -> None:
+    await store.set(GUILD, settings.MAX_SESSION_HOURS, "6", T0)
+    with pytest.raises(ValueError):
+        await store.set(GUILD, settings.MAX_SESSION_HOURS, "bogus", T0)
+    assert await store.get(GUILD, settings.MAX_SESSION_HOURS) == "6"

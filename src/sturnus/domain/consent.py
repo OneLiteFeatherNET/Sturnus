@@ -20,6 +20,8 @@ class ConsentRecord:
 
 def is_consent_active(record: ConsentRecord | None, current_policy_version: str) -> bool:
     """Consent expires through revocation and through a changed policy."""
+    if not current_policy_version:
+        return False
     if record is None or record.granted_at is None:
         return False
     if record.revoked_at is not None:

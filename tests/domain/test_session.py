@@ -95,3 +95,32 @@ def test_naive_datetime_is_rejected() -> None:
     m = machine()
     with pytest.raises(ValueError, match="timezone-aware"):
         m.participants_changed(1, datetime(2026, 8, 19, 20, 0, 0))
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"empty_grace_seconds": 0},
+        {"empty_grace_seconds": -1},
+        {"idle_timeout_minutes": 0},
+        {"idle_timeout_minutes": -1},
+        {"max_session_hours": 0},
+        {"max_session_hours": -1},
+    ],
+)
+def test_non_positive_timeouts_are_rejected(kwargs: dict[str, int]) -> None:
+    with pytest.raises(ValueError, match="must be positive"):
+        SessionTimeouts(**kwargs)
+
+
+def test_max_session_hours_above_the_rtp_ceiling_is_rejected() -> None:
+    # The RTP wraparound safety margin (timeline.MAX_SUPPORTED_SESSION_HOURS)
+    # caps how high an admin can push this via /config: above it, the
+    # signed-delta interpretation in timeline.py could reinterpret a
+    # legitimate forward jump as a backwards step.
+    with pytest.raises(ValueError, match="must not exceed"):
+        SessionTimeouts(max_session_hours=13)
+
+
+def test_max_session_hours_at_the_rtp_ceiling_is_accepted() -> None:
+    SessionTimeouts(max_session_hours=12)

@@ -107,3 +107,47 @@ def test_participants_dedup_by_discord_id_prefer_external_fields() -> None:
     assert t.participants[0].discord_user_id == 1
     assert t.participants[0].external_user_id == "out-1"
     assert t.participants[0].external_display_name == "Anna Example"
+
+    # The continuation check must key on discord_user_id, not full identity
+    # equality, or a mid-session identity variant would split one speaker
+    # into several blocks (Spec 8.3: consecutive segments from the same
+    # speaker merge). The merged block must also carry the richer identity,
+    # never a poorer one than any of its segments had.
+    assert len(t.blocks) == 1
+    assert t.blocks[0].text == "first second"
+    assert t.blocks[0].speaker.external_user_id == "out-1"
+    assert t.blocks[0].speaker.external_display_name == "Anna Example"
+
+
+def test_merge_survives_identity_variants_interleaved() -> None:
+    """No-external, with-external, no-external in sequence must still merge to one block."""
+    anna_no_external = SpeakerIdentity(1, "anna")
+    anna_with_external = SpeakerIdentity(
+        1, "anna", external_user_id="out-1", external_display_name="Anna Example"
+    )
+
+    t = build(
+        seg(anna_no_external, 0, 1, "a"),
+        seg(anna_with_external, 3, 1, "b"),
+        seg(anna_no_external, 6, 1, "c"),
+    )
+    assert len(t.participants) == 1
+    assert len(t.blocks) == 1
+    assert t.blocks[0].text == "a b c"
+    # Even though the last segment reverted to the poorer variant, the block
+    # must still carry the richer identity seen earlier in the run.
+    assert t.blocks[0].speaker.external_user_id == "out-1"
+
+
+def test_merge_continues_across_a_display_name_change() -> None:
+    """A display-name change alone must not split the block: only the ID anchors identity."""
+    anna_old_name = SpeakerIdentity(1, "anna")
+    anna_new_name = SpeakerIdentity(1, "anna-renamed")
+
+    t = build(
+        seg(anna_old_name, 0, 1, "before rename"),
+        seg(anna_new_name, 3, 1, "after rename"),
+    )
+    assert len(t.blocks) == 1
+    assert t.blocks[0].text == "before rename after rename"
+    assert t.blocks[0].speaker.discord_user_id == 1

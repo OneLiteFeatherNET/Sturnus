@@ -10,6 +10,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import StrEnum
 
+from ._time import require_aware as _require_aware
+from .timeline import MAX_SUPPORTED_SESSION_HOURS
+
 
 class SessionState(StrEnum):
     IDLE = "idle"
@@ -30,11 +33,19 @@ class SessionTimeouts:
     idle_timeout_minutes: int = 15
     max_session_hours: int = 4
 
-
-def _require_aware(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        raise ValueError("timezone-aware datetime required")
-    return value
+    def __post_init__(self) -> None:
+        if self.empty_grace_seconds <= 0:
+            raise ValueError("empty_grace_seconds must be positive")
+        if self.idle_timeout_minutes <= 0:
+            raise ValueError("idle_timeout_minutes must be positive")
+        if self.max_session_hours <= 0:
+            raise ValueError("max_session_hours must be positive")
+        if self.max_session_hours > MAX_SUPPORTED_SESSION_HOURS:
+            raise ValueError(
+                "max_session_hours must not exceed "
+                f"{MAX_SUPPORTED_SESSION_HOURS} (RTP wraparound safety margin, "
+                "see timeline.MAX_SUPPORTED_SESSION_HOURS)"
+            )
 
 
 class SessionMachine:

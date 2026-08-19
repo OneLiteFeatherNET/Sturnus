@@ -27,3 +27,15 @@ DEFAULTS: dict[str, str] = {
 REQUIRED_KEYS: frozenset[str] = frozenset(
     {VOICE_CHANNEL_ID, CONSENT_ROLE_ID, DOCUMENT_TARGET, POLICY_VERSION, POLICY_URL}
 )
+
+# Keys whose stored value must parse as a positive integer. Checked by
+# ConfigStore.set at write time so a bad value never reaches the read path.
+INTEGER_KEYS: frozenset[str] = frozenset(
+    {
+        EMPTY_GRACE_SECONDS,
+        IDLE_TIMEOUT_MINUTES,
+        MAX_SESSION_HOURS,
+        PUBLISH_POLL_SECONDS,
+        AUDIO_RETENTION_DAYS,
+    }
+)

@@ -9,14 +9,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
+from ._time import require_aware as _require_aware
+
 RTP_CLOCK_HZ = 48_000
 _RTP_MODULO = 2**32
 
-
-def _require_aware(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        raise ValueError("timezone-aware datetime required")
-    return value
+# The signed-delta interpretation below is only safe while every legitimate
+# forward jump stays well under half the 32-bit RTP range. Half the range is
+# 2**31 ticks; at 48 kHz that is 2**31 / 48_000 ≈ 44_739.24 seconds ≈ 12.43
+# hours. Twelve hours keeps a comfortable margin below that threshold, so a
+# `max_session_hours` (Section 11) at or below this ceiling can never make a
+# legitimate forward jump be misread as a backwards step.
+MAX_SUPPORTED_SESSION_HOURS = 12
 
 
 class SpeakerClock:
@@ -40,10 +44,11 @@ class SpeakerClock:
         # turn that small backwards step into a huge forward value (near 2**32).
         # Interpret the delta as signed: if it exceeds half the range (2**31 ≈ 12.4 hours),
         # it is unambiguously a backwards step, not a forward wraparound. This is safe
-        # because legitimate forward jumps cannot exceed max_session_hours (default 4 hours),
-        # which is well below the 12.4-hour threshold. A negative delta correctly positions
-        # a late packet slightly before the reference time, which downstream code relies on
-        # to maintain chronological order.
+        # because legitimate forward jumps cannot exceed MAX_SUPPORTED_SESSION_HOURS
+        # (enforced by SessionTimeouts and ConfigStore.set), which stays below the
+        # 12.4-hour threshold. A negative delta correctly positions a late packet
+        # slightly before the reference time, which downstream code relies on to
+        # maintain chronological order.
         delta_ticks = (rtp_timestamp - rtp_first) % _RTP_MODULO
         if delta_ticks > _RTP_MODULO // 2:
             delta_ticks -= _RTP_MODULO

@@ -57,6 +57,12 @@ def build_transcript(
         key=lambda s: (s.start, s.speaker.discord_user_id),
     )
 
+    def richer(a: SpeakerIdentity, b: SpeakerIdentity) -> SpeakerIdentity:
+        """Prefers the identity variant that carries external fields."""
+        if a.external_user_id is None and b.external_user_id is not None:
+            return b
+        return a
+
     blocks: list[TranscriptBlock] = []
     participants: list[SpeakerIdentity] = []
     open_speaker: SpeakerIdentity | None = None
@@ -88,8 +94,14 @@ def build_transcript(
         ):
             participants[participant_idx] = segment.speaker
 
+        # Continuation is decided by discord_user_id alone, matching the
+        # participant dedup above: the Discord ID is the stable anchor
+        # (Spec 8.3), not the full identity, which can vary segment to
+        # segment (e.g. an external link arriving mid-session, or a
+        # display-name change).
         continues = (
-            open_speaker == segment.speaker
+            open_speaker is not None
+            and open_speaker.discord_user_id == segment.speaker.discord_user_id
             and open_end is not None
             and segment.start - open_end <= merge_gap
         )
@@ -97,6 +109,10 @@ def build_transcript(
             flush()
             open_speaker = segment.speaker
             open_start = segment.start
+        else:
+            assert open_speaker is not None
+            # Never let the block carry a poorer identity than one of its segments.
+            open_speaker = richer(open_speaker, segment.speaker)
 
         open_parts.append(segment.text.strip())
         open_end = max(open_end, segment.end) if open_end is not None else segment.end
