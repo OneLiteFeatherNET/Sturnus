@@ -116,6 +116,64 @@ Aufgaben: Chunk-Jobs aus der Queue ziehen, transkribieren, Chunk-Audio löschen;
 bei Session-Abschluss die Chunk-Transkripte zusammenführen und das
 Outline-Dokument anlegen.
 
+### 4.4 Code-Struktur
+
+Alle drei Deployments teilen sich ein Paket mit einer nach innen gerichteten
+Abhängigkeitsregel:
+
+```
+src/sturnus/
+  domain/          reine Logik, keine I/O
+    session.py       Session-State-Machine
+    timeline.py      RTP-Zeitrekonstruktion, Segment-Merge
+    transcript.py    Markdown- und Mention-Rendering
+    consent.py       Consent-Auflösung
+  application/     Use-Cases, orchestrieren Ports
+    ports.py         Protocol-Definitionen
+    record_session.py
+    transcribe_chunk.py
+    link_account.py
+  infrastructure/  Adapter auf konkrete Technik
+    discord/         Voice-Receive-Adapter, Cogs
+    db/              ORM-Modelle, Repositories, Migrationen
+    objectstore/     S3
+    whisper/         faster-whisper
+    outline/         Outline-API-Client
+```
+
+**Die Abhängigkeitsregel:** `domain` importiert weder `application` noch
+`infrastructure` und keine Fremdbibliothek mit I/O — kein `discord`, kein
+`sqlalchemy`, kein `boto3`. `application` kennt nur `domain` und die eigenen
+Ports, niemals einen konkreten Adapter.
+
+Das ist kein Selbstzweck. Die gesamte Logik, die dieses Projekt schwierig macht
+— Zeitrekonstruktion, Session-Übergänge, Chunk-Merge — liegt damit in Code, der
+ohne Discord-Verbindung, ohne Datenbank und ohne Audiodatei testbar ist. Und der
+Adapter, der laut Abschnitt 15 das größte Fremdrisiko trägt, ist austauschbar,
+ohne die Kernlogik zu berühren.
+
+Damit die Regel nicht mit der Zeit verfällt, wird sie **als Test durchgesetzt**
+(Abschnitt 14), nicht als Konvention dokumentiert.
+
+### 4.5 Ports und ihre Grenze
+
+Als Protocol abstrahiert werden die Systeme, die in Tests durch Fakes ersetzt
+werden müssen oder deren Implementierung wechseln kann:
+
+| Port | Begründung |
+|---|---|
+| `TranscriptionEngine` | In Unit-Tests gefaked; Wechsel zwischen `large-v3-turbo` und `small` |
+| `AudioStore` | S3 in Unit-Tests durch In-Memory-Fake ersetzt |
+| `DocumentSink` | Outline-API in Tests gefaked |
+| `VoiceReceiver` | Kapselt `discord-ext-voice-recv`, hält den Bibliothekswechsel lokal |
+
+**Für Repositories werden bewusst keine Interfaces definiert.** Die
+Datenzugriffsschicht wird gegen eine echte PostgreSQL-Instanz über Testcontainers
+getestet (Abschnitt 14); ein Interface mit genau einer Implementierung und einem
+echten Datenbanktest dahinter wäre Zeremonie ohne Nutzen. SOLID verlangt
+Abstraktion dort, wo Implementierungen variieren — nicht überall. Diese Grenze
+ist Teil des Entwurfs und keine Nachlässigkeit.
+
 ## 5. Session-Lebenszyklus
 
 Der Bot beobachtet `on_voice_state_update` für den konfigurierten Channel.
@@ -266,6 +324,17 @@ nach absoluter Zeit zusammen und rendert Markdown:
 PostgreSQL über CloudNativePG, eigene Datenbank nach dem bestehenden
 `database/`-Muster des Clusters.
 
+Zugriff ausschließlich über **SQLAlchemy 2.0 im async-Modus** (`DeclarativeBase`,
+`Mapped[...]`, `async_sessionmaker`) mit `asyncpg` als Treiber. Roher SQL-Zugriff
+neben dem ORM ist ausgeschlossen: im RAG-Bot existieren ORM-Modelle und direkte
+`asyncpg`-Zugriffe nebeneinander, was zu zwei parallelen Datenzugriffswegen für
+dieselbe Datenbank führt. Sturnus hat genau einen.
+
+Schema-Änderungen laufen über **Alembic**-Migrationen, die beim Start des
+`worker` angewandt werden — nicht durch `create_all()` und nicht durch manuelles
+DDL. Der RAG-Bot hat keine Migrationen; das ist eine Lücke, kein zu
+übernehmendes Muster.
+
 | Tabelle | Inhalt |
 |---|---|
 | `guild_config` | Laufzeit-Konfiguration je Guild (Abschnitt 10) |
@@ -275,7 +344,8 @@ PostgreSQL über CloudNativePG, eigene Datenbank nach dem bestehenden
 | `session` | `id`, `guild_id`, `channel_id`, `started_at`, `ended_at`, `end_reason`, `status`, `outline_document_id` |
 | `chunk_job` | `id`, `session_id`, `discord_user_id`, `seq`, `starts_at`, `s3_key`, `status`, `attempts`, `error`, `transcript` |
 
-Die Queue ist `chunk_job`, konsumiert über `SELECT … FOR UPDATE SKIP LOCKED`.
+Die Queue ist `chunk_job`, konsumiert über
+`select(ChunkJob).with_for_update(skip_locked=True)`.
 Ein Message-Broker wird bewusst nicht eingesetzt: PostgreSQL wird für das
 Mapping ohnehin benötigt, und das erwartete Volumen von wenigen Sessions pro Tag
 rechtfertigt keine zusätzliche Betriebskomponente.
@@ -369,9 +439,17 @@ beziehungsweise Klassen geschnitten:
 - Markdown- und Mention-Rendering
 - Consent-Auflösung einschließlich des Administrator-Bypass-Falls
 
-PostgreSQL über Testcontainers. Whisper in Unit-Tests gemockt, ergänzt um einen
-Integrationstest mit einer kurzen echten Audiodatei, damit die Modellanbindung
-nicht nur theoretisch funktioniert.
+PostgreSQL über Testcontainers — die Repositories werden gegen eine echte
+Datenbank geprüft, nicht gegen Fakes. Whisper in Unit-Tests über den
+`TranscriptionEngine`-Port gefaked, ergänzt um einen Integrationstest mit einer
+kurzen echten Audiodatei, damit die Modellanbindung nicht nur theoretisch
+funktioniert.
+
+**Ein Architektur-Test setzt die Abhängigkeitsregel aus Abschnitt 4.4 durch:** er
+prüft die Import-Graphen und schlägt fehl, sobald `domain` etwas aus
+`application`, `infrastructure` oder einer I/O-Bibliothek importiert. Eine
+Schichtungsregel, die nur in der Dokumentation steht, wird nach wenigen Monaten
+verletzt sein; als Test ist sie eine Zusicherung.
 
 Voice-Receive selbst bleibt ein dünner Adapter ohne eigene Tests — die Logik
 liegt bewusst außerhalb.
