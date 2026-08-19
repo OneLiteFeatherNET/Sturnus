@@ -205,7 +205,7 @@ The bot observes `on_voice_state_update` for the configured channel.
 | First user **with the consent role** joins the channel | `IDLE` → `RECORDING`, the bot joins, an announcement is posted |
 | A user without the consent role joins the empty channel | no transition — nobody can speak |
 | Last eligible user leaves the channel | `RECORDING` → `GRACE` |
-| An eligible user returns during `GRACE` | `GRACE` → `RECORDING`, the same session continues |
+| An eligible user returns during `GRACE` | `GRACE` → `RECORDING`, the same session continues, **the idle timer restarts** |
 | `empty_grace_seconds` elapses | `GRACE` → `CLOSING` |
 | `idle_timeout_minutes` with no audio at all | `RECORDING` → `CLOSING` |
 | `max_session_hours` reached | `RECORDING` → `CLOSING` |
@@ -213,6 +213,12 @@ The bot observes `on_voice_state_update` for the configured channel.
 `CLOSING` closes the recording files, uploads them to S3, enqueues one
 transcription job per speaker, sets the session to `closed`, and leaves the
 channel.
+
+**The idle timer restarts when someone returns during `GRACE`.** Without this it
+would keep counting from before the channel emptied, and a returning participant
+who does not speak at once could see the bot leave seconds after they arrived —
+the recording ending exactly when there is again someone to record. Whoever
+returns gets the full `idle_timeout_minutes` before silence closes the session.
 
 One session corresponds to exactly one Outline document.
 
@@ -274,7 +280,30 @@ the network jitter of each stream's first packet and is typically under
 mapping is therefore continuously maintained via the speaking events, and
 every new SSRC gets its own reference point.
 
-### 6.3 Recording and hand-off
+### 6.3 The audio epoch of a speaker
+
+Time reconstruction (Section 6.2) yields absolute time for every incoming packet,
+but that knowledge lives in the bot's memory and never reaches the worker. What
+the worker receives is one audio file per speaker and, after transcription, a set
+of offsets relative to the start of that file. Something has to anchor those
+offsets to wall-clock time.
+
+That anchor is **`session_participant.audio_started_at`**: the wall-clock time
+corresponding to sample zero of that speaker's recording. The bot writes it when
+it opens the buffer for a speaker, taken from the same reference point the
+speaker clock establishes on their first packet.
+
+It is deliberately a separate field from `first_seen_at`. The two differ whenever
+someone joins the channel and stays silent for a while: `first_seen_at` records
+when they appeared, `audio_started_at` when their recording begins. Using the
+former as the anchor would shift every one of that speaker's segments by the
+length of their initial silence — producing a plausible-looking transcript in
+which one person consistently speaks too early.
+
+The worker therefore computes each segment's absolute position as
+`audio_started_at + offset_in_file`, depending on no in-memory state at all.
+
+### 6.4 Recording and hand-off
 
 The recording runs across the entire session as **one continuous stream per
 speaker**, with no segmentation. Only once the session transitions to
@@ -512,7 +541,7 @@ migrations; that's a gap, not a pattern to adopt.
 | `consent` | `discord_user_id`, `guild_id`, `granted_at`, `revoked_at`, `policy_version`, `source` |
 | `oauth_state` | `state` (PK), `discord_user_id`, `created_at`, `expires_at` |
 | `session` | `id`, `guild_id`, `channel_id`, `started_at`, `ended_at`, `end_reason`, `status`, `document_provider`, `document_id`, `document_url`, `announced_at` |
-| `session_participant` | `session_id`, `discord_user_id`, `discord_display_name` (frozen at session time), `detected_language`, `first_seen_at` |
+| `session_participant` | `session_id`, `discord_user_id`, `discord_display_name` (frozen at session time), `detected_language`, `first_seen_at`, `audio_started_at` (Section 6.3) |
 | `transcription_job` | `id`, `session_id`, `discord_user_id`, `s3_key`, `encryption_key_id`, `retention_until`, `audio_deleted_at`, `status`, `attempts`, `error`, `transcript` |
 
 The queue is `transcription_job`, consumed via
@@ -718,7 +747,7 @@ In the Kubernetes FLUX repository:
 
 For `bot`, a PodDisruptionBudget is set that limits unwanted evictions during
 active sessions, along with an **RWO PVC for the recording in progress**
-(Section 6.3). Its size follows from `max_session_hours` and the expected
+(Section 6.4). Its size follows from `max_session_hours` and the expected
 number of speakers — roughly 5 GB at four hours and ten speakers. Because the
 PVC ties the pod to a zone, `bot` is pinned to the region via node affinity,
 the same way the cluster's other stateful applications are.
@@ -785,7 +814,7 @@ logic deliberately lives outside it.
   before rollout; the fallback to `small` is planned for.
 - **The bot is a singleton with no takeover, and a session is indivisible.**
   On an orderly restart, the SIGTERM handler closes the recording; on a hard
-  kill, recovery from the PVC takes over at the next start (Section 6.3). If
+  kill, recovery from the PVC takes over at the next start (Section 6.4). If
   both fail — say, on loss of the volume — the entire session is lost, not
   just a portion. That is the deliberately accepted price for not segmenting
   the recording. A PodDisruptionBudget limits unwanted evictions, but it
