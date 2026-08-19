@@ -1,0 +1,56 @@
+[project]
+name = "sturnus"
+version = "0.1.0" # x-release-please-version
+description = "Discord voice transcription with Outline document output"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "OneLiteFeather" }]
+dependencies = [
+    "sqlalchemy>=2.0.44",
+    "asyncpg>=0.31.0",
+    "alembic>=1.14.0",
+    "pydantic-settings>=2.12.0",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+lint = ["mypy>=1.19.0", "ruff>=0.14.7"]
+test = [
+    "psycopg[binary]>=3.2",
+    "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
+    "testcontainers[postgres]>=4.9.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# ruff >=0.15 lints/formats *.md by default; docs/ holds prose specs and plans,
+# not source, and their embedded code fences are illustrative, not real modules.
+# migrations/versions/ is regenerated verbatim by `alembic revision --autogenerate`;
+# hand-editing it to satisfy the lint config would only drift from what the tool
+# produces next time. migrations/env.py is hand-written logic (URL resolution) and
+# stays linted like the rest of the source tree.
+extend-exclude = ["docs", "migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ARG"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+# These three ship no type information. Strictness stays intact for our own
+# code; without this block the test run fails on import-untyped without an
+# actual defect in the code.
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "alembic.*", "psycopg.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

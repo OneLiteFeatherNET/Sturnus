@@ -1,10 +1,10 @@
-# Sturnus Plan 1: Fundament, Domäne und Persistenz
+# Sturnus Plan 1: Foundation, Domain, and Persistence
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Ein lauffähiges Python-Repository mit CI, der vollständig getesteten Domänenlogik (Session-Zustände, Zeitrekonstruktion, Transkript-Aufbau, Einwilligung) und der Datenbankschicht samt Migrationen.
+**Goal:** A working Python repository with CI, fully tested domain logic (session states, time reconstruction, transcript assembly, consent) and the database layer including migrations.
 
-**Architecture:** Schichtung mit nach innen gerichteter Abhängigkeitsregel. `domain/` enthält reine Logik ohne jede I/O und ohne Fremdbibliotheken; `infrastructure/db/` kapselt SQLAlchemy. Die Regel wird durch einen Test erzwungen, der ab Task 2 gilt — jede spätere Verletzung schlägt in der CI fehl.
+**Architecture:** Layering with an inward-facing dependency rule. `domain/` contains pure logic with no I/O and no third-party libraries; `infrastructure/db/` encapsulates SQLAlchemy. The rule is enforced by a test that applies from Task 2 onward — any later violation fails in CI.
 
 **Tech Stack:** Python 3.12, uv, SQLAlchemy 2.0 (async, `asyncpg`), Alembic, pytest, pytest-asyncio, testcontainers, ruff, mypy.
 
@@ -12,18 +12,18 @@
 
 ## Global Constraints
 
-- **Python `>=3.12`**, Paketverwaltung ausschließlich über `uv`.
-- **Abhängigkeitsregel:** `sturnus.domain` importiert weder `sturnus.application` noch `sturnus.infrastructure` noch eine Bibliothek mit I/O (`discord`, `sqlalchemy`, `boto3`, `jinja2`, `faster_whisper`). Durchgesetzt durch `tests/test_architecture.py`.
-- **Ein Datenzugriffsweg:** ausschließlich SQLAlchemy 2.0 ORM im async-Modus. Rohes `asyncpg` neben dem ORM ist ausgeschlossen (Spec 9).
-- **Schemaänderungen ausschließlich über Alembic.** Kein `create_all()` im Produktivpfad.
-- **Conventional Commits** — Eingabe für Release Please. Commit-Präfixe: `feat:`, `fix:`, `chore:`, `test:`, `docs:`, `refactor:`.
-- **Keine Claude-Attribution** in Commits (Organisationsvorgabe).
-- **Zeitangaben sind `datetime` mit `timezone.utc`**, niemals naiv.
-- Version steht **nur** in `pyproject.toml` mit dem Marker `# x-release-please-version`.
+- **Python `>=3.12`**, package management exclusively via `uv`.
+- **Dependency rule:** `sturnus.domain` imports neither `sturnus.application` nor `sturnus.infrastructure` nor any library with I/O (`discord`, `sqlalchemy`, `boto3`, `jinja2`, `faster_whisper`). Enforced by `tests/test_architecture.py`.
+- **One data access path:** exclusively the SQLAlchemy 2.0 ORM in async mode. Raw `asyncpg` alongside the ORM is excluded (Spec 9).
+- **Schema changes exclusively via Alembic.** No `create_all()` in the production path.
+- **Conventional Commits** — input for Release Please. Commit prefixes: `feat:`, `fix:`, `chore:`, `test:`, `docs:`, `refactor:`.
+- **No Claude attribution** in commits (org requirement).
+- **Timestamps are `datetime` with `timezone.utc`**, never naive.
+- The version lives **only** in `pyproject.toml` with the marker `# x-release-please-version`.
 
 ---
 
-### Task 1: Repository-Grundgerüst, Werkzeuge und CI
+### Task 1: Repository Scaffolding, Tooling, and CI
 
 **Files:**
 - Create: `pyproject.toml`, `.python-version`, `README.md`, `CHANGELOG.md`
@@ -33,10 +33,10 @@
 - Test: `tests/test_smoke.py`
 
 **Interfaces:**
-- Consumes: nichts
-- Produces: Paket `sturnus` importierbar; `sturnus.__version__` als `str`
+- Consumes: nothing
+- Produces: package `sturnus` importable; `sturnus.__version__` as `str`
 
-- [ ] **Step 1: `pyproject.toml` anlegen**
+- [ ] **Step 1: Create `pyproject.toml`**
 
 ```toml
 [project]
@@ -59,7 +59,7 @@ sturnus-link = "sturnus.entrypoints.link:main"
 sturnus-worker = "sturnus.entrypoints.worker:main"
 
 [build-system]
-requires = ["uv_build>=0.9.4,<0.10.0"]
+requires = ["uv_build>=0.12.1,<0.13.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
@@ -82,16 +82,23 @@ python_version = "3.12"
 strict = true
 files = ["src", "tests"]
 
+# These three ship no type information. Strictness for our own code
+# stays untouched; without this block the test run fails on
+# import-untyped even though there's no actual error in the code.
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "alembic.*", "psycopg.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 ```
 
-Die Einsprungpunkte unter `[project.scripts]` zeigen auf Module, die erst in
-späteren Plänen entstehen. Das ist beabsichtigt — `uv sync` prüft sie nicht,
-erst ein Aufruf würde fehlschlagen.
+The entry points under `[project.scripts]` point to modules that don't
+exist until later plans. That's intentional — `uv sync` doesn't check
+them; only an actual invocation would fail.
 
-- [ ] **Step 2: Paketstruktur und Version anlegen**
+- [ ] **Step 2: Create package structure and version**
 
 ```bash
 mkdir -p src/sturnus/{domain,application,infrastructure} tests
@@ -102,7 +109,7 @@ printf '# Changelog\n' > CHANGELOG.md
 printf '# Sturnus\n\nDiscord voice transcription with Outline document output.\n' > README.md
 ```
 
-- [ ] **Step 3: Rauchtest schreiben**
+- [ ] **Step 3: Write smoke test**
 
 ```python
 # tests/test_smoke.py
@@ -114,17 +121,17 @@ def test_package_exposes_version() -> None:
     assert sturnus.__version__.count(".") == 2
 ```
 
-- [ ] **Step 4: Abhängigkeiten installieren und Test laufen lassen**
+- [ ] **Step 4: Install dependencies and run the test**
 
 Run: `uv sync --all-groups && uv run pytest tests/test_smoke.py -v`
 Expected: PASS
 
-- [ ] **Step 5: Linter und Typprüfung laufen lassen**
+- [ ] **Step 5: Run linter and type check**
 
 Run: `uv run ruff check . && uv run ruff format --check . && uv run mypy`
-Expected: beide ohne Befund. Bei Formatierungsbefund `uv run ruff format .` ausführen und erneut prüfen.
+Expected: both clean. If formatting flags something, run `uv run ruff format .` and check again.
 
-- [ ] **Step 6: Release-Please-Dateien anlegen**
+- [ ] **Step 6: Create Release Please files**
 
 ```json
 // release-please-config.json
@@ -152,11 +159,11 @@ Expected: beide ohne Befund. Bei Formatierungsbefund `uv run ruff format .` ausf
 { ".": "0.1.0" }
 ```
 
-Der Eintrag für `charts/sturnus/Chart.yaml` in `extra-files` kommt in Plan 4
-dazu, sobald das Chart existiert — ein Verweis auf eine fehlende Datei ließe
-Release Please fehlschlagen.
+The entry for `charts/sturnus/Chart.yaml` in `extra-files` gets added in
+Plan 4, once the chart exists — a reference to a missing file would make
+Release Please fail.
 
-- [ ] **Step 7: PR-Ablauf anlegen**
+- [ ] **Step 7: Create PR workflow**
 
 ```yaml
 # .github/workflows/build.yml
@@ -186,10 +193,10 @@ jobs:
       - run: uv run pytest -v
 ```
 
-Dieser Ablauf ist bewusst repositoryeigen: der zentrale Katalog hat kein
-Python-Gegenstück zu `gradle-build-pr.yml` (Spec 13.3).
+This workflow is deliberately repo-local: the central catalog has no
+Python counterpart to `gradle-build-pr.yml` (Spec 13.3).
 
-- [ ] **Step 8: Release-Please-Ablauf anlegen**
+- [ ] **Step 8: Create Release Please workflow**
 
 ```yaml
 # .github/workflows/release-please.yml
@@ -217,11 +224,11 @@ jobs:
           manifest-file: .release-please-manifest.json
 ```
 
-Der `publish`-Auftrag, der `docker-publish.yml@v2.4.0` einhängt, kommt in
-Plan 4 dazu — ohne Dockerfile hätte er nichts zu bauen. Ein per Tag
-ausgelöster Ablauf wird nicht angelegt (Spec 13.1).
+The `publish` job that hooks in `docker-publish.yml@v2.4.0` gets added in
+Plan 4 — without a Dockerfile it would have nothing to build. A
+tag-triggered workflow is not created (Spec 13.1).
 
-- [ ] **Step 9: `.gitignore` ergänzen und committen**
+- [ ] **Step 9: Add `.gitignore` and commit**
 
 ```bash
 printf '.venv/\n__pycache__/\n*.pyc\n.env\n.pytest_cache/\n.mypy_cache/\n.ruff_cache/\n' > .gitignore
@@ -231,19 +238,19 @@ git commit -m "chore: scaffold python project with ci and release-please"
 
 ---
 
-### Task 2: Architektur-Test für die Abhängigkeitsregel
+### Task 2: Architecture Test for the Dependency Rule
 
-Dieser Test kommt vor der Domänenlogik, damit die Regel ab der ersten
-Zeile Domänencode gilt statt nachträglich durchgesetzt zu werden.
+This test comes before the domain logic, so the rule applies from the
+first line of domain code instead of being enforced after the fact.
 
 **Files:**
 - Test: `tests/test_architecture.py`
 
 **Interfaces:**
-- Consumes: Paketstruktur aus Task 1
-- Produces: nichts (reiner Test)
+- Consumes: package structure from Task 1
+- Produces: nothing (pure test)
 
-- [ ] **Step 1: Test schreiben**
+- [ ] **Step 1: Write the test**
 
 ```python
 # tests/test_architecture.py
@@ -274,7 +281,7 @@ def _imported_modules(path: Path) -> set[str]:
         if isinstance(node, ast.Import):
             found.update(alias.name for alias in node.names)
         elif isinstance(node, ast.ImportFrom):
-            # level > 0 ist ein relativer Import und bleibt damit im Paket
+            # level > 0 is a relative import and thus stays within the package
             if node.level == 0 and node.module:
                 found.add(node.module)
     return found
@@ -286,7 +293,7 @@ def test_domain_has_no_outward_imports() -> None:
         for module in _imported_modules(path):
             if module.startswith(FORBIDDEN_PREFIXES):
                 violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
-    assert not violations, "domain darf nicht nach außen importieren:\n" + "\n".join(violations)
+    assert not violations, "domain must not import outward:\n" + "\n".join(violations)
 
 
 def test_application_does_not_import_infrastructure() -> None:
@@ -296,25 +303,25 @@ def test_application_does_not_import_infrastructure() -> None:
         for module in _imported_modules(path):
             if module.startswith("sturnus.infrastructure"):
                 violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
-    assert not violations, "application darf infrastructure nicht importieren:\n" + "\n".join(violations)
+    assert not violations, "application must not import infrastructure:\n" + "\n".join(violations)
 ```
 
-- [ ] **Step 2: Test laufen lassen**
+- [ ] **Step 2: Run the test**
 
 Run: `uv run pytest tests/test_architecture.py -v`
-Expected: PASS (beide Pakete sind noch leer, es gibt nichts zu verletzen)
+Expected: PASS (both packages are still empty, there's nothing to violate)
 
-- [ ] **Step 3: Test gegen eine echte Verletzung prüfen**
+- [ ] **Step 3: Verify the test against an actual violation**
 
 ```bash
 printf 'import sqlalchemy\n' > src/sturnus/domain/_probe.py
 uv run pytest tests/test_architecture.py -v
 ```
-Expected: FAIL mit `domain darf nicht nach außen importieren: domain/_probe.py: sqlalchemy`
+Expected: FAIL with `domain must not import outward: domain/_probe.py: sqlalchemy`
 
-Ein Test, der nie fehlschlägt, prüft nichts — dieser Schritt belegt, dass er greift.
+A test that never fails doesn't verify anything — this step proves it actually triggers.
 
-- [ ] **Step 4: Sonde entfernen und erneut prüfen**
+- [ ] **Step 4: Remove the probe and verify again**
 
 ```bash
 rm src/sturnus/domain/_probe.py
@@ -322,7 +329,7 @@ uv run pytest tests/test_architecture.py -v
 ```
 Expected: PASS
 
-- [ ] **Step 5: Committen**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add tests/test_architecture.py
@@ -331,28 +338,28 @@ git commit -m "test: enforce inward dependency rule for domain layer"
 
 ---
 
-### Task 3: Session-Zustandsautomat
+### Task 3: Session State Machine
 
-Setzt Spec 5.1 um. Der Automat kennt weder Discord noch Datenbank und
-erhält die Zeit von außen.
+Implements Spec 5.1. The machine knows nothing about Discord or the
+database and receives time from outside.
 
 **Files:**
 - Create: `src/sturnus/domain/session.py`
 - Test: `tests/domain/test_session.py`
 
 **Interfaces:**
-- Consumes: nichts
+- Consumes: nothing
 - Produces:
   - `SessionState` (StrEnum): `IDLE`, `RECORDING`, `GRACE`, `CLOSING`
   - `EndReason` (StrEnum): `EMPTY`, `IDLE_TIMEOUT`, `MAX_DURATION`
   - `SessionTimeouts(empty_grace_seconds: int, idle_timeout_minutes: int, max_session_hours: int)`
-  - `SessionMachine(timeouts: SessionTimeouts)` mit
+  - `SessionMachine(timeouts: SessionTimeouts)` with
     `state: SessionState`, `started_at: datetime | None`, `end_reason: EndReason | None`,
     `participants_changed(consented_count: int, now: datetime) -> None`,
     `audio_received(now: datetime) -> None`,
     `tick(now: datetime) -> EndReason | None`
 
-- [ ] **Step 1: Test schreiben**
+- [ ] **Step 1: Write the test**
 
 ```python
 # tests/domain/test_session.py
@@ -400,7 +407,7 @@ def test_return_within_grace_resumes_same_session() -> None:
     m.participants_changed(0, T0 + timedelta(minutes=5))
     m.participants_changed(1, T0 + timedelta(minutes=5, seconds=30))
     assert m.state is SessionState.RECORDING
-    assert m.started_at == T0  # dieselbe Session, kein Neustart
+    assert m.started_at == T0  # same session, no restart
 
 
 def test_grace_expiry_closes_session() -> None:
@@ -439,7 +446,7 @@ def test_tick_is_idempotent_after_closing() -> None:
     m.participants_changed(1, T0)
     m.participants_changed(0, T0)
     assert m.tick(T0 + timedelta(seconds=61)) is EndReason.EMPTY
-    assert m.tick(T0 + timedelta(seconds=62)) is None  # meldet nicht doppelt
+    assert m.tick(T0 + timedelta(seconds=62)) is None  # doesn't report twice
     assert m.end_reason is EndReason.EMPTY
 
 
@@ -453,19 +460,19 @@ def test_naive_datetime_is_rejected() -> None:
         m.participants_changed(1, datetime(2026, 8, 19, 20, 0, 0))
 ```
 
-- [ ] **Step 2: Test laufen lassen, Fehlschlag prüfen**
+- [ ] **Step 2: Run the test, verify it fails**
 
 Run: `uv run pytest tests/domain/test_session.py -v`
-Expected: FAIL mit `ModuleNotFoundError: No module named 'sturnus.domain.session'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'sturnus.domain.session'`
 
-- [ ] **Step 3: Implementierung schreiben**
+- [ ] **Step 3: Write the implementation**
 
 ```python
 # src/sturnus/domain/session.py
-"""Zustandsautomat einer Aufnahmesitzung.
+"""State machine for a recording session.
 
-Kennt weder Discord noch Datenbank; die Zeit wird bei jedem Aufruf
-übergeben, damit sämtliche Übergänge deterministisch prüfbar sind.
+Knows nothing about Discord or the database; time is passed in on every
+call so that all transitions are deterministically testable.
 """
 
 from __future__ import annotations
@@ -511,7 +518,7 @@ class SessionMachine:
         self._grace_since: datetime | None = None
 
     def participants_changed(self, consented_count: int, now: datetime) -> None:
-        """Meldet, wie viele einwilligende Teilnehmer im Kanal sind."""
+        """Reports how many consenting participants are in the channel."""
         _require_aware(now)
         if self.state is SessionState.CLOSING:
             return
@@ -530,9 +537,9 @@ class SessionMachine:
         self._last_audio_at = now
 
     def tick(self, now: datetime) -> EndReason | None:
-        """Prüft die Zeitbedingungen. Gibt den Grund zurück, sobald geschlossen wird.
+        """Checks the time conditions. Returns the reason once the session closes.
 
-        Meldet jeden Abschluss genau einmal; weitere Aufrufe geben None zurück.
+        Reports each closure exactly once; further calls return None.
         """
         _require_aware(now)
         if self.state in (SessionState.IDLE, SessionState.CLOSING):
@@ -559,17 +566,17 @@ class SessionMachine:
         return None
 ```
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `uv run pytest tests/domain/test_session.py -v`
-Expected: alle PASS
+Expected: all PASS
 
-- [ ] **Step 5: Linter, Typprüfung und Architekturtest**
+- [ ] **Step 5: Linter, type check, and architecture test**
 
 Run: `uv run ruff check . && uv run mypy && uv run pytest -v`
-Expected: alles ohne Befund
+Expected: everything clean
 
-- [ ] **Step 6: Committen**
+- [ ] **Step 6: Commit**
 
 ```bash
 git add src/sturnus/domain/session.py tests/domain/test_session.py
@@ -578,23 +585,23 @@ git commit -m "feat: add session state machine with injected clock"
 
 ---
 
-### Task 4: Zeitrekonstruktion aus RTP-Zeitstempeln
+### Task 4: Time Reconstruction from RTP Timestamps
 
-Setzt Spec 6.2 um, einschließlich Wechsel der SSRC bei Wiederverbindung
-und Überlauf des 32-Bit-Zählers.
+Implements Spec 6.2, including SSRC changes on reconnection and
+overflow of the 32-bit counter.
 
 **Files:**
 - Create: `src/sturnus/domain/timeline.py`
 - Test: `tests/domain/test_timeline.py`
 
 **Interfaces:**
-- Consumes: nichts
+- Consumes: nothing
 - Produces:
   - `RTP_CLOCK_HZ: int = 48000`
-  - `SpeakerClock()` mit `absolute_time(ssrc: int, rtp_timestamp: int, wall_now: datetime) -> datetime`
-    und `reset(ssrc: int) -> None`
+  - `SpeakerClock()` with `absolute_time(ssrc: int, rtp_timestamp: int, wall_now: datetime) -> datetime`
+    and `reset(ssrc: int) -> None`
 
-- [ ] **Step 1: Test schreiben**
+- [ ] **Step 1: Write the test**
 
 ```python
 # tests/domain/test_timeline.py
@@ -616,7 +623,7 @@ def test_first_packet_defines_the_reference() -> None:
 def test_later_packet_uses_rtp_delta_not_wall_clock() -> None:
     clock = SpeakerClock()
     clock.absolute_time(SSRC, 5_000_000, T0)
-    # eine Sekunde in RTP-Ticks, aber die Wanduhr behauptet 30 Sekunden
+    # one second in RTP ticks, but the wall clock claims 30 seconds
     later = clock.absolute_time(SSRC, 5_000_000 + RTP_CLOCK_HZ, T0 + timedelta(seconds=30))
     assert later == T0 + timedelta(seconds=1)
 
@@ -624,7 +631,7 @@ def test_later_packet_uses_rtp_delta_not_wall_clock() -> None:
 def test_silence_gap_is_reconstructed_from_timestamps() -> None:
     clock = SpeakerClock()
     clock.absolute_time(SSRC, 1_000, T0)
-    # fünf Minuten Stille: es kamen keine Pakete, der Zeitstempel springt
+    # five minutes of silence: no packets arrived, the timestamp jumps
     resumed = clock.absolute_time(SSRC, 1_000 + RTP_CLOCK_HZ * 300, T0 + timedelta(minutes=99))
     assert resumed == T0 + timedelta(minutes=5)
 
@@ -645,7 +652,7 @@ def test_reconnect_with_new_ssrc_starts_new_reference() -> None:
 
 def test_timestamp_wraparound_is_handled() -> None:
     clock = SpeakerClock()
-    start = 2**32 - RTP_CLOCK_HZ  # eine Sekunde vor dem Überlauf
+    start = 2**32 - RTP_CLOCK_HZ  # one second before the overflow
     clock.absolute_time(SSRC, start, T0)
     wrapped = clock.absolute_time(SSRC, RTP_CLOCK_HZ, T0 + timedelta(seconds=99))
     assert wrapped == T0 + timedelta(seconds=2)
@@ -664,20 +671,20 @@ def test_naive_datetime_is_rejected() -> None:
         SpeakerClock().absolute_time(SSRC, 1, datetime(2026, 8, 19))
 ```
 
-- [ ] **Step 2: Test laufen lassen, Fehlschlag prüfen**
+- [ ] **Step 2: Run the test, verify it fails**
 
 Run: `uv run pytest tests/domain/test_timeline.py -v`
-Expected: FAIL mit `ModuleNotFoundError: No module named 'sturnus.domain.timeline'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'sturnus.domain.timeline'`
 
-- [ ] **Step 3: Implementierung schreiben**
+- [ ] **Step 3: Write the implementation**
 
 ```python
 # src/sturnus/domain/timeline.py
-"""Umrechnung von RTP-Zeitstempeln in absolute Zeit.
+"""Converts RTP timestamps into absolute time.
 
-Discord sendet während Stille keine Pakete, weshalb sich die Position
-eines Sprechabschnitts nicht aus der Ankunftszeit ergibt. Der RTP-Zeitstempel
-läuft dagegen lückenlos mit 48 kHz weiter.
+Discord sends no packets during silence, so the position of a speech
+segment can't be derived from arrival time. The RTP timestamp, however,
+keeps running gap-free at 48 kHz.
 """
 
 from __future__ import annotations
@@ -695,7 +702,7 @@ def _require_aware(value: datetime) -> datetime:
 
 
 class SpeakerClock:
-    """Hält je SSRC den Referenzpunkt aus erstem Paket und Wanduhrzeit."""
+    """Holds, per SSRC, the reference point from the first packet and wall-clock time."""
 
     def __init__(self) -> None:
         self._references: dict[int, tuple[datetime, int]] = {}
@@ -708,23 +715,23 @@ class SpeakerClock:
             return wall_now
 
         wall_first, rtp_first = reference
-        # Der Zähler ist 32 Bit breit und läuft nach rund 24,8 Stunden über.
-        # Die Restklassenrechnung liefert auch über den Überlauf hinweg die
-        # richtige Differenz, solange sie kleiner als der halbe Wertebereich ist.
+        # The counter is 32 bits wide and overflows after roughly 24.8 hours.
+        # Modular arithmetic yields the correct difference even across the
+        # overflow, as long as it's smaller than half the value range.
         delta_ticks = (rtp_timestamp - rtp_first) % _RTP_MODULO
         return wall_first + timedelta(seconds=delta_ticks / RTP_CLOCK_HZ)
 
     def reset(self, ssrc: int) -> None:
-        """Verwirft den Referenzpunkt, etwa nach einer Wiederverbindung."""
+        """Discards the reference point, e.g. after a reconnection."""
         self._references.pop(ssrc, None)
 ```
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `uv run pytest tests/domain/test_timeline.py -v`
-Expected: alle PASS
+Expected: all PASS
 
-- [ ] **Step 5: Committen**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/sturnus/domain/timeline.py tests/domain/test_timeline.py
@@ -733,17 +740,17 @@ git commit -m "feat: reconstruct absolute time from rtp timestamps"
 
 ---
 
-### Task 5: Transkript-Modell und Zusammenführung
+### Task 5: Transcript Model and Merging
 
-Setzt Spec 8.1 um: ein zielneutrales Modell ohne jedes Markup, aus dem
-später jeder Adapter sein eigenes Format rendert.
+Implements Spec 8.1: a target-neutral model with no markup at all, from
+which each adapter later renders its own format.
 
 **Files:**
 - Create: `src/sturnus/domain/transcript.py`
 - Test: `tests/domain/test_transcript.py`
 
 **Interfaces:**
-- Consumes: nichts
+- Consumes: nothing
 - Produces:
   - `SpeakerIdentity(discord_user_id: int, discord_display_name: str, external_user_id: str | None, external_display_name: str | None)`
   - `Segment(speaker: SpeakerIdentity, start: datetime, end: datetime, text: str)`
@@ -751,7 +758,7 @@ später jeder Adapter sein eigenes Format rendert.
   - `Transcript(session_started_at: datetime, session_ended_at: datetime, participants: tuple[SpeakerIdentity, ...], blocks: tuple[TranscriptBlock, ...])`
   - `build_transcript(segments, session_started_at, session_ended_at, merge_gap=timedelta(seconds=15)) -> Transcript`
 
-- [ ] **Step 1: Test schreiben**
+- [ ] **Step 1: Write the test**
 
 ```python
 # tests/domain/test_transcript.py
@@ -760,7 +767,7 @@ from datetime import datetime, timedelta, timezone
 from sturnus.domain.transcript import Segment, SpeakerIdentity, build_transcript
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=timezone.utc)
-ANNA = SpeakerIdentity(1, "anna", external_user_id="out-1", external_display_name="Anna Beispiel")
+ANNA = SpeakerIdentity(1, "anna", external_user_id="out-1", external_display_name="Anna Example")
 BEN = SpeakerIdentity(2, "ben")
 
 
@@ -778,25 +785,25 @@ def build(*segments: Segment):
 
 
 def test_blocks_are_ordered_by_time_across_speakers() -> None:
-    t = build(seg(BEN, 30, 3, "zweitens"), seg(ANNA, 0, 2, "erstens"))
-    assert [b.text for b in t.blocks] == ["erstens", "zweitens"]
+    t = build(seg(BEN, 30, 3, "second"), seg(ANNA, 0, 2, "first"))
+    assert [b.text for b in t.blocks] == ["first", "second"]
 
 
 def test_consecutive_segments_of_same_speaker_merge() -> None:
-    t = build(seg(ANNA, 0, 2, "erster Teil"), seg(ANNA, 3, 2, "zweiter Teil"))
+    t = build(seg(ANNA, 0, 2, "first half"), seg(ANNA, 3, 2, "second half"))
     assert len(t.blocks) == 1
-    assert t.blocks[0].text == "erster Teil zweiter Teil"
+    assert t.blocks[0].text == "first half second half"
     assert t.blocks[0].start == T0
 
 
 def test_long_pause_splits_a_block() -> None:
-    t = build(seg(ANNA, 0, 2, "vorher"), seg(ANNA, 300, 2, "nachher"))
-    assert [b.text for b in t.blocks] == ["vorher", "nachher"]
+    t = build(seg(ANNA, 0, 2, "before"), seg(ANNA, 300, 2, "after"))
+    assert [b.text for b in t.blocks] == ["before", "after"]
 
 
 def test_other_speaker_interrupts_a_block() -> None:
-    t = build(seg(ANNA, 0, 2, "eins"), seg(BEN, 3, 1, "dazwischen"), seg(ANNA, 5, 2, "drei"))
-    assert [b.text for b in t.blocks] == ["eins", "dazwischen", "drei"]
+    t = build(seg(ANNA, 0, 2, "one"), seg(BEN, 3, 1, "interjection"), seg(ANNA, 5, 2, "three"))
+    assert [b.text for b in t.blocks] == ["one", "interjection", "three"]
 
 
 def test_participants_are_unique_and_ordered_by_first_appearance() -> None:
@@ -805,8 +812,8 @@ def test_participants_are_unique_and_ordered_by_first_appearance() -> None:
 
 
 def test_empty_and_whitespace_segments_are_dropped() -> None:
-    t = build(seg(ANNA, 0, 1, "   "), seg(ANNA, 60, 1, "echt"))
-    assert [b.text for b in t.blocks] == ["echt"]
+    t = build(seg(ANNA, 0, 1, "   "), seg(ANNA, 60, 1, "real"))
+    assert [b.text for b in t.blocks] == ["real"]
 
 
 def test_no_segments_yields_empty_transcript() -> None:
@@ -822,25 +829,25 @@ def test_transcript_carries_session_bounds() -> None:
 
 
 def test_model_carries_no_markup() -> None:
-    t = build(seg(ANNA, 0, 1, "reiner Text"))
-    assert t.blocks[0].text == "reiner Text"
-    assert t.blocks[0].speaker.external_display_name == "Anna Beispiel"
+    t = build(seg(ANNA, 0, 1, "plain text"))
+    assert t.blocks[0].text == "plain text"
+    assert t.blocks[0].speaker.external_display_name == "Anna Example"
 ```
 
-- [ ] **Step 2: Test laufen lassen, Fehlschlag prüfen**
+- [ ] **Step 2: Run the test, verify it fails**
 
 Run: `uv run pytest tests/domain/test_transcript.py -v`
-Expected: FAIL mit `ModuleNotFoundError: No module named 'sturnus.domain.transcript'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'sturnus.domain.transcript'`
 
-- [ ] **Step 3: Implementierung schreiben**
+- [ ] **Step 3: Write the implementation**
 
 ```python
 # src/sturnus/domain/transcript.py
-"""Zielneutrales Transkript-Modell.
+"""Target-neutral transcript model.
 
-Enthält bewusst kein Markup: welche Bestandteile einer Sprecheridentität
-im Ergebnis auftauchen und in welcher Form, entscheidet allein der
-jeweilige Adapter über sein Template.
+Deliberately contains no markup: which parts of a speaker identity show
+up in the result, and in what form, is decided solely by the respective
+adapter via its template.
 """
 
 from __future__ import annotations
@@ -889,7 +896,7 @@ def build_transcript(
     session_ended_at: datetime,
     merge_gap: timedelta = DEFAULT_MERGE_GAP,
 ) -> Transcript:
-    """Ordnet Segmente aller Sprecher chronologisch und fasst Blöcke zusammen."""
+    """Orders segments from all speakers chronologically and merges them into blocks."""
     usable = sorted(
         (s for s in segments if s.text.strip()),
         key=lambda s: (s.start, s.speaker.discord_user_id),
@@ -935,12 +942,12 @@ def build_transcript(
     )
 ```
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `uv run pytest tests/domain/test_transcript.py -v`
-Expected: alle PASS
+Expected: all PASS
 
-- [ ] **Step 5: Committen**
+- [ ] **Step 5: Commit**
 
 ```bash
 git add src/sturnus/domain/transcript.py tests/domain/test_transcript.py
@@ -949,23 +956,23 @@ git commit -m "feat: add target-neutral transcript model with block merging"
 
 ---
 
-### Task 6: Einwilligungsauflösung
+### Task 6: Consent Resolution
 
-Setzt Spec 3.1 und 3.3 um. Eine Einwilligung erlischt bei Widerruf und
-bei einer Änderung der Datenschutzerklärung.
+Implements Spec 3.1 and 3.3. Consent expires on revocation and on a
+change to the privacy policy.
 
 **Files:**
 - Create: `src/sturnus/domain/consent.py`
 - Test: `tests/domain/test_consent.py`
 
 **Interfaces:**
-- Consumes: nichts
+- Consumes: nothing
 - Produces:
   - `ConsentRecord(granted_at: datetime | None, revoked_at: datetime | None, policy_version: str | None)`
   - `is_consent_active(record: ConsentRecord | None, current_policy_version: str) -> bool`
   - `may_record(record: ConsentRecord | None, current_policy_version: str, has_consent_role: bool) -> bool`
 
-- [ ] **Step 1: Test schreiben**
+- [ ] **Step 1: Write the test**
 
 ```python
 # tests/domain/test_consent.py
@@ -999,8 +1006,8 @@ def test_outdated_policy_version_invalidates_consent() -> None:
 
 
 def test_recording_requires_both_role_and_consent() -> None:
-    # Der Rollencheck allein genügt nicht: Administratoren umgehen die
-    # Kanalberechtigung, weshalb der Datensatz zusätzlich geprüft wird.
+    # The role check alone isn't enough: administrators bypass channel
+    # permissions, which is why the record is also checked.
     assert may_record(granted(), POLICY, has_consent_role=True) is True
     assert may_record(granted(), POLICY, has_consent_role=False) is False
     assert may_record(None, POLICY, has_consent_role=True) is False
@@ -1011,20 +1018,20 @@ def test_revoked_user_with_stale_role_may_not_be_recorded() -> None:
     assert may_record(record, POLICY, has_consent_role=True) is False
 ```
 
-- [ ] **Step 2: Test laufen lassen, Fehlschlag prüfen**
+- [ ] **Step 2: Run the test, verify it fails**
 
 Run: `uv run pytest tests/domain/test_consent.py -v`
-Expected: FAIL mit `ModuleNotFoundError: No module named 'sturnus.domain.consent'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'sturnus.domain.consent'`
 
-- [ ] **Step 3: Implementierung schreiben**
+- [ ] **Step 3: Write the implementation**
 
 ```python
 # src/sturnus/domain/consent.py
-"""Auflösung der Einwilligung.
+"""Consent resolution.
 
-Die Discord-Rolle ist der erste Schutz, aber nicht der einzige: Nutzer mit
-Administratorrecht umgehen Kanalberechtigungen und könnten ohne Rolle
-sprechen. Deshalb entscheidet stets auch der gespeicherte Datensatz.
+The Discord role is the first line of defense, but not the only one:
+users with administrator rights bypass channel permissions and could
+speak without the role. That's why the stored record always decides too.
 """
 
 from __future__ import annotations
@@ -1041,7 +1048,7 @@ class ConsentRecord:
 
 
 def is_consent_active(record: ConsentRecord | None, current_policy_version: str) -> bool:
-    """Eine Einwilligung erlischt durch Widerruf und durch eine geänderte Erklärung."""
+    """Consent expires through revocation and through a changed policy."""
     if record is None or record.granted_at is None:
         return False
     if record.revoked_at is not None:
@@ -1057,12 +1064,12 @@ def may_record(
     return has_consent_role and is_consent_active(record, current_policy_version)
 ```
 
-- [ ] **Step 4: Tests laufen lassen**
+- [ ] **Step 4: Run the tests**
 
 Run: `uv run pytest tests/domain/test_consent.py -v`
-Expected: alle PASS
+Expected: all PASS
 
-- [ ] **Step 5: Gesamtlauf und Committen**
+- [ ] **Step 5: Full run and commit**
 
 ```bash
 uv run ruff check . && uv run mypy && uv run pytest -v
@@ -1072,10 +1079,10 @@ git commit -m "feat: add consent resolution with policy versioning"
 
 ---
 
-### Task 7: Datenbankmodelle und erste Migration
+### Task 7: Database Models and First Migration
 
-Setzt Spec 9 um. Ab hier wird SQLAlchemy verwendet — ausschließlich in
-`infrastructure/db/`, niemals in `domain/`.
+Implements Spec 9. From here on SQLAlchemy is used — exclusively in
+`infrastructure/db/`, never in `domain/`.
 
 **Files:**
 - Create: `src/sturnus/infrastructure/db/__init__.py`, `src/sturnus/infrastructure/db/models.py`
@@ -1083,13 +1090,13 @@ Setzt Spec 9 um. Ab hier wird SQLAlchemy verwendet — ausschließlich in
 - Test: `tests/infrastructure/test_migrations.py`, `tests/conftest.py`
 
 **Interfaces:**
-- Consumes: nichts aus vorigen Tasks
+- Consumes: nothing from previous tasks
 - Produces:
   - `Base` (DeclarativeBase)
-  - Modelle `GuildConfig`, `AccountLink`, `Consent`, `OAuthState`, `Session`, `SessionParticipant`, `TranscriptionJob`
-  - pytest-Fixtures `postgres_url: str` (sitzungsweit) und `clean_database: str` (setzt das Schema je Test zurück)
+  - Models `GuildConfig`, `AccountLink`, `Consent`, `OAuthState`, `Session`, `SessionParticipant`, `TranscriptionJob`
+  - pytest fixtures `postgres_url: str` (session-scoped) and `clean_database: str` (resets the schema per test)
 
-- [ ] **Step 1: Testfundament für Postgres schreiben**
+- [ ] **Step 1: Write the Postgres test foundation**
 
 ```python
 # tests/conftest.py
@@ -1102,20 +1109,20 @@ from testcontainers.postgres import PostgresContainer
 
 @pytest.fixture(scope="session")
 def postgres_url() -> Iterator[str]:
-    """Ein Container für den gesamten Testlauf — das Hochfahren kostet Sekunden."""
+    """One container for the whole test run — starting it up costs seconds."""
     with PostgresContainer("postgres:17-alpine", driver="asyncpg") as container:
         yield container.get_connection_url()
 
 
 @pytest.fixture
 def clean_database(postgres_url: str) -> str:
-    """Setzt das Schema vor jedem Test vollständig zurück.
+    """Fully resets the schema before every test.
 
-    Notwendig, weil sich alle Tests einen Container teilen und auf zwei Wegen
-    Tabellen entstehen: über Alembic (mit `alembic_version`) und über
-    `create_all` (ohne). Ein blosses `drop_all` liesse die Alembic-Buchführung
-    stehen, worauf ein späteres `upgrade head` an bereits vorhandenen Tabellen
-    scheitert. Das Schema zu verwerfen trifft beide Fälle.
+    Necessary because all tests share one container, and tables can come
+    from two paths: via Alembic (with `alembic_version`) and via
+    `create_all` (without). A plain `drop_all` would leave Alembic's
+    bookkeeping in place, causing a later `upgrade head` to fail on tables
+    that already exist. Dropping the schema handles both cases.
     """
     engine = create_engine(postgres_url.replace("+asyncpg", "+psycopg"))
     with engine.begin() as conn:
@@ -1125,17 +1132,17 @@ def clean_database(postgres_url: str) -> str:
     return postgres_url
 ```
 
-Jeder Test, der die Datenbank berührt, hängt an `clean_database` statt an
-`postgres_url` — das macht die Testreihenfolge gleichgültig.
+Every test that touches the database depends on `clean_database` rather
+than `postgres_url` — that makes test order irrelevant.
 
-- [ ] **Step 2: Migrationstest schreiben**
+- [ ] **Step 2: Write the migration test**
 
 ```python
 # tests/infrastructure/test_migrations.py
-"""Migrationstests laufen bewusst synchron.
+"""Migration tests deliberately run synchronously.
 
-`alembic.command.*` ist eine synchrone API; aus einem `async def`-Test heraus
-aufgerufen bricht sie in der laufenden Ereignisschleife ab.
+`alembic.command.*` is a synchronous API; called from an `async def`
+test it breaks inside the running event loop.
 """
 
 from alembic import command
@@ -1187,10 +1194,10 @@ def test_downgrade_removes_the_tables(clean_database: str) -> None:
 
 
 def test_models_and_migration_do_not_drift(clean_database: str) -> None:
-    """Nach `upgrade head` darf ein Autogenerate nichts mehr zu tun finden.
+    """After `upgrade head`, an autogenerate must find nothing left to do.
 
-    Ohne diesen Test bleibt eine Modelländerung ohne zugehörige Migration
-    unbemerkt, bis sie in der Produktion auffällt.
+    Without this test, a model change with no matching migration goes
+    unnoticed until it shows up in production.
     """
     command.upgrade(_alembic_config(clean_database), "head")
 
@@ -1199,25 +1206,25 @@ def test_models_and_migration_do_not_drift(clean_database: str) -> None:
         context = MigrationContext.configure(conn)
         diff = compare_metadata(context, Base.metadata)
 
-    assert diff == [], f"Modelle und Migration weichen ab: {diff}"
+    assert diff == [], f"models and migration have drifted: {diff}"
 ```
 
-Der Drift-Test ist der wertvollste der drei: er schlägt fehl, sobald jemand ein
-Feld ergänzt, ohne `alembic revision --autogenerate` laufen zu lassen.
+The drift test is the most valuable of the three: it fails as soon as
+someone adds a field without running `alembic revision --autogenerate`.
 
-- [ ] **Step 3: `psycopg` als Testabhängigkeit ergänzen und Test laufen lassen**
+- [ ] **Step 3: Add `psycopg` as a test dependency and run the test**
 
 ```bash
 uv add --group test "psycopg[binary]>=3.2"
 uv run pytest tests/infrastructure/test_migrations.py -v
 ```
-Expected: FAIL — `alembic.ini` existiert nicht (`FileNotFoundError` bzw. Alembic meldet die fehlende Konfiguration)
+Expected: FAIL — `alembic.ini` doesn't exist (`FileNotFoundError`, or Alembic reports the missing configuration)
 
-- [ ] **Step 4: Modelle schreiben**
+- [ ] **Step 4: Write the models**
 
 ```python
 # src/sturnus/infrastructure/db/models.py
-"""SQLAlchemy-Modelle. Einziger Datenzugriffsweg des Systems."""
+"""SQLAlchemy models. The system's only data access path."""
 
 from __future__ import annotations
 
@@ -1343,33 +1350,32 @@ class TranscriptionJob(Base):
     )
 ```
 
-`wrapped_data_key` hält den mit dem Hauptschlüssel verschlüsselten
-Datenschlüssel der Sitzung (Spec 12.1); `encryption_key_id` benennt den
-verwendeten Hauptschlüssel, damit ein Wechsel ohne Neuverschlüsselung möglich
-bleibt.
+`wrapped_data_key` holds the session's data key encrypted with the
+master key (Spec 12.1); `encryption_key_id` names the master key used,
+so that rotating it remains possible without re-encryption.
 
-- [ ] **Step 5: Alembic einrichten — synchron, nicht async**
+- [ ] **Step 5: Set up Alembic — synchronous, not async**
 
 ```bash
 uv run alembic init migrations
 ```
 
-**Bewusst ohne `-t async`.** Die Anwendung läuft asynchron über `asyncpg`, die
-Migrationen laufen synchron über `psycopg`. Grund: `alembic.command.upgrade()`
-ruft bei einer asynchronen `env.py` intern `asyncio.run()` auf — innerhalb eines
-laufenden pytest-asyncio-Ereignisschleife bricht das mit
-`RuntimeError: asyncio.run() cannot be called from a running event loop` ab. Die
-Migrationen synchron zu halten macht sie aus Tests und aus einem
-Init-Container gleichermaßen aufrufbar.
+**Deliberately without `-t async`.** The application runs asynchronously
+via `asyncpg`; the migrations run synchronously via `psycopg`. Reason:
+with an asynchronous `env.py`, `alembic.command.upgrade()` internally
+calls `asyncio.run()` — inside a running pytest-asyncio event loop that
+breaks with `RuntimeError: asyncio.run() cannot be called from a running
+event loop`. Keeping the migrations synchronous makes them callable
+equally from tests and from an init container.
 
-In `alembic.ini` die URL leeren, da sie zur Laufzeit gesetzt wird:
+Clear the URL in `alembic.ini`, since it's set at runtime:
 
 ```ini
 sqlalchemy.url =
 ```
 
-`migrations/env.py` bekommt die Metadaten und die URL-Auflösung. Die von
-`alembic init` erzeugte Zeile `target_metadata = None` ersetzen durch:
+`migrations/env.py` gets the metadata and the URL resolution. Replace
+the line `target_metadata = None` generated by `alembic init` with:
 
 ```python
 import os
@@ -1380,7 +1386,7 @@ target_metadata = Base.metadata
 
 
 def _resolve_url() -> str:
-    """URL aus -x url=..., sonst aus DATABASE_URL. asyncpg wird zu psycopg."""
+    """URL from -x url=..., else from DATABASE_URL. asyncpg becomes psycopg."""
     from alembic import context as _context
 
     supplied = _context.get_x_argument(as_dictionary=True).get("url")
@@ -1393,10 +1399,10 @@ def _resolve_url() -> str:
 config.set_main_option("sqlalchemy.url", _resolve_url())
 ```
 
-Diese Zeile muss **vor** `run_migrations_offline()`/`run_migrations_online()`
-stehen, damit beide Pfade die aufgelöste URL sehen.
+This line must come **before** `run_migrations_offline()`/
+`run_migrations_online()`, so both paths see the resolved URL.
 
-- [ ] **Step 6: Erste Migration erzeugen**
+- [ ] **Step 6: Generate the first migration**
 
 ```bash
 docker run -d --name sturnus-pg -e POSTGRES_USER=sturnus -e POSTGRES_PASSWORD=sturnus \
@@ -1406,25 +1412,26 @@ uv run alembic -x url="postgresql://sturnus:sturnus@localhost:5432/sturnus" \
   revision --autogenerate -m "initial schema"
 ```
 
-Die erzeugte Datei nach `migrations/versions/` prüfen: sie muss alle sieben
-Tabellen anlegen und in `downgrade()` wieder entfernen. Fehlt eine, ist das
-Modell nicht importiert worden. Anschließend
+Check the generated file under `migrations/versions/`: it must create
+all seven tables and remove them again in `downgrade()`. If one is
+missing, the model wasn't imported. Afterward run
 `docker rm -f sturnus-pg`.
 
-- [ ] **Step 7: Migrationstests laufen lassen**
+- [ ] **Step 7: Run the migration tests**
 
 ```bash
 uv run pytest tests/infrastructure/test_migrations.py -v
 ```
-Expected: alle drei PASS. Schlägt `test_models_and_migration_do_not_drift` fehl,
-fehlt in der erzeugten Migration etwas — die Ausgabe benennt die Abweichung.
+Expected: all three PASS. If `test_models_and_migration_do_not_drift`
+fails, something is missing from the generated migration — the output
+names the discrepancy.
 
-- [ ] **Step 8: Architekturtest und Gesamtlauf**
+- [ ] **Step 8: Architecture test and full run**
 
 Run: `uv run ruff check . && uv run mypy && uv run pytest -v`
-Expected: alles grün — insbesondere schlägt `test_domain_has_no_outward_imports` nicht an, weil SQLAlchemy nur unter `infrastructure/` verwendet wird
+Expected: everything green — in particular, `test_domain_has_no_outward_imports` does not trigger, because SQLAlchemy is only used under `infrastructure/`
 
-- [ ] **Step 9: Committen**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add src/sturnus/infrastructure alembic.ini migrations tests/conftest.py tests/infrastructure
@@ -1433,10 +1440,10 @@ git commit -m "feat: add sqlalchemy models and initial alembic migration"
 
 ---
 
-### Task 8: Konfigurationsspeicher mit Vorrangauflösung
+### Task 8: Config Store with Precedence Resolution
 
-Setzt Spec 11 um: Werte je Guild, mit Standardwerten aus dem Code, wenn
-nichts hinterlegt ist.
+Implements Spec 11: per-guild values, falling back to defaults from
+the code when nothing is stored.
 
 **Files:**
 - Create: `src/sturnus/infrastructure/db/config_store.py`
@@ -1444,19 +1451,19 @@ nichts hinterlegt ist.
 - Test: `tests/infrastructure/test_config_store.py`
 
 **Interfaces:**
-- Consumes: `Base`, `GuildConfig` aus Task 7; `SessionTimeouts` aus Task 3
+- Consumes: `Base`, `GuildConfig` from Task 7; `SessionTimeouts` from Task 3
 - Produces:
   - `DEFAULTS: dict[str, str]` in `domain/settings.py`
-  - `ConfigStore(session_factory)` mit
+  - `ConfigStore(session_factory)` with
     `get(guild_id: int, key: str) -> str | None`,
     `set(guild_id: int, key: str, value: str | None, now: datetime) -> None`,
     `timeouts(guild_id: int) -> SessionTimeouts`
 
-- [ ] **Step 1: Standardwerte als reine Domänendaten schreiben**
+- [ ] **Step 1: Write default values as pure domain data**
 
 ```python
 # src/sturnus/domain/settings.py
-"""Standardwerte der Laufzeitkonfiguration (Spec 11)."""
+"""Default values for runtime configuration (Spec 11)."""
 
 from __future__ import annotations
 
@@ -1481,13 +1488,13 @@ DEFAULTS: dict[str, str] = {
     AUDIO_RETENTION_DAYS: "30",
 }
 
-# Ohne Standardwert und damit vor dem Betrieb zwingend zu setzen.
+# No default value, so these must be set before going live.
 REQUIRED_KEYS: frozenset[str] = frozenset(
     {VOICE_CHANNEL_ID, CONSENT_ROLE_ID, DOCUMENT_TARGET, POLICY_VERSION, POLICY_URL}
 )
 ```
 
-- [ ] **Step 2: Test schreiben**
+- [ ] **Step 2: Write the test**
 
 ```python
 # tests/infrastructure/test_config_store.py
@@ -1546,20 +1553,20 @@ async def test_timeouts_are_assembled_from_config(store: ConfigStore) -> None:
     await store.set(GUILD, settings.EMPTY_GRACE_SECONDS, "90", T0)
     timeouts = await store.timeouts(GUILD)
     assert timeouts.empty_grace_seconds == 90
-    assert timeouts.idle_timeout_minutes == 15  # Standardwert
+    assert timeouts.idle_timeout_minutes == 15  # default value
     assert timeouts.max_session_hours == 4
 ```
 
-- [ ] **Step 3: Test laufen lassen, Fehlschlag prüfen**
+- [ ] **Step 3: Run the test, verify it fails**
 
 Run: `uv run pytest tests/infrastructure/test_config_store.py -v`
-Expected: FAIL mit `ModuleNotFoundError: No module named 'sturnus.infrastructure.db.config_store'`
+Expected: FAIL with `ModuleNotFoundError: No module named 'sturnus.infrastructure.db.config_store'`
 
-- [ ] **Step 4: Implementierung schreiben**
+- [ ] **Step 4: Write the implementation**
 
 ```python
 # src/sturnus/infrastructure/db/config_store.py
-"""Laufzeitkonfiguration je Guild mit Rückfall auf die Standardwerte."""
+"""Per-guild runtime configuration with fallback to the defaults."""
 
 from __future__ import annotations
 
@@ -1590,7 +1597,7 @@ class ConfigStore:
         return settings.DEFAULTS.get(key)
 
     async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None:
-        """Setzt einen Wert; `None` entfernt ihn und stellt den Standard wieder her."""
+        """Sets a value; `None` removes it and restores the default."""
         async with self._session_factory() as session:
             if value is None:
                 await session.execute(
@@ -1624,17 +1631,17 @@ class ConfigStore:
         return int(value)
 ```
 
-- [ ] **Step 5: Tests laufen lassen**
+- [ ] **Step 5: Run the tests**
 
 Run: `uv run pytest tests/infrastructure/test_config_store.py -v`
-Expected: alle PASS
+Expected: all PASS
 
-- [ ] **Step 6: Gesamtlauf**
+- [ ] **Step 6: Full run**
 
 Run: `uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest -v`
-Expected: alles grün
+Expected: everything green
 
-- [ ] **Step 7: Committen**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add src/sturnus/domain/settings.py src/sturnus/infrastructure/db/config_store.py tests/infrastructure/test_config_store.py
@@ -1643,17 +1650,17 @@ git commit -m "feat: add per-guild config store with default fallback"
 
 ---
 
-## Abschluss von Plan 1
+## Conclusion of Plan 1
 
-Nach Task 8 steht:
+After Task 8, we have:
 
-- Ein Repository mit CI, das Linter, Typprüfung und Tests auf jedem PR ausführt.
-- Release Please, bereit für den ersten `feat:`-Commit.
-- Die vollständige Domänenlogik: Zustandsautomat, Zeitrekonstruktion,
-  Transkript-Aufbau, Einwilligungsauflösung — alle ohne I/O und ohne
-  Discord-Abhängigkeit prüfbar.
-- Ein durchgesetzter Architekturtest, der die Schichtung ab hier bewacht.
-- Das vollständige Datenbankschema mit Migration und den Konfigurationsspeicher.
+- A repository with CI that runs linter, type checking, and tests on every PR.
+- Release Please, ready for the first `feat:` commit.
+- The complete domain logic: state machine, time reconstruction,
+  transcript assembly, consent resolution — all testable without I/O
+  and without a Discord dependency.
+- An enforced architecture test that guards the layering from here on.
+- The complete database schema with migration, and the config store.
 
-**Noch nicht vorhanden und Gegenstand von Plan 2:** Discord-Anbindung,
-Sprachaufzeichnung, Verschlüsselung, S3.
+**Not yet present, and the subject of Plan 2:** Discord integration,
+voice recording, encryption, S3.
