@@ -2,6 +2,8 @@
 import ast
 from pathlib import Path
 
+import pytest
+
 DOMAIN = Path(__file__).parent.parent / "src" / "sturnus" / "domain"
 SRC = Path(__file__).parent.parent / "src"
 
@@ -23,117 +25,108 @@ FORBIDDEN_PREFIXES = (
 def _get_package_name(file_path: Path, src_path: Path) -> str:
     """Get the package name that a Python file belongs to."""
     relative = file_path.relative_to(src_path)
-
-    # The package is the parent directory (same for __init__.py and other files)
     directory = relative.parent
-
-    # Convert path to module name
     parts = directory.parts
     return ".".join(parts) if parts else ""
 
 
-def _resolve_relative_import(module: str | None, level: int, file_package: str) -> str | None:
-    """Resolve a relative import to its absolute module name.
+def _resolve_relative_base(module: str | None, level: int, file_package: str) -> str | None:
+    """Resolve the base module path for a relative from...import statement.
 
     Args:
-        module: Module part after 'from' (e.g., 'infrastructure' in 'from ..infrastructure')
-        level: The number of dots (e.g., 2 for '..')
+        module: The module name after 'from' (e.g., 'db' in 'from ..db import')
+        level: The relative level (1 for '.', 2 for '..', etc.)
         file_package: The package the importing file belongs to
 
     Returns:
-        The absolute module name, or None if the import is invalid or local-only.
+        The absolute base module path, or None if invalid.
     """
-    if not module:
-        # from . or from .. without a specific module - these are local
-        return None
-
     parts = file_package.split(".")
-
-    # Walk up level-1 levels from the current package
-    # level=1 means "from .module" - stay at current package
-    # level=2 means "from ..module" - go up one level
     levels_up = level - 1
 
     if levels_up >= len(parts):
         # Invalid: trying to go above the root
         return None
 
-    # Remove the last levels_up elements
+    # Walk up the package hierarchy
     base_parts = list(parts[: len(parts) - levels_up])
 
-    # Append the module
-    base_parts.append(module)
-    return ".".join(base_parts)
+    # Append the module name if present
+    if module:
+        base_parts.extend(module.split("."))
 
-
-def _resolve_relative_names(
-    names: list[ast.alias], level: int, file_package: str
-) -> set[str]:
-    """Resolve names imported from a relative package (from .. import x, y, z).
-
-    When level >= 2, these imports can escape the current package.
-    When level == 1, imports stay within the package.
-
-    Args:
-        names: The imported names from the from...import statement
-        level: The relative level (1 for '.', 2 for '..', etc.)
-        file_package: The package the importing file belongs to
-
-    Returns:
-        Set of absolute module names, or empty set if imports stay local (level == 1).
-    """
-    if level < 2:
-        # from . import x stays within the package
-        return set()
-
-    parts = file_package.split(".")
-    levels_up = level - 1
-
-    if levels_up >= len(parts):
-        # Can't go up that many levels
-        return set()
-
-    base_parts = list(parts[: len(parts) - levels_up])
-    result = set()
-
-    for alias in names:
-        name = alias.name
-        submodule = ".".join(base_parts + [name])
-        result.add(submodule)
-
-    return result
+    return ".".join(base_parts) if base_parts else None
 
 
 def _imported_modules(path: Path, src_path: Path = SRC) -> set[str]:
-    """Extract all imported modules from a file, resolving relative imports."""
+    """Extract all module paths reachable by imports in a file.
+
+    For each import statement, yields the full set of module paths it can reach:
+    - 'import a.b' reaches 'a.b'
+    - 'from a.b import c' reaches both 'a.b' and 'a.b.c'
+    - 'from a.b import *' reaches only 'a.b'
+    - Relative imports are resolved to absolute paths first
+    """
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: set[str] = set()
-
-    # Determine the package of this file
     file_package = _get_package_name(path, src_path)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
-            # Absolute imports: import x, import x.y, import x as y
-            found.update(alias.name for alias in node.names)
+            # import a, import a.b, import a.b as x
+            # Record the full module name (alias.name is the left side of 'as')
+            for alias in node.names:
+                found.add(alias.name)
+
         elif isinstance(node, ast.ImportFrom):
+            # Determine the base module (what's after 'from')
             if node.level == 0:
-                # Absolute import: from x import y
-                if node.module:
-                    found.add(node.module)
+                # Absolute import: from a.b import c
+                base_module = node.module
             else:
-                # Relative import: from .x import y or from ..x import y
-                if node.module:
-                    # from .x import y or from ..x import y
-                    resolved = _resolve_relative_import(node.module, node.level, file_package)
-                    if resolved:
-                        found.add(resolved)
-                else:
-                    # from . import x, y or from .. import x, y
-                    resolved_names = _resolve_relative_names(node.names, node.level, file_package)
-                    found.update(resolved_names)
+                # Relative import: from . import c or from ..a.b import c
+                base_module = _resolve_relative_base(node.module, node.level, file_package)
+
+            if base_module:
+                # Record the base module itself
+                found.add(base_module)
+
+                # For each imported name, also record the submodule path
+                # (unless it's a star import)
+                for alias in node.names:
+                    if alias.name != "*":
+                        found.add(f"{base_module}.{alias.name}")
 
     return found
+
+
+def _check_violations(
+    source: str, file_path: Path = DOMAIN / "session.py"
+) -> set[str]:
+    """Parse source and return any resolved modules that violate the rule."""
+    tree = ast.parse(source, filename=str(file_path))
+    found: set[str] = set()
+    file_package = _get_package_name(file_path, SRC)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                found.add(alias.name)
+
+        elif isinstance(node, ast.ImportFrom):
+            if node.level == 0:
+                base_module = node.module
+            else:
+                base_module = _resolve_relative_base(node.module, node.level, file_package)
+
+            if base_module:
+                found.add(base_module)
+
+                for alias in node.names:
+                    if alias.name != "*":
+                        found.add(f"{base_module}.{alias.name}")
+
+    return {m for m in found if m.startswith(FORBIDDEN_PREFIXES)}
 
 
 def test_domain_has_no_outward_imports() -> None:
@@ -169,71 +162,72 @@ def test_application_does_not_import_infrastructure() -> None:
     assert not violations, "application must not import infrastructure:\n" + "\n".join(violations)
 
 
-def test_domain_rejects_relative_imports_escaping_domain_layer() -> None:
-    """Verify the test catches relative imports that escape the domain package."""
-    probe_file = DOMAIN / "_probe_escape.py"
-    try:
-        # This probe violates the rule: escaping domain via relative import
-        probe_file.write_text("from ..infrastructure import db\n")
+@pytest.mark.parametrize(
+    "import_stmt,should_violate",
+    [
+        # Violations: absolute imports from forbidden modules
+        ("import sqlalchemy", True),
+        ("import sqlalchemy.orm", True),
+        ("import sqlalchemy as sa", True),
+        ("from sqlalchemy import select", True),
+        ("from sqlalchemy.orm import Mapped", True),
+        # Violations: absolute imports from sturnus forbidden packages
+        ("from sturnus import infrastructure", True),
+        ("from sturnus import application", True),
+        ("from sturnus.infrastructure.db import models", True),
+        # Violations: relative imports that escape domain
+        ("from ..infrastructure import db", True),
+        ("from .. import infrastructure", True),
+        ("from .. import infrastructure, application", True),
+        ("from ..infrastructure import *", True),
+        # Allowed: standard library and project packages
+        ("import json", False),
+        ("from dataclasses import dataclass", False),
+        ("from . import helper", False),
+        ("from .timeline import SpeakerClock", False),
+        ("from sturnus.domain import timeline", False),
+    ],
+)
+def test_import_resolution_comprehensive(
+    import_stmt: str, should_violate: bool
+) -> None:
+    """Exhaustive test of all import forms to prevent regression.
 
-        violations: list[str] = []
-        for path in DOMAIN.rglob("*.py"):
-            for module in _imported_modules(path):
-                if module.startswith(FORBIDDEN_PREFIXES):
-                    violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
+    This table specifies the expected behavior for every import spelling.
+    If this test fails, it means a new syntax has been found that bypasses
+    the rule, or an existing syntax is incorrectly flagged.
+    """
+    violations = _check_violations(import_stmt)
 
-        # The violation must be caught
-        assert any("_probe_escape.py" in v and "sturnus.infrastructure" in v for v in violations), \
-            f"Expected violation not detected. Got violations: {violations}"
-    finally:
-        probe_file.unlink(missing_ok=True)
-
-
-def test_domain_rejects_name_list_relative_imports_escaping_domain_layer() -> None:
-    """Verify the test catches 'from .. import name' syntax for escaping imports."""
-    probe_file = DOMAIN / "_probe_escape_names.py"
-    try:
-        # This probe uses the name-list syntax: from .. import infrastructure
-        # Both this and 'from ..infrastructure import db' should escape to sturnus.infrastructure
-        probe_file.write_text("from .. import infrastructure\n")
-
-        modules = _imported_modules(probe_file)
-
-        # Verify it resolved to the forbidden module
-        assert "sturnus.infrastructure" in modules, \
-            f"Expected sturnus.infrastructure in resolved modules, got: {modules}"
-
-        violations: list[str] = []
-        for path in DOMAIN.rglob("*.py"):
-            for module in _imported_modules(path):
-                if module.startswith(FORBIDDEN_PREFIXES):
-                    violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
-
-        # The violation must be caught
-        found = any(
-            "_probe_escape_names.py" in v and "sturnus.infrastructure" in v
-            for v in violations
+    if should_violate:
+        assert violations, (
+            f"Expected violation not detected\n"
+            f"Statement: {import_stmt}\n"
+            f"Violations: {violations}"
         )
-        assert found, f"Expected violation not detected. Got violations: {violations}"
-    finally:
-        probe_file.unlink(missing_ok=True)
+    else:
+        assert not violations, (
+            f"Unexpected violation detected\n"
+            f"Statement: {import_stmt}\n"
+            f"Violations: {violations}"
+        )
 
 
-def test_domain_allows_relative_imports_within_domain_layer() -> None:
-    """Verify relative imports within domain are allowed and resolve correctly."""
-    probe_file = DOMAIN / "_probe_local.py"
+def test_directory_walk_detects_real_violation() -> None:
+    """End-to-end test that the directory walk detects actual violations."""
+    probe_file = DOMAIN / "_probe_real_violation.py"
     try:
-        # These imports stay within domain - should NOT violate
-        probe_file.write_text("from .models import Session\n")
+        # Create a real probe file with an absolute import of a forbidden module
+        probe_file.write_text("from sturnus.infrastructure import db\n")
 
-        modules = _imported_modules(probe_file)
+        violations: list[str] = []
+        for path in DOMAIN.rglob("*.py"):
+            for module in _imported_modules(path):
+                if module.startswith(FORBIDDEN_PREFIXES):
+                    violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
 
-        # Verify the import resolved correctly to a domain-internal module
-        assert "sturnus.domain.models" in modules, \
-            f"Expected sturnus.domain.models in resolved modules, got: {modules}"
-
-        # Verify no violations
-        violations = [m for m in modules if m.startswith(FORBIDDEN_PREFIXES)]
-        assert not violations, f"Unexpected violations: {violations}"
+        # Verify the violation was caught by the directory walk
+        found = any("_probe_real_violation.py" in v for v in violations)
+        assert found, f"Expected violation not found in directory walk. Violations: {violations}"
     finally:
         probe_file.unlink(missing_ok=True)
