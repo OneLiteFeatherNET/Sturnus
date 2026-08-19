@@ -51,9 +51,7 @@ class Consent(Base):
     policy_version: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(Text, nullable=False)
 
-    __table_args__ = (
-        Index("ix_consent_user_guild", "discord_user_id", "guild_id"),
-    )
+    __table_args__ = (Index("ix_consent_user_guild", "discord_user_id", "guild_id"),)
 
 
 class OAuthState(Base):
@@ -81,9 +79,7 @@ class Session(Base):
     document_url: Mapped[str | None] = mapped_column(Text)
     announced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
-    __table_args__ = (
-        Index("ix_session_status", "status"),
-    )
+    __table_args__ = (Index("ix_session_status", "status"),)
 
 
 class SessionParticipant(Base):

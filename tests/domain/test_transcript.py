@@ -73,9 +73,9 @@ def test_model_carries_no_markup() -> None:
 def test_nested_segment_does_not_break_merge() -> None:
     """Short segment entirely inside a longer one should not break the run."""
     t = build(
-        seg(ANNA, 0, 20, "long"),      # T0 to T0+20
-        seg(ANNA, 2, 1, "short"),      # T0+2 to T0+3 (nested inside "long")
-        seg(ANNA, 20, 1, "after"),     # T0+20 to T0+21 (gap 0 from "long")
+        seg(ANNA, 0, 20, "long"),  # T0 to T0+20
+        seg(ANNA, 2, 1, "short"),  # T0+2 to T0+3 (nested inside "long")
+        seg(ANNA, 20, 1, "after"),  # T0+20 to T0+21 (gap 0 from "long")
     )
     assert len(t.blocks) == 1
     assert t.blocks[0].text == "long short after"
@@ -84,9 +84,9 @@ def test_nested_segment_does_not_break_merge() -> None:
 def test_partial_overlap_continues_merge() -> None:
     """Segment starting before first ends, extending past it."""
     t = build(
-        seg(ANNA, 0, 5, "first"),      # T0 to T0+5
-        seg(ANNA, 3, 5, "second"),     # T0+3 to T0+8 (overlaps, extends past)
-        seg(ANNA, 8, 1, "third"),      # T0+8 to T0+9 (gap 0 from "second")
+        seg(ANNA, 0, 5, "first"),  # T0 to T0+5
+        seg(ANNA, 3, 5, "second"),  # T0+3 to T0+8 (overlaps, extends past)
+        seg(ANNA, 8, 1, "third"),  # T0+8 to T0+9 (gap 0 from "second")
     )
     assert len(t.blocks) == 1
     assert t.blocks[0].text == "first second third"

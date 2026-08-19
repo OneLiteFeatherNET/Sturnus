@@ -7,6 +7,7 @@ Scope: Static import statements are checked via AST parsing. Dynamic imports
 via __import__() or importlib.import_module() are not detected by this test
 and are out of scope.
 """
+
 import ast
 from pathlib import Path
 
@@ -258,15 +259,11 @@ def test_import_resolution_comprehensive(
     # Verify violation detection matches expectation
     if should_violate:
         assert violations, (
-            f"Expected violation not detected\n"
-            f"Statement: {import_stmt}\n"
-            f"Violations: {violations}"
+            f"Expected violation not detected\nStatement: {import_stmt}\nViolations: {violations}"
         )
     else:
         assert not violations, (
-            f"Unexpected violation detected\n"
-            f"Statement: {import_stmt}\n"
-            f"Violations: {violations}"
+            f"Unexpected violation detected\nStatement: {import_stmt}\nViolations: {violations}"
         )
 
 

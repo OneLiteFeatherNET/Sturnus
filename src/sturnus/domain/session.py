@@ -86,14 +86,12 @@ class SessionMachine:
         assert self.started_at is not None
         if now - self.started_at > timedelta(hours=self._timeouts.max_session_hours):
             return EndReason.MAX_DURATION
-        if (
-            self._grace_since is not None
-            and now - self._grace_since > timedelta(seconds=self._timeouts.empty_grace_seconds)
+        if self._grace_since is not None and now - self._grace_since > timedelta(
+            seconds=self._timeouts.empty_grace_seconds
         ):
             return EndReason.EMPTY
-        if (
-            self._last_audio_at is not None
-            and now - self._last_audio_at > timedelta(minutes=self._timeouts.idle_timeout_minutes)
+        if self._last_audio_at is not None and now - self._last_audio_at > timedelta(
+            minutes=self._timeouts.idle_timeout_minutes
         ):
             return EndReason.IDLE_TIMEOUT
         return None
