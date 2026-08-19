@@ -1,0 +1,56 @@
+[project]
+name = "sturnus"
+version = "0.1.0" # x-release-please-version
+description = "Discord voice transcription with Outline document output"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "OneLiteFeather" }]
+dependencies = [
+    "sqlalchemy>=2.0.44",
+    "asyncpg>=0.31.0",
+    "alembic>=1.14.0",
+    "pydantic-settings>=2.12.0",
+]
+
+[project.scripts]
+sturnus-bot = "sturnus.entrypoints.bot:main"
+sturnus-link = "sturnus.entrypoints.link:main"
+sturnus-worker = "sturnus.entrypoints.worker:main"
+
+[build-system]
+requires = ["uv_build>=0.9.4,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+lint = ["mypy>=1.19.0", "ruff>=0.14.7"]
+test = [
+    "pytest>=9.0.1",
+    "pytest-asyncio>=1.3.0",
+    "testcontainers[postgres]>=4.9.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# ruff >=0.15 lints/formats *.md by default; docs/ holds prose specs and plans,
+# not source, and their embedded code fences are illustrative, not real modules.
+extend-exclude = ["docs"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src", "tests"]
+
+# Diese drei bringen keine Typinformationen mit. Die Strenge bleibt für
+# eigenen Code unangetastet; ohne diesen Block scheitert der Testlauf an
+# import-untyped, ohne dass ein Fehler im Code vorliegt.
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "alembic.*", "psycopg.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
