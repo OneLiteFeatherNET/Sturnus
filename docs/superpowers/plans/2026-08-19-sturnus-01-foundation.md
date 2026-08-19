@@ -82,6 +82,13 @@ python_version = "3.12"
 strict = true
 files = ["src", "tests"]
 
+# Diese drei bringen keine Typinformationen mit. Die Strenge bleibt für
+# eigenen Code unangetastet; ohne diesen Block scheitert der Testlauf an
+# import-untyped, ohne dass ein Fehler im Code vorliegt.
+[[tool.mypy.overrides]]
+module = ["testcontainers.*", "alembic.*", "psycopg.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
