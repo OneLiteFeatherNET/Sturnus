@@ -159,12 +159,12 @@ from sturnus.config import Settings
 
 def _env(**overrides: str) -> dict[str, str]:
     base = {
-        "STURNUS_DISCORD_TOKEN": "token",
+        "STURNUS_DISCORD_TOKEN": "discord-secret-value",
         "STURNUS_DATABASE_URL": "postgresql+asyncpg://u:p@localhost/db",
         "STURNUS_S3_ENDPOINT": "https://s3.example",
         "STURNUS_S3_BUCKET": "sturnus-audio",
         "STURNUS_S3_ACCESS_KEY": "ak",
-        "STURNUS_S3_SECRET_KEY": "sk",
+        "STURNUS_S3_SECRET_KEY": "s3-secret-value",
         "STURNUS_MASTER_KEY": "c3R1cm51cy10ZXN0LWtleS0zMi1ieXRlcy1sb25nISE=",
         "STURNUS_MASTER_KEY_ID": "k1",
         "STURNUS_RECORDING_DIR": "/tmp/rec",
@@ -194,8 +194,11 @@ def test_secrets_are_not_exposed_by_repr(monkeypatch: pytest.MonkeyPatch) -> Non
     for k, v in _env().items():
         monkeypatch.setenv(k, v)
     rendered = repr(Settings())
-    assert "token" not in rendered
-    assert "sk" not in rendered
+    # Assert on the secret VALUES, never on words that also appear in field
+    # names — `discord_token` contains "token", so such an assertion could
+    # never hold regardless of whether masking works.
+    assert "discord-secret-value" not in rendered
+    assert "s3-secret-value" not in rendered
     assert "c3R1cm51cy" not in rendered
 ```
 
@@ -207,12 +210,23 @@ Expected: FAIL — `sturnus.config` does not exist.
 - [ ] **Step 3: Add the dependencies**
 
 ```bash
-uv add "pydantic-settings>=2.12.0" "cryptography>=44.0" "soxr>=0.5" "boto3>=1.35" \
-  "discord.py>=2.6.4" "discord-ext-voice-recv>=0.5.4a0"
-uv add --group test "moto[s3]>=5.0" "pytest-cov>=6.0"
+uv add "pydantic-settings>=2.12.0" "cryptography>=44.0" "soxr>=0.5" "numpy>=2.1" \
+  "boto3>=1.35" "discord.py>=2.6.4" "discord-ext-voice-recv>=0.5.2a179"
+uv add --group test "moto[s3]>=5.0"
 ```
 
-> **Verify during implementation:** the exact distribution name and version of the voice-receive extension. It is published from `imayhaveborkedit/discord-ext-voice-recv` and its release cadence is irregular. If the coordinate above does not resolve, find the current one rather than substituting a different library — Task 9 depends on this specific extension for RTP timestamp access.
+Also add the pydantic plugin to `[tool.mypy]`, or every `Settings()` reads as a
+call missing each required argument:
+
+```toml
+plugins = ["pydantic.mypy"]
+```
+
+> The voice-receive extension resolves at `0.5.2a179`; earlier drafts of this
+> plan guessed a version that does not exist. See
+> `docs/verification/voice-receive-spike.md` for what the installed package
+> actually exposes — `RTPPacket` carries `timestamp` and `ssrc`, which settles
+> the assumption Spec 6.2 rests on.
 
 - [ ] **Step 4: Write the settings module**
 
@@ -403,6 +417,7 @@ import os
 from pathlib import Path
 
 import pytest
+from cryptography.exceptions import InvalidTag
 
 from sturnus.infrastructure.crypto import (
     CHUNK_SIZE,
@@ -433,7 +448,7 @@ def test_each_data_key_is_distinct() -> None:
 def test_a_wrong_master_key_cannot_unwrap() -> None:
     wrapped = wrapper().new_data_key().wrapped
     other = KeyWrapper(master_key=b"1" * 32, key_id="k1")
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidTag):
         other.unwrap(wrapped)
 
 
@@ -481,7 +496,7 @@ def test_tampering_is_detected(tmp_path: Path) -> None:
     data[-1] ^= 0xFF
     encrypted.write_bytes(bytes(data))
 
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidTag):
         decrypt_file(encrypted, tmp_path / "b.out", key)
 
 
@@ -490,7 +505,7 @@ def test_a_wrong_data_key_cannot_decrypt(tmp_path: Path) -> None:
     plain.write_bytes(os.urandom(4096))
     w = wrapper()
     encrypt_file(plain, tmp_path / "c.enc", w.new_data_key().plaintext)
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidTag):
         decrypt_file(tmp_path / "c.enc", tmp_path / "c.out", w.new_data_key().plaintext)
 
 
