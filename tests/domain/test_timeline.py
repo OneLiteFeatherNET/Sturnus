@@ -1,11 +1,11 @@
 # tests/domain/test_timeline.py
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from sturnus.domain.timeline import RTP_CLOCK_HZ, SpeakerClock
 
-T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 SSRC = 111
 
 
@@ -63,3 +63,26 @@ def test_reset_drops_the_reference() -> None:
 def test_naive_datetime_is_rejected() -> None:
     with pytest.raises(ValueError, match="timezone-aware"):
         SpeakerClock().absolute_time(SSRC, 1, datetime(2026, 8, 19))
+
+
+def test_late_packet_arrives_before_reference() -> None:
+    clock = SpeakerClock()
+    clock.absolute_time(SSRC, 1_000_000, T0)
+    # A UDP packet arriving 1000 ticks late (roughly 1/48 second early).
+    # Must resolve to before the reference, not hours in the future.
+    late = clock.absolute_time(SSRC, 1_000_000 - 1_000, T0 + timedelta(seconds=10))
+    assert late < T0, "late packet must arrive before the reference time"
+    assert late == T0 - timedelta(seconds=1_000 / RTP_CLOCK_HZ)
+
+
+def test_large_forward_delta_just_under_threshold() -> None:
+    clock = SpeakerClock()
+    rtp_start = 1_000_000
+    clock.absolute_time(SSRC, rtp_start, T0)
+    # A large forward delta just under half the range should still be treated as forward.
+    # Half the range is 2**31; test with 2**31 - 1 (to stay just under the threshold).
+    large_forward = rtp_start + (2**31 - 1)
+    result = clock.absolute_time(SSRC, large_forward, T0 + timedelta(seconds=10))
+    # Result should be well after the reference (roughly at 2**31 - 1 ticks from start).
+    expected = T0 + timedelta(seconds=(2**31 - 1) / RTP_CLOCK_HZ)
+    assert result == expected

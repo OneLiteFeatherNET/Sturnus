@@ -34,9 +34,19 @@ class SpeakerClock:
 
         wall_first, rtp_first = reference
         # The counter is 32 bits wide and overflows after roughly 24.8 hours.
-        # Modular arithmetic yields the correct difference even across the
-        # overflow, as long as it's smaller than half the value range.
+        # Modular arithmetic yields the correct difference even across the overflow.
+        # However, RTP packets often arrive out of order on UDP: a late-arriving packet
+        # has a smaller timestamp than a previously seen one. The modulo operation would
+        # turn that small backwards step into a huge forward value (near 2**32).
+        # Interpret the delta as signed: if it exceeds half the range (2**31 ≈ 12.4 hours),
+        # it is unambiguously a backwards step, not a forward wraparound. This is safe
+        # because legitimate forward jumps cannot exceed max_session_hours (default 4 hours),
+        # which is well below the 12.4-hour threshold. A negative delta correctly positions
+        # a late packet slightly before the reference time, which downstream code relies on
+        # to maintain chronological order.
         delta_ticks = (rtp_timestamp - rtp_first) % _RTP_MODULO
+        if delta_ticks > _RTP_MODULO // 2:
+            delta_ticks -= _RTP_MODULO
         return wall_first + timedelta(seconds=delta_ticks / RTP_CLOCK_HZ)
 
     def reset(self, ssrc: int) -> None:
