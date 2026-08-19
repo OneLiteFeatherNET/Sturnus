@@ -1,4 +1,12 @@
-# tests/test_architecture.py
+"""Architecture test for the inward dependency rule.
+
+This test enforces that sturnus.domain has no outward dependencies, and that
+sturnus.application does not depend on sturnus.infrastructure.
+
+Scope: Static import statements are checked via AST parsing. Dynamic imports
+via __import__() or importlib.import_module() are not detected by this test
+and are out of scope.
+"""
 import ast
 from pathlib import Path
 
@@ -58,18 +66,24 @@ def _resolve_relative_base(module: str | None, level: int, file_package: str) ->
     return ".".join(base_parts) if base_parts else None
 
 
-def _imported_modules(path: Path, src_path: Path = SRC) -> set[str]:
-    """Extract all module paths reachable by imports in a file.
+def _resolve_imports_in_module(tree: ast.Module, file_path: Path) -> set[str]:
+    """Resolve all module paths reachable by imports in an AST tree.
 
     For each import statement, yields the full set of module paths it can reach:
     - 'import a.b' reaches 'a.b'
     - 'from a.b import c' reaches both 'a.b' and 'a.b.c'
     - 'from a.b import *' reaches only 'a.b'
     - Relative imports are resolved to absolute paths first
+
+    Args:
+        tree: An ast.Module from ast.parse()
+        file_path: The file path (used to determine the package context for relative imports)
+
+    Returns:
+        Set of all reachable module names.
     """
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     found: set[str] = set()
-    file_package = _get_package_name(path, src_path)
+    file_package = _get_package_name(file_path, SRC)
 
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
@@ -88,7 +102,6 @@ def _imported_modules(path: Path, src_path: Path = SRC) -> set[str]:
                 base_module = _resolve_relative_base(node.module, node.level, file_package)
 
             if base_module:
-                # Record the base module itself
                 found.add(base_module)
 
                 # For each imported name, also record the submodule path
@@ -100,33 +113,17 @@ def _imported_modules(path: Path, src_path: Path = SRC) -> set[str]:
     return found
 
 
-def _check_violations(
-    source: str, file_path: Path = DOMAIN / "session.py"
-) -> set[str]:
+def _imported_modules(path: Path, src_path: Path = SRC) -> set[str]:
+    """Extract all module paths reachable by imports in a file."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    return _resolve_imports_in_module(tree, path)
+
+
+def _check_violations(source: str, file_path: Path = DOMAIN / "session.py") -> set[str]:
     """Parse source and return any resolved modules that violate the rule."""
     tree = ast.parse(source, filename=str(file_path))
-    found: set[str] = set()
-    file_package = _get_package_name(file_path, SRC)
-
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                found.add(alias.name)
-
-        elif isinstance(node, ast.ImportFrom):
-            if node.level == 0:
-                base_module = node.module
-            else:
-                base_module = _resolve_relative_base(node.module, node.level, file_package)
-
-            if base_module:
-                found.add(base_module)
-
-                for alias in node.names:
-                    if alias.name != "*":
-                        found.add(f"{base_module}.{alias.name}")
-
-    return {m for m in found if m.startswith(FORBIDDEN_PREFIXES)}
+    all_modules = _resolve_imports_in_module(tree, file_path)
+    return {m for m in all_modules if m.startswith(FORBIDDEN_PREFIXES)}
 
 
 def test_domain_has_no_outward_imports() -> None:
@@ -163,42 +160,102 @@ def test_application_does_not_import_infrastructure() -> None:
 
 
 @pytest.mark.parametrize(
-    "import_stmt,should_violate",
+    "import_stmt,should_violate,expected_modules",
     [
         # Violations: absolute imports from forbidden modules
-        ("import sqlalchemy", True),
-        ("import sqlalchemy.orm", True),
-        ("import sqlalchemy as sa", True),
-        ("from sqlalchemy import select", True),
-        ("from sqlalchemy.orm import Mapped", True),
+        ("import sqlalchemy", True, {"sqlalchemy"}),
+        ("import sqlalchemy.orm", True, {"sqlalchemy.orm"}),
+        ("import sqlalchemy as sa", True, {"sqlalchemy"}),
+        (
+            "from sqlalchemy import select",
+            True,
+            {"sqlalchemy", "sqlalchemy.select"},
+        ),
+        (
+            "from sqlalchemy.orm import Mapped",
+            True,
+            {"sqlalchemy.orm", "sqlalchemy.orm.Mapped"},
+        ),
         # Violations: absolute imports from sturnus forbidden packages
-        ("from sturnus import infrastructure", True),
-        ("from sturnus import application", True),
-        ("from sturnus.infrastructure.db import models", True),
+        (
+            "from sturnus import infrastructure",
+            True,
+            {"sturnus", "sturnus.infrastructure"},
+        ),
+        ("from sturnus import application", True, {"sturnus", "sturnus.application"}),
+        (
+            "from sturnus.infrastructure.db import models",
+            True,
+            {"sturnus.infrastructure.db", "sturnus.infrastructure.db.models"},
+        ),
         # Violations: relative imports that escape domain
-        ("from ..infrastructure import db", True),
-        ("from .. import infrastructure", True),
-        ("from .. import infrastructure, application", True),
-        ("from ..infrastructure import *", True),
+        (
+            "from ..infrastructure import db",
+            True,
+            {"sturnus.infrastructure", "sturnus.infrastructure.db"},
+        ),
+        (
+            "from .. import infrastructure",
+            True,
+            {"sturnus", "sturnus.infrastructure"},
+        ),
+        (
+            "from .. import infrastructure, application",
+            True,
+            {"sturnus", "sturnus.infrastructure", "sturnus.application"},
+        ),
+        ("from ..infrastructure import *", True, {"sturnus.infrastructure"}),
         # Allowed: standard library and project packages
-        ("import json", False),
-        ("from dataclasses import dataclass", False),
-        ("from . import helper", False),
-        ("from .timeline import SpeakerClock", False),
-        ("from sturnus.domain import timeline", False),
+        ("import json", False, {"json"}),
+        (
+            "from dataclasses import dataclass",
+            False,
+            {"dataclasses", "dataclasses.dataclass"},
+        ),
+        (
+            "from . import helper",
+            False,
+            {"sturnus.domain", "sturnus.domain.helper"},
+        ),
+        (
+            "from .timeline import SpeakerClock",
+            False,
+            {"sturnus.domain.timeline", "sturnus.domain.timeline.SpeakerClock"},
+        ),
+        (
+            "from sturnus.domain import timeline",
+            False,
+            {"sturnus.domain", "sturnus.domain.timeline"},
+        ),
     ],
 )
 def test_import_resolution_comprehensive(
-    import_stmt: str, should_violate: bool
+    import_stmt: str, should_violate: bool, expected_modules: set[str]
 ) -> None:
     """Exhaustive test of all import forms to prevent regression.
 
     This table specifies the expected behavior for every import spelling.
-    If this test fails, it means a new syntax has been found that bypasses
-    the rule, or an existing syntax is incorrectly flagged.
-    """
-    violations = _check_violations(import_stmt)
+    Each row verifies both:
+    - Whether a violation is detected (if applicable)
+    - That the imports resolve to the expected module names
 
+    If this test fails, either a new syntax has been found that bypasses
+    the rule, or an existing syntax is incorrectly handled.
+    """
+    fake_path = DOMAIN / "session.py"
+    tree = ast.parse(import_stmt, filename=str(fake_path))
+    modules = _resolve_imports_in_module(tree, fake_path)
+    violations = _check_violations(import_stmt, fake_path)
+
+    # Verify the expected modules were resolved
+    assert modules == expected_modules, (
+        f"Expected modules mismatch\n"
+        f"Statement: {import_stmt}\n"
+        f"Expected: {expected_modules}\n"
+        f"Got: {modules}"
+    )
+
+    # Verify violation detection matches expectation
     if should_violate:
         assert violations, (
             f"Expected violation not detected\n"
