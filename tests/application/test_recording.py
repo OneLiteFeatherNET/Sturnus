@@ -27,6 +27,7 @@ class FakeSessions:
         self.participants: dict[int, str] = {}
         self.epochs: dict[int, datetime] = {}
         self.closed: list[tuple[int, str]] = []
+        self.keys: dict[int, tuple[str, bytes]] = {}
         self._next = 1
 
     async def open_session(self, _guild_id: int, _channel_id: int, _now: datetime) -> int:
@@ -34,6 +35,14 @@ class FakeSessions:
         self._next += 1
         self.opened.append(sid)
         return sid
+
+    async def record_session_key(
+        self, session_id: int, encryption_key_id: str, wrapped_data_key: bytes
+    ) -> None:
+        self.keys[session_id] = (encryption_key_id, wrapped_data_key)
+
+    async def session_key(self, session_id: int) -> tuple[str, bytes] | None:
+        return self.keys.get(session_id)
 
     async def add_participant(
         self, _session_id: int, user_id: int, display_name: str, _now: datetime
@@ -170,6 +179,20 @@ async def test_a_consenting_participant_opens_a_session(tmp_path: Path) -> None:
     await svc.participants_changed(1, T0)
     assert svc.is_recording is True
     assert sessions.opened == [1]
+
+
+async def test_the_session_row_carries_the_key_once_opened(tmp_path: Path) -> None:
+    """The wrapped key must reach the session row when the session opens.
+
+    A crash right after this point -- before any recording finishes and
+    the first job enqueues -- must still leave crash recovery something to
+    read the key from.
+    """
+    sessions = FakeSessions()
+    encryptor = FakeEncryptor(key_id="k1")
+    svc = service(tmp_path, sessions=sessions, encryptor=encryptor)
+    await svc.participants_changed(1, T0)
+    assert sessions.keys == {1: ("k1", b"wrapped-key")}
 
 
 async def test_the_first_packet_defines_the_audio_epoch(tmp_path: Path) -> None:

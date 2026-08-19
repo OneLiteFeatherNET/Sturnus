@@ -6,20 +6,23 @@ the template makes -- this module only feeds it the data.
 
 Dependency-rule note: `documents.py` lives in `application`, which must not
 import from `infrastructure` (tests/test_architecture.py) -- not even the
-sandboxed Jinja2 environment and the `md` escaping filter that ship in
-`sturnus.infrastructure.templates` for the other adapters. This module
-therefore builds its own sandboxed environment directly from Jinja2 (a
-third-party dependency, not a project layer -- importing it here does not
-violate the rule) and defines its own Markdown-escaping filter rather than
-importing `sturnus.infrastructure.templates.markdown.escape_markdown`. The
-brief's literal description ("passes through the `md` filter from
-`sturnus.infrastructure.templates`") is followed in spirit -- every value
-from the transcript passes through an `md` filter with identical escaping
-rules -- but not in the letter, since the two filters cannot share an
-import across the layer boundary. `render_transcript` still takes the
-template source as a plain string, exactly as specified, so callers outside
-`application` are free to load it from anywhere, including the packaged
-template shipped in `sturnus.infrastructure.documents`.
+sandboxed Jinja2 environment that ships in `sturnus.infrastructure.templates`
+for the other adapters. This module therefore builds its own sandboxed
+environment directly from Jinja2 (a third-party dependency, not a project
+layer -- importing it here does not violate the rule). `render_transcript`
+still takes the template source as a plain string, exactly as specified, so
+callers outside `application` are free to load it from anywhere, including
+the packaged template shipped in `sturnus.infrastructure.documents`.
+
+`escape_markdown` below is the single definition of which characters are
+dangerous at this boundary. It lives here, in `application`, rather than in
+`infrastructure` or being duplicated per adapter, because the layering
+allows `infrastructure` to import from `application` but not the reverse
+(the same resolution `sturnus.application.recording.audio_key` uses, which
+`sturnus.infrastructure.objectstore` imports). `sturnus.infrastructure.
+templates.markdown` re-exports it for the other Markdown-producing adapters,
+so there is exactly one character set for this rule anywhere in the
+codebase.
 """
 
 from __future__ import annotations
@@ -32,18 +35,17 @@ from jinja2.sandbox import SandboxedEnvironment
 
 from sturnus.domain.transcript import SpeakerIdentity, Transcript
 
-# Mirrors sturnus.infrastructure.templates.markdown.escape_markdown's
-# character set; see the module docstring for why it is duplicated here
-# rather than imported.
 _MARKDOWN_SPECIAL = "\\`*_{}[]()#+-.!|>~"
 
 
-def _escape_markdown(value: str) -> str:
+def escape_markdown(value: str) -> str:
     """Neutralises Markdown metacharacters in attacker-controlled text.
 
     Discord display names and transcript text are not trustworthy: someone
     calling themselves `[click here](https://...)` would otherwise place a
-    link into every protocol they appear in.
+    link into every protocol they appear in. This is the single definition
+    of the escaped character set; `sturnus.infrastructure.templates.markdown`
+    imports it rather than keeping its own copy.
     """
     return "".join("\\" + ch if ch in _MARKDOWN_SPECIAL else ch for ch in value)
 
@@ -53,7 +55,7 @@ def _build_environment() -> SandboxedEnvironment:
     # autoescape is off deliberately: the output is Markdown, not HTML, and
     # HTML escaping would corrupt it. Escaping is explicit through the `md`
     # filter instead, applied to every value drawn from the transcript.
-    env.filters["md"] = _escape_markdown
+    env.filters["md"] = escape_markdown
     return env
 
 

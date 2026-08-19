@@ -83,6 +83,33 @@ async def test_session_lifecycle(factory: async_sessionmaker[AsyncSession]) -> N
     assert await repo.find_open_session(GUILD) is None
 
 
+async def test_session_row_carries_the_key_after_opening(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The session row is the source of truth crash recovery reads from.
+
+    Without this, a process that dies between encrypting a recording and
+    enqueueing the job for it leaves a key that only ever lived in memory
+    -- unrecoverable.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    assert await repo.session_key(session_id) is None
+
+    await repo.record_session_key(session_id, "k1", b"wrapped-bytes")
+
+    assert await repo.session_key(session_id) == ("k1", b"wrapped-bytes")
+
+
+async def test_session_key_is_none_for_a_session_without_one(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Covers both a session that predates the column and one that crashed early."""
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    assert await repo.session_key(session_id) is None
+
+
 async def test_adding_a_participant_twice_is_harmless(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:

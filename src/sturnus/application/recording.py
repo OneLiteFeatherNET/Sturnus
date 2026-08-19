@@ -51,6 +51,28 @@ class SessionRecorder(Protocol):
 
     async def close_session(self, session_id: int, ended_at: datetime, reason: str) -> None: ...
 
+    async def record_session_key(
+        self, session_id: int, encryption_key_id: str, wrapped_data_key: bytes
+    ) -> None:
+        """Persists the session's data key onto its row, once, when it opens.
+
+        The session row is the source of truth for which key encrypted a
+        session's recordings -- crash recovery reads it back from here
+        rather than ever generating a fresh key that could not decrypt
+        files the original key already produced.
+        """
+        ...
+
+    async def session_key(self, session_id: int) -> tuple[str, bytes] | None:
+        """Returns the `(encryption_key_id, wrapped_data_key)` recorded when the
+        session opened, or `None` if nothing was ever stored.
+
+        `None` covers two cases alike: a session that predates this column,
+        and one that crashed before `record_session_key` ever ran. Either
+        way, the caller has no key to recover with.
+        """
+        ...
+
 
 class JobQueue(Protocol):
     """Where a finished speaker recording is handed off for transcription."""
@@ -124,6 +146,14 @@ class RecordingService:
                 self._guild_id, self._channel_id, now
             )
             self._data_key = self._encryptor.new_session_key()
+            # The session row is the source of truth for which key encrypted
+            # this session's recordings. Persist it now, at the moment it is
+            # generated, instead of waiting for the first job to enqueue --
+            # a crash before any speaker has finished must not leave the
+            # key stranded only in this process's memory.
+            await self._sessions.record_session_key(
+                self._session_id, self._encryptor.key_id, self._data_key.wrapped
+            )
 
     async def voice_packet(
         self,

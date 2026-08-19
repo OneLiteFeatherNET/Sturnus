@@ -179,6 +179,42 @@ class SessionRepository:
             )
             await session.commit()
 
+    async def record_session_key(
+        self, session_id: int, encryption_key_id: str, wrapped_data_key: bytes
+    ) -> None:
+        """Persists the session's data key onto its row.
+
+        The session row is the source of truth for which key encrypted this
+        session's recordings -- crash recovery reads it back from here
+        rather than ever generating a fresh key that could not decrypt
+        files the original key already produced.
+        """
+        async with self._session_factory() as session:
+            await session.execute(
+                update(Session)
+                .where(Session.id == session_id)
+                .values(encryption_key_id=encryption_key_id, wrapped_data_key=wrapped_data_key)
+            )
+            await session.commit()
+
+    async def session_key(self, session_id: int) -> tuple[str, bytes] | None:
+        """Returns `(encryption_key_id, wrapped_data_key)` for a session, or `None`.
+
+        `None` covers a session that predates this column and one that
+        crashed before `record_session_key` ever ran alike -- either way,
+        there is no key here to recover with.
+        """
+        async with self._session_factory() as session:
+            row = await session.execute(
+                select(Session.encryption_key_id, Session.wrapped_data_key).where(
+                    Session.id == session_id
+                )
+            )
+            result = row.first()
+        if result is None or result[0] is None or result[1] is None:
+            return None
+        return (result[0], result[1])
+
     async def find_open_session(self, guild_id: int) -> int | None:
         """Returns the id of the guild's session whose status is not `closed`, or None."""
         async with self._session_factory() as session:

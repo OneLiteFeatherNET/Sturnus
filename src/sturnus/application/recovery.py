@@ -33,14 +33,11 @@ log = logging.getLogger(__name__)
 
 _SESSION_DIR_RE = re.compile(r"^session-(\d+)$")
 
-# No transition in `SessionMachine` models "the process was killed" -- its
-# three `EndReason` members all describe a state-machine timeout that fired
-# while the bot was alive to observe it. Recovery runs after the fact, with
-# no idea which of those would have applied, so it records the closest
-# available approximation rather than inventing a value the domain model
-# doesn't define. Worth revisiting if `EndReason` grows a reason of its own
-# for an out-of-band close.
-RECOVERY_END_REASON = EndReason.IDLE_TIMEOUT
+# Recovery only ever runs because the previous process ended without going
+# through `SessionMachine` at all -- a hard kill, an evicted pod -- so
+# every session it closes ends with this honest reason rather than one of
+# the machine's own timeout reasons, none of which actually fired.
+RECOVERY_END_REASON = EndReason.CRASHED
 
 
 @dataclass(frozen=True)
@@ -173,21 +170,29 @@ async def recover_orphans(
 ) -> list[OrphanRecording]:
     """Finishes every recording a previous process left unfinished.
 
-    Grouped by session, because one session's data key -- generated fresh
-    here, since the original only ever lived in the crashed process's
-    memory and was never persisted anywhere recovery can reach -- covers
-    every speaker of that session.
+    Grouped by session, because a session's speakers share one data key --
+    but the two kinds of orphan need that key from different places.
 
-    For a plain `.wav`, this reuses `RecordingService.close` for the
-    encrypt-upload-enqueue sequence, exactly as an orderly shutdown would.
-    `close` does not delete the `.enc` it produces, so recovery removes it
-    afterwards -- otherwise the same file would be rediscovered as an
-    orphan on the next restart and enqueued a second time.
+    A plain `.wav` was never encrypted, so a freshly generated key is not
+    just acceptable but the only option: the key that would have encrypted
+    it only ever lived in the crashed process's memory and was never
+    persisted anywhere recovery can reach. This reuses
+    `RecordingService.close` for the encrypt-upload-enqueue sequence,
+    exactly as an orderly shutdown would. `close` does not delete the
+    `.enc` it produces, so recovery removes it afterwards -- otherwise the
+    same file would be rediscovered as an orphan on the next restart and
+    enqueued a second time.
 
-    For a `.enc` with no `.wav`, encryption already ran; only the upload
-    and the enqueue are still owed, so those two steps run directly rather
-    than through `close`, which unconditionally expects a plaintext file to
-    encrypt.
+    A `.enc` was already encrypted with the session's *original* key, and
+    only that key can ever decrypt it -- a freshly generated one is
+    guaranteed to fail. That key is read back from the `session` row
+    (`SessionRepository.session_key`), the source of truth written once
+    when the session opened. When a session has no stored key -- one that
+    predates this column, or one that crashed before the row was ever
+    written -- its `.enc` orphans are skipped and logged rather than
+    enqueued as jobs that could never succeed: a loud skip is honest,
+    where a doomed job would hide the loss behind work that looks like
+    progress.
     """
     orphans = find_orphans(root)
     if not orphans:
@@ -199,18 +204,20 @@ async def recover_orphans(
 
     for session_id, group in by_session.items():
         log.warning("Recovering %d orphaned recording(s) for session %d", len(group), session_id)
-        service = _service_for_recovery(sessions, jobs, store, encryptor, retention_days)
-        # Accessing RecordingService's private state directly is the point:
-        # its public API can only ever start a *new* session, never resume
-        # an existing one, and duplicating its close() logic on top of that
-        # is exactly the drift this function exists to avoid.
-        service._session_id = session_id  # noqa: SLF001
-        service._data_key = encryptor.new_session_key()  # noqa: SLF001
+        stored_key = await sessions.session_key(session_id)
 
         plain = [o for o in group if not o.encrypted]
         already_encrypted = [o for o in group if o.encrypted]
 
         if plain:
+            service = _service_for_recovery(sessions, jobs, store, encryptor, retention_days)
+            # Accessing RecordingService's private state directly is the
+            # point: its public API can only ever start a *new* session,
+            # never resume an existing one, and duplicating its close()
+            # logic on top of that is exactly the drift this function
+            # exists to avoid.
+            service._session_id = session_id  # noqa: SLF001
+            service._data_key = encryptor.new_session_key()  # noqa: SLF001
             service._writers = {  # noqa: SLF001
                 o.discord_user_id: _AlreadyWrittenFile(o.path) for o in plain
             }
@@ -224,6 +231,19 @@ async def recover_orphans(
             # does it and it was never reached in this branch.
             await sessions.close_session(session_id, now, RECOVERY_END_REASON.value)
 
+        if stored_key is None:
+            for o in already_encrypted:
+                log.warning(
+                    "Cannot recover session %d speaker %d: session has no stored data "
+                    "key, so the file at %s cannot be decrypted -- skipping instead of "
+                    "enqueuing a job that could never succeed",
+                    session_id,
+                    o.discord_user_id,
+                    o.path,
+                )
+            continue
+
+        encryption_key_id, wrapped_data_key = stored_key
         for o in already_encrypted:
             key = audio_key(session_id, o.discord_user_id)
             await store.put(key, o.path)
@@ -231,8 +251,8 @@ async def recover_orphans(
                 session_id=session_id,
                 discord_user_id=o.discord_user_id,
                 s3_key=key,
-                encryption_key_id=encryptor.key_id,
-                wrapped_data_key=service._data_key.wrapped,  # noqa: SLF001
+                encryption_key_id=encryption_key_id,
+                wrapped_data_key=wrapped_data_key,
                 retention_until=now + timedelta(days=retention_days),
             )
             o.path.unlink(missing_ok=True)

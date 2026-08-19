@@ -25,6 +25,13 @@ class EndReason(StrEnum):
     EMPTY = "empty"
     IDLE_TIMEOUT = "idle_timeout"
     MAX_DURATION = "max_duration"
+    #: The process ended without going through `SessionMachine` at all --
+    #: a hard kill, an evicted pod -- observed only after the fact, by
+    #: `recover_orphans` scanning what was left on disk.
+    CRASHED = "crashed"
+    #: An orderly shutdown (e.g. `SIGTERM`) closed the session while it
+    #: was still recording, before any of the machine's own timeouts fired.
+    SHUTDOWN = "shutdown"
 
 
 @dataclass(frozen=True)

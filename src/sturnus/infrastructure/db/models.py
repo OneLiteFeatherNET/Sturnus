@@ -78,6 +78,15 @@ class Session(Base):
     document_id: Mapped[str | None] = mapped_column(Text)
     document_url: Mapped[str | None] = mapped_column(Text)
     announced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The session's own data key -- the source of truth for which key
+    # encrypted this session's recordings. Written once, when the session
+    # opens, so crash recovery can read back the key that actually
+    # encrypted whatever `.enc` files are left on disk instead of
+    # generating one that cannot decrypt them. Nullable because sessions
+    # predating this column, and sessions that crashed before this row was
+    # even written, have neither value.
+    encryption_key_id: Mapped[str | None] = mapped_column(Text)
+    wrapped_data_key: Mapped[bytes | None] = mapped_column(LargeBinary)
 
     __table_args__ = (Index("ix_session_status", "status"),)
 

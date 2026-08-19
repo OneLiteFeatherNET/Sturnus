@@ -73,8 +73,9 @@ def test_escaping_survives_a_round_of_rendering() -> None:
 def test_a_speaker_name_cannot_break_out_of_a_mention() -> None:
     """The exact shape used by the Outline adapter.
 
-    `_SPECIAL` in markdown.py escapes every `\\`, `[`, `]`, `(` and `)` a
-    name contains, backslash-prefixing each one. That guarantees a hostile
+    `escape_markdown` (defined in `sturnus.application.documents`, re-exported
+    from markdown.py) escapes every `\\`, `[`, `]`, `(` and `)` a name
+    contains, backslash-prefixing each one. That guarantees a hostile
     name can never contribute an unescaped `]` immediately followed by an
     unescaped `(`: whichever of the two the name supplies arrives with a
     backslash sitting directly in front of it, which breaks the contiguity

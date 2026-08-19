@@ -1,8 +1,11 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from sturnus.application.documents import document_title, render_transcript
+from sturnus.application.documents import document_title, escape_markdown, render_transcript
 from sturnus.domain.transcript import SpeakerIdentity, Transcript, TranscriptBlock
+from sturnus.infrastructure.templates.markdown import (
+    escape_markdown as infrastructure_escape_markdown,
+)
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 TEMPLATE = (
@@ -85,3 +88,24 @@ def test_a_participant_list_is_present() -> None:
     out = render(block(LINKED, 0, "a"), block(GUEST, 10, "b"))
     assert "Max Example" in out
     assert "guestuser" in out
+
+
+def test_the_application_and_infrastructure_escaping_agree() -> None:
+    """Pins the two layers to a single escaping rule.
+
+    `sturnus.application.documents.escape_markdown` is used directly by
+    `render_transcript` above; `sturnus.infrastructure.templates.markdown`
+    re-exports the very same function for the other Markdown-producing
+    adapters (e.g. the Jinja2 `md` filter in
+    `sturnus.infrastructure.templates.engine`). This test imports both
+    entry points and checks they produce identical output for a hostile
+    input, so that a future edit which reintroduces a second, independent
+    character set -- rather than editing this one shared definition --
+    fails here instead of leaving an invisible gap between the two layers.
+    """
+    hostile = "[click](https://evil.example) *bold* `code` # heading \\ [x] {y} !z |q >r ~s -t +u"
+    assert escape_markdown(hostile) == infrastructure_escape_markdown(hostile)
+    # And it is not merely a lookalike: the infrastructure re-export must be
+    # the exact same function object, not a second, independently maintained
+    # copy of the character set that happens to agree today.
+    assert infrastructure_escape_markdown is escape_markdown

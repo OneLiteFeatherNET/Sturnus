@@ -43,13 +43,11 @@ log = logging.getLogger(__name__)
 #: How often the background loop checks every guild's session for a timeout.
 TICK_INTERVAL_SECONDS = 10.0
 
-# No `EndReason` models "the process was asked to shut down" -- its three
-# members all describe a timeout the state machine itself observed. A
-# SIGTERM is an external event the machine never sees, so this records the
-# closest available approximation instead of inventing a value the domain
-# doesn't define. Worth revisiting if `EndReason` grows a reason of its own
-# for an externally triggered close.
-SHUTDOWN_END_REASON = EndReason.IDLE_TIMEOUT
+# A SIGTERM is an external event the state machine itself never observes,
+# so this records the honest, dedicated reason for an externally triggered
+# close rather than one of the machine's own timeout reasons, none of
+# which actually fired here.
+SHUTDOWN_END_REASON = EndReason.SHUTDOWN
 
 
 @dataclass
