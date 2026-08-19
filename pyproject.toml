@@ -55,6 +55,10 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ARG"]
 python_version = "3.12"
 strict = true
 files = ["src", "tests"]
+# pydantic-settings populates its fields from the environment, so a
+# zero-argument Settings() is correct. Without this plugin mypy reads it as a
+# call missing every required argument.
+plugins = ["pydantic.mypy"]
 
 # These three ship no type information. Strictness stays intact for our own
 # code; without this block the test run fails on import-untyped without an

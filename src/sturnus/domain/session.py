@@ -66,6 +66,8 @@ class SessionMachine:
             if self.state is SessionState.IDLE:
                 self.started_at = now
                 self._last_audio_at = now
+            elif self.state is SessionState.GRACE:
+                self._last_audio_at = now
             self.state = SessionState.RECORDING
             self._grace_since = None
         elif self.state is SessionState.RECORDING:

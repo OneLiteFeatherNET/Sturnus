@@ -124,3 +124,29 @@ def test_max_session_hours_above_the_rtp_ceiling_is_rejected() -> None:
 
 def test_max_session_hours_at_the_rtp_ceiling_is_accepted() -> None:
     SessionTimeouts(max_session_hours=12)
+
+
+def test_returning_participant_restarts_the_idle_timer() -> None:
+    """Someone returning during grace gets the full idle window.
+
+    Without this the timer keeps counting from before the channel emptied,
+    and a returning participant who stays quiet briefly would see the bot
+    leave seconds after they arrived.
+    """
+    m = machine()
+    m.participants_changed(1, T0)
+    m.audio_received(T0 + timedelta(minutes=1))
+    m.participants_changed(0, T0 + timedelta(minutes=14))
+    m.participants_changed(1, T0 + timedelta(minutes=14, seconds=30))
+    # Without the restart the idle window would expire at T0+16min.
+    assert m.tick(T0 + timedelta(minutes=20)) is None
+    assert m.state is SessionState.RECORDING
+
+
+def test_idle_still_closes_after_a_return_without_speech() -> None:
+    """Restarting the timer delays the close; it does not disable it."""
+    m = machine()
+    m.participants_changed(1, T0)
+    m.participants_changed(0, T0 + timedelta(minutes=1))
+    m.participants_changed(1, T0 + timedelta(minutes=1, seconds=30))
+    assert m.tick(T0 + timedelta(minutes=16, seconds=31)) is EndReason.IDLE_TIMEOUT

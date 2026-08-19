@@ -91,6 +91,7 @@ class SessionParticipant(Base):
     discord_display_name: Mapped[str] = mapped_column(Text, nullable=False)
     detected_language: Mapped[str | None] = mapped_column(Text)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    audio_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         UniqueConstraint("session_id", "discord_user_id", name="uq_participant_per_session"),

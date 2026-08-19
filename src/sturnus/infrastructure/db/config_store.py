@@ -28,13 +28,32 @@ class ConfigStore:
             return stored
         return settings.DEFAULTS.get(key)
 
+    async def get_stored(self, guild_id: int, key: str) -> str | None:
+        """Returns only the stored value, without falling back to the default.
+
+        Lets a caller distinguish "explicitly set" from "using the default" —
+        `get` alone cannot, since both cases return the same string.
+        """
+        async with self._session_factory() as session:
+            return await session.scalar(
+                select(GuildConfig.value).where(
+                    GuildConfig.guild_id == guild_id, GuildConfig.key == key
+                )
+            )
+
     async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None:
         """Sets a value; `None` removes it and restores the default.
+
+        `key` must be a known key — a member of `DEFAULTS` or `REQUIRED_KEYS` —
+        otherwise a typo would silently store a setting nobody reads.
 
         For a known integer key, the value must parse as a positive integer.
         Rejecting a bad value here keeps the read path (`_int`) reachable
         only with data that is already known to be sane.
         """
+        if key not in settings.DEFAULTS and key not in settings.REQUIRED_KEYS:
+            raise ValueError(f"unknown configuration key {key!r}")
+
         if value is not None and key in settings.INTEGER_KEYS:
             try:
                 parsed = int(value)
