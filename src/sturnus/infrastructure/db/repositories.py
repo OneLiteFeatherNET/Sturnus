@@ -1,0 +1,220 @@
+"""Repositories. Everything the bot reads and writes, in one place.
+
+Tested against real PostgreSQL through Testcontainers. There are
+deliberately no repository interfaces — an interface with one
+implementation behind a real database test is ceremony.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime
+
+from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from sturnus.domain.consent import ConsentRecord
+from sturnus.infrastructure.db.models import (
+    Consent,
+    Session,
+    SessionParticipant,
+    TranscriptionJob,
+)
+
+
+class ConsentRepository:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def record_grant(
+        self,
+        discord_user_id: int,
+        guild_id: int,
+        policy_version: str,
+        source: str,
+        now: datetime,
+    ) -> None:
+        async with self._session_factory() as session:
+            session.add(
+                Consent(
+                    discord_user_id=discord_user_id,
+                    guild_id=guild_id,
+                    granted_at=now,
+                    revoked_at=None,
+                    policy_version=policy_version,
+                    source=source,
+                )
+            )
+            await session.commit()
+
+    async def record_revocation(self, discord_user_id: int, guild_id: int, now: datetime) -> None:
+        """Sets `revoked_at` on the newest row rather than inserting a new one.
+
+        The history keeps grants; a revocation modifies the grant it revokes.
+        """
+        async with self._session_factory() as session:
+            newest_id = await session.scalar(
+                select(Consent.id)
+                .where(Consent.discord_user_id == discord_user_id, Consent.guild_id == guild_id)
+                .order_by(Consent.granted_at.desc())
+                .limit(1)
+            )
+            if newest_id is not None:
+                await session.execute(
+                    update(Consent).where(Consent.id == newest_id).values(revoked_at=now)
+                )
+            await session.commit()
+
+    async def current(self, discord_user_id: int, guild_id: int) -> ConsentRecord | None:
+        """Returns the newest grant for this user and guild.
+
+        Consent history is kept permanently, so several rows exist; someone
+        who revoked and later consented again must read as consenting. This
+        selection rule lives here so no caller has to invent it.
+        """
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(Consent)
+                .where(Consent.discord_user_id == discord_user_id, Consent.guild_id == guild_id)
+                .order_by(Consent.granted_at.desc())
+                .limit(1)
+            )
+        if row is None:
+            return None
+        return ConsentRecord(
+            granted_at=row.granted_at,
+            revoked_at=row.revoked_at,
+            policy_version=row.policy_version,
+        )
+
+
+class SessionRepository:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def open_session(self, guild_id: int, channel_id: int, now: datetime) -> int:
+        async with self._session_factory() as session:
+            record = Session(
+                guild_id=guild_id,
+                channel_id=channel_id,
+                started_at=now,
+                ended_at=None,
+                end_reason=None,
+                status="open",
+                document_provider=None,
+                document_id=None,
+                document_url=None,
+                announced_at=None,
+            )
+            session.add(record)
+            await session.commit()
+            return record.id
+
+    async def add_participant(
+        self,
+        session_id: int,
+        discord_user_id: int,
+        discord_display_name: str,
+        now: datetime,
+    ) -> None:
+        """Idempotent per (session_id, discord_user_id); keeps the first display name."""
+        async with self._session_factory() as session:
+            statement = insert(SessionParticipant).values(
+                session_id=session_id,
+                discord_user_id=discord_user_id,
+                discord_display_name=discord_display_name,
+                detected_language=None,
+                first_seen_at=now,
+                audio_started_at=None,
+            )
+            await session.execute(
+                statement.on_conflict_do_nothing(
+                    index_elements=["session_id", "discord_user_id"],
+                )
+            )
+            await session.commit()
+
+    async def set_audio_epoch(self, session_id: int, discord_user_id: int, now: datetime) -> None:
+        """Writes only while `audio_started_at` is still null.
+
+        The epoch marks the first packet; a later packet must not move it.
+        """
+        async with self._session_factory() as session:
+            await session.execute(
+                update(SessionParticipant)
+                .where(
+                    SessionParticipant.session_id == session_id,
+                    SessionParticipant.discord_user_id == discord_user_id,
+                    SessionParticipant.audio_started_at.is_(None),
+                )
+                .values(audio_started_at=now)
+            )
+            await session.commit()
+
+    async def audio_epoch(self, session_id: int, discord_user_id: int) -> datetime | None:
+        async with self._session_factory() as session:
+            return await session.scalar(
+                select(SessionParticipant.audio_started_at).where(
+                    SessionParticipant.session_id == session_id,
+                    SessionParticipant.discord_user_id == discord_user_id,
+                )
+            )
+
+    async def participant_names(self, session_id: int) -> dict[int, str]:
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(
+                    SessionParticipant.discord_user_id,
+                    SessionParticipant.discord_display_name,
+                ).where(SessionParticipant.session_id == session_id)
+            )
+            return {discord_user_id: name for discord_user_id, name in rows}
+
+    async def close_session(self, session_id: int, now: datetime, end_reason: str) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                update(Session)
+                .where(Session.id == session_id)
+                .values(ended_at=now, end_reason=end_reason, status="closed")
+            )
+            await session.commit()
+
+    async def find_open_session(self, guild_id: int) -> int | None:
+        """Returns the id of the guild's session whose status is not `closed`, or None."""
+        async with self._session_factory() as session:
+            session_id: int | None = await session.scalar(
+                select(Session.id).where(Session.guild_id == guild_id, Session.status != "closed")
+            )
+            return session_id
+
+
+class JobRepository:
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def enqueue(
+        self,
+        session_id: int,
+        discord_user_id: int,
+        s3_key: str,
+        encryption_key_id: str,
+        wrapped_data_key: bytes,
+        retention_until: datetime,
+    ) -> int:
+        async with self._session_factory() as session:
+            job = TranscriptionJob(
+                session_id=session_id,
+                discord_user_id=discord_user_id,
+                s3_key=s3_key,
+                encryption_key_id=encryption_key_id,
+                wrapped_data_key=wrapped_data_key,
+                retention_until=retention_until,
+                audio_deleted_at=None,
+                status="pending",
+                attempts=0,
+                error=None,
+                transcript=None,
+            )
+            session.add(job)
+            await session.commit()
+            return job.id
