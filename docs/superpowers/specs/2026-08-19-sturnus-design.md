@@ -16,7 +16,11 @@ Der Name folgt der Vogel-Konvention der Organisation (Falco, Otis, Ducula, Pica,
 Guira, Aves): *Sturnus vulgaris*, der Star, ist für seine Stimmen-Imitation
 bekannt.
 
-## 2. Nicht-Ziele
+## 2. Umfang dieser Phase
+
+Ziel ist ein MVP auf der Strecke **Discord → Outline**, das im echten Betrieb
+erprobt werden kann. Alles, was diese Strecke nicht zum Laufen bringt, ist
+verschoben.
 
 Bewusst außerhalb dieser Phase:
 
@@ -34,6 +38,11 @@ Bewusst außerhalb dieser Phase:
 - **Nur der Outline-Adapter.** Der Port für die Dokumentablage wird gezogen,
   aber allein Outline dahinter implementiert. Confluence, Notion und Markdown-
   Dateien sind vorgesehene Erweiterungen, kein Lieferumfang dieser Phase.
+- **Templates sind mitgeliefert, nicht konfigurierbar.** Die Jinja2-Vorlagen für
+  Dokument und Discord-Nachrichten stammen aus dem Abbild; ein Admin-Befehl zum
+  Setzen eigener Vorlagen kommt später. Das spart Bedienoberfläche und entschärft
+  zugleich das größte Sicherheitsrisiko des Entwurfs (Abschnitt 8.2), weil im MVP
+  keine von außen eingebrachte Vorlage ausgeführt wird.
 - **Nur ein Aufnahme-Channel pro Guild.** Das Datenmodell ist auf mehrere
   vorbereitet, die Konfiguration in dieser Phase nicht.
 
@@ -370,8 +379,9 @@ Notion strukturiertes JSON, und einfaches Markdown kennt überhaupt keine
 Erwähnungen. Ein einziger fest verdrahteter Renderer könnte nur den kleinsten
 gemeinsamen Nenner bedienen.
 
-Jeder Adapter bringt ein Standard-Template mit. Ist in `guild_config` ein eigenes
-hinterlegt, hat dieses Vorrang.
+Jeder Adapter bringt ein Standard-Template mit. Das Auflösen einer abweichenden,
+in der Konfiguration hinterlegten Vorlage ist im Modell vorgesehen, im MVP aber
+nicht bedienbar (Abschnitt 2).
 
 Dieselbe Engine rendert die Discord-Nachrichten — Aufnahme-Ankündigung,
 Consent-Hinweis, Fertigstellungsmeldung mit Dokument-Link —, sodass Wortlaut und
@@ -379,11 +389,16 @@ Sprache dieser Texte ohne Codeänderung anpassbar sind.
 
 **Templates laufen in einer `SandboxedEnvironment`.** Jinja2 ist im
 Auslieferungszustand keine Sandbox: ein Ausdruck wie `{{ ''.__class__.__mro__ }}`
-öffnet den Weg zu beliebiger Codeausführung. Da Templates über einen
-Admin-Command gesetzt werden können, wäre ein ungeschütztes Environment
-gleichbedeutend mit einer Shell im Bot-Pod für jeden Guild-Administrator. Die
-Umgebung erhält ausschließlich das Transkript-Modell und eine feste Menge an
-Filtern; nichts, was I/O ausführt.
+öffnet den Weg zu beliebiger Codeausführung. Die Umgebung erhält deshalb
+ausschließlich das Transkript-Modell und eine feste Menge an Filtern; nichts, was
+I/O ausführt.
+
+Im MVP stammen alle Vorlagen aus dem Abbild, womit diese Absicherung noch keine
+Angriffsfläche abdeckt, sondern eine vorbereitet: sobald Vorlagen per Befehl
+gesetzt werden können, wäre eine ungeschützte Umgebung gleichbedeutend mit einer
+Shell im Bot-Pod für jeden Guild-Administrator. Die Sandbox jetzt einzuziehen
+kostet nichts und verhindert, dass diese Erweiterung später an einer Stelle
+ansetzt, die sie nicht trägt.
 
 **Eingesetzte Werte werden zielformat-spezifisch escaped.** Discord-Anzeigenamen
 und Transkripttext sind nicht vertrauenswürdig — wer sich `[hier klicken](https://…)`
@@ -515,7 +530,7 @@ rechtfertigt keine zusätzliche Betriebskomponente.
 | `/link remove` | alle | Verknüpfung löschen |
 | `/audio delete` | alle | Eigene Audioaufnahmen sofort löschen, unabhängig von der Aufbewahrungsfrist |
 | `/audio purge` | Admin | Aufnahmen eines benannten Nutzers löschen (Art. 17 DSGVO) |
-| `/config …` | Admin | Laufzeit-Konfiguration lesen und setzen, einschließlich Templates |
+| `/config …` | Admin | Laufzeit-Konfiguration lesen und setzen |
 
 Alle Antworten sind ephemeral. Für Admin-Commands wird das bestehende
 `require_admin()`-Muster aus dem RAG-Bot übernommen.
@@ -535,8 +550,6 @@ Laufzeit-konfigurierbar über die `/config`-Gruppe, gespeichert in
 | `publish_poll_seconds` | 30 | Bot |
 | `document_provider` | `outline` | Worker |
 | `document_target` | — | Worker |
-| `document_template` | Adapter-Standard | Worker |
-| `message_templates` | mitgeliefert | Bot |
 | `audio_retention_days` | 30 | Worker |
 | `policy_version` | — | beide |
 | `policy_url` | — | beide |
@@ -613,20 +626,93 @@ Verarbeitungsergebnis und liegen im Dokumentsystem, nicht bei Sturnus.
 - Fertige Transkripte unterliegen dem Lebenszyklus des Zielsystems und werden von
   Sturnus nicht weiter verwaltet.
 
-## 13. Deployment
+## 13. Repository, Auslieferung und Betrieb
 
-Neues Repository nach OLF-Standard: Helm-Chart unter `charts/`, Images über die
-reusable workflows in Version `@v2.3.0` nach GHCR, Release-Please für Versionen
-und Changelog, zentrales Renovate-Preset, Trunk-Based Development mit
-Conventional Commits.
+### 13.1 Versionierung und Release
 
-Cluster-seitig im Kubernetes-FLUX-Repository:
+**Release Please** nach OLF-Standard, gespeist aus Conventional Commits. Kein
+`@semantic-release`, kein manuelles Tagging — der RAG-Bot nutzt noch
+`.releaserc.json`, das ist Altbestand und kein Vorbild.
+
+Die drei Standarddateien liegen im Repositorywurzelverzeichnis:
+`release-please-config.json` mit `release-type: "simple"`,
+`.release-please-manifest.json` und ein zunächst leeres `CHANGELOG.md`.
+
+Der Versionsmarker sitzt bei einem Python-Projekt in `pyproject.toml` statt in
+`build.gradle.kts`; der `generic`-Updater von Release Please arbeitet auf
+beliebigen Textdateien und findet ihn dort ebenso:
+
+```toml
+version = "0.1.0" # x-release-please-version
+```
+
+**Chart und Anwendung werden gemeinsam versioniert.** `extra-files` verweist
+zusätzlich auf `charts/sturnus/Chart.yaml`, dessen `version` und `appVersion`
+denselben Marker tragen. Getrennte Versionsstränge wären für ein Chart, das
+ausschließlich diese eine Anwendung ausliefert, Aufwand ohne Gegenwert.
+
+Der `publish`-Auftrag hängt über `needs`/`if` am Release-Please-Auftrag. Ein
+zusätzlicher, per Tag ausgelöster Ablauf wird ausdrücklich **nicht** eingerichtet:
+Release Please taggt mit dem Standard-`GITHUB_TOKEN`, das im selben Repository
+keine Tag-Abläufe erneut auslöst — ein solcher Ablauf liefe entweder nie oder
+liefe sich mit dem verketteten Auftrag gegenseitig in die Quere.
+
+### 13.2 Container
+
+Alle drei Prozesse teilen sich **ein Abbild mit drei Einsprungpunkten**
+(`sturnus-bot`, `sturnus-link`, `sturnus-worker` als Konsolenskripte). Drei
+Abbilder aus derselben Codebasis zu bauen verdreifachte Bauzeit, Prüfung und
+Registrierungsspeicher, ohne etwas zu trennen, was nicht ohnehin getrennt ist —
+das übernimmt das Deployment.
+
+`faster-whisper` setzt auf CTranslate2 statt PyTorch auf und fällt damit
+moderat aus; die Modellgewichte liegen **nicht im Abbild**, sondern werden beim
+Start geladen und auf einem Volume zwischengespeichert — dasselbe Muster, das die
+Ollama-Installation im Cluster bereits verwendet.
+
+Veröffentlicht wird über `docker-publish.yml` aus
+`OneLiteFeatherNET/workflows`, angebunden mit einem vollständigen SemVer-Pin
+(`@v2.4.0`, niemals `@main` oder ein bloßer Major-Alias). Der Ablauf ist
+werkzeugunabhängig und benötigt lediglich Kontext und Dockerfile — dass hier
+kein Gradle beteiligt ist, spielt keine Rolle. **Ziel ist die Harbor-Registrierung
+der Organisation, nicht GHCR.**
+
+### 13.3 Prüfung auf Pull Requests
+
+Der zentrale Katalog enthält `gradle-build-pr.yml`, aber **kein Gegenstück für
+Python**. Linting, Typprüfung und Tests laufen deshalb zunächst als
+repositoryeigener Auftrag: `uv sync`, `ruff`, `mypy`, `pytest`.
+
+Ein wiederverwendbarer `python-build-pr.yml` wäre der sauberere Ort — mit dem
+RAG-Bot existiert bereits ein zweiter Python-Verbraucher. Eine gemeinsame
+Abstraktion aus einem einzigen, noch nicht erprobten Verbraucher zu ziehen hieße
+allerdings raten statt belegen. Die Auslagerung ist deshalb als Folgearbeit
+vorgesehen, sobald sich das Muster hier bewährt hat, und betrifft dann ein
+anderes Repository.
+
+Ergänzend aus dem Katalog: `markdown-lint.yml` für die Dokumentation und
+`close-invalid-prs.yml`.
+
+### 13.4 Abhängigkeiten
+
+Zentrales Renovate-Preset der Organisation. Die genaue Einbindung folgt dem
+`renovate`-Skill und ist beim Aufsetzen dort nachzuschlagen, statt sie zu raten.
+Renovate hält auch den Versions-Pin der wiederverwendbaren Abläufe aktuell —
+weshalb dieser als vollständiger Tag und nicht als Alias gesetzt wird.
+
+Jinja2 zählt zu den sicherheitsrelevanten Abhängigkeiten (Abschnitt 15).
+
+### 13.5 Cluster
+
+Im Kubernetes-FLUX-Repository:
 
 - `apps/base/sturnus/` und `apps/clusters/feathre-core/base-apps/sturnus/`
 - CloudNativePG-Datenbank nach dem bestehenden `database/`-Muster
-- `ObjectBucketClaim` für den Audio-Bucket nach dem Muster von `outline.yaml`
-- Secrets über SOPS: Discord-Token, Outline-Service-Token, OAuth-Client-Secret
-- Ingress ausschließlich für `link-service`, über Cloudflare Tunnel
+- `ObjectBucketClaim` für den Audio-Bucket nach dem Muster von `outline.yaml`,
+  mit eigenen Zugangsdaten (Abschnitt 12.1)
+- Geheimnisse über SOPS: Discord-Token, Outline-Dienstschlüssel,
+  OAuth-Client-Geheimnis, Hauptschlüssel für die Audio-Verschlüsselung
+- Eingehender Verkehr ausschließlich für `link-service`, über Cloudflare Tunnel
 
 Für `bot` wird ein PodDisruptionBudget gesetzt, das ungewollte Evictions während
 laufender Sessions begrenzt, sowie ein **RWO-PVC für die laufende Aufnahme**
@@ -637,7 +723,14 @@ die übrigen zustandsbehafteten Anwendungen im Cluster ebenfalls tun.
 
 Ressourcen: `bot` 1 CPU, `link-service` minimal, `worker` 4 CPU mit
 Speicheranforderung passend zum gewählten Modell (rund 2 GB für
-`large-v3-turbo` in int8, zuzüglich Puffer).
+`large-v3-turbo` in int8, zuzüglich Puffer) und einem Volume für die
+Modellgewichte.
+
+### 13.6 Entwicklungsablauf
+
+Trunk-Based Development mit Conventional Commits, wie in der übrigen
+Organisation. Die Commit-Form ist nicht Kosmetik, sondern die Eingabe, aus der
+Release Please Version und Changelog ableitet.
 
 ## 14. Teststrategie
 
@@ -702,10 +795,11 @@ liegt bewusst außerhalb.
 - **Die Outline-OAuth-Details sind unverifiziert** (siehe Abschnitt 8.4) und vor
   der Implementierung des Link-Flows gegen die laufende Instanz zu prüfen.
 - **Die Jinja2-Sandbox ist eine Hürde, keine Garantie.** Für
-  `SandboxedEnvironment` sind in der Vergangenheit Ausbrüche bekannt geworden.
-  Die Möglichkeit, Templates zu setzen, bleibt deshalb auf Administratoren
-  beschränkt, Änderungen werden protokolliert, und die Jinja2-Version gehört zu
-  den sicherheitsrelevanten Abhängigkeiten, die Renovate zeitnah aktualisiert.
+  `SandboxedEnvironment` sind in der Vergangenheit Ausbrüche bekannt geworden. Im
+  MVP ist das folgenlos, weil alle Vorlagen aus dem Abbild stammen. Wird das
+  Setzen eigener Vorlagen nachgereicht, muss es auf Administratoren beschränkt
+  bleiben und protokolliert werden; die Jinja2-Version zählt dann zu den
+  sicherheitsrelevanten Abhängigkeiten, die Renovate zeitnah aktualisiert.
 - **Die verlängerte Aufbewahrung vergrößert den Schaden einer Kompromittierung.**
   Wochenlang vorgehaltenes Rohaudio privater Gespräche wiegt schwerer als jedes
   andere Datum in diesem System. Die Verschlüsselung vor dem Upload begrenzt das
