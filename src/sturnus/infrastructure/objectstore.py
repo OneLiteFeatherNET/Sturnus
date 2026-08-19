@@ -13,10 +13,9 @@ from pathlib import Path
 import boto3  # type: ignore[import-untyped]
 from botocore.exceptions import ClientError  # type: ignore[import-untyped]
 
+from sturnus.application.recording import audio_key
 
-def audio_key(session_id: int, discord_user_id: int) -> str:
-    """Object key for one speaker's recording within a session."""
-    return f"sessions/{session_id}/speakers/{discord_user_id}.enc"
+__all__ = ["S3AudioStore", "audio_key"]
 
 
 class S3AudioStore:
