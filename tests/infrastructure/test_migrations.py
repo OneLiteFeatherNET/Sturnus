@@ -42,7 +42,7 @@ def _table_names(url: str) -> set[str]:
 
 def test_migration_creates_every_table(clean_database: str) -> None:
     command.upgrade(_alembic_config(clean_database), "head")
-    assert EXPECTED_TABLES <= _table_names(clean_database)  # noqa: SIM300
+    assert _table_names(clean_database) >= EXPECTED_TABLES
 
 
 def test_downgrade_removes_the_tables(clean_database: str) -> None:

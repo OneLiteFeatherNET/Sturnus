@@ -1,9 +1,7 @@
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-
 from alembic import context
+from sqlalchemy import engine_from_config, pool
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
@@ -14,18 +12,16 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-import os
+import os  # noqa: E402
 
-from sturnus.infrastructure.db.models import Base
+from sturnus.infrastructure.db.models import Base  # noqa: E402
 
 target_metadata = Base.metadata
 
 
 def _resolve_url() -> str:
     """URL from -x url=..., else from DATABASE_URL. asyncpg becomes psycopg."""
-    from alembic import context as _context
-
-    supplied = _context.get_x_argument(as_dictionary=True).get("url")
+    supplied = context.get_x_argument(as_dictionary=True).get("url")
     url = supplied or config.get_main_option("sqlalchemy.url") or os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("no database url: pass -x url=... or set DATABASE_URL")
