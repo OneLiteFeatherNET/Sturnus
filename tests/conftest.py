@@ -2,7 +2,7 @@ from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import create_engine, text
-from testcontainers.postgres import PostgresContainer
+from testcontainers.community.postgres import PostgresContainer
 
 
 @pytest.fixture(scope="session")
