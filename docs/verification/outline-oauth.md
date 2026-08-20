@@ -35,6 +35,29 @@ target instance, and every item below is labelled accordingly:
 - **Assumed** -- no source found either way; carried over from general
   OAuth 2.0 / Outline API convention.
 
+
+## How to close this document
+
+Do not verify these by hand — `scripts/verify_outline_api.py` makes exactly
+the calls this document describes and reports each assumption below as
+CONFIRMED, CONTRADICTED, SKIPPED or ERROR, exiting non-zero if anything is
+contradicted. It needs a scratch collection and a revocable token, and it
+redacts the token from all output:
+
+```bash
+uv run python scripts/verify_outline_api.py \
+  --base-url https://outline.example.com \
+  --token "$OUTLINE_TOKEN" \
+  --collection-id <scratch-collection-id>
+```
+
+Add `--oauth-client-id` and `--oauth-redirect-uri` to cover the OAuth
+assumptions in `outline-oauth.md` in the same run; the script prints an
+authorize URL, and `--oauth-client-secret` with the `--oauth-code` from the
+redirect completes the exchange.
+
+Record the run's output here, replacing this section.
+
 ## What is assumed, and where it lives in the code
 
 | Item | Where it is spelled | If verification finds it wrong |
