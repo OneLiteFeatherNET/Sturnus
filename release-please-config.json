@@ -10,7 +10,12 @@
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
         { "type": "generic", "path": "pyproject.toml" },
-        { "type": "generic", "path": "charts/sturnus/Chart.yaml" }
+        { "type": "generic", "path": "charts/sturnus/Chart.yaml" },
+        {
+          "type": "toml",
+          "path": "uv.lock",
+          "jsonpath": "$.package[?(@.name.value=='sturnus')].version"
+        }
       ]
     }
   }

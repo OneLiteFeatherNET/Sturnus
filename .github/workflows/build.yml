@@ -24,6 +24,31 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
+      # release-please bumps pyproject.toml and charts/sturnus/Chart.yaml through
+      # `# x-release-please-version` marker comments, but uv.lock cannot carry a
+      # marker: `uv lock` rewrites the file and strips comments. The lock still
+      # records this project's own version, in the `version` field of its
+      # [[package]] entry for "sturnus", so release-please updates that field
+      # through the `toml` extra-file entry in release-please-config.json.
+      #
+      # That updater fails silently. When its JSONPath matches nothing it logs a
+      # warning, leaves uv.lock untouched and still opens the release PR, and the
+      # only symptom is `uv sync --all-groups --locked` below failing with "The
+      # lockfile at `uv.lock` needs to be updated, but `--locked` was provided" --
+      # which reads like a contributor forgot to run `uv lock` and says nothing
+      # about release-please. This check names the real cause instead.
+      #
+      # It is not redundant with `--locked`, which catches the same drift one step
+      # later with the misleading message; it is here to make a silently skipped
+      # updater diagnosable. Two things can silence that updater: the `.value` in
+      # the filter `$.package[?(@.name.value=='sturnus')].version` is
+      # load-bearing, because release-please parses TOML into {start, end, value}
+      # scalars so it can splice bytes, and the textbook spelling
+      # `@.name=='sturnus'` therefore matches nothing; and no upstream test covers
+      # filter expressions at all, so a release-please upgrade can break it
+      # without a changelog entry. Do not "correct" that path.
+      - name: uv.lock must pin the same version as pyproject.toml
+        run: python3 scripts/check_lock_version.py
       - run: uv sync --all-groups --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .
