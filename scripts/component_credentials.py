@@ -16,14 +16,16 @@ import json
 import sys
 
 from pydantic import SecretStr
+from pydantic_settings import BaseSettings
 
 from sturnus.config import Settings
 from sturnus.entrypoints.link import LinkSettings
 from sturnus.entrypoints.worker import WorkerSettings
 
 #: Keyed by the Deployment name the chart renders, so the caller can compare
-#: without translating.
-COMPONENTS = {
+#: without translating. Annotated so the values are settings classes rather
+#: than pydantic's metaclass, which is what mypy infers from a bare literal.
+COMPONENTS: dict[str, type[BaseSettings]] = {
     "sturnus-bot": Settings,
     "sturnus-worker": WorkerSettings,
     "sturnus-link": LinkSettings,
