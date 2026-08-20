@@ -135,6 +135,22 @@ to be read back. Refusing to start is the loud version of the same event, and
 {{- if not (hasKey $lists .component) -}}
 {{- fail (printf "sturnus.secretEnv: no secret key list defined for component %q" .component) -}}
 {{- end -}}
+{{- /*
+  Scoping the secretKeyRefs is only half the property. A values file can
+  still put a credential on any component as a literal through that
+  component's own `env` map -- `--set link.env.STURNUS_MASTER_KEY=...`
+  renders the master key in plain text on the internet-facing container,
+  and the pod starts, so nothing signals it. Refuse to render instead: an
+  operator who needs a credential somewhere new adds it to the list above,
+  where the decision is reviewed, rather than routing around it from a
+  cluster values file.
+*/ -}}
+{{- $componentEnv := (index $.root.Values .component | default dict).env | default dict -}}
+{{- range $all := (concat (index $lists "bot") (index $lists "worker") (index $lists "link")) -}}
+{{- if hasKey $componentEnv $all -}}
+{{- fail (printf "sturnus.secretEnv: %s sets the credential %s as a plain env value. Credentials reach a component only through the Secret named by existingSecret; add it to the key list in _helpers.tpl if this component genuinely needs it." $.component $all) -}}
+{{- end -}}
+{{- end -}}
 {{- range (index $lists .component) }}
 - name: {{ . }}
   valueFrom:
