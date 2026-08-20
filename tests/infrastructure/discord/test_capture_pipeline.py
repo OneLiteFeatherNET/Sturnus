@@ -85,6 +85,10 @@ class FakeSessions:
         self, session_id: int, discord_user_id: int, at: datetime
     ) -> None: ...
 
+    async def record_silent_audio(
+        self, session_id: int, discord_user_id: int, at: datetime
+    ) -> None: ...
+
     async def close_session(self, session_id: int, ended_at: datetime, reason: str) -> None: ...
 
     async def record_session_key(
@@ -101,6 +105,18 @@ class FakeSessions:
 class FakeJobs:
     async def enqueue(self, **kwargs: object) -> int:  # noqa: ARG002
         return 1
+
+
+class FakeAnnouncer:
+    """Stands in for the gateway on the `Announcer` port.
+
+    Silent, because nothing in this module feeds the pipeline the thirty
+    seconds of level-less audio that would make it speak -- every packet
+    here is either real audio or a decode failure.
+    """
+
+    async def post(self, channel_id: int, text: str) -> None:  # noqa: ARG002
+        return None
 
 
 class FakeStore:
@@ -171,6 +187,7 @@ def build_service(tmp_path: Path) -> RecordingService:
         store=FakeStore(),
         writers=FileAudioWriterFactory(tmp_path),
         encryptor=FakeEncryptor(),
+        announcer=FakeAnnouncer(),
         retention_days=30,
     )
 

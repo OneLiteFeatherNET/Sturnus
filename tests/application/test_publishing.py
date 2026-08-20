@@ -1,6 +1,10 @@
 from datetime import UTC, datetime
 
-from sturnus.application.publishing import announce_ready_sessions, sessions_to_announce
+from sturnus.application.publishing import (
+    announce_ready_sessions,
+    render_silent_audio_warning,
+    sessions_to_announce,
+)
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 
@@ -119,3 +123,29 @@ async def test_announce_ready_sessions_survives_one_sessions_failure() -> None:
     await announce_ready_sessions(sessions, announcer, T0)  # must not raise
     assert [channel_id for channel_id, _ in announcer.posted] == [43]
     assert sessions.announced == [2]
+
+
+# ---------------------------------------------------------------------------
+# The silent-audio warning: the other message this system posts into a
+# recording channel, rendered through the same engine as the link above.
+# ---------------------------------------------------------------------------
+
+
+def test_the_silent_audio_warning_mentions_the_speaker() -> None:
+    """`<@id>` is Discord's mention syntax, and the point of posting publicly.
+
+    The person whose microphone is dead is frequently the last one to
+    notice, and a message nobody is addressed by scrolls past unread.
+    """
+    assert "<@100>" in render_silent_audio_warning(100)
+
+
+def test_the_silent_audio_warning_says_the_recording_continues() -> None:
+    """Naming somebody in the channel is already uncomfortable enough.
+
+    Without this, the obvious reading of the message is "you are not being
+    recorded, do something now" -- which is false: everything after the
+    warning is still captured, and a fixed microphone simply starts
+    arriving audibly.
+    """
+    assert "Recording continues." in render_silent_audio_warning(100)

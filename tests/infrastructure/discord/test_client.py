@@ -110,6 +110,7 @@ class FakeSessions:
         self.opened: list[int] = []
         self.keys: dict[int, tuple[str, bytes]] = {}
         self.closed: list[tuple[int, str]] = []
+        self.silent_audio: list[tuple[int, int, datetime]] = []
         self._participants: dict[int, set[int]] = {}
         self._next = 1
 
@@ -137,6 +138,11 @@ class FakeSessions:
 
     async def set_audio_epoch(self, _session_id: int, _discord_user_id: int, _at: datetime) -> None:
         pass
+
+    async def record_silent_audio(
+        self, session_id: int, discord_user_id: int, at: datetime
+    ) -> None:
+        self.silent_audio.append((session_id, discord_user_id, at))
 
     async def close_session(self, session_id: int, _ended_at: datetime, reason: str) -> None:
         self.closed.append((session_id, reason))
@@ -219,6 +225,18 @@ class FakeConfigStore:
 
     async def snapshot(self, guild_id: int) -> dict[str, str]:
         return {**settings.DEFAULTS, **self.values.get(guild_id, {})}
+
+
+class FakeAnnouncer:
+    """Satisfies the `Announcer` port for the pipelines these tests build by hand.
+
+    The pipelines the *client* builds get the real `DiscordAnnouncer`
+    instead -- see `test_a_pipeline_the_client_builds_can_warn_its_own_
+    channel`, which stands in for the channel rather than for the adapter.
+    """
+
+    async def post(self, channel_id: int, text: str) -> None:  # noqa: ARG002
+        return None
 
 
 class FakeVoiceReceiver:
@@ -384,6 +402,7 @@ async def test_two_consecutive_sessions_through_the_client(tmp_path: Path) -> No
         store=FakeStore(),
         writers=FakeAudioWriterFactory(tmp_path),
         encryptor=FakeEncryptor(),
+        announcer=FakeAnnouncer(),
         retention_days=30,
     )
     voice = FakeVoiceReceiver()
@@ -1445,6 +1464,7 @@ def _service(sessions: FakeSessions, jobs: FakeJobs, root: Path) -> RecordingSer
         store=FakeStore(),
         writers=FakeAudioWriterFactory(root),
         encryptor=FakeEncryptor(),
+        announcer=FakeAnnouncer(),
         retention_days=30,
     )
 
@@ -1597,3 +1617,60 @@ async def test_the_guard_lapses_on_the_tick_with_no_voice_state_update_at_all(
     assert voice.joined == [CHANNEL_ID, CHANNEL_ID]
     assert client._guilds[GUILD_ID].service.is_recording is True
     assert client._guilds[GUILD_ID].blocked_until is None
+
+
+async def test_a_pipeline_the_client_builds_can_warn_its_own_channel(tmp_path: Path) -> None:
+    """The wiring, end to end through the real build path and the real adapter.
+
+    `RecordingService` can only say anything if `_build` handed it an
+    announcer, and it can only say it in the right place if that announcer
+    resolves the session's own voice channel and sends there. None of that
+    is visible to `tests/application/test_recording.py`, which constructs
+    the service itself around a fake -- exactly the kind of gap that let a
+    `sessions_to_announce` with no caller anywhere sit in this codebase
+    with passing tests (Defect 3).
+
+    So nothing between `reconcile_guild` and `VoiceChannel.send` is
+    substituted here: the real `DiscordAnnouncer` runs, and only the
+    channel it resolves is a stand-in. `_voice_channel` produces a
+    `MagicMock(spec=discord.VoiceChannel)`, which really does satisfy the
+    adapter's `isinstance(..., discord.abc.Messageable)` check, so even
+    the "can this channel receive messages" branch is the live one.
+
+    Thirty seconds of level-less audio is what a microphone muted at
+    system level produces: packets arrive, decode, and contain nothing.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client._tick_all(clock.now())
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, anna)
+
+    # What the gateway's channel cache would hand back. Assigned onto the
+    # instance rather than reaching into `_connection`, because the only
+    # thing under test here is what the announcer does with the id it is
+    # given.
+    channel = _voice_channel(CHANNEL_ID, members=[anna])
+    client.get_channel = MagicMock(return_value=channel)  # type: ignore[method-assign]
+
+    service = client._guilds[GUILD_ID].service
+    silence = b"\x00" * (48_000 * 4)  # one second of 48 kHz stereo 16-bit zeroes
+    for second in range(30):
+        await service.voice_packet(
+            ANNA, "anna", 1, 48_000 * (second + 1), silence, T0 + timedelta(seconds=second)
+        )
+
+    channel.send.assert_awaited_once_with(  # type: ignore[attr-defined]
+        "Audio is arriving from <@100> but at no audible level. The microphone is "
+        "most likely muted at system level. Recording continues."
+    )
+    assert [(user_id, at) for _, user_id, at in sessions.silent_audio] == [
+        (ANNA, T0 + timedelta(seconds=29))
+    ]

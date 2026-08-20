@@ -134,6 +134,23 @@ class _UnusedWriterFactory:
         )
 
 
+class _UnusedAnnouncer:
+    """Satisfies `RecordingService`'s constructor without ever posting anything.
+
+    Recovery runs at boot, before the Discord client is even constructed,
+    and only ever calls `close` -- the one method that says nothing to
+    anybody. The service posts from `voice_packet` alone, which recovery
+    never reaches, so being asked to post here means the wiring above has
+    gone wrong and the process would otherwise be quietly announcing into
+    a channel it has no connection to.
+    """
+
+    async def post(self, channel_id: int, text: str) -> None:
+        raise RuntimeError(
+            f"recovery must not announce anything (channel {channel_id}, {len(text)} chars)"
+        )
+
+
 def _service_for_recovery(
     sessions: SessionRecorder,
     jobs: JobQueue,
@@ -155,6 +172,7 @@ def _service_for_recovery(
         store=store,
         writers=_UnusedWriterFactory(),
         encryptor=encryptor,
+        announcer=_UnusedAnnouncer(),
         retention_days=retention_days,
     )
 

@@ -49,6 +49,11 @@ class FakeSessions:
     async def set_audio_epoch(self, _session_id: int, _user_id: int, _at: datetime) -> None:
         raise AssertionError("recovery must never set an audio epoch")
 
+    async def record_silent_audio(self, _session_id: int, _user_id: int, _at: datetime) -> None:
+        # Only `voice_packet` ever detects silent audio, and recovery never
+        # reaches it -- there are no packets left to observe, only files.
+        raise AssertionError("recovery must never record silent audio")
+
     async def close_session(self, session_id: int, _ended_at: datetime, reason: str) -> None:
         self.closed.append((session_id, reason))
         self._status[session_id] = "closed"

@@ -1,12 +1,13 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.application.assembly import serialize_transcript
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
 from sturnus.entrypoints.worker import _WorkerSessionStore
-from sturnus.infrastructure.db.models import AccountLink, Base, Session
+from sturnus.infrastructure.db.models import AccountLink, Base, Session, SessionParticipant
 from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -157,6 +158,80 @@ async def test_audio_epoch_is_written_once(factory: async_sessionmaker[AsyncSess
     await repo.set_audio_epoch(session_id, ANNA, T0 + timedelta(seconds=3))
     await repo.set_audio_epoch(session_id, ANNA, T0 + timedelta(seconds=9))
     assert await repo.audio_epoch(session_id, ANNA) == T0 + timedelta(seconds=3)
+
+
+async def _silent_audio_at(
+    factory: async_sessionmaker[AsyncSession], session_id: int, user_id: int
+) -> datetime | None:
+    """Reads the column back directly: nothing in the running system reads it.
+
+    The bot writes it so that an operator investigating an empty transcript
+    weeks later can tell "we could not hear them" from "they said nothing",
+    and that reader is a person with a SQL prompt. Adding a repository
+    method purely so this test could call one would be production code with
+    no production caller.
+    """
+    async with factory() as session:
+        return await session.scalar(
+            select(SessionParticipant.silent_audio_detected_at).where(
+                SessionParticipant.session_id == session_id,
+                SessionParticipant.discord_user_id == user_id,
+            )
+        )
+
+
+async def test_silent_audio_is_recorded_on_the_participant(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The durable half of the silent-audio warning (`sturnus.domain.silence`).
+
+    The message posted into the channel is gone by the next meeting; this
+    row is what is still there when somebody asks why a transcript was
+    empty.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await repo.add_participant(session_id, ANNA, "anna", T0)
+
+    await repo.record_silent_audio(session_id, ANNA, T0 + timedelta(seconds=30))
+
+    assert await _silent_audio_at(factory, session_id, ANNA) == T0 + timedelta(seconds=30)
+
+
+async def test_silent_audio_keeps_the_first_detection(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """First detection wins, the same way `set_audio_epoch` does.
+
+    The column answers "from when was this speaker's audio empty", and a
+    later write would move that answer forward every time somebody looked
+    -- turning the one fact worth keeping into the time of the most recent
+    observation.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await repo.add_participant(session_id, ANNA, "anna", T0)
+
+    await repo.record_silent_audio(session_id, ANNA, T0 + timedelta(seconds=30))
+    await repo.record_silent_audio(session_id, ANNA, T0 + timedelta(minutes=10))
+
+    assert await _silent_audio_at(factory, session_id, ANNA) == T0 + timedelta(seconds=30)
+
+
+async def test_a_participant_with_audible_audio_has_no_silence_stamp(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Null is the normal case and must stay the default.
+
+    Everyone in every meeting who was simply quiet shares this row shape;
+    only a speaker whose audio actually arrived empty gets a timestamp, so
+    a non-null value means something on its own.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await repo.add_participant(session_id, ANNA, "anna", T0)
+
+    assert await _silent_audio_at(factory, session_id, ANNA) is None
 
 
 async def test_job_enqueue(factory: async_sessionmaker[AsyncSession]) -> None:

@@ -133,6 +133,7 @@ class SessionRepository:
                 detected_language=None,
                 first_seen_at=now,
                 audio_started_at=None,
+                silent_audio_detected_at=None,
             )
             await session.execute(
                 statement.on_conflict_do_nothing(
@@ -155,6 +156,35 @@ class SessionRepository:
                     SessionParticipant.audio_started_at.is_(None),
                 )
                 .values(audio_started_at=now)
+            )
+            await session.commit()
+
+    async def record_silent_audio(
+        self, session_id: int, discord_user_id: int, at: datetime
+    ) -> None:
+        """Stamps that this speaker's audio arrived carrying no audible level.
+
+        Writes only while `silent_audio_detected_at` is still null, the
+        same "first write wins" guard `set_audio_epoch` uses just above and
+        for the same reason: the column answers *from when* this speaker's
+        audio was empty, and a later write would keep moving that answer
+        forward to whenever somebody last looked.
+
+        Nothing in the running system reads it back. It exists for the
+        person who asks, weeks later, why a transcript was empty -- the
+        question two live sessions left unanswerable, because a recording
+        at the noise floor and a meeting in which nobody spoke leave
+        exactly the same rows behind.
+        """
+        async with self._session_factory() as session:
+            await session.execute(
+                update(SessionParticipant)
+                .where(
+                    SessionParticipant.session_id == session_id,
+                    SessionParticipant.discord_user_id == discord_user_id,
+                    SessionParticipant.silent_audio_detected_at.is_(None),
+                )
+                .values(silent_audio_detected_at=at)
             )
             await session.commit()
 

@@ -23,12 +23,24 @@ def pcm(frames: int) -> bytes:
     return b"\x10\x27" * 2 * frames
 
 
+def silent_pcm(seconds: float) -> bytes:
+    """`seconds` of the same format, with every sample at zero.
+
+    What a microphone muted at system level produces: packets arrive and
+    decode, and there is nothing in them. Sized in seconds rather than
+    frames because the threshold it has to reach is measured in seconds of
+    received audio (`sturnus.domain.silence.SILENCE_EVIDENCE_SECONDS`).
+    """
+    return b"\x00" * (int(seconds * 48_000) * 4)
+
+
 class FakeSessions:
     def __init__(self) -> None:
         self.opened: list[int] = []
         self.channel_names: list[str | None] = []
         self.participants: dict[int, str] = {}
         self.epochs: dict[int, datetime] = {}
+        self.silent_audio: dict[int, datetime] = {}
         self.closed: list[tuple[int, str]] = []
         self.keys: dict[int, tuple[str, bytes]] = {}
         self.status: dict[int, str] = {}
@@ -60,6 +72,9 @@ class FakeSessions:
     async def set_audio_epoch(self, _session_id: int, user_id: int, at: datetime) -> None:
         self.epochs.setdefault(user_id, at)
 
+    async def record_silent_audio(self, _session_id: int, user_id: int, at: datetime) -> None:
+        self.silent_audio.setdefault(user_id, at)
+
     async def close_session(self, session_id: int, _ended_at: datetime, reason: str) -> None:
         self.closed.append((session_id, reason))
         self.status[session_id] = "closed"
@@ -69,6 +84,24 @@ class FakeSessions:
 
     async def find_open_session(self, _guild_id: int) -> int | None:
         return None
+
+
+class FakeAnnouncer:
+    """Stands in for the Discord gateway on the `Announcer` port.
+
+    `fails` makes `post` raise the way an unreachable channel or a rate
+    limit would, so the tests can pin that a failed message costs the
+    message and nothing else.
+    """
+
+    def __init__(self, fails: bool = False) -> None:
+        self.posted: list[tuple[int, str]] = []
+        self._fails = fails
+
+    async def post(self, channel_id: int, text: str) -> None:
+        if self._fails:
+            raise RuntimeError("Discord API is briefly unreachable")
+        self.posted.append((channel_id, text))
 
 
 class FakeJobs:
@@ -174,6 +207,7 @@ def service(
     writers: FakeAudioWriterFactory | None = None,
     encryptor: FakeEncryptor | None = None,
     channel_name: str | None = None,
+    announcer: FakeAnnouncer | None = None,
 ) -> RecordingService:
     return RecordingService(
         guild_id=GUILD,
@@ -186,6 +220,7 @@ def service(
         store=store or FakeStore(),
         writers=writers or FakeAudioWriterFactory(tmp_path),
         encryptor=encryptor or FakeEncryptor(),
+        announcer=announcer or FakeAnnouncer(),
         retention_days=30,
         channel_name=channel_name,
     )
@@ -613,3 +648,189 @@ async def test_speaker_stream_ended_retires_that_ssrcs_reference_point(tmp_path:
     # Without the reset, an RTP timestamp of 0 against a reference of
     # 48_000 would place this packet a second *before* the epoch.
     assert writer.placed_at[-1] == later
+
+
+# ---------------------------------------------------------------------------
+# Audio that arrives and decodes but carries no level. Not "somebody is
+# quiet" -- that is most of a meeting and must never trigger anything -- but
+# "packets are flowing from this speaker and every sample in them is zero",
+# which is a microphone muted at system level and produces a recording that
+# transcribes to nothing. See `sturnus.domain.silence`.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_speaker_whose_audio_carries_no_level_is_named_in_the_channel(
+    tmp_path: Path,
+) -> None:
+    """The whole point of the feature: say so while the meeting can still act.
+
+    Posted publicly into the recording channel and mentioning the person,
+    because whoever is muted at system level is usually the last to notice
+    and somebody else in the room can help.
+    """
+    announcer = FakeAnnouncer()
+    svc = service(tmp_path, announcer=announcer)
+    await svc.participants_changed(1, T0)
+
+    for second in range(30):
+        await svc.voice_packet(
+            ANNA, "anna", 1, RTP * (second + 1), silent_pcm(1.0), T0 + timedelta(seconds=second)
+        )
+
+    assert len(announcer.posted) == 1
+    channel_id, text = announcer.posted[0]
+    assert channel_id == CHANNEL, "into the recording channel itself, not somewhere else"
+    assert "<@100>" in text
+    assert "Recording continues." in text
+
+
+async def test_the_speaker_is_named_only_once_in_a_session(tmp_path: Path) -> None:
+    """A repeat costs the same person the same embarrassment for no new information."""
+    announcer = FakeAnnouncer()
+    svc = service(tmp_path, announcer=announcer)
+    await svc.participants_changed(1, T0)
+
+    for second in range(120):
+        await svc.voice_packet(
+            ANNA, "anna", 1, RTP * (second + 1), silent_pcm(1.0), T0 + timedelta(seconds=second)
+        )
+
+    assert len(announcer.posted) == 1
+
+
+async def test_a_participant_who_simply_does_not_speak_is_never_warned(tmp_path: Path) -> None:
+    """The distinction the whole feature rests on.
+
+    No packets means the person is not speaking or not transmitting, which
+    is normal for most of a meeting and is nobody's fault. Only audio that
+    actually arrived and decoded into nothing is evidence of a fault.
+    """
+    announcer = FakeAnnouncer()
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions, announcer=announcer)
+    await svc.participants_changed(1, T0)
+
+    await svc.tick(T0 + timedelta(minutes=10))
+
+    assert announcer.posted == []
+    assert sessions.silent_audio == {}
+
+
+async def test_audible_audio_is_never_warned_about(tmp_path: Path) -> None:
+    announcer = FakeAnnouncer()
+    svc = service(tmp_path, announcer=announcer)
+    await svc.participants_changed(1, T0)
+
+    for second in range(120):
+        await svc.voice_packet(
+            ANNA, "anna", 1, RTP * (second + 1), pcm(48_000), T0 + timedelta(seconds=second)
+        )
+
+    assert announcer.posted == []
+
+
+async def test_the_finding_is_recorded_on_the_participant_row(tmp_path: Path) -> None:
+    """A chat message is gone by the next meeting; the row is what an
+    operator can still read afterwards to tell a broken pipeline from a
+    room full of people who said nothing.
+
+    Stamped with the packet's own place on the timeline rather than the
+    arrival time, matching `audio_started_at` -- both answer "when in this
+    recording", and a reader comparing the two must not be comparing two
+    different clocks.
+
+    The last packet is handed in three quarters of a second late, which is
+    what the hop from the capture thread through the queue onto the event
+    loop does under load. That lag is what separates the two candidate
+    timestamps here at all: without it they coincide and the test would
+    pass whichever one the code picked.
+    """
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions)
+    await svc.participants_changed(1, T0)
+
+    for second in range(29):
+        await svc.voice_packet(
+            ANNA, "anna", 1, RTP * (second + 1), silent_pcm(1.0), T0 + timedelta(seconds=second)
+        )
+    await svc.voice_packet(
+        ANNA, "anna", 1, RTP * 30, silent_pcm(1.0), T0 + timedelta(seconds=29, milliseconds=750)
+    )
+
+    assert sessions.silent_audio == {ANNA: T0 + timedelta(seconds=29)}
+
+
+async def test_a_failing_announcer_costs_the_message_and_nothing_else(tmp_path: Path) -> None:
+    """An unreachable channel must never cost the recording it is reporting on.
+
+    The audio still reaches the writer, the finding still reaches the
+    participant row, and the session keeps running -- a warning that could
+    take a meeting down with it would be worse than no warning at all.
+    """
+    sessions = FakeSessions()
+    jobs = FakeJobs()
+    svc = service(tmp_path, sessions=sessions, jobs=jobs, announcer=FakeAnnouncer(fails=True))
+    await svc.participants_changed(1, T0)
+
+    for second in range(30):
+        await svc.voice_packet(
+            ANNA, "anna", 1, RTP * (second + 1), silent_pcm(1.0), T0 + timedelta(seconds=second)
+        )
+
+    assert svc.is_recording is True
+    assert sessions.silent_audio == {ANNA: T0 + timedelta(seconds=29)}
+    await svc.close(EndReason.EMPTY, T0 + timedelta(minutes=1))
+    assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
+
+
+async def test_a_failing_participant_row_still_gets_the_message_out(tmp_path: Path) -> None:
+    """The two halves are independent, and the in-meeting half is the urgent one.
+
+    A database hiccup while stamping the row must not swallow the message
+    that could still get somebody's microphone fixed before the meeting
+    ends.
+    """
+
+    class BrokenSessions(FakeSessions):
+        async def record_silent_audio(self, _session_id: int, _user_id: int, _at: datetime) -> None:
+            raise RuntimeError("the database is briefly unreachable")
+
+    announcer = FakeAnnouncer()
+    svc = service(tmp_path, sessions=BrokenSessions(), announcer=announcer)
+    await svc.participants_changed(1, T0)
+
+    for second in range(30):
+        await svc.voice_packet(
+            ANNA, "anna", 1, RTP * (second + 1), silent_pcm(1.0), T0 + timedelta(seconds=second)
+        )
+
+    assert len(announcer.posted) == 1
+    assert svc.is_recording is True
+
+
+async def test_the_next_session_may_warn_the_same_speaker_again(tmp_path: Path) -> None:
+    """ "Once per speaker" is scoped to the session, not to the process.
+
+    Somebody who arrived muted last week and again today has a problem
+    today too, and a bot that stayed quiet about it because it had
+    mentioned it once, hours ago, in a meeting that is already over would
+    be useless.
+    """
+    announcer = FakeAnnouncer()
+    svc = service(tmp_path, announcer=announcer)
+
+    for session_start in (T0, T0 + timedelta(hours=1)):
+        await svc.participants_changed(1, session_start)
+        for second in range(30):
+            await svc.voice_packet(
+                ANNA,
+                "anna",
+                1,
+                RTP * (second + 1),
+                silent_pcm(1.0),
+                session_start + timedelta(seconds=second),
+            )
+        await svc.end_now(EndReason.SHUTDOWN, session_start + timedelta(minutes=1))
+        svc.reset()
+
+    assert len(announcer.posted) == 2
