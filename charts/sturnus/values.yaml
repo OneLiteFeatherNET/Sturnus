@@ -31,7 +31,12 @@ serviceAccount:
   create: true
   name: ""
   annotations: {}
-  automount: true
+  # None of the three components calls the Kubernetes API, so the projected
+  # token is a standing credential with no job to do. Also set explicitly to
+  # `false` on every pod spec (belt and suspenders: a pod-level value always
+  # wins over this one, but this keeps the ServiceAccount object itself from
+  # defaulting a future, differently-configured pod back to `true`).
+  automount: false
 
 # Non-secret environment shared by all three components. Component-specific
 # non-secret env lives under each component's own `env` map below.
@@ -58,8 +63,35 @@ region:
   key: topology.kubernetes.io/region
   value: eu-central-1
 
-podSecurityContext: {}
-securityContext: {}
+# Shared across all three components: they run from the same image as the
+# same uid/gid, so one pod- and one container-level policy covers bot, link
+# and worker alike.
+#
+# `runAsUser`/`runAsGroup` are pinned to 1000 explicitly rather than left to
+# the image default (Dockerfile creates `sturnus` at uid/gid 1000) -- if a
+# future image build ever changes that, a mismatch here fails at admission
+# instead of silently running as whatever uid the image happens to declare.
+# `fsGroup: 1000` is what lets that non-root user write the PVC-backed
+# volumes (bot's recordings, worker's model cache): without it the volume is
+# mounted root-owned and both writes fail at runtime instead of at deploy.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# `readOnlyRootFilesystem: true` is why every deployment template also
+# mounts an emptyDir at /tmp (Python and its libraries write there
+# regardless of what the process itself does), and why worker additionally
+# sizes /tmp to hold a decrypted audio file, not just interpreter scratch
+# space -- see `worker.tmpSizeLimit` below.
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: true
 
 nodeSelector: {}
 tolerations: []
@@ -72,6 +104,9 @@ bot:
   command: ["sturnus-bot"]
   env:
     STURNUS_RECORDING_DIR: /data/recordings
+  # Recordings themselves go straight to the PVC above; this only needs to
+  # cover Python/library scratch writes to /tmp under readOnlyRootFilesystem.
+  tmpSizeLimit: 256Mi
   resources:
     requests:
       cpu: "1"
@@ -121,6 +156,10 @@ link:
   command: ["sturnus-link"]
   replicaCount: 2
   env: {}
+  # link writes nothing but Python/library scratch to /tmp under
+  # readOnlyRootFilesystem -- it is the most locked-down of the three, and
+  # the only one reachable from outside the cluster.
+  tmpSizeLimit: 128Mi
   resources:
     requests:
       cpu: 50m
@@ -166,6 +205,17 @@ worker:
   env:
     STURNUS_MODEL_CACHE_DIR: /data/model-cache
     STURNUS_WHISPER_MODEL: large-v3-turbo
+  # Larger than bot/link's: `process_one` (plan 3, task 9 -- not yet landed
+  # on this branch as of this hardening pass) downloads the encrypted
+  # object and decrypts it to a temporary WAV before transcribing, and the
+  # plan's own language ("temporary directory", "temporary WAV", removed in
+  # a `finally`) is exactly Python's `tempfile` module, which resolves to
+  # /tmp (or $TMPDIR) by default. Sized for one speaker's decrypted
+  # recording plus the encrypted download and interpreter scratch, not just
+  # the latter. If the worker entrypoint ends up writing its working
+  # directory somewhere other than /tmp, this mount and size need revisiting
+  # against that actual path.
+  tmpSizeLimit: 4Gi
   resources:
     requests:
       cpu: "4"

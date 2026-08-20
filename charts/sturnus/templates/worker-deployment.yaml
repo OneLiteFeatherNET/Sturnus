@@ -19,6 +19,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "sturnus.serviceAccountName" . }}
+      # worker never calls the Kubernetes API; the projected token would be
+      # a standing credential with no job to do.
+      automountServiceAccountToken: false
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -68,10 +71,20 @@ spec:
           volumeMounts:
             - name: model-cache
               mountPath: {{ .Values.worker.env.STURNUS_MODEL_CACHE_DIR }}
+            # readOnlyRootFilesystem: true. Covers Python/library scratch
+            # writes *and* the decrypted-audio working directory
+            # `process_one` uses before transcribing -- see the comment on
+            # worker.tmpSizeLimit in values.yaml for why /tmp is that
+            # directory and how sure we are of that.
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: model-cache
           persistentVolumeClaim:
             claimName: {{ include "sturnus.fullname" . }}-worker
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.worker.tmpSizeLimit }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

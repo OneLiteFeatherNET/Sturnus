@@ -19,6 +19,10 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "sturnus.serviceAccountName" . }}
+      # link never calls the Kubernetes API; the projected token would be a
+      # standing credential with no job to do -- and link is the one
+      # component reachable from the internet.
+      automountServiceAccountToken: false
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -61,6 +65,15 @@ spec:
           resources:
             {{- toYaml . | nindent 12 }}
           {{- end }}
+          volumeMounts:
+            # readOnlyRootFilesystem: true. link writes nothing of its own
+            # -- only Python/library scratch writes to /tmp need this.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.link.tmpSizeLimit }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

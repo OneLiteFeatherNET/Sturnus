@@ -10,7 +10,13 @@
 # other than the resulting virtual environment and the source tree reaches
 # the runtime image.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS builder
+# Pinned by digest, not just tag: `python:3.12-slim` is a moving tag, and a
+# digest makes the build reproducible and stops a routine re-pull from
+# silently swapping the base image out from under this Dockerfile. Obtained
+# via `docker pull python:3.12-slim && docker inspect --format
+# '{{index .RepoDigests 0}}' python:3.12-slim` on 2026-08-19; re-derive the
+# same way to move to a newer base.
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a AS builder
 
 # Pin the same uv release the lockfile was produced with (see
 # [build-system] in pyproject.toml).
@@ -36,7 +42,7 @@ RUN uv sync --frozen --no-default-groups
 # Runtime: a slim image with the built virtual environment and source only.
 # No compiler, no uv, no build tools.
 # ---------------------------------------------------------------------------
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a AS runtime
 
 # libopus0 is a runtime library, not a build tool: discord.py's voice-receive
 # path (discord.ext.voice_recv -> discord.opus.Decoder) loads Opus via

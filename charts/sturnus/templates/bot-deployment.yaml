@@ -28,6 +28,9 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "sturnus.serviceAccountName" . }}
+      # bot never calls the Kubernetes API; the projected token would be a
+      # standing credential with no job to do.
+      automountServiceAccountToken: false
       {{- with .Values.podSecurityContext }}
       securityContext:
         {{- toYaml . | nindent 8 }}
@@ -91,10 +94,18 @@ spec:
           volumeMounts:
             - name: recordings
               mountPath: {{ .Values.bot.env.STURNUS_RECORDING_DIR }}
+            # readOnlyRootFilesystem: true means Python and its libraries
+            # can no longer write their own scratch files to /tmp on the
+            # container's root filesystem without this.
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: recordings
           persistentVolumeClaim:
             claimName: {{ include "sturnus.fullname" . }}-bot
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.bot.tmpSizeLimit }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
