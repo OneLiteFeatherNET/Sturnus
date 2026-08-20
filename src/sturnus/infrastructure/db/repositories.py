@@ -13,8 +13,11 @@ from sqlalchemy import select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sturnus.application.assembly import deserialize_transcript
+from sturnus.application.transcription import TranscriptionResult
 from sturnus.domain.consent import ConsentRecord
 from sturnus.infrastructure.db.models import (
+    AccountLink,
     Consent,
     Session,
     SessionParticipant,
@@ -223,6 +226,25 @@ class SessionRepository:
             )
             return session_id
 
+    async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]:
+        """Returns `(started_at, ended_at)` for a session that has closed.
+
+        Raises if the session is still open: an ongoing session has no end
+        yet, and inventing one (e.g. "now") would misrepresent how long it
+        actually ran in the finished protocol.
+        """
+        async with self._session_factory() as session:
+            row = await session.execute(
+                select(Session.started_at, Session.ended_at).where(Session.id == session_id)
+            )
+            result = row.first()
+        if result is None:
+            raise ValueError(f"session {session_id} does not exist")
+        started_at, ended_at = result
+        if ended_at is None:
+            raise ValueError(f"session {session_id} is still open")
+        return started_at, ended_at
+
 
 class JobRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -254,3 +276,52 @@ class JobRepository:
             session.add(job)
             await session.commit()
             return job.id
+
+    async def transcripts_for(self, session_id: int) -> dict[int, TranscriptionResult]:
+        """Each speaker's stored transcript for a session, keyed by `discord_user_id`.
+
+        Only `done` jobs are read: a `dead` job (one that exhausted its
+        retries, see `JobQueue.fail`) or one still `pending`/`running` has
+        no transcript to read, and skipping it must not stop the session's
+        other speakers from appearing in the document.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(TranscriptionJob.discord_user_id, TranscriptionJob.transcript).where(
+                    TranscriptionJob.session_id == session_id,
+                    TranscriptionJob.status == "done",
+                )
+            )
+            return {
+                discord_user_id: deserialize_transcript(transcript)
+                for discord_user_id, transcript in rows
+                if transcript is not None
+            }
+
+
+class AccountLinkRepository:
+    """Reads `account_link` for one configured provider.
+
+    `provider` is fixed at construction from configuration (Spec 11's
+    `document_provider`), not passed per call: so a later Confluence
+    adapter is wired up with its own `AccountLinkRepository("confluence")`
+    and reads its own mapping rows rather than Outline's.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession], provider: str) -> None:
+        self._session_factory = session_factory
+        self._provider = provider
+
+    async def external_identity(self, discord_user_id: int) -> tuple[str, str] | None:
+        """Returns `(external_user_id, display_name)` for this provider, or `None`."""
+        async with self._session_factory() as session:
+            row = await session.execute(
+                select(AccountLink.external_user_id, AccountLink.display_name).where(
+                    AccountLink.discord_user_id == discord_user_id,
+                    AccountLink.provider == self._provider,
+                )
+            )
+            result = row.first()
+        if result is None:
+            return None
+        return (result[0], result[1])

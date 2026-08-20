@@ -3,8 +3,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from sturnus.infrastructure.db.models import Base
+from sturnus.application.assembly import serialize_transcript
+from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
+from sturnus.infrastructure.db.models import AccountLink, Base
+from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import (
+    AccountLinkRepository,
     ConsentRepository,
     JobRepository,
     SessionRepository,
@@ -148,3 +152,130 @@ async def test_job_enqueue(factory: async_sessionmaker[AsyncSession]) -> None:
         retention_until=T0 + timedelta(days=30),
     )
     assert job_id > 0
+
+
+async def test_session_bounds_returns_start_and_end_of_a_closed_session(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    assert await repo.session_bounds(session_id) == (T0, T0 + timedelta(hours=1))
+
+
+async def test_session_bounds_raises_while_the_session_is_still_open(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An open session has no end yet; inventing one would misrepresent how long it ran."""
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    with pytest.raises(ValueError, match="open"):
+        await repo.session_bounds(session_id)
+
+
+async def _enqueue_job(
+    sessions: SessionRepository,
+    jobs: JobRepository,
+    session_id: int,
+    user_id: int,
+) -> int:
+    await sessions.add_participant(session_id, user_id, f"user{user_id}", T0)
+    return await jobs.enqueue(
+        session_id=session_id,
+        discord_user_id=user_id,
+        s3_key=f"sessions/{session_id}/speakers/{user_id}.enc",
+        encryption_key_id="k1",
+        wrapped_data_key=b"wrapped",
+        retention_until=T0 + timedelta(days=30),
+    )
+
+
+async def test_transcripts_for_returns_each_speakers_stored_transcript(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    queue = JobQueue(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    anna_job = await _enqueue_job(sessions, jobs, session_id, ANNA)
+    ben_job = await _enqueue_job(sessions, jobs, session_id, BEN)
+
+    anna_result = TranscriptionResult(
+        segments=(TranscribedSegment(0.0, 1.0, "hello"),), language="de"
+    )
+    ben_result = TranscriptionResult(segments=(TranscribedSegment(0.0, 1.0, "hi"),), language="en")
+    await queue.complete(anna_job, serialize_transcript(anna_result))
+    await queue.complete(ben_job, serialize_transcript(ben_result))
+
+    transcripts = await jobs.transcripts_for(session_id)
+    assert transcripts == {ANNA: anna_result, BEN: ben_result}
+
+
+async def test_transcripts_for_skips_dead_and_unfinished_jobs(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A dead job must not stop the remaining speakers from appearing in the document."""
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    queue = JobQueue(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    anna_job = await _enqueue_job(sessions, jobs, session_id, ANNA)
+    await _enqueue_job(sessions, jobs, session_id, BEN)  # left pending
+
+    anna_result = TranscriptionResult(
+        segments=(TranscribedSegment(0.0, 1.0, "hello"),), language="de"
+    )
+    await queue.complete(anna_job, serialize_transcript(anna_result))
+
+    # A third speaker whose job died outright.
+    dead_job = await _enqueue_job(sessions, jobs, session_id, 300)
+    await queue.fail(dead_job, "boom", max_attempts=1)
+
+    transcripts = await jobs.transcripts_for(session_id)
+    assert transcripts == {ANNA: anna_result}
+
+
+async def test_external_identity_returns_the_linked_account_for_the_configured_provider(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with factory() as session:
+        session.add(
+            AccountLink(
+                discord_user_id=ANNA,
+                provider="outline",
+                external_user_id="out-1",
+                display_name="Anna Example",
+                linked_at=T0,
+            )
+        )
+        await session.commit()
+
+    repo = AccountLinkRepository(factory, provider="outline")
+    assert await repo.external_identity(ANNA) == ("out-1", "Anna Example")
+
+
+async def test_external_identity_returns_none_for_an_unlinked_user(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = AccountLinkRepository(factory, provider="outline")
+    assert await repo.external_identity(BEN) is None
+
+
+async def test_external_identity_only_reads_its_own_provider(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A later Confluence adapter must read its own mapping, not Outline's."""
+    async with factory() as session:
+        session.add(
+            AccountLink(
+                discord_user_id=ANNA,
+                provider="outline",
+                external_user_id="out-1",
+                display_name="Anna Example",
+                linked_at=T0,
+            )
+        )
+        await session.commit()
+
+    repo = AccountLinkRepository(factory, provider="confluence")
+    assert await repo.external_identity(ANNA) is None
