@@ -17,7 +17,15 @@ from sturnus.infrastructure.discord.client import SturnusClient
 
 #: Every cog `setup_hook` is expected to register. Extend this set in the
 #: same commit that adds a new cog -- that is the whole point of this test.
-EXPECTED_COGS = {"ConsentCog", "ConfigCog", "AboutCog", "SetupCog", "AudioCog", "LinkCog"}
+EXPECTED_COGS = {
+    "ConsentCog",
+    "ConfigCog",
+    "AboutCog",
+    "SetupCog",
+    "AudioCog",
+    "LinkCog",
+    "QueueCog",
+}
 
 
 def _registered_cog_names() -> set[str]:
