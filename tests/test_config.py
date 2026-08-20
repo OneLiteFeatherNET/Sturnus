@@ -12,7 +12,10 @@ def _env(**overrides: str) -> dict[str, str]:
         "STURNUS_S3_BUCKET": "sturnus-audio",
         "STURNUS_S3_ACCESS_KEY": "ak",
         "STURNUS_S3_SECRET_KEY": "s3-secret-value",
-        "STURNUS_MASTER_KEY": "c3R1cm51cy10ZXN0LWtleS0zMi1ieXRlcy1sb25nISE=",
+        # Decodes to b"THIS-IS-NOT-A-REAL-KEY-test-only" -- 32 bytes, which is
+        # what KeyWrapper requires. Spelled out so neither a reader nor a
+        # secret scanner mistakes it for a real key.
+        "STURNUS_MASTER_KEY": "VEhJUy1JUy1OT1QtQS1SRUFMLUtFWS10ZXN0LW9ubHk=",
         "STURNUS_MASTER_KEY_ID": "k1",
         "STURNUS_RECORDING_DIR": "/tmp/rec",
     }
