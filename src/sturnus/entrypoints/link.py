@@ -29,8 +29,9 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
-from sturnus.infrastructure.db.link_state import AccountLinkRepository, LinkStateStore
+from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.models import AccountLink, OAuthState
+from sturnus.infrastructure.db.repositories import AccountLinkRepository
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.linkserver import build_app
 

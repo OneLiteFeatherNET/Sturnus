@@ -279,3 +279,50 @@ async def test_external_identity_only_reads_its_own_provider(
 
     repo = AccountLinkRepository(factory, provider="confluence")
     assert await repo.external_identity(ANNA) is None
+
+
+# ---------------------------------------------------------------------------
+# `AccountLinkRepository.save` / `.delete` -- the write side. These used to
+# live in `sturnus.infrastructure.db.link_state` behind a second class of
+# the same name; now that both sides live in one class in this module, the
+# tests belong beside `external_identity`'s above rather than split into a
+# different file.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def write_repo(clean_database: str) -> AccountLinkRepository:
+    engine = create_async_engine(clean_database)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    return AccountLinkRepository(async_sessionmaker(engine, expire_on_commit=False))
+
+
+async def test_save_persists_a_new_mapping(write_repo: AccountLinkRepository) -> None:
+    await write_repo.save(ANNA, "outline", "ext-1", "Anna")
+    assert await write_repo.delete(ANNA, "outline") is True
+
+
+async def test_save_upserts_on_the_composite_key(write_repo: AccountLinkRepository) -> None:
+    """Re-linking after changing accounts replaces, it does not conflict."""
+    await write_repo.save(ANNA, "outline", "ext-1", "Anna Old")
+    await write_repo.save(ANNA, "outline", "ext-2", "Anna New")
+    # No primary-key violation was raised; the second save replaced the first.
+    assert await write_repo.delete(ANNA, "outline") is True
+    assert await write_repo.delete(ANNA, "outline") is False
+
+
+async def test_different_providers_do_not_collide(write_repo: AccountLinkRepository) -> None:
+    await write_repo.save(ANNA, "outline", "ext-1", "Anna")
+    await write_repo.save(ANNA, "confluence", "ext-9", "Anna")
+    assert await write_repo.delete(ANNA, "outline") is True
+    assert await write_repo.delete(ANNA, "confluence") is True
+
+
+async def test_delete_reports_whether_anything_was_removed(
+    write_repo: AccountLinkRepository,
+) -> None:
+    assert await write_repo.delete(BEN, "outline") is False
+    await write_repo.save(BEN, "outline", "ext-3", "Ben")
+    assert await write_repo.delete(BEN, "outline") is True
+    assert await write_repo.delete(BEN, "outline") is False

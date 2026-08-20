@@ -91,7 +91,7 @@ class StateStore(Protocol):
 class LinkRepository(Protocol):
     """What the callback route needs from an account-link repository.
 
-    See `sturnus.infrastructure.db.link_state.AccountLinkRepository.save`.
+    See `sturnus.infrastructure.db.repositories.AccountLinkRepository.save`.
     """
 
     async def save(

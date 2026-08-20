@@ -62,9 +62,19 @@ WORKDIR /app
 COPY --from=builder --chown=sturnus:sturnus /app/.venv /app/.venv
 COPY --chown=sturnus:sturnus src ./src
 
+# The worker owns the schema (Spec 13.1): it runs Alembic to head before
+# anything else starts (`sturnus.entrypoints.worker._run_migrations`),
+# resolving `alembic.ini` relative to the working directory the same way
+# the CLI does. Without these two, the worker crash-loops on every start
+# in the container even though nothing in the test suite (which runs
+# against the source tree, not the image) catches it.
+COPY --chown=sturnus:sturnus alembic.ini ./alembic.ini
+COPY --chown=sturnus:sturnus migrations ./migrations
+
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    HF_HOME=/data/cache/huggingface
+    HF_HOME=/data/cache/huggingface \
+    PYTHONPYCACHEPREFIX=/tmp/pycache
 
 # The Whisper model is deliberately not part of this image -- it is
 # downloaded on first use and cached here instead, the same pattern the

@@ -7,9 +7,9 @@ implementation behind a real database test is ceremony.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 
-from sqlalchemy import select, update
+from sqlalchemy import CursorResult, delete, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -300,20 +300,41 @@ class JobRepository:
 
 
 class AccountLinkRepository:
-    """Reads `account_link` for one configured provider.
+    """Reads and writes `account_link`: the mapping between a Discord user and an
+    external (e.g. Outline) account.
 
-    `provider` is fixed at construction from configuration (Spec 11's
-    `document_provider`), not passed per call: so a later Confluence
-    adapter is wired up with its own `AccountLinkRepository("confluence")`
-    and reads its own mapping rows rather than Outline's.
+    Two call shapes coexist here because the read side and the write side
+    are used by two different processes with two different needs:
+
+    - **Read** (`external_identity`): the bot reads with `provider` fixed at
+      construction from configuration (Spec 11's `document_provider`), not
+      passed per call -- so a later Confluence adapter is wired up with its
+      own `AccountLinkRepository(session_factory, provider="confluence")`
+      and reads its own mapping rows rather than Outline's.
+    - **Write** (`save`/`delete`): the link service's OAuth callback (Spec
+      8.4) and the `/link remove` command take `provider` per call instead,
+      because the caller only learns which provider a link is for from the
+      consumed `PendingLink`/command argument, not from how this repository
+      was wired up. `provider` is therefore optional at construction --
+      callers that only ever write never need to pass it.
     """
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession], provider: str) -> None:
+    def __init__(
+        self, session_factory: async_sessionmaker[AsyncSession], provider: str | None = None
+    ) -> None:
         self._session_factory = session_factory
         self._provider = provider
 
     async def external_identity(self, discord_user_id: int) -> tuple[str, str] | None:
-        """Returns `(external_user_id, display_name)` for this provider, or `None`."""
+        """Returns `(external_user_id, display_name)` for this provider, or `None`.
+
+        Requires `provider` to have been fixed at construction (see the
+        class docstring's "Read" case).
+        """
+        assert self._provider is not None, (
+            "external_identity() requires AccountLinkRepository to have been "
+            "constructed with a provider"
+        )
         async with self._session_factory() as session:
             row = await session.execute(
                 select(AccountLink.external_user_id, AccountLink.display_name).where(
@@ -325,3 +346,54 @@ class AccountLinkRepository:
         if result is None:
             return None
         return (result[0], result[1])
+
+    async def save(
+        self, discord_user_id: int, provider: str, external_user_id: str, display_name: str
+    ) -> None:
+        """Upserts the mapping for `(discord_user_id, provider)`.
+
+        Someone re-linking after changing their external account would
+        otherwise hit a primary-key violation on the second attempt --
+        "link my account again" reads as replace, not fail, so this writes
+        `INSERT ... ON CONFLICT DO UPDATE` rather than a plain insert.
+        """
+        async with self._session_factory() as session:
+            statement = insert(AccountLink).values(
+                discord_user_id=discord_user_id,
+                provider=provider,
+                external_user_id=external_user_id,
+                display_name=display_name,
+                linked_at=datetime.now(UTC),
+            )
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["discord_user_id", "provider"],
+                    set_={
+                        "external_user_id": statement.excluded.external_user_id,
+                        "display_name": statement.excluded.display_name,
+                        "linked_at": statement.excluded.linked_at,
+                    },
+                )
+            )
+            await session.commit()
+
+    async def delete(self, discord_user_id: int, provider: str) -> bool:
+        """Deletes the mapping for `(discord_user_id, provider)`.
+
+        Returns whether a row actually existed to remove, which `/link
+        remove` reports back to the user rather than claiming success
+        unconditionally.
+        """
+        async with self._session_factory() as session:
+            result = await session.execute(
+                delete(AccountLink).where(
+                    AccountLink.discord_user_id == discord_user_id,
+                    AccountLink.provider == provider,
+                )
+            )
+            await session.commit()
+        # `execute` on a Core DELETE always yields a `CursorResult` at
+        # runtime; the assertion narrows the statically-typed `Result[Any]`
+        # so `.rowcount` is available without an unchecked cast.
+        assert isinstance(result, CursorResult)
+        return result.rowcount > 0

@@ -32,7 +32,14 @@ exactly the one missing method; `_WorkerSessionStore` reads and writes the
 same tables `SessionRepository` already owns, through the same
 SQLAlchemy 2.0 async ORM, the project's one data-access path -- narrowly
 scoped to what the worker needs rather than duplicating the rest of that
-repository's surface.
+repository's surface. `participant_names`/`audio_epoch`/`session_bounds`
+-- the rest of the widened `SessionStore` shape `process_one` now needs to
+call `sturnus.application.assembly.assemble` on a session's last job --
+are the exception: `SessionRepository` already has all three, so
+`_WorkerSessionStore` simply delegates to one instead of duplicating them.
+`process_one`'s other two `assemble` collaborators, `JobRepository.
+transcripts_for` and `AccountLinkRepository.external_identity`, likewise
+already exist and are wired in directly below, with no adapter needed.
 
 **Deployment note on the working directory (see the brief's dispatch).**
 `process_one`'s scratch directory for the downloaded/decrypted audio
@@ -57,6 +64,7 @@ import contextlib
 import logging
 import os
 import signal
+from datetime import datetime
 from pathlib import Path
 
 from alembic import command
@@ -71,6 +79,11 @@ from sturnus.application.worker import process_one
 from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file
 from sturnus.infrastructure.db.models import Session, SessionParticipant
 from sturnus.infrastructure.db.queue import JobQueue
+from sturnus.infrastructure.db.repositories import (
+    AccountLinkRepository,
+    JobRepository,
+    SessionRepository,
+)
 from sturnus.infrastructure.documents.outline import OutlineSink
 from sturnus.infrastructure.health import ReadinessState, start_health_server
 from sturnus.infrastructure.objectstore import S3AudioStore
@@ -158,7 +171,7 @@ class _KeyWrapperDecryptor:
 
 
 class _WorkerSessionStore:
-    """Adapts persistence for the worker's language pinning and completion bookkeeping.
+    """Adapts persistence to `sturnus.application.worker.SessionStore`.
 
     `SessionRepository` (`sturnus.infrastructure.db.repositories`) does not
     yet expose `detected_language`/`set_detected_language`/`mark_documented`
@@ -166,10 +179,27 @@ class _WorkerSessionStore:
     instead of adding them there. Reads and writes the same
     `session_participant.detected_language` and `session.*` columns that
     repository already owns, through the same async ORM.
+
+    `participant_names`/`audio_epoch`/`session_bounds` -- the rest of the
+    widened `SessionStore` shape, needed by `sturnus.application.assembly.
+    assemble` -- delegate to a `SessionRepository` instance instead of
+    re-implementing those queries: that repository already owns them, and
+    duplicating its SQL here would just be a second place for them to
+    drift out of sync.
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+        self._sessions = SessionRepository(session_factory)
+
+    async def participant_names(self, session_id: int) -> dict[int, str]:
+        return await self._sessions.participant_names(session_id)
+
+    async def audio_epoch(self, session_id: int, user_id: int) -> datetime | None:
+        return await self._sessions.audio_epoch(session_id, user_id)
+
+    async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]:
+        return await self._sessions.session_bounds(session_id)
 
     async def detected_language(self, session_id: int, user_id: int) -> str | None:
         async with self._session_factory() as session:
@@ -281,6 +311,11 @@ async def _run() -> None:
         collection_id=settings.outline_collection_id,
     )
     sessions = _WorkerSessionStore(session_factory)
+    jobs = JobRepository(session_factory)
+    # "outline" matches the literal `mark_documented` already writes into
+    # `session.document_provider` -- the only document provider this
+    # worker supports today.
+    links = AccountLinkRepository(session_factory, "outline")
 
     readiness = ReadinessState(discord_connected=True)  # this process has no gateway to wait on
 
@@ -314,6 +349,8 @@ async def _run() -> None:
                 crypto=crypto,
                 documents=documents,
                 sessions=sessions,
+                jobs=jobs,
+                links=links,
                 work_dir=settings.work_dir,
                 max_attempts=settings.max_job_attempts,
             )

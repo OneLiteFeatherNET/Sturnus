@@ -32,31 +32,19 @@ to prevent, and neither that module nor `sturnus.application.documents`
 (where a shared exception type would otherwise belong) is a file this task
 may modify.
 
-**Known gap, reported rather than papered over.** Step 6 of the brief asks
-this function to "assemble, render, create the document" once a session's
-last job completes -- i.e. to call `sturnus.application.assembly.assemble`,
-which needs a `SessionReader` (`session_bounds`, `participant_names`,
-`audio_epoch`), a `JobReader` (`transcripts_for`), and a `LinkReader`
-(`external_identity`) to merge every speaker's stored transcript into one
-chronological document. But the `sessions` collaborator this function
-actually receives -- per the brief's own test fixture, `FakeSessions` in
-`tests/application/test_worker.py` -- exposes only `detected_language`,
-`set_detected_language`, and `mark_documented`; `assemble`'s very first
-line calls `session_bounds`, which that fixture does not implement, so
-calling `assemble` with this object would fail every "last job" test at
-runtime, not just under static analysis. None of the twelve given tests
-supply anything richer. Rather than silently deciding this away, the
-document built below uses *only the job that happened to finish last*: its
-own transcript, converted through the same `to_absolute`/`build_transcript`
-machinery `assemble` itself uses, anchored to the moment this function
-runs. For a session with more than one speaker, the created document
-currently reflects only that last speaker's words, not the full merge
-`assemble` would produce. Closing this gap needs a decision this module
-should not make unilaterally: either widen `sessions` (and its test
-double) to the full `SessionReader`/`JobReader`/`LinkReader` shape and
-genuinely call `assemble`, or give `process_one` those three readers as
-their own parameters, wired from the real repositories in
-`sturnus.entrypoints.worker`.
+Once a session's last job completes, `process_one` calls
+`sturnus.application.assembly.assemble` to merge *every* participant's
+stored transcript -- not just the job that happened to finish last -- into
+one chronological `Transcript`, then renders it through
+`sturnus.application.documents.render_transcript`/`document_title` before
+handing the result to `documents.create`. `assemble` needs a `SessionReader`
+(`session_bounds`, `participant_names`, `audio_epoch`), a `JobReader`
+(`transcripts_for`), and a `LinkReader` (`external_identity`). `SessionStore`
+below is widened to be structurally a `SessionReader` as well as its
+original language-pinning/completion shape, so the one `sessions`
+collaborator satisfies both; `jobs` and `links` are threaded through
+`process_one` as their own parameters, typed with `assembly`'s own
+`JobReader`/`LinkReader` protocols rather than duplicating them here.
 """
 
 from __future__ import annotations
@@ -65,23 +53,18 @@ import asyncio
 import logging
 import shutil
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol, cast
 
-from sturnus.application.assembly import serialize_transcript
+from sturnus.application.assembly import JobReader, LinkReader, assemble, serialize_transcript
 from sturnus.application.documents import (
     CreatedDocument,
     DocumentSink,
     document_title,
     render_transcript,
 )
-from sturnus.application.transcription import (
-    TranscriptionEngine,
-    TranscriptionResult,
-    to_absolute,
-)
-from sturnus.domain.transcript import SpeakerIdentity, build_transcript
+from sturnus.application.transcription import TranscriptionEngine
 
 log = logging.getLogger(__name__)
 
@@ -134,10 +117,16 @@ class Decryptor(Protocol):
 
 
 class SessionStore(Protocol):
-    """The session-scoped bookkeeping this job needs: language pinning and completion.
+    """The session-scoped bookkeeping this job needs.
 
-    Deliberately narrow -- see the module docstring's "Known gap" note for
-    why this does not also cover `sturnus.application.assembly.SessionReader`.
+    Covers the original language-pinning/completion bookkeeping
+    (`detected_language`/`set_detected_language`/`mark_documented`) *and*
+    everything `sturnus.application.assembly.assemble` needs to know about
+    a session's participants (`participant_names`/`audio_epoch`/
+    `session_bounds`) -- widened to that full shape so the one `sessions`
+    collaborator `process_one` already receives can also be passed to
+    `assemble` as its `SessionReader`, structurally, without a separate
+    parameter.
     """
 
     async def detected_language(self, session_id: int, user_id: int) -> str | None: ...
@@ -145,6 +134,12 @@ class SessionStore(Protocol):
     async def set_detected_language(self, session_id: int, user_id: int, lang: str) -> None: ...
 
     async def mark_documented(self, session_id: int, doc_id: str, url: str) -> None: ...
+
+    async def participant_names(self, session_id: int) -> dict[int, str]: ...
+
+    async def audio_epoch(self, session_id: int, user_id: int) -> datetime | None: ...
+
+    async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]: ...
 
 
 class _ClaimedJobShape(Protocol):
@@ -165,29 +160,30 @@ class _ClaimedJobShape(Protocol):
 async def _create_session_document(
     documents: DocumentSink,
     sessions: SessionStore,
-    job: _ClaimedJobShape,
-    result: TranscriptionResult,
+    jobs: JobReader,
+    links: LinkReader,
+    session_id: int,
     template_source: str,
 ) -> None:
-    """Builds and creates the document for the job that finished a session.
+    """Assembles, renders, and creates the document for a session's last job.
 
-    See the module docstring's "Known gap" note: this uses only the one
-    job that happened to complete the session, not every speaker's stored
-    transcript. A permanently-rejected creation (an unretryable rejection
-    from the document sink, e.g. a deleted collection) is swallowed here
-    rather than re-raised: the transcription job this belongs to already
-    completed successfully before this is ever called, so there is nothing
-    left to fail or retry -- only the document never gets created, which is
-    logged instead.
+    Calls `sturnus.application.assembly.assemble` to merge every
+    participant's stored transcript -- not just the job that happened to
+    complete the session -- into one chronological `Transcript`, then
+    renders it through `render_transcript`/`document_title`. Both are
+    localised to UTC: no timezone configuration exists anywhere in this
+    codebase yet (`sturnus.entrypoints.worker.WorkerSettings` has no such
+    field), so this keeps the same UTC anchor the previous, single-speaker
+    version of this function already used rather than inventing one.
+
+    A permanently-rejected creation (an unretryable rejection from the
+    document sink, e.g. a deleted collection) is swallowed here rather than
+    re-raised: the transcription job this belongs to already completed
+    successfully before this is ever called, so there is nothing left to
+    fail or retry -- only the document never gets created, which is logged
+    instead.
     """
-    speaker = SpeakerIdentity(
-        discord_user_id=job.discord_user_id,
-        discord_display_name=str(job.discord_user_id),
-    )
-    epoch = datetime.now(UTC)
-    segments = to_absolute(result, epoch, speaker)
-    ended_at = epoch + timedelta(seconds=max((s.end for s in result.segments), default=0.0))
-    transcript = build_transcript(segments, epoch, ended_at)
+    transcript = await assemble(session_id, sessions, jobs, links, UTC)
 
     body = render_transcript(transcript, template_source, UTC)
     title = document_title(transcript, UTC)
@@ -199,9 +195,9 @@ async def _create_session_document(
         # which this module must never import (see the module docstring).
         if type(exc).__name__ != "PermanentDocumentError":
             raise
-        log.warning("Document sink permanently rejected creation for session %d", job.session_id)
+        log.warning("Document sink permanently rejected creation for session %d", session_id)
         return
-    await sessions.mark_documented(job.session_id, created.id, created.url)
+    await sessions.mark_documented(session_id, created.id, created.url)
 
 
 async def process_one(
@@ -211,6 +207,8 @@ async def process_one(
     crypto: Decryptor,
     documents: DocumentSink,
     sessions: SessionStore,
+    jobs: JobReader,
+    links: LinkReader,
     work_dir: Path,
     max_attempts: int,
     template_source: str = _FALLBACK_TEMPLATE,
@@ -224,11 +222,18 @@ async def process_one(
     3. Unwrap the data key and decrypt to a plaintext WAV, still on disk.
     4. Transcribe -- language pinning per Spec 7 (see the module docstring).
     5. Store the transcript on the job; ask whether it was the session's last.
-    6. If it was: create the document and mark the session documented.
+    6. If it was: assemble every participant's stored transcript into one
+       document (`_create_session_document`, `sturnus.application.assembly.
+       assemble`) and mark the session documented.
     7. Every temporary file made in steps 2-3 is removed in a `finally`, so
        a failure anywhere above never leaves decrypted speech on disk. The
        audio object in S3 is left alone deliberately -- see the module
        docstring.
+
+    `jobs` and `links` are only ever read from in step 6, but are accepted
+    as parameters up front (rather than constructed lazily) so every
+    collaborator `process_one` needs is visible in its signature, matching
+    `sessions`/`documents`/`queue` and the rest.
     """
     claimed = await queue.claim()
     if claimed is None:
@@ -266,7 +271,9 @@ async def process_one(
         is_last = await queue.complete(job.id, serialize_transcript(result))
 
         if is_last:
-            await _create_session_document(documents, sessions, job, result, template_source)
+            await _create_session_document(
+                documents, sessions, jobs, links, job.session_id, template_source
+            )
 
         return True
     finally:

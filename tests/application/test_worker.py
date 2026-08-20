@@ -3,8 +3,15 @@
 What is being tested is the order of operations: decrypt, transcribe,
 store, delete the local copy, and only then mark the job done. A wrong
 order either loses a transcript or leaves plaintext audio on disk.
+
+It also tests, from `test_a_multi_speaker_sessions_document_contains_every_speakers_text`
+onward, that the document created for a session's last job is the real
+*assembled* merge of every participant's stored transcript
+(`sturnus.application.assembly.assemble`) rather than only the transcript
+of whichever job happened to finish last.
 """
 
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +20,8 @@ from sturnus.application.transcription import TranscribedSegment, TranscriptionR
 from sturnus.application.worker import process_one
 from sturnus.infrastructure.db.queue import ClaimedJob
 from sturnus.infrastructure.documents.outline import PermanentDocumentError
+
+T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 
 
 class FakeQueue:
@@ -83,9 +92,19 @@ class FakeDocuments:
 
 
 class FakeSessions:
+    """Also satisfies `sturnus.application.assembly.SessionReader`.
+
+    Defaults describe a single participant (`discord_user_id=100`, matching
+    the default `job()`), so every existing test -- none of which cares
+    about the assembled document's content -- keeps working unchanged.
+    """
+
     def __init__(self) -> None:
         self.languages: dict[int, str] = {}
         self.documented: list[tuple[int, str]] = []
+        self.names: dict[int, str] = {100: "speaker-100"}
+        self.epochs: dict[int, datetime] = {100: T0}
+        self.bounds: tuple[datetime, datetime] = (T0, T0 + timedelta(hours=1))
 
     async def detected_language(self, _session_id: int, user_id: int) -> str | None:
         return self.languages.get(user_id)
@@ -95,6 +114,42 @@ class FakeSessions:
 
     async def mark_documented(self, session_id: int, _doc_id: str, url: str) -> None:
         self.documented.append((session_id, url))
+
+    async def participant_names(self, _session_id: int) -> dict[int, str]:
+        return self.names
+
+    async def audio_epoch(self, _session_id: int, user_id: int) -> datetime | None:
+        return self.epochs.get(user_id)
+
+    async def session_bounds(self, _session_id: int) -> tuple[datetime, datetime]:
+        return self.bounds
+
+
+class FakeJobs:
+    """Satisfies `sturnus.application.assembly.JobReader`.
+
+    Stands in for what is already persisted in `transcription_job` by the
+    time `assemble` reads it -- independent of whatever `FakeQueue`
+    records in the same test, exactly as `JobRepository.transcripts_for`
+    (real DB rows) is independent of `JobQueue.complete` (a different
+    repository over the same table) in production.
+    """
+
+    def __init__(self, per_speaker: dict[int, TranscriptionResult] | None = None) -> None:
+        self._per_speaker = per_speaker or {}
+
+    async def transcripts_for(self, _session_id: int) -> dict[int, TranscriptionResult]:
+        return self._per_speaker
+
+
+class FakeLinks:
+    """Satisfies `sturnus.application.assembly.LinkReader`."""
+
+    def __init__(self, linked: dict[int, tuple[str, str]] | None = None) -> None:
+        self._linked = linked or {}
+
+    async def external_identity(self, discord_user_id: int) -> tuple[str, str] | None:
+        return self._linked.get(discord_user_id)
 
 
 def job(job_id: int = 1, session_id: int = 1, user_id: int = 100) -> ClaimedJob:
@@ -117,6 +172,8 @@ def run(tmp_path: Path, **kw: Any) -> dict[str, Any]:
         "crypto": kw.get("crypto") or FakeCrypto(),
         "documents": kw.get("documents") or FakeDocuments(),
         "sessions": kw.get("sessions") or FakeSessions(),
+        "jobs": kw.get("jobs") or FakeJobs(),
+        "links": kw.get("links") or FakeLinks(),
         "work_dir": tmp_path,
         "max_attempts": 3,
     }
@@ -167,6 +224,94 @@ async def test_the_last_job_of_a_session_creates_the_document(tmp_path: Path) ->
     await process_one(**run(tmp_path, queue=queue, documents=documents, sessions=sessions))
     assert len(documents.created) == 1
     assert sessions.documented == [(1, "https://outline.example/doc/1")]
+
+
+async def test_a_single_speakers_document_contains_their_transcript(tmp_path: Path) -> None:
+    """The base case (Spec 8.3): a session with one speaker still gets a
+    document containing that speaker's assembled words."""
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    documents = FakeDocuments()
+    jobs = FakeJobs(
+        {
+            100: TranscriptionResult(
+                segments=(TranscribedSegment(0.0, 1.0, "only speaker talking"),), language="de"
+            )
+        }
+    )
+    await process_one(**run(tmp_path, queue=queue, documents=documents, jobs=jobs))
+    assert len(documents.created) == 1
+    assert "only speaker talking" in documents.created[0][1]
+
+
+async def test_a_multi_speaker_sessions_document_contains_both_speakers_text(
+    tmp_path: Path,
+) -> None:
+    """Regression test for the defect this task fixes.
+
+    `_create_session_document` must call `sturnus.application.assembly.
+    assemble` to merge every participant's stored transcript, not build
+    the document from only the one job that happened to finish the
+    session. Multi-speaker sessions are the entire reason speakers are
+    recorded separately -- a document with only one person's words is
+    wrong even though nothing raises.
+    """
+    queue = FakeQueue([job(job_id=2, session_id=1, user_id=200)])
+    queue.last_is_final = True
+    sessions = FakeSessions()
+    sessions.names = {100: "anna", 200: "ben"}
+    sessions.epochs = {100: T0, 200: T0 + timedelta(seconds=30)}
+    documents = FakeDocuments()
+    jobs = FakeJobs(
+        {
+            100: TranscriptionResult(
+                segments=(TranscribedSegment(0.0, 1.0, "anna spoke first"),), language="de"
+            ),
+            200: TranscriptionResult(
+                segments=(TranscribedSegment(0.0, 1.0, "ben spoke second"),), language="de"
+            ),
+        }
+    )
+    await process_one(
+        **run(tmp_path, queue=queue, documents=documents, sessions=sessions, jobs=jobs)
+    )
+    assert len(documents.created) == 1
+    body = documents.created[0][1]
+    assert "anna spoke first" in body
+    assert "ben spoke second" in body
+    # Chronological order: anna's epoch is 30 seconds before ben's.
+    assert body.index("anna spoke first") < body.index("ben spoke second")
+
+
+async def test_a_dead_speakers_job_does_not_prevent_others_from_appearing(
+    tmp_path: Path,
+) -> None:
+    """A speaker whose job exhausted its retries and went `dead`
+    (`JobQueue.fail`) has no transcript for `JobRepository.transcripts_for`
+    to read -- it only reads `done` jobs -- but that must not stop the
+    session's other speakers from appearing in the document.
+    """
+    queue = FakeQueue([job()])  # anna (100) completes normally and is last
+    queue.last_is_final = True
+    sessions = FakeSessions()
+    sessions.names = {100: "anna", 200: "ben"}
+    # Ben is a known participant (he has an audio epoch) but his job never
+    # reached `done`, so he has no entry in `jobs` -- exactly what a `dead`
+    # job looks like to `assemble`.
+    sessions.epochs = {100: T0, 200: T0 + timedelta(seconds=30)}
+    documents = FakeDocuments()
+    jobs = FakeJobs(
+        {
+            100: TranscriptionResult(
+                segments=(TranscribedSegment(0.0, 1.0, "anna is still here"),), language="de"
+            )
+        }
+    )
+    await process_one(
+        **run(tmp_path, queue=queue, documents=documents, sessions=sessions, jobs=jobs)
+    )
+    assert len(documents.created) == 1
+    assert "anna is still here" in documents.created[0][1]
 
 
 async def test_a_job_that_is_not_the_last_creates_nothing(tmp_path: Path) -> None:

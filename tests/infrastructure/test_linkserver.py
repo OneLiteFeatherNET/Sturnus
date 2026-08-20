@@ -5,10 +5,7 @@ from typing import Any
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
-from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from sturnus.infrastructure.db.link_state import AccountLinkRepository
-from sturnus.infrastructure.db.models import Base
 from sturnus.infrastructure.linkserver import build_app
 
 # `pytest-aiohttp` is what normally supplies the `aiohttp_client` fixture
@@ -157,55 +154,3 @@ async def test_the_error_page_does_not_echo_the_input(aiohttp_client: AiohttpCli
     )
     body = await response.text()
     assert "<script>" not in body
-
-
-# ---------------------------------------------------------------------------
-# `AccountLinkRepository.save` / `.delete` (db/link_state.py).
-#
-# These belong with the rest of the repository suite
-# (tests/infrastructure/test_repositories.py), but that file is being edited
-# by another task in the same wave; putting the tests here, alongside the
-# class itself, avoids a collision. See the task report for the full
-# rationale.
-# ---------------------------------------------------------------------------
-
-GUILD_ANNA = 100
-BEN = 200
-
-
-@pytest.fixture
-async def link_repo(clean_database: str) -> AccountLinkRepository:
-    engine = create_async_engine(clean_database)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    return AccountLinkRepository(async_sessionmaker(engine, expire_on_commit=False))
-
-
-async def test_save_persists_a_new_mapping(link_repo: AccountLinkRepository) -> None:
-    await link_repo.save(GUILD_ANNA, "outline", "ext-1", "Anna")
-    assert await link_repo.delete(GUILD_ANNA, "outline") is True
-
-
-async def test_save_upserts_on_the_composite_key(link_repo: AccountLinkRepository) -> None:
-    """Re-linking after changing accounts replaces, it does not conflict."""
-    await link_repo.save(GUILD_ANNA, "outline", "ext-1", "Anna Old")
-    await link_repo.save(GUILD_ANNA, "outline", "ext-2", "Anna New")
-    # No primary-key violation was raised; the second save replaced the first.
-    assert await link_repo.delete(GUILD_ANNA, "outline") is True
-    assert await link_repo.delete(GUILD_ANNA, "outline") is False
-
-
-async def test_different_providers_do_not_collide(link_repo: AccountLinkRepository) -> None:
-    await link_repo.save(GUILD_ANNA, "outline", "ext-1", "Anna")
-    await link_repo.save(GUILD_ANNA, "confluence", "ext-9", "Anna")
-    assert await link_repo.delete(GUILD_ANNA, "outline") is True
-    assert await link_repo.delete(GUILD_ANNA, "confluence") is True
-
-
-async def test_delete_reports_whether_anything_was_removed(
-    link_repo: AccountLinkRepository,
-) -> None:
-    assert await link_repo.delete(BEN, "outline") is False
-    await link_repo.save(BEN, "outline", "ext-3", "Ben")
-    assert await link_repo.delete(BEN, "outline") is True
-    assert await link_repo.delete(BEN, "outline") is False
