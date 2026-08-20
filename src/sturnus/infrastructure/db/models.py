@@ -78,6 +78,15 @@ class Session(Base):
     document_id: Mapped[str | None] = mapped_column(Text)
     document_url: Mapped[str | None] = mapped_column(Text)
     announced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The session's own data key -- the source of truth for which key
+    # encrypted this session's recordings. Written once, when the session
+    # opens, so crash recovery can read back the key that actually
+    # encrypted whatever `.enc` files are left on disk instead of
+    # generating one that cannot decrypt them. Nullable because sessions
+    # predating this column, and sessions that crashed before this row was
+    # even written, have neither value.
+    encryption_key_id: Mapped[str | None] = mapped_column(Text)
+    wrapped_data_key: Mapped[bytes | None] = mapped_column(LargeBinary)
 
     __table_args__ = (Index("ix_session_status", "status"),)
 
@@ -91,6 +100,7 @@ class SessionParticipant(Base):
     discord_display_name: Mapped[str] = mapped_column(Text, nullable=False)
     detected_language: Mapped[str | None] = mapped_column(Text)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    audio_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         UniqueConstraint("session_id", "discord_user_id", name="uq_participant_per_session"),
@@ -109,6 +119,14 @@ class TranscriptionJob(Base):
     retention_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     audio_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(Text, nullable=False)
+    # Set every time `claim` hands this job to a worker (including a
+    # reclaim). `claim` reads this back to decide whether a `running` job's
+    # lease has expired -- a worker killed mid-job (SIGKILL, an evicted pod)
+    # would otherwise strand it `running` forever, since `claim` only ever
+    # selects `pending` jobs and nothing else ever moves it out of
+    # `running`. Nullable because a job that has never been claimed yet
+    # (still `pending`) has no lease to speak of.
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text)
     transcript: Mapped[str | None] = mapped_column(Text)

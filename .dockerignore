@@ -1,0 +1,25 @@
+# Version control
+.git
+.github
+
+# Local virtual environment -- rebuilt inside the image by `uv sync`.
+.venv
+
+# Documentation and planning material; not part of the running application.
+docs
+.superpowers
+
+# Tests never ship in the runtime image.
+tests
+
+# Tool caches -- regenerated as needed, never useful inside a build context.
+.mypy_cache
+.pytest_cache
+.ruff_cache
+**/__pycache__
+*.pyc
+.coverage
+htmlcov
+
+# Editor/OS noise.
+.DS_Store

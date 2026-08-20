@@ -1,0 +1,17 @@
+{{- if .Values.link.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sturnus.fullname" . }}-link
+  labels:
+    {{- include "sturnus.componentLabels" (dict "root" . "component" "link") | nindent 4 }}
+spec:
+  type: {{ .Values.link.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.link.service.port }}
+      targetPort: health
+      protocol: TCP
+  selector:
+    {{- include "sturnus.componentSelectorLabels" (dict "root" . "component" "link") | nindent 4 }}
+{{- end }}

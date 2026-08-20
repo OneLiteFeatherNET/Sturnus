@@ -9,7 +9,8 @@
       "package-name": "sturnus",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        { "type": "generic", "path": "pyproject.toml" }
+        { "type": "generic", "path": "pyproject.toml" },
+        { "type": "generic", "path": "charts/sturnus/Chart.yaml" }
       ]
     }
   }

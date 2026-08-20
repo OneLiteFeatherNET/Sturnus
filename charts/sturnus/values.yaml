@@ -1,0 +1,256 @@
+# Sturnus deploys as three components from one image, differing only in
+# `command` and in resources/volumes (Spec 4, Spec 13.5):
+#   bot    -- holds the Discord gateway connection and records; replicas: 1,
+#             fixed, RWO PVC for the in-progress recording.
+#   link   -- the small HTTP service handling the OAuth account-link callback;
+#             the only component with any inbound route.
+#   worker -- pulls transcription jobs, runs faster-whisper; PVC for the
+#             model cache so a restart does not re-download the model.
+
+image:
+  repository: harbor.onelitefeather.dev/sturnus/sturnus
+  # Defaults to .Chart.AppVersion (kept in lockstep by release-please).
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Name of a Kubernetes Secret that already exists in the namespace (managed
+# outside this chart, via SOPS -- Spec 13.5) and holds every credential the
+# process config in `sturnus.config.Settings` reads from the environment:
+# STURNUS_DISCORD_TOKEN, STURNUS_DATABASE_URL, STURNUS_S3_ACCESS_KEY,
+# STURNUS_S3_SECRET_KEY, STURNUS_MASTER_KEY -- plus, once the link component's
+# own settings land, the Outline service key and the OAuth client secret.
+# This chart only ever references the Secret by name via `envFrom.secretRef`;
+# it never places a secret value into values.yaml or a template.
+existingSecret: sturnus-secrets
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  # None of the three components calls the Kubernetes API, so the projected
+  # token is a standing credential with no job to do. Also set explicitly to
+  # `false` on every pod spec (belt and suspenders: a pod-level value always
+  # wins over this one, but this keeps the ServiceAccount object itself from
+  # defaulting a future, differently-configured pod back to `true`).
+  automount: false
+
+# Non-secret environment shared by all three components. Component-specific
+# non-secret env lives under each component's own `env` map below.
+commonEnv:
+  STURNUS_HEALTH_PORT: "8080"
+  STURNUS_S3_ENDPOINT: "https://s3.onelitefeather.dev"
+  STURNUS_S3_BUCKET: "sturnus-audio"
+  # Identifies which master key encrypted a recording, so the key can be
+  # rotated without re-encrypting existing material (see config.py). Not a
+  # credential itself, so it is plain config rather than Secret material.
+  STURNUS_MASTER_KEY_ID: "v1"
+
+# Every component's health/readiness server listens on this container port
+# (see sturnus/infrastructure/health.py); the container image is the same
+# for all three, so the port is shared here rather than repeated per component.
+healthPort: 8080
+
+# The node label + value `bot` (and, if the cluster needs it, `worker`) is
+# pinned to, since bot's PVC binds the pod to a zone within that region
+# anyway (Spec 13.5). The real value belongs to the target cluster and is
+# expected to be overridden by the environment-specific values file (the
+# Kubernetes-FLUX repo's app overlay), not hardcoded here.
+region:
+  key: topology.kubernetes.io/region
+  value: eu-central-1
+
+# Shared across all three components: they run from the same image as the
+# same uid/gid, so one pod- and one container-level policy covers bot, link
+# and worker alike.
+#
+# `runAsUser`/`runAsGroup` are pinned to 1000 explicitly rather than left to
+# the image default (Dockerfile creates `sturnus` at uid/gid 1000) -- if a
+# future image build ever changes that, a mismatch here fails at admission
+# instead of silently running as whatever uid the image happens to declare.
+# `fsGroup: 1000` is what lets that non-root user write the PVC-backed
+# volumes (bot's recordings, worker's model cache): without it the volume is
+# mounted root-owned and both writes fail at runtime instead of at deploy.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# `readOnlyRootFilesystem: true` is why every deployment template also
+# mounts an emptyDir at /tmp (Python and its libraries write there
+# regardless of what the process itself does), and why worker additionally
+# sizes /tmp to hold a decrypted audio file, not just interpreter scratch
+# space -- see `worker.tmpSizeLimit` below.
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: true
+
+nodeSelector: {}
+tolerations: []
+
+bot:
+  # Fixed at 1: two instances would hold two Discord gateway connections and
+  # record every session twice. Not exposed as a values knob -- the
+  # Deployment template hardcodes both `replicas: 1` and `strategy.type:
+  # Recreate` for this reason, so nothing can turn it into a rolling update.
+  command: ["sturnus-bot"]
+  env:
+    STURNUS_RECORDING_DIR: /data/recordings
+  # Recordings themselves go straight to the PVC above; this only needs to
+  # cover Python/library scratch writes to /tmp under readOnlyRootFilesystem.
+  tmpSizeLimit: 256Mi
+  resources:
+    requests:
+      cpu: "1"
+      memory: 512Mi
+    limits:
+      cpu: "1"
+      memory: 1Gi
+  # A session is one continuous, unsegmented recording per speaker (Spec
+  # 6.4): on SIGTERM the bot must close every file, encrypt it and upload it
+  # to S3 before the process is killed. The default 30s grace period would
+  # truncate that mid-upload on any multi-hour session and silently discard
+  # exactly what the SIGTERM handler exists to save. 21600s (6h) covers the
+  # documented `max_session_hours` ceiling plus upload time with margin; size
+  # this to the deployed `max_session_hours` if that default ever changes.
+  terminationGracePeriodSeconds: 21600
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    initialDelaySeconds: 10
+    periodSeconds: 20
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: health
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  persistence:
+    # RWO is sufficient at replicas: 1 (Spec 6.4). Sized for
+    # `max_session_hours` x expected speaker count -- roughly 5Gi at four
+    # hours and ten speakers per Spec 13.5.
+    size: 5Gi
+    storageClassName: ""
+    accessMode: ReadWriteOnce
+  pdb:
+    enabled: true
+    # With a single, fixed replica, `minAvailable: 1` blocks every voluntary
+    # eviction -- that is the point: a live recording must not be evicted
+    # mid-session (Spec 13.5). It does not protect against a node failure or
+    # a manual/forced drain, only against routine, voluntary disruption.
+    minAvailable: 1
+  service:
+    enabled: true
+    type: ClusterIP
+
+link:
+  command: ["sturnus-link"]
+  replicaCount: 2
+  env: {}
+  # link writes nothing but Python/library scratch to /tmp under
+  # readOnlyRootFilesystem -- it is the most locked-down of the three, and
+  # the only one reachable from outside the cluster.
+  tmpSizeLimit: 128Mi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    initialDelaySeconds: 5
+    periodSeconds: 20
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: health
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 80
+
+# The bot holds the Discord token, the S3 credentials and the audio master
+# key and must never be reachable from outside the cluster; `link` is the
+# only component with a public callback (the OAuth redirect) and is
+# therefore the only one ever exposed. Following the Outline installation's
+# pattern, actual exposure is an external Cloudflare Tunnel Ingress managed
+# outside this chart -- so the chart's own route stays disabled by default.
+httpRoute:
+  enabled: false
+  annotations: {}
+  parentRefs:
+    - name: gateway
+      sectionName: http
+  hostnames:
+    - link.sturnus.example.invalid
+
+worker:
+  command: ["sturnus-worker"]
+  replicaCount: 1
+  env:
+    STURNUS_MODEL_CACHE_DIR: /data/model-cache
+    STURNUS_WHISPER_MODEL: large-v3-turbo
+  # Larger than bot/link's: `process_one` (plan 3, task 9 -- not yet landed
+  # on this branch as of this hardening pass) downloads the encrypted
+  # object and decrypts it to a temporary WAV before transcribing, and the
+  # plan's own language ("temporary directory", "temporary WAV", removed in
+  # a `finally`) is exactly Python's `tempfile` module, which resolves to
+  # /tmp (or $TMPDIR) by default. Sized for one speaker's decrypted
+  # recording plus the encrypted download and interpreter scratch, not just
+  # the latter. If the worker entrypoint ends up writing its working
+  # directory somewhere other than /tmp, this mount and size need revisiting
+  # against that actual path.
+  tmpSizeLimit: 4Gi
+  resources:
+    requests:
+      cpu: "4"
+      memory: 2Gi
+    limits:
+      cpu: "4"
+      memory: 2560Mi
+  # The model (faster-whisper large-v3-turbo) downloads on first start on a
+  # cold cache volume, which takes minutes -- not seconds. A startupProbe
+  # gives that its own, generous budget: liveness and readiness are not
+  # evaluated at all until it succeeds, so a slow download cannot be mistaken
+  # for a hung process and cannot trigger a restart loop. Once the startup
+  # probe succeeds, liveness/readiness take over on their normal cadence.
+  startupProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    periodSeconds: 10
+    failureThreshold: 60 # 10 minutes to cover a cold-cache model download
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    periodSeconds: 20
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: health
+    periodSeconds: 10
+  persistence:
+    # Holds the downloaded model weights so a restart doesn't repeat the
+    # download; ~1.6GB for large-v3-turbo in int8 (Spec 7) plus headroom.
+    size: 10Gi
+    storageClassName: ""
+    accessMode: ReadWriteOnce
+  service:
+    enabled: true
+    type: ClusterIP

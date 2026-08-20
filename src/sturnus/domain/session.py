@@ -25,6 +25,13 @@ class EndReason(StrEnum):
     EMPTY = "empty"
     IDLE_TIMEOUT = "idle_timeout"
     MAX_DURATION = "max_duration"
+    #: The process ended without going through `SessionMachine` at all --
+    #: a hard kill, an evicted pod -- observed only after the fact, by
+    #: `recover_orphans` scanning what was left on disk.
+    CRASHED = "crashed"
+    #: An orderly shutdown (e.g. `SIGTERM`) closed the session while it
+    #: was still recording, before any of the machine's own timeouts fired.
+    SHUTDOWN = "shutdown"
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,8 @@ class SessionMachine:
             if self.state is SessionState.IDLE:
                 self.started_at = now
                 self._last_audio_at = now
+            elif self.state is SessionState.GRACE:
+                self._last_audio_at = now
             self.state = SessionState.RECORDING
             self._grace_since = None
         elif self.state is SessionState.RECORDING:
@@ -92,6 +101,28 @@ class SessionMachine:
         self.state = SessionState.CLOSING
         self.end_reason = reason
         return reason
+
+    def reset(self) -> None:
+        """Returns the machine from CLOSING to IDLE, ready for a new session.
+
+        CLOSING is otherwise a dead end -- nothing in this class ever
+        leaves it on its own, which is exactly what left a guild deaf
+        forever after its first recorded session. This is the explicit
+        exit edge: called once the caller has finished acting on the
+        reason `tick()` reported (closing files, uploading, enqueuing),
+        never automatically by `tick()` itself, since a caller that is
+        shutting down for good (Spec 6.4's `SHUTDOWN` reason) must be free
+        to leave the machine in CLOSING rather than implicitly offering a
+        session that will never be recorded.
+        """
+        assert self.state is SessionState.CLOSING, (
+            "reset() must only follow a reason reported by tick()"
+        )
+        self.state = SessionState.IDLE
+        self.started_at = None
+        self.end_reason = None
+        self._last_audio_at = None
+        self._grace_since = None
 
     def _due_reason(self, now: datetime) -> EndReason | None:
         assert self.started_at is not None

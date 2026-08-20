@@ -159,12 +159,12 @@ from sturnus.config import Settings
 
 def _env(**overrides: str) -> dict[str, str]:
     base = {
-        "STURNUS_DISCORD_TOKEN": "token",
+        "STURNUS_DISCORD_TOKEN": "discord-secret-value",
         "STURNUS_DATABASE_URL": "postgresql+asyncpg://u:p@localhost/db",
         "STURNUS_S3_ENDPOINT": "https://s3.example",
         "STURNUS_S3_BUCKET": "sturnus-audio",
         "STURNUS_S3_ACCESS_KEY": "ak",
-        "STURNUS_S3_SECRET_KEY": "sk",
+        "STURNUS_S3_SECRET_KEY": "s3-secret-value",
         "STURNUS_MASTER_KEY": "c3R1cm51cy10ZXN0LWtleS0zMi1ieXRlcy1sb25nISE=",
         "STURNUS_MASTER_KEY_ID": "k1",
         "STURNUS_RECORDING_DIR": "/tmp/rec",
@@ -194,8 +194,11 @@ def test_secrets_are_not_exposed_by_repr(monkeypatch: pytest.MonkeyPatch) -> Non
     for k, v in _env().items():
         monkeypatch.setenv(k, v)
     rendered = repr(Settings())
-    assert "token" not in rendered
-    assert "sk" not in rendered
+    # Assert on the secret VALUES, never on words that also appear in field
+    # names — `discord_token` contains "token", so such an assertion could
+    # never hold regardless of whether masking works.
+    assert "discord-secret-value" not in rendered
+    assert "s3-secret-value" not in rendered
     assert "c3R1cm51cy" not in rendered
 ```
 
@@ -207,12 +210,23 @@ Expected: FAIL — `sturnus.config` does not exist.
 - [ ] **Step 3: Add the dependencies**
 
 ```bash
-uv add "pydantic-settings>=2.12.0" "cryptography>=44.0" "soxr>=0.5" "boto3>=1.35" \
-  "discord.py>=2.6.4" "discord-ext-voice-recv>=0.5.4a0"
-uv add --group test "moto[s3]>=5.0" "pytest-cov>=6.0"
+uv add "pydantic-settings>=2.12.0" "cryptography>=44.0" "soxr>=0.5" "numpy>=2.1" \
+  "boto3>=1.35" "discord.py>=2.6.4" "discord-ext-voice-recv>=0.5.2a179"
+uv add --group test "moto[s3]>=5.0"
 ```
 
-> **Verify during implementation:** the exact distribution name and version of the voice-receive extension. It is published from `imayhaveborkedit/discord-ext-voice-recv` and its release cadence is irregular. If the coordinate above does not resolve, find the current one rather than substituting a different library — Task 9 depends on this specific extension for RTP timestamp access.
+Also add the pydantic plugin to `[tool.mypy]`, or every `Settings()` reads as a
+call missing each required argument:
+
+```toml
+plugins = ["pydantic.mypy"]
+```
+
+> The voice-receive extension resolves at `0.5.2a179`; earlier drafts of this
+> plan guessed a version that does not exist. See
+> `docs/verification/voice-receive-spike.md` for what the installed package
+> actually exposes — `RTPPacket` carries `timestamp` and `ssrc`, which settles
+> the assumption Spec 6.2 rests on.
 
 - [ ] **Step 4: Write the settings module**
 
@@ -403,6 +417,7 @@ import os
 from pathlib import Path
 
 import pytest
+from cryptography.exceptions import InvalidTag
 
 from sturnus.infrastructure.crypto import (
     CHUNK_SIZE,
@@ -433,7 +448,7 @@ def test_each_data_key_is_distinct() -> None:
 def test_a_wrong_master_key_cannot_unwrap() -> None:
     wrapped = wrapper().new_data_key().wrapped
     other = KeyWrapper(master_key=b"1" * 32, key_id="k1")
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidTag):
         other.unwrap(wrapped)
 
 
@@ -481,7 +496,7 @@ def test_tampering_is_detected(tmp_path: Path) -> None:
     data[-1] ^= 0xFF
     encrypted.write_bytes(bytes(data))
 
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidTag):
         decrypt_file(encrypted, tmp_path / "b.out", key)
 
 
@@ -490,7 +505,7 @@ def test_a_wrong_data_key_cannot_decrypt(tmp_path: Path) -> None:
     plain.write_bytes(os.urandom(4096))
     w = wrapper()
     encrypt_file(plain, tmp_path / "c.enc", w.new_data_key().plaintext)
-    with pytest.raises(Exception):
+    with pytest.raises(InvalidTag):
         decrypt_file(tmp_path / "c.enc", tmp_path / "c.out", w.new_data_key().plaintext)
 
 
@@ -1854,3 +1869,147 @@ Nothing reads those jobs yet. Plan 3 adds the worker: transcription, the transcr
 - **The spike in Task 10 may invalidate Spec 6.2.** If the extension does not expose RTP timestamps, silence reconstruction has no basis and the design needs revisiting before the worker is built on top of it.
 - **CPU under real load is unmeasured.** Resampling several concurrent streams on one core is plausible but untested; the first real session is also the first measurement.
 - **`audio_started_at` accuracy depends on the SSRC-to-user mapping being available at the first packet.** If it arrives later, the first packets of a speaker cannot be attributed, and the epoch shifts by however long that takes. The spike must answer this.
+
+---
+
+### Task 12: Guided setup and two constants moved into configuration
+
+Implements Spec 10.1 and the two configuration keys added alongside it.
+
+**Files:**
+- Create: `src/sturnus/infrastructure/discord/setup_cog.py`
+- Create: `src/sturnus/application/setup_plan.py`
+- Modify: `src/sturnus/domain/settings.py`, `src/sturnus/infrastructure/discord/permissions.py`, `src/sturnus/application/documents.py`
+- Test: `tests/application/test_setup_plan.py`
+
+**Interfaces:**
+- Produces:
+  - `settings.ADMIN_ROLE_ID`, `settings.MERGE_GAP_SECONDS` and their defaults
+  - `PermissionChange(target: str, allow_speak: bool | None)`, `SetupPlan(writes: dict[str, str], permission_changes: list[PermissionChange], role_to_create: str | None, missing: list[str])`
+  - `plan_setup(current: dict[str, str | None], channel_id: int, role_id: int | None, policy_url: str, policy_version: str, everyone_may_speak: bool, role_may_speak: bool) -> SetupPlan`
+  - `SetupCog`
+
+- [ ] **Step 1: Write the failing test for the planning function**
+
+The command's decisions live in a pure function so they can be tested without a guild. Discord objects never reach it — only the ids and permission facts read off them.
+
+```python
+# tests/application/test_setup_plan.py
+from sturnus.application.setup_plan import PermissionChange, plan_setup
+from sturnus.domain import settings
+
+CHANNEL, ROLE = 111, 222
+POLICY_URL = "https://example.org/privacy"
+POLICY_VERSION = "2026-08-01"
+
+
+def plan(current: dict[str, str | None] | None = None, **kw: object) -> object:
+    defaults: dict[str, object] = {
+        "current": current or {},
+        "channel_id": CHANNEL,
+        "role_id": ROLE,
+        "policy_url": POLICY_URL,
+        "policy_version": POLICY_VERSION,
+        "everyone_may_speak": True,
+        "role_may_speak": False,
+    }
+    defaults.update(kw)
+    return plan_setup(**defaults)  # type: ignore[arg-type]
+
+
+def test_a_fresh_guild_writes_every_required_key() -> None:
+    result = plan(None)
+    assert result.writes[settings.VOICE_CHANNEL_ID] == str(CHANNEL)
+    assert result.writes[settings.CONSENT_ROLE_ID] == str(ROLE)
+    assert result.writes[settings.POLICY_URL] == POLICY_URL
+
+
+def test_nothing_required_remains_missing_after_a_full_setup() -> None:
+    assert plan(None).missing == []
+
+
+def test_a_missing_document_target_is_reported_not_invented() -> None:
+    """The Outline collection cannot be guessed from Discord."""
+    result = plan({settings.DOCUMENT_TARGET: None})
+    assert settings.DOCUMENT_TARGET in result.missing
+
+
+def test_everyone_speaking_is_denied() -> None:
+    """The primary layer of the consent protection (Spec 3.1)."""
+    result = plan(everyone_may_speak=True)
+    assert PermissionChange("everyone", allow_speak=False) in result.permission_changes
+
+
+def test_the_consent_role_is_allowed_to_speak() -> None:
+    result = plan(role_may_speak=False)
+    assert PermissionChange("consent_role", allow_speak=True) in result.permission_changes
+
+
+def test_correct_permissions_produce_no_changes() -> None:
+    """Re-running against a configured guild must be a no-op, not a rewrite."""
+    result = plan(everyone_may_speak=False, role_may_speak=True)
+    assert result.permission_changes == []
+
+
+def test_a_missing_role_is_requested_for_creation() -> None:
+    result = plan(role_id=None)
+    assert result.role_to_create is not None
+    assert settings.CONSENT_ROLE_ID not in result.writes
+
+
+def test_an_unchanged_value_is_not_rewritten() -> None:
+    result = plan({settings.VOICE_CHANNEL_ID: str(CHANNEL)})
+    assert settings.VOICE_CHANNEL_ID not in result.writes
+
+
+def test_a_changed_channel_is_rewritten() -> None:
+    result = plan({settings.VOICE_CHANNEL_ID: "999"})
+    assert result.writes[settings.VOICE_CHANNEL_ID] == str(CHANNEL)
+```
+
+- [ ] **Step 2: Run it, confirm it fails, then implement `plan_setup`**
+
+It compares the desired state against what is already configured and returns only the differences. Re-running against a correctly configured guild yields an empty plan — that is what makes the command safe to run twice.
+
+`document_target` cannot be derived from Discord, so it is reported as missing rather than guessed.
+
+- [ ] **Step 3: Add the two configuration keys**
+
+In `domain/settings.py`: `ADMIN_ROLE_ID = "admin_role_id"` (required, no default) and `MERGE_GAP_SECONDS = "merge_gap_seconds"` with default `"15"`. Add the latter to the integer keys that `ConfigStore.set` validates, and `ADMIN_ROLE_ID` to `REQUIRED_KEYS`.
+
+Then remove the two constants they replace:
+- `permissions.py`'s hardcoded role name — `require_admin()` reads `admin_role_id` from the config store instead. Discord's own administrator permission still passes unconditionally, so a guild that has not configured the key yet is not locked out of `/config` and `/setup`.
+- `documents.py`'s merge gap default — `render_transcript` already takes the gap from its caller; make the worker read it from configuration in plan 3.
+
+- [ ] **Step 4: Write the cog**
+
+`/setup` with typed parameters so Discord renders native pickers:
+
+```python
+@app_commands.command()
+@require_admin()
+async def setup(
+    self,
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel,
+    policy_url: str,
+    policy_version: str,
+    consent_role: discord.Role | None = None,
+) -> None: ...
+```
+
+The cog reads the current configuration and the channel's existing overwrites, calls `plan_setup`, applies the result, and reports what it changed, what it left alone, and what is still missing. Ephemeral, like every other reply.
+
+Requirements a reviewer checks by reading:
+
+- **Permission failures are reported, never swallowed.** If the bot may not edit the channel or create the role, it says exactly what a human must do instead. A half-applied setup that claims success is worse than one that admits it stopped.
+- **It applies the configuration writes even when the permission changes fail**, and says so — the two are independent, and refusing to store anything because a permission edit failed would leave the guild worse off than before.
+- **It never prints a token or a secret**, and its summary names keys, not values, for anything that could be sensitive later.
+
+- [ ] **Step 5: Verify and commit**
+
+```bash
+uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest
+git add -A
+git commit -m "feat: add guided setup and move two constants into configuration"
+```

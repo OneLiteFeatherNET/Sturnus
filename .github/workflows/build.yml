@@ -4,6 +4,10 @@ on:
   pull_request:
   push:
     branches: [main]
+  schedule:
+    # Weekly run so the `slow` tests (real Whisper model download + inference)
+    # stay exercised somewhere, even though pull requests deselect them.
+    - cron: "0 4 * * 1"
 
 permissions:
   contents: read
@@ -24,4 +28,12 @@ jobs:
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy
-      - run: uv run pytest -v
+      # Pull requests deselect `slow` (real Whisper model download + inference from
+      # HuggingFace): it is slow and depends on a third party being reachable. It
+      # still runs on push to main and on the weekly schedule above.
+      - name: Run tests (pull requests skip slow tests)
+        if: github.event_name == 'pull_request'
+        run: uv run pytest -v -m "not slow"
+      - name: Run tests (including slow tests)
+        if: github.event_name != 'pull_request'
+        run: uv run pytest -v

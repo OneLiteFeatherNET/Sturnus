@@ -1,0 +1,20 @@
+{
+  "config": {
+    // The design spec, plans, and task briefs under docs/ and .superpowers/ use long
+    // prose lines; wrapping them would make diffs unreadable. Mirrors the exclusion
+    // ruff already applies to docs/ for the same reason (see [tool.ruff] in pyproject.toml).
+    "MD013": false
+  },
+  "ignores": [
+    "**/node_modules/**",
+    "**/.venv/**",
+    // Release Please writes this; its heading structure is not ours to police.
+    "CHANGELOG.md",
+    // Prose specs, plans, and verification checklists, not maintained documentation.
+    "docs/**",
+    // Ephemeral per-task briefs and fix reports, not maintained documentation.
+    ".superpowers/**",
+    // Manual verification transcripts, kept as run records rather than docs.
+    "scripts/**"
+  ]
+}

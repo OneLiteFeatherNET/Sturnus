@@ -20,3 +20,16 @@ jobs:
         with:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+  publish:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+      id-token: write   # keyless signing
+    uses: OneLiteFeatherNET/workflows/.github/workflows/docker-publish.yml@v2.8.1
+    with:
+      image-name: "onelitefeather/sturnus"
+      version: ${{ needs.release-please.outputs.version }}
+      context: "."
+    secrets: inherit

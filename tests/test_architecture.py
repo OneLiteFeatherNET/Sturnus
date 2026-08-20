@@ -270,21 +270,36 @@ def test_import_resolution_comprehensive(
         )
 
 
-def test_directory_walk_detects_real_violation() -> None:
-    """End-to-end test that the directory walk detects actual violations."""
-    probe_file = DOMAIN / "_probe_real_violation.py"
-    try:
-        # Create a real probe file with an absolute import of a forbidden module
-        probe_file.write_text("from sturnus.infrastructure import db\n")
+def test_directory_walk_detects_real_violation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End-to-end test that the directory walk detects actual violations.
 
-        violations: list[str] = []
-        for path in DOMAIN.rglob("*.py"):
-            for module in _imported_modules(path):
-                if not _is_stdlib_or_domain(module):
-                    violations.append(f"{path.relative_to(DOMAIN.parent)}: {module}")
+    This builds a throwaway package tree under `tmp_path` that mirrors the
+    real `src/sturnus/domain` layout closely enough for `_get_package_name`
+    to resolve it, and points the module-level `SRC` constant at that tree
+    for the duration of the test. `_imported_modules` resolves relative
+    imports through `SRC`, so this is what lets a probe file with a real,
+    on-disk absolute import be walked and detected exactly as production
+    code would be -- without ever writing into the real `src/` tree, which
+    would make the test impure and fail on a read-only checkout.
+    """
+    fake_src = tmp_path / "src"
+    fake_domain = fake_src / "sturnus" / "domain"
+    fake_domain.mkdir(parents=True)
 
-        # Verify the violation was caught by the directory walk
-        found = any("_probe_real_violation.py" in v for v in violations)
-        assert found, f"Expected violation not found in directory walk. Violations: {violations}"
-    finally:
-        probe_file.unlink(missing_ok=True)
+    # A real probe file with an absolute import of a forbidden module.
+    probe_file = fake_domain / "_probe_real_violation.py"
+    probe_file.write_text("from sturnus.infrastructure import db\n")
+
+    monkeypatch.setattr(sys.modules[__name__], "SRC", fake_src)
+
+    violations: list[str] = []
+    for path in fake_domain.rglob("*.py"):
+        for module in _imported_modules(path):
+            if not _is_stdlib_or_domain(module):
+                violations.append(f"{path.relative_to(fake_domain.parent)}: {module}")
+
+    # Verify the violation was caught by the directory walk
+    found = any("_probe_real_violation.py" in v for v in violations)
+    assert found, f"Expected violation not found in directory walk. Violations: {violations}"
