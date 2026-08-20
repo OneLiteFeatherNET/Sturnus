@@ -59,8 +59,9 @@ class GuildRuntimeConfig:
     """Everything about a guild that the bot process holds in memory.
 
     Deliberately *not* every configuration key: `admin_role_id`,
-    `policy_url`, `policy_version`, `document_target`, `merge_gap_seconds`
-    and `document_provider` are read per use (by a permission check, by the
+    `policy_url`, `policy_version`, `document_target`, `merge_gap_seconds`,
+    `document_provider`, `transcription_language` and
+    `transcription_prompt` are read per use (by a permission check, by the
     consent cache, or by the worker process entirely) and were never stale
     to begin with. Only what the bot caches needs reconciling.
     """

@@ -30,11 +30,21 @@ class TranscriptionResult:
 
 
 class TranscriptionEngine(Protocol):
-    async def transcribe(self, path: Path, language: str | None) -> TranscriptionResult:
+    async def transcribe(
+        self, path: Path, language: str | None, initial_prompt: str | None
+    ) -> TranscriptionResult:
         """Transcribe one speaker's recording.
 
         `language` pins the language; `None` asks the engine to detect it and
         report what it found.
+
+        `initial_prompt` is vocabulary and style for the engine to lean
+        towards — an organisation's project names, the words a general
+        model has never seen and will otherwise replace with something it
+        has. It is deliberately a required argument rather than one with a
+        default: the guild's configured prompt (Spec 11) is worth nothing
+        if a call site can quietly leave it out, and a caller that really
+        has no vocabulary to offer says so by passing `None`.
         """
         ...
 

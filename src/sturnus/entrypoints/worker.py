@@ -112,9 +112,21 @@ _RETENTION_SWEEP_INTERVAL_SECONDS = 3600.0
 _DOCUMENT_RETRY_INTERVAL_SECONDS = 300.0
 
 #: faster-whisper on CPU (Spec 7 sizes the deployment for CPU, not GPU --
-#: see `charts/sturnus/values.yaml`'s `worker.resources`): int8 is the
-#: quantisation the chart's own model-size comment already assumes.
-_WHISPER_COMPUTE_TYPE = "int8"
+#: see `charts/sturnus/values.yaml`'s `worker.resources`). The weights are
+#: still quantised to int8, which is what keeps `large-v3` inside a
+#: memory budget a CPU node will actually give it; the `_float32` half
+#: names the type everything *else* runs in -- activations, accumulation,
+#: the layers that are never quantised.
+#:
+#: Naming it is the point. Plain `int8` is an alias whose float type
+#: CTranslate2 picks for the device it finds itself on, so what the
+#: decoder accumulates in is decided by the node the pod landed on rather
+#: than by this file; on today's x86 workers the alias resolves to exactly
+#: this, and on a machine with bfloat16 support it need not. Transcription
+#: quality is not something to leave to the scheduler, and CTranslate2
+#: falls back silently rather than refusing a compute type it cannot
+#: provide -- there would be nothing in the logs to say it had happened.
+_WHISPER_COMPUTE_TYPE = "int8_float32"
 
 #: Package and resource name of the real Outline document template. See
 #: `_load_template` -- this is the packaged template `process_one` must
@@ -161,8 +173,20 @@ class WorkerSettings(StrictSettings):
     master_key_id: str
     outline_base_url: str
     outline_service_key: SecretStr
-    whisper_model: str = "large-v3-turbo"
-    whisper_default_language: str = "en"
+    # `large-v3` rather than `large-v3-turbo`: turbo is a distillation with
+    # four decoder layers instead of thirty-two, and what it gives up is
+    # concentrated outside English -- which is the only place this
+    # deployment operates. It buys speed, and nothing here is waiting:
+    # transcription runs offline, one speaker's file at a time, after the
+    # meeting is over. The cost is paid in the chart instead, in memory
+    # and in a longer first start (`charts/sturnus/values.yaml`).
+    whisper_model: str = "large-v3"
+    # The floor under `transcription_language` (Spec 11), which is
+    # per-guild and normally decides this; reached only when a guild asked
+    # for detection and the engine's detection came back with nothing.
+    # `en` here was a real defect, not a harmless default: every guild
+    # this serves meets in German.
+    whisper_default_language: str = "de"
     model_cache_dir: Path | None = None
     work_dir: Path = Path("/tmp")
     max_job_attempts: int = 3

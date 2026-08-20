@@ -16,6 +16,17 @@ POLICY_URL = "policy_url"
 ADMIN_ROLE_ID = "admin_role_id"
 MERGE_GAP_SECONDS = "merge_gap_seconds"
 TIMEZONE = "timezone"
+TRANSCRIPTION_LANGUAGE = "transcription_language"
+TRANSCRIPTION_PROMPT = "transcription_prompt"
+
+#: The one value of `TRANSCRIPTION_LANGUAGE` that is not a language: it
+#: asks the engine to detect one per speaker and pin what it found for the
+#: rest of the session, which is what the worker did unconditionally before
+#: this key existed. It exists because `DEFAULTS` below names a language,
+#: and `/config clear` restores a default rather than removing it -- without
+#: a spelling for "detect", a guild that really does meet in several
+#: languages would have no way back to detection at all.
+DETECT_LANGUAGE = "auto"
 
 DEFAULTS: dict[str, str] = {
     EMPTY_GRACE_SECONDS: "60",
@@ -30,6 +41,32 @@ DEFAULTS: dict[str, str] = {
     # not obviously wrong to a reader -- 15:08 looks like a plausible
     # meeting time whether or not it is the right one.
     TIMEZONE: "Europe/Berlin",
+    # Naming the language is worth far more than it looks. The
+    # alternative is detection, which runs on one speaker's track after
+    # the silence has been cut out of it, and a speaker whose first
+    # contribution is "ja, genau" gives it almost nothing to go on --
+    # German, Dutch and Danish are all plausible readings of three
+    # seconds of that. Whatever comes back is then pinned for that
+    # speaker for the rest of the session, so a single unlucky guess is
+    # not one bad job, it is every job for that person from then on.
+    # German is what this deployment's guilds actually meet in; `auto`
+    # (see `DETECT_LANGUAGE` above) is how one that does not says so.
+    TRANSCRIPTION_LANGUAGE: "de",
+    # Whisper's `initial_prompt` biases the decoder towards the
+    # vocabulary and the style of this text. Proper nouns are where a
+    # general model fails and where a protocol is judged: a model that
+    # has never seen "Ducula" will confidently write the nearest word it
+    # has seen, and a decision recorded about the wrong project is worse
+    # than no minutes at all. The default is OneLiteFeather's own
+    # vocabulary -- the bird-named projects and the stack they are built
+    # on -- written as an ordinary German sentence so the style it biases
+    # towards is punctuated prose in the language above rather than a
+    # bare word list.
+    TRANSCRIPTION_PROMPT: (
+        "Protokoll eines OneLiteFeather-Meetings über die Projekte Falco, Otis, "
+        "Ducula, Pica, Guira, Aves, Sturnus, Cygnus, Apus und Coris sowie über "
+        "Minestom, Paper, Outline, Harbor, Flux, Kubernetes, Renovate und Gradle."
+    ),
 }
 
 # No default value, so these must be set before going live.
