@@ -301,6 +301,15 @@ The policy that replaces it:
   timers know nothing about that, and without this the session runs on to
   `idle_timeout` and closes looking exactly like a meeting where nobody spoke —
   the row that let the original incident go unnoticed for hours.
+- **A capture-side end holds the guild out of the channel for fifteen minutes.**
+  Leaving the channel is itself a voice-state update, so acting on that event
+  is how a persistent fault feeds itself: leave, rejoin, fail, leave again — a
+  run of empty sessions, each one announcing to everyone present that they are
+  being recorded. The guard lapses on the tick loop, not on the next
+  voice-state update, and then recounts the channel itself: capture failing is
+  not something the people in the channel did, and none of them has any reason
+  to leave and come back afterwards. A guard that only somebody else's action
+  can lift is an outage wearing a timeout's clothes.
 - **We conceal what the network lost, never what our decoder could not read.**
   Packet-loss concealment fills in lost frames for a capped run; a decode
   failure is filled with real silence, because inventing audio to cover our own
@@ -313,10 +322,10 @@ checked for them. Their frames are not decoded, not buffered and not written,
 and one WARNING per SSRC says so. Identity is never inferred: a guess in front
 of a consent gate is not an acceptable trade for a second of audio.
 
-What this deliberately does *not* do — a rejoin cooldown, a bounded hand-off, a
-non-blocking consent lookup, notices into the channel, voice metrics — is
-recorded with what was observed in
-`docs/verification/voice-receive-spike.md`, under *Known limitations*.
+What this deliberately does *not* do — a bounded hand-off, a non-blocking
+consent lookup, notices into the channel, voice metrics — is recorded with what
+was observed in `docs/verification/voice-receive-spike.md`, under *Known
+limitations*.
 
 ### 6.2 Time reconstruction
 

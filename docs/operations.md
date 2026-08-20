@@ -367,6 +367,34 @@ These happen at different granularities and leave different traces:
   problem is fixed; anything else raised there is a transient failure
   worth retrying.
 
+**The bot is sitting out of the channel while people are in it.** A
+session that ended with `capture_failure` or `decode_failure` means the bot
+could not hear, not that nobody spoke, and the guild is then held out of
+that channel for fifteen minutes
+(`sturnus.infrastructure.discord.client.REJOIN_COOLDOWN`) — the bot's own
+departure is itself a voice-state update, so rejoining immediately would
+just meet the same fault and open another empty session row. It is not a
+state anyone has to clear: the tick loop lifts it on its own and picks the
+channel back up if consenting members are still there, without waiting for
+anyone to leave and rejoin. The log says which of the two it is:
+
+- `The session in channel N ended with capture_failure; not recording there
+  again before <timestamp>` — armed, with the deadline in the line.
+- `Ignoring a voice-state update in channel N: capture failed and no
+  session will start there before <timestamp>` — someone came or went
+  while it was in force.
+- `The capture-failure cooldown for channel N has passed; recording may
+  resume` — lifted.
+
+If there is none of that in the log, the silence has some other cause.
+Sessions that ended this way are also visible directly:
+```sql
+SELECT id, guild_id, channel_id, ended_at, end_reason FROM session
+WHERE end_reason IN ('capture_failure', 'decode_failure') ORDER BY ended_at DESC;
+```
+A run of them fifteen minutes apart is a fault that is not transient; the
+ERROR that the voice adapter logged at the time says what it was.
+
 **A stalled queue.** `JobQueue.claim` uses `SELECT ... FOR UPDATE SKIP
 LOCKED`, so any number of `pending` jobs sitting unclaimed with `attempts`
 not increasing is not a database contention problem — it means nothing is

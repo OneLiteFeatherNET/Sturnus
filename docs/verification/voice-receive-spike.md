@@ -213,19 +213,6 @@ should follow and corrupts that SSRC's RTP reference point. Bounding the audio
 is worth doing. Reordering it against control messages is not, and the two need
 to be separated before either lands.
 
-### Capture failure can loop
-
-A session that ends with `capture_failure` or `decode_failure` makes the bot
-leave the channel, and leaving is itself a voice-state update. If the fault is
-persistent, the next event opens a fresh session row, rejoins, meets the same
-fault and closes again — a run of empty sessions, each one telling everyone
-present that they are being recorded.
-
-*What was tried:* a 15-minute per-guild rejoin cooldown with `blocked_until`
-bookkeeping on `_GuildRecording`. It works, but it is a second scheduling
-mechanism living beside the session machine's own, and it belongs in a change
-about rejoin policy rather than in one about Opus decoding.
-
 ### Nobody in the channel is told
 
 Every failure here is visible to an operator — WARNING or ERROR in the log, and
