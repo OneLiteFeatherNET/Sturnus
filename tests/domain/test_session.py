@@ -91,6 +91,54 @@ def test_tick_before_start_does_nothing() -> None:
     assert machine().tick(T0 + timedelta(hours=10)) is None
 
 
+def test_reset_returns_closing_to_idle_ready_for_a_new_session() -> None:
+    """CLOSING must not be a dead end -- `reset()` is its only exit edge.
+
+    Before this method existed, nothing ever moved a machine out of
+    CLOSING: `is_recording` on `RecordingService` stayed `False` forever
+    after the first session closed, which is exactly what let the bot
+    record exactly one session per process lifetime.
+    """
+    m = machine()
+    m.participants_changed(1, T0)
+    m.participants_changed(0, T0)
+    assert m.tick(T0 + timedelta(seconds=61)) is EndReason.EMPTY
+    # `tick()` returning a reason is exactly what puts the machine in
+    # CLOSING (see its docstring), so that state is not re-asserted here --
+    # doing so would pin down a `Literal[SessionState.CLOSING]` type that
+    # mypy does not widen back out across the `m.reset()` call below.
+
+    m.reset()
+
+    assert m.state is SessionState.IDLE
+    assert m.started_at is None
+    assert m.end_reason is None
+
+    # A fresh session on the same machine must behave exactly like a
+    # session that never had a predecessor. (`m.state` is not re-asserted
+    # by identity here either, for the same reason noted above.)
+    later = T0 + timedelta(hours=1)
+    m.participants_changed(1, later)
+    assert m.started_at == later
+    assert m.tick(later + timedelta(minutes=20)) is EndReason.IDLE_TIMEOUT
+
+
+def test_reset_outside_closing_is_rejected() -> None:
+    """`reset()` must only ever follow a reason `tick()` reported.
+
+    Calling it from any other state would silently discard a session that
+    is still recording -- an assertion catches that misuse immediately
+    instead of corrupting the machine's state.
+    """
+    m = machine()
+    with pytest.raises(AssertionError):
+        m.reset()
+
+    m.participants_changed(1, T0)
+    with pytest.raises(AssertionError):
+        m.reset()
+
+
 def test_naive_datetime_is_rejected() -> None:
     m = machine()
     with pytest.raises(ValueError, match="timezone-aware"):

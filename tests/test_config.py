@@ -26,6 +26,9 @@ def _env(**overrides: str) -> dict[str, str]:
         "STURNUS_MASTER_KEY": _FAKE_MASTER_KEY_B64,
         "STURNUS_MASTER_KEY_ID": "k1",
         "STURNUS_RECORDING_DIR": "/tmp/rec",
+        "STURNUS_OUTLINE_BASE_URL": "https://outline.example",
+        "STURNUS_OUTLINE_CLIENT_ID": "outline-client-id",
+        "STURNUS_OUTLINE_REDIRECT_URI": "https://bot.example/oauth/callback",
     }
     base.update(overrides)
     return base

@@ -10,7 +10,9 @@ with fakes.
 
 from __future__ import annotations
 
+import contextlib
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Protocol
 
 from sturnus.application.ports import (
@@ -70,6 +72,19 @@ class SessionRecorder(Protocol):
         `None` covers two cases alike: a session that predates this column,
         and one that crashed before `record_session_key` ever ran. Either
         way, the caller has no key to recover with.
+        """
+        ...
+
+    async def session_status(self, session_id: int) -> str | None:
+        """Returns the session row's `status` ("open"/"closed"/"documented"), or
+        `None` if the row does not exist.
+
+        Used by `recover_orphans` to tell a session that has genuinely
+        crashed (status still `open`) from one that already finished --
+        `close()` ran to completion and only its local cleanup was
+        interrupted by the crash. Reprocessing the latter would enqueue
+        the same speaker's job a second time and violate
+        `uq_job_per_speaker`.
         """
         ...
 
@@ -198,6 +213,18 @@ class RecordingService:
         The job is enqueued only after the upload succeeds, so a job never
         points at an object that was never written. The session row closes
         once, after every speaker has been handled.
+
+        Local cleanup happens last, after the session row is closed: each
+        speaker's `.enc` is removed once its upload and job are both
+        confirmed, and the now-empty session directory follows once every
+        speaker is done (Spec 12.4). Leaving the encrypted file behind
+        would keep filling the PVC forever, break `/audio delete`'s
+        erasure guarantee (the S3 copy is gone but this one survives), and
+        make `recover_orphans` rediscover it on every future restart --
+        which is also why cleanup runs only after `close_session` commits:
+        if a crash lands between upload and this unlink, the row is
+        already `closed` and recovery's own check for that skips it
+        instead of enqueuing the same speaker's job a second time.
         """
         if self._closed:
             return
@@ -207,10 +234,13 @@ class RecordingService:
         session_id = self._session_id
         retention_until = now + timedelta(days=self._retention_days)
 
+        enc_paths: list[Path] = []
+        session_dir: Path | None = None
         for discord_user_id, writer in self._writers.items():
             writer.close()
             wav_path = writer.path
             enc_path = wav_path.with_suffix(".enc")
+            session_dir = wav_path.parent
             self._encryptor.encrypt(wav_path, enc_path, self._data_key.plaintext)
             wav_path.unlink()
 
@@ -224,5 +254,40 @@ class RecordingService:
                 wrapped_data_key=self._data_key.wrapped,
                 retention_until=retention_until,
             )
+            enc_paths.append(enc_path)
 
         await self._sessions.close_session(session_id, now, reason.value)
+
+        for enc_path in enc_paths:
+            enc_path.unlink(missing_ok=True)
+        if session_dir is not None:
+            # Only succeeds once it is actually empty -- if anything
+            # unexpected is still in there, leave it rather than losing
+            # data or raising out of an otherwise-successful close().
+            with contextlib.suppress(OSError):
+                session_dir.rmdir()
+
+    def reset(self) -> None:
+        """Forgets this session so the next consenting participant starts a fresh one.
+
+        Must only be called after `close()` has finished -- everything
+        that needed to outlive this process was already written by then:
+        the session row, the uploaded recordings, the enqueued jobs. This
+        only clears this instance's own bookkeeping, so the same
+        `RecordingService` (and whatever holds a reference to it, such as
+        the voice adapter that dispatches packets into it) can be reused
+        for a second, third, ... session without ever being reconstructed.
+
+        Without this, `_closed` stays `True` and `_machine` stays stuck in
+        `SessionState.CLOSING` forever: `is_recording` never becomes
+        `True` again, `voice_packet` keeps returning early, and
+        `participants_changed` can never open a new session row. One
+        session per process lifetime is the bug this method exists to fix.
+        """
+        assert self._closed, "reset() must only follow close()"
+        self._machine.reset()
+        self._clock = SpeakerClock()
+        self._session_id = None
+        self._data_key = None
+        self._writers = {}
+        self._closed = False

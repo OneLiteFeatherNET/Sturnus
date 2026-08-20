@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     # rotated without re-encrypting existing material.
     master_key_id: str
     recording_dir: Path
+    # Public OAuth client info for `/link` (Spec 8.4): enough to build the
+    # authorization URL the user's browser is sent to. Deliberately no
+    # `outline_client_secret` here -- that stays confined to
+    # `sturnus.entrypoints.link.LinkSettings`, the one process allowed to
+    # hold it (Spec 13.2's blast-radius separation). The bot never
+    # exchanges a code for a token, so it never needs the secret.
+    outline_base_url: str
+    outline_client_id: str
+    outline_redirect_uri: str
     health_port: int = 8080
 
 

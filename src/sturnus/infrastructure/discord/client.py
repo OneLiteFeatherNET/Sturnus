@@ -19,24 +19,38 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 import discord
 from discord.ext import commands
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from sturnus.application.ports import AudioStore, AudioWriterFactory, Clock, Encryptor
+from sturnus.application.ports import (
+    AudioStore,
+    AudioWriterFactory,
+    Clock,
+    Encryptor,
+    VoiceReceiver,
+)
 from sturnus.application.recording import RecordingService
 from sturnus.domain import settings
 from sturnus.domain.session import EndReason
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import (
+    AccountLinkRepository,
     ConsentRepository,
     JobRepository,
     SessionRepository,
 )
 from sturnus.infrastructure.discord.about_cog import AboutCog
+from sturnus.infrastructure.discord.audio_cog import AudioCog
 from sturnus.infrastructure.discord.config_cog import ConfigCog
 from sturnus.infrastructure.discord.consent_cog import ConsentCog
+from sturnus.infrastructure.discord.link_cog import LinkCog
+from sturnus.infrastructure.discord.setup_cog import SetupCog
 from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter
+from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState
 
 log = logging.getLogger(__name__)
@@ -58,7 +72,12 @@ class _GuildRecording:
     channel_id: int
     role_id: int
     service: RecordingService
-    voice: VoiceReceiveAdapter
+    #: Typed against the narrow `VoiceReceiver` port rather than the
+    #: concrete `VoiceReceiveAdapter` -- the only thing this class ever
+    #: does with it is `join`/`leave`, and a test's fake stands in for it
+    #: without dragging in `discord-ext-voice-recv` or a real gateway
+    #: connection.
+    voice: VoiceReceiver
 
 
 class SturnusClient(commands.Bot):
@@ -77,6 +96,10 @@ class SturnusClient(commands.Bot):
         encryptor: Encryptor,
         readiness: ReadinessState,
         database_ping: Callable[[], Awaitable[bool]],
+        session_factory: async_sessionmaker[AsyncSession],
+        outline_oauth: OutlineOAuth,
+        link_states: LinkStateStore,
+        account_links: AccountLinkRepository,
         tick_interval_seconds: float = TICK_INTERVAL_SECONDS,
     ) -> None:
         intents = discord.Intents.default()
@@ -97,15 +120,31 @@ class SturnusClient(commands.Bot):
         self._encryptor = encryptor
         self._readiness = readiness
         self._database_ping = database_ping
+        self._session_factory = session_factory
+        self._outline_oauth = outline_oauth
+        self._link_states = link_states
+        self._account_links = account_links
         self._tick_interval_seconds = tick_interval_seconds
 
         self._guilds: dict[int, _GuildRecording] = {}
         self._tick_task: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
-        """Loads the cogs and syncs the command tree; runs once before login completes."""
+        """Loads the cogs and syncs the command tree; runs once before login completes.
+
+        Every cog Sturnus ships is registered here -- a cog that exists but
+        is missing from this list is unreachable at runtime even though it
+        compiles and its own tests pass (see
+        `tests/infrastructure/discord/test_client_cogs.py`, added
+        specifically to catch that failure mode).
+        """
         await self.add_cog(ConsentCog(self._consent_repo, self._config_store, self._clock))
         await self.add_cog(ConfigCog(self._config_store))
+        await self.add_cog(SetupCog(self._config_store, self._clock))
+        await self.add_cog(AudioCog(self._session_factory, self._audio_store, self._clock))
+        await self.add_cog(
+            LinkCog(self._outline_oauth, self._link_states, self._account_links, self._clock)
+        )
         # The AGPL's section 13 obliges us to offer the source to people who
         # interact with this over a network. They never receive a binary, so a
         # LICENSE file in the repository does not reach them — /about does.
@@ -208,12 +247,32 @@ class SturnusClient(commands.Bot):
             while True:
                 await asyncio.sleep(self._tick_interval_seconds)
                 self._readiness.database_reachable = await self._database_ping()
-                for recording in list(self._guilds.values()):
-                    reason = await recording.service.tick(self._clock.now())
-                    if reason is not None:
-                        await recording.voice.leave()
+                await self._tick_all(self._clock.now())
         except asyncio.CancelledError:
             pass
+
+    async def _tick_all(self, now: datetime) -> None:
+        """Checks every guild's session for a timeout and re-arms any that closed.
+
+        Split out of `_tick_loop` so this -- the actual per-guild decision,
+        not the sleep around it -- can be driven directly by a test without
+        sleeping through real time.
+
+        `RecordingService.reset()` is the fix for a bot that used to go
+        deaf after its first session: `tick()` on its own only closes a
+        session, and closing left `is_recording` false forever, since
+        nothing ever put the machine's `SessionMachine` back in `IDLE`.
+        Calling `reset()` here, right after `close()` has finished
+        encrypting, uploading and enqueuing, is what lets the very next
+        consenting participant open a fresh session -- its own row, its
+        own data key, its own writers -- on the same `RecordingService`
+        instance, so the voice adapter's reference to it never goes stale.
+        """
+        for recording in list(self._guilds.values()):
+            reason = await recording.service.tick(now)
+            if reason is not None:
+                await recording.voice.leave()
+                recording.service.reset()
 
     async def graceful_shutdown(self) -> None:
         """Closes every active session before the connection is torn down.

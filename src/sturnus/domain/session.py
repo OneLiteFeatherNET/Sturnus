@@ -102,6 +102,28 @@ class SessionMachine:
         self.end_reason = reason
         return reason
 
+    def reset(self) -> None:
+        """Returns the machine from CLOSING to IDLE, ready for a new session.
+
+        CLOSING is otherwise a dead end -- nothing in this class ever
+        leaves it on its own, which is exactly what left a guild deaf
+        forever after its first recorded session. This is the explicit
+        exit edge: called once the caller has finished acting on the
+        reason `tick()` reported (closing files, uploading, enqueuing),
+        never automatically by `tick()` itself, since a caller that is
+        shutting down for good (Spec 6.4's `SHUTDOWN` reason) must be free
+        to leave the machine in CLOSING rather than implicitly offering a
+        session that will never be recorded.
+        """
+        assert self.state is SessionState.CLOSING, (
+            "reset() must only follow a reason reported by tick()"
+        )
+        self.state = SessionState.IDLE
+        self.started_at = None
+        self.end_reason = None
+        self._last_audio_at = None
+        self._grace_since = None
+
     def _due_reason(self, now: datetime) -> EndReason | None:
         assert self.started_at is not None
         if now - self.started_at > timedelta(hours=self._timeouts.max_session_hours):

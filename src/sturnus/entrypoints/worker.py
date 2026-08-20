@@ -61,6 +61,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import importlib.resources
 import logging
 import os
 import signal
@@ -100,6 +101,34 @@ _POLL_SECONDS = 5.0
 #: see `charts/sturnus/values.yaml`'s `worker.resources`): int8 is the
 #: quantisation the chart's own model-size comment already assumes.
 _WHISPER_COMPUTE_TYPE = "int8"
+
+#: Package and resource name of the real Outline document template. See
+#: `_load_template` -- this is the packaged template `process_one` must
+#: render every production document with, never the minimal
+#: `sturnus.application.worker._FALLBACK_TEMPLATE`.
+_TEMPLATE_PACKAGE = "sturnus.infrastructure.documents"
+_TEMPLATE_RESOURCE = "outline_template.md.j2"
+
+
+def _load_template() -> str:
+    """Loads the packaged Outline document template's text.
+
+    Uses `importlib.resources` rather than a path relative to the source
+    tree -- this process runs from an installed wheel inside the container
+    image (see `Dockerfile`), which has no `src/` layout to resolve a
+    relative path against. `sturnus.application.worker.process_one`
+    defaults to a minimal fallback template precisely so its own tests do
+    not need this file at all; every real invocation of `process_one` --
+    this one -- must pass this loader's result in as `template_source`
+    instead, or a document ships with no participants list, no Outline
+    mentions, and no Discord profile links: the entire visible payoff of
+    account linking, silently absent.
+    """
+    return (
+        importlib.resources.files(_TEMPLATE_PACKAGE)
+        .joinpath(_TEMPLATE_RESOURCE)
+        .read_text(encoding="utf-8")
+    )
 
 
 class WorkerSettings(BaseSettings):
@@ -316,6 +345,7 @@ async def _run() -> None:
     # `session.document_provider` -- the only document provider this
     # worker supports today.
     links = AccountLinkRepository(session_factory, "outline")
+    template_source = _load_template()
 
     readiness = ReadinessState(discord_connected=True)  # this process has no gateway to wait on
 
@@ -353,6 +383,7 @@ async def _run() -> None:
                 links=links,
                 work_dir=settings.work_dir,
                 max_attempts=settings.max_job_attempts,
+                template_source=template_source,
             )
             if not did_work:
                 with contextlib.suppress(TimeoutError):

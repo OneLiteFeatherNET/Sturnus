@@ -218,6 +218,14 @@ class SessionRepository:
             return None
         return (result[0], result[1])
 
+    async def session_status(self, session_id: int) -> str | None:
+        """Returns the row's `status`, or `None` if no such session exists."""
+        async with self._session_factory() as session:
+            status: str | None = await session.scalar(
+                select(Session.status).where(Session.id == session_id)
+            )
+            return status
+
     async def find_open_session(self, guild_id: int) -> int | None:
         """Returns the id of the guild's session whose status is not `closed`, or None."""
         async with self._session_factory() as session:

@@ -24,9 +24,17 @@ class FakeSessions:
     recovery is now cleaning up after.
     """
 
-    def __init__(self, keys: dict[int, tuple[str, bytes]] | None = None) -> None:
+    def __init__(
+        self,
+        keys: dict[int, tuple[str, bytes]] | None = None,
+        status: dict[int, str] | None = None,
+    ) -> None:
         self.closed: list[tuple[int, str]] = []
         self._keys: dict[int, tuple[str, bytes]] = dict(keys or {})
+        #: Seeds what a real session row's `status` would already be --
+        #: `"open"` (the default, i.e. a genuine crash), `"closed"`, or
+        #: `"documented"` -- for the sessions this test wants to pre-exist.
+        self._status: dict[int, str] = dict(status or {})
 
     async def open_session(self, _guild_id: int, _channel_id: int, _now: datetime) -> int:
         raise AssertionError("recovery must never open a new session")
@@ -41,6 +49,10 @@ class FakeSessions:
 
     async def close_session(self, session_id: int, _ended_at: datetime, reason: str) -> None:
         self.closed.append((session_id, reason))
+        self._status[session_id] = "closed"
+
+    async def session_status(self, session_id: int) -> str | None:
+        return self._status.get(session_id, "open")
 
     async def record_session_key(
         self, session_id: int, encryption_key_id: str, wrapped_data_key: bytes
@@ -189,3 +201,65 @@ async def test_an_enc_file_with_no_stored_key_is_skipped(tmp_path: Path) -> None
     assert store.put_keys == []
     assert enc_path.exists()  # left in place, not silently discarded
     assert sessions.closed == [(9, "crashed")]
+
+
+async def test_recover_orphans_skips_a_session_that_is_already_closed(tmp_path: Path) -> None:
+    """A leftover `.enc` for an already-closed session must not be reprocessed.
+
+    Before this guard, `close()` never deleted its own `.enc` files, so
+    every normal, successful session left one behind; the next start's
+    `recover_orphans` treated it as a fresh crash, rewrote the
+    already-closed row with `end_reason="crashed"`, re-uploaded audio a
+    user may have had erased via `/audio delete`, and then hit
+    `uq_job_per_speaker`'s `IntegrityError` re-enqueuing a job that
+    already existed -- taking the whole next bot start down with it. The
+    row's `status` is the belt-and-braces guard against that even after
+    `close()` is fixed to clean up after itself (a crash could still land
+    between the upload and that cleanup): a `closed` (or `documented`)
+    row means every speaker in it was already uploaded and enqueued, so
+    recovery must only remove the stale local copy, never touch the
+    database or the store again.
+    """
+    d = tmp_path / "session-7"
+    d.mkdir()
+    enc_path = d / "100.enc"
+    enc_path.write_bytes(b"STRN-ENCRYPTED-DATA")
+
+    sessions = FakeSessions(
+        keys={7: ("original-key-id", b"original-wrapped-key")}, status={7: "closed"}
+    )
+    jobs = FakeJobs()
+    store = FakeStore()
+    encryptor = FakeEncryptor()
+
+    recovered = await recover_orphans(
+        tmp_path, sessions, jobs, store, encryptor, retention_days=30, now=T0
+    )
+
+    assert len(recovered) == 1  # still reported as found on disk
+    assert jobs.enqueued == []  # never re-enqueued -- would violate uq_job_per_speaker
+    assert store.put_keys == []  # never re-uploaded -- could resurrect erased audio
+    assert sessions.closed == []  # the already-closed row is never touched again
+    assert not enc_path.exists()  # the stale local copy is still cleaned up
+
+
+async def test_recover_orphans_skips_a_session_that_is_already_documented(tmp_path: Path) -> None:
+    """`documented` is further along than `closed` and must be skipped the same way."""
+    d = tmp_path / "session-11"
+    d.mkdir()
+    enc_path = d / "100.enc"
+    enc_path.write_bytes(b"STRN-ENCRYPTED-DATA")
+
+    sessions = FakeSessions(status={11: "documented"})
+    jobs = FakeJobs()
+    store = FakeStore()
+    encryptor = FakeEncryptor()
+
+    recovered = await recover_orphans(
+        tmp_path, sessions, jobs, store, encryptor, retention_days=30, now=T0
+    )
+
+    assert len(recovered) == 1
+    assert jobs.enqueued == []
+    assert store.put_keys == []
+    assert not enc_path.exists()

@@ -28,12 +28,14 @@ class FakeSessions:
         self.epochs: dict[int, datetime] = {}
         self.closed: list[tuple[int, str]] = []
         self.keys: dict[int, tuple[str, bytes]] = {}
+        self.status: dict[int, str] = {}
         self._next = 1
 
     async def open_session(self, _guild_id: int, _channel_id: int, _now: datetime) -> int:
         sid = self._next
         self._next += 1
         self.opened.append(sid)
+        self.status[sid] = "open"
         return sid
 
     async def record_session_key(
@@ -54,6 +56,10 @@ class FakeSessions:
 
     async def close_session(self, session_id: int, _ended_at: datetime, reason: str) -> None:
         self.closed.append((session_id, reason))
+        self.status[session_id] = "closed"
+
+    async def session_status(self, session_id: int) -> str | None:
+        return self.status.get(session_id)
 
     async def find_open_session(self, _guild_id: int) -> int | None:
         return None
@@ -71,10 +77,16 @@ class FakeJobs:
 class FakeStore:
     def __init__(self) -> None:
         self.put_keys: list[str] = []
+        #: The uploaded bytes, captured at `put()` time -- `close()` removes
+        #: the local `.enc` right after a successful upload (Spec 12.4), so
+        #: a test that wants to inspect what was actually uploaded cannot
+        #: read the file back off disk afterwards.
+        self.put_contents: dict[str, bytes] = {}
 
     async def put(self, key: str, source: Path) -> None:
         assert source.exists(), "uploading a file that is not there"
         self.put_keys.append(key)
+        self.put_contents[key] = source.read_bytes()
 
     async def delete(self, key: str) -> None:
         pass
@@ -213,12 +225,22 @@ async def test_the_epoch_is_not_moved_by_later_packets(tmp_path: Path) -> None:
 
 
 async def test_each_speaker_gets_their_own_file(tmp_path: Path) -> None:
-    svc = service(tmp_path)
+    """Each speaker gets their own upload, and the recording directory ends up empty.
+
+    Spec 12.4 requires the local `.enc` to go once the upload succeeds --
+    left behind, it would fill the PVC and resurface as a false orphan on
+    the next restart (see `test_recovery.py`). This asserts the directory
+    is empty rather than counting `.enc` files, so it fails if a leftover
+    file of *any* kind survives `close()`, not just the two expected ones.
+    """
+    jobs = FakeJobs()
+    svc = service(tmp_path, jobs=jobs)
     await svc.participants_changed(2, T0)
     await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
     await svc.voice_packet(BEN, "ben", 2, RTP, pcm(960), T0)
     await svc.close(EndReason.EMPTY, T0 + timedelta(minutes=5))
-    assert len(list(tmp_path.glob("**/*.enc"))) == 2
+    assert len(jobs.enqueued) == 2  # both speakers were still uploaded and enqueued
+    assert list(tmp_path.rglob("*")) == []
 
 
 async def test_closing_uploads_and_enqueues_one_job_per_speaker(tmp_path: Path) -> None:
@@ -255,20 +277,22 @@ async def test_the_uploaded_file_is_encrypted(tmp_path: Path) -> None:
     Which byte sequence a real encrypted file starts with is the crypto
     adapter's business (see `tests/infrastructure/test_crypto.py`); what
     this layer must guarantee is that every uploaded file passed through
-    the `Encryptor` port first.
+    the `Encryptor` port first -- checked here against the bytes the
+    `FakeStore` actually received, since by the time `close()` returns the
+    `.enc` file itself must already be gone from disk (Spec 12.4).
     """
+    store = FakeStore()
     encryptor = FakeEncryptor()
-    svc = service(tmp_path, encryptor=encryptor)
+    svc = service(tmp_path, store=store, encryptor=encryptor)
     await svc.participants_changed(1, T0)
     marker = b"\x11\x22" * 2 * 4800
     await svc.voice_packet(ANNA, "anna", 1, RTP, marker, T0)
     await svc.close(EndReason.EMPTY, T0 + timedelta(minutes=1))
 
-    enc_paths = list(tmp_path.glob("**/*.enc"))
-    assert enc_paths
-    assert sorted(enc_paths) == sorted(encryptor.encrypted)
-    for path in enc_paths:
-        assert path.read_bytes().startswith(FakeEncryptor.MARKER)
+    assert encryptor.encrypted  # the writer's plaintext went through the encryptor
+    assert store.put_keys == ["sessions/1/speakers/100.enc"]
+    assert store.put_contents["sessions/1/speakers/100.enc"].startswith(FakeEncryptor.MARKER)
+    assert list(tmp_path.rglob("*")) == []  # nothing left behind after the upload
 
 
 async def test_plaintext_audio_is_removed_after_upload(tmp_path: Path) -> None:
@@ -278,6 +302,25 @@ async def test_plaintext_audio_is_removed_after_upload(tmp_path: Path) -> None:
     await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
     await svc.close(EndReason.EMPTY, T0 + timedelta(minutes=1))
     assert list(tmp_path.glob("**/*.wav")) == []
+
+
+async def test_close_leaves_no_files_behind(tmp_path: Path) -> None:
+    """Spec 12.4: nothing may survive on the volume once close() returns.
+
+    Before the fix, `close()` encrypted, uploaded and enqueued but never
+    unlinked the `.enc` -- it stayed on disk forever, filling the PVC and
+    getting rediscovered by `recover_orphans` on every future restart
+    (`tests/application/test_recovery.py`). This covers several speakers
+    and the now-empty session directory too, not just one file.
+    """
+    svc = service(tmp_path)
+    await svc.participants_changed(2, T0)
+    await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
+    await svc.voice_packet(BEN, "ben", 2, RTP, pcm(960), T0)
+    await svc.close(EndReason.EMPTY, T0 + timedelta(minutes=1))
+
+    assert list(tmp_path.rglob("*")) == []
+    assert not (tmp_path / "session-1").exists()
 
 
 async def test_closing_twice_does_not_duplicate_jobs(tmp_path: Path) -> None:
@@ -303,6 +346,43 @@ async def test_tick_reports_the_close_reason(tmp_path: Path) -> None:
     await svc.participants_changed(1, T0)
     await svc.participants_changed(0, T0 + timedelta(minutes=1))
     assert await svc.tick(T0 + timedelta(minutes=2, seconds=1)) is EndReason.EMPTY
+
+
+async def test_reset_after_close_lets_a_new_session_open(tmp_path: Path) -> None:
+    """One `RecordingService` must be able to record a second, independent session.
+
+    Before `reset()` existed, `_closed` stayed `True` and the machine
+    stayed in `CLOSING` forever once a session closed: `is_recording`
+    never became `True` again, so a second participant could never open a
+    new session on this instance -- the bot recorded exactly one session
+    per process lifetime. This is the same guarantee
+    `tests/infrastructure/discord/test_client.py`'s two-session test
+    checks at the client boundary; this one pins it directly against
+    `RecordingService`.
+    """
+    sessions = FakeSessions()
+    jobs = FakeJobs()
+    svc = service(tmp_path, sessions=sessions, jobs=jobs)
+
+    await svc.participants_changed(1, T0)
+    await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
+    assert await svc.tick(T0 + timedelta(minutes=20)) is EndReason.IDLE_TIMEOUT
+    svc.reset()
+    assert svc.is_recording is False
+    assert svc.session_id is None
+
+    second_start = T0 + timedelta(hours=1)
+    await svc.participants_changed(1, second_start)
+    await svc.voice_packet(BEN, "ben", 2, RTP, pcm(960), second_start)
+    await svc.close(EndReason.EMPTY, second_start + timedelta(minutes=1))
+
+    # The second session got its own row, own writer, and its own job --
+    # nothing carried over from the first.
+    assert sessions.opened == [1, 2]
+    assert sessions.keys.keys() == {1, 2}
+    assert len(jobs.enqueued) == 2
+    assert {job["session_id"] for job in jobs.enqueued} == {1, 2}
+    assert {job["discord_user_id"] for job in jobs.enqueued} == {ANNA, BEN}
 
 
 async def test_returning_participant_keeps_the_same_session(tmp_path: Path) -> None:

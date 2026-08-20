@@ -25,13 +25,17 @@ from sturnus.application.recovery import recover_orphans
 from sturnus.config import get_settings
 from sturnus.domain import settings as domain_settings
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.models import Base
 from sturnus.infrastructure.db.repositories import (
+    AccountLinkRepository,
     ConsentRepository,
     JobRepository,
     SessionRepository,
 )
 from sturnus.infrastructure.discord.client import SturnusClient
+from sturnus.infrastructure.discord.link_cog import PROVIDER as OUTLINE_PROVIDER
+from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState, start_health_server
 from sturnus.infrastructure.objectstore import S3AudioStore
 from sturnus.infrastructure.recording_adapters import CryptoEncryptor, FileAudioWriterFactory
@@ -94,6 +98,23 @@ async def _run() -> None:
     consent_repo = ConsentRepository(session_factory)
     session_repo = SessionRepository(session_factory)
     job_repo = JobRepository(session_factory)
+    link_states = LinkStateStore(session_factory)
+    # `provider` fixed at construction: the bot only ever reads its own
+    # Outline mapping back (`/link status`), never another provider's --
+    # see `AccountLinkRepository`'s class docstring for why the read and
+    # write sides differ here.
+    account_links = AccountLinkRepository(session_factory, OUTLINE_PROVIDER)
+    outline_oauth = OutlineOAuth(
+        base_url=settings.outline_base_url,
+        client_id=settings.outline_client_id,
+        # Deliberately empty: this process never exchanges a code for a
+        # token (that is the `link` deployment's job), so it never calls
+        # `identity_from_code`, the only method that reads this value. The
+        # real secret must never enter the bot process (Spec 13.2) -- see
+        # `sturnus.config.Settings`'s comment on the same split.
+        client_secret="",
+        redirect_uri=settings.outline_redirect_uri,
+    )
 
     audio_store = S3AudioStore(
         settings.s3_endpoint,
@@ -149,6 +170,10 @@ async def _run() -> None:
         encryptor=encryptor,
         readiness=readiness,
         database_ping=database_ping,
+        session_factory=session_factory,
+        outline_oauth=outline_oauth,
+        link_states=link_states,
+        account_links=account_links,
     )
 
     stop = asyncio.Event()

@@ -183,6 +183,17 @@ async def recover_orphans(
     same file would be rediscovered as an orphan on the next restart and
     enqueued a second time.
 
+    Belt and braces against `close()`'s own cleanup: a session whose row
+    is already `closed` (or further along, `documented`) has, by
+    definition, already been through `close()` to completion -- every
+    speaker it had was uploaded and enqueued before the row was ever
+    marked closed. A `.enc` still on disk for such a session can only mean
+    a crash landed between that upload/enqueue and `close()`'s own local
+    cleanup, never that the work is still outstanding. Reprocessing it
+    would enqueue the same `(session_id, discord_user_id)` job a second
+    time and hit `uq_job_per_speaker`'s `IntegrityError` -- so recovery
+    skips it, logs it, and just finishes the interrupted cleanup instead.
+
     A `.enc` was already encrypted with the session's *original* key, and
     only that key can ever decrypt it -- a freshly generated one is
     guaranteed to fail. That key is read back from the `session` row
@@ -203,6 +214,23 @@ async def recover_orphans(
         by_session.setdefault(orphan.session_id, []).append(orphan)
 
     for session_id, group in by_session.items():
+        status = await sessions.session_status(session_id)
+        if status is not None and status != "open":
+            # The row already closed (or was fully documented), so every
+            # speaker it had was already uploaded and enqueued before that
+            # happened -- these are stale local copies of work already
+            # done, not work still owed. See `recover_orphans`'s docstring.
+            log.warning(
+                "Session %d's row is already %s; removing %d leftover file(s) on disk "
+                "instead of reprocessing them, which would duplicate already-enqueued jobs",
+                session_id,
+                status,
+                len(group),
+            )
+            for orphan in group:
+                orphan.path.unlink(missing_ok=True)
+            continue
+
         log.warning("Recovering %d orphaned recording(s) for session %d", len(group), session_id)
         stored_key = await sessions.session_key(session_id)
 
