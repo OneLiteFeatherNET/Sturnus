@@ -105,11 +105,17 @@ def build_app(
     states: StateStore,
     links: LinkRepository,
     now: Callable[[], datetime],
+    schema_ready: Callable[[], bool],
 ) -> web.Application:
     """Builds the aiohttp application the link deployment serves.
 
     `now` is injected rather than read from the wall clock directly so a
     test can pin it -- the same reason `SystemClock` exists for the bot.
+
+    `schema_ready` reports whether the database tables the worker creates
+    have appeared yet. The caller starts this server *before* waiting for
+    them, so `/healthz` answers from the first moment while `/readyz` stays
+    503 until the wait finishes -- see `sturnus.entrypoints.link`.
     """
 
     async def healthz(_request: web.Request) -> web.Response:
@@ -119,10 +125,12 @@ def build_app(
         return web.json_response({"status": "ok"})
 
     async def readyz(_request: web.Request) -> web.Response:
-        # This process holds no connection of its own beyond `states` and
-        # `links`, both backed by the same database the callback route
-        # already exercises on every real request; there is no separate
-        # dependency to probe here that `/healthz` does not already cover.
+        # Beyond the schema, this process holds no connection of its own:
+        # `states` and `links` are backed by the same database the callback
+        # route exercises on every real request, so there is nothing further
+        # to probe that `/healthz` does not already cover.
+        if not schema_ready():
+            return web.json_response({"status": "waiting for database schema"}, status=503)
         return web.json_response({"status": "ready"})
 
     async def oauth_callback(request: web.Request) -> web.Response:
