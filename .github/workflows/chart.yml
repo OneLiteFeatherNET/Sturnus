@@ -33,7 +33,7 @@ jobs:
   render:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: azure/setup-helm@v5
       # The per-component credential lists asserted below are derived from the
       # settings classes rather than restated here, so this job needs the
