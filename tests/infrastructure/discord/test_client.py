@@ -81,7 +81,9 @@ class FakeSessions:
         self._participants: dict[int, set[int]] = {}
         self._next = 1
 
-    async def open_session(self, _guild_id: int, _channel_id: int, _now: datetime) -> int:
+    async def open_session(
+        self, _guild_id: int, _channel_id: int, _channel_name: str | None, _now: datetime
+    ) -> int:
         sid = self._next
         self._next += 1
         self.opened.append(sid)

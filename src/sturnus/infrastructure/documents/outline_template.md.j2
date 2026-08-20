@@ -1,9 +1,13 @@
+{% if channel %}**Channel:** [{{ channel.label | md }}]({{ channel.url }})
+{% endif %}**Date:** @[{{ date_label }}](mention://date/{{ date_iso }}) · {{ started }}, {{ duration_minutes }} min · {{ participants | length }} participant{{ '' if participants | length == 1 else 's' }}
+
 ## Participants
 
 {% for speaker in participants %}
 - {% if speaker.external_user_id %}@[{{ speaker.external_display_name | md }}](mention://user/{{ speaker.external_user_id }}) ([{{ speaker.discord_display_name | md }}](https://discord.com/users/{{ speaker.discord_user_id }})){% else %}[{{ speaker.discord_display_name | md }}](https://discord.com/users/{{ speaker.discord_user_id }}){% endif %}
 
 {% endfor %}
+
 ## Transcript
 
 {% for block in blocks %}

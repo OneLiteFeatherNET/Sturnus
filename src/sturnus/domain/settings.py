@@ -15,6 +15,7 @@ POLICY_VERSION = "policy_version"
 POLICY_URL = "policy_url"
 ADMIN_ROLE_ID = "admin_role_id"
 MERGE_GAP_SECONDS = "merge_gap_seconds"
+TIMEZONE = "timezone"
 
 DEFAULTS: dict[str, str] = {
     EMPTY_GRACE_SECONDS: "60",
@@ -24,6 +25,11 @@ DEFAULTS: dict[str, str] = {
     DOCUMENT_PROVIDER: "outline",
     AUDIO_RETENTION_DAYS: "30",
     MERGE_GAP_SECONDS: "15",
+    # Protocols are read by the people who were in the room, so the
+    # times in them are theirs, not the cluster's. A wrong offset is
+    # not obviously wrong to a reader -- 15:08 looks like a plausible
+    # meeting time whether or not it is the right one.
+    TIMEZONE: "Europe/Berlin",
 }
 
 # No default value, so these must be set before going live.

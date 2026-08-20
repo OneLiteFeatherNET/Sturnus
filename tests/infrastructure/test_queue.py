@@ -23,7 +23,7 @@ async def factory(clean_database: str) -> async_sessionmaker[AsyncSession]:
 async def seed(factory: async_sessionmaker[AsyncSession], speakers: list[int]) -> int:
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     for user_id in speakers:
         await sessions.add_participant(session_id, user_id, f"user{user_id}", T0)
         await jobs.enqueue(
@@ -177,7 +177,7 @@ async def test_completing_a_job_is_not_last_while_the_session_is_still_open(
     """
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await sessions.add_participant(session_id, ANNA, "anna", T0)
     await jobs.enqueue(
         session_id=session_id,
@@ -204,7 +204,7 @@ async def test_completing_the_final_job_is_last_once_the_session_closes(
     """
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await sessions.add_participant(session_id, ANNA, "anna", T0)
     await jobs.enqueue(
         session_id=session_id,

@@ -24,6 +24,7 @@ def pcm(frames: int) -> bytes:
 class FakeSessions:
     def __init__(self) -> None:
         self.opened: list[int] = []
+        self.channel_names: list[str | None] = []
         self.participants: dict[int, str] = {}
         self.epochs: dict[int, datetime] = {}
         self.closed: list[tuple[int, str]] = []
@@ -31,10 +32,13 @@ class FakeSessions:
         self.status: dict[int, str] = {}
         self._next = 1
 
-    async def open_session(self, _guild_id: int, _channel_id: int, _now: datetime) -> int:
+    async def open_session(
+        self, _guild_id: int, _channel_id: int, channel_name: str | None, _now: datetime
+    ) -> int:
         sid = self._next
         self._next += 1
         self.opened.append(sid)
+        self.channel_names.append(channel_name)
         self.status[sid] = "open"
         return sid
 
@@ -162,6 +166,7 @@ def service(
     store: FakeStore | None = None,
     writers: FakeAudioWriterFactory | None = None,
     encryptor: FakeEncryptor | None = None,
+    channel_name: str | None = None,
 ) -> RecordingService:
     return RecordingService(
         guild_id=GUILD,
@@ -175,6 +180,7 @@ def service(
         writers=writers or FakeAudioWriterFactory(tmp_path),
         encryptor=encryptor or FakeEncryptor(),
         retention_days=30,
+        channel_name=channel_name,
     )
 
 
@@ -393,3 +399,17 @@ async def test_returning_participant_keeps_the_same_session(tmp_path: Path) -> N
     await svc.participants_changed(1, T0 + timedelta(seconds=30))
     assert sessions.opened == [1]
     assert svc.session_id == 1
+
+
+async def test_the_channel_name_is_recorded_when_the_session_opens(tmp_path: Path) -> None:
+    """The worker writes the protocol and has no Discord connection, so the
+    name has to be captured here or not at all. Capturing it at open time
+    also means a channel renamed later does not rewrite the protocols of
+    meetings held under the old name.
+    """
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions, channel_name="Meeting-Raum")
+
+    await svc.participants_changed(1, T0)
+
+    assert sessions.channel_names == ["Meeting-Raum"]
