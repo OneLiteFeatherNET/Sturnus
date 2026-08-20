@@ -179,6 +179,16 @@ class SturnusClient(commands.Bot):
         #: voice connections would then sit in the channel forever with
         #: nothing holding a reference to it.
         self._reconfigure_locks: dict[int, asyncio.Lock] = {}
+        #: Guilds with a voice-state update already queued behind the lock
+        #: above. discord.py dispatches every gateway event as its own
+        #: task, so a busy channel can produce a dozen of them while one
+        #: reconcile holds the lock through a `leave()`; each would then
+        #: recount the very same membership in turn. Since the handler
+        #: reads the channel's *current* members rather than replaying a
+        #: delta, one waiter answers for all of them and the rest can be
+        #: dropped on arrival -- which is what keeps the lock from turning
+        #: a burst of joins into a queue of handlers.
+        self._voice_updates_waiting: set[int] = set()
         #: Last configuration complaint logged per guild, so a guild that
         #: is simply unconfigured -- or whose value someone fat-fingered
         #: with a direct UPDATE -- is reported once, not every ten seconds.
@@ -354,7 +364,7 @@ class SturnusClient(commands.Bot):
         became_live = False
         if plan.action is ReconfigureAction.BUILD:
             assert desired is not None
-            self._build(guild_id, desired)
+            await self._build(guild_id, desired)
             recording = self._guilds[guild_id]
             became_live = True
         elif plan.action is ReconfigureAction.RETARGET:
@@ -363,7 +373,7 @@ class SturnusClient(commands.Bot):
         elif plan.action is ReconfigureAction.DEFER_RETARGET:
             assert recording is not None and desired is not None
             if force:
-                await self._end_session_now(recording)
+                await self._end_session_now(guild_id, recording)
                 await self._retarget(guild_id, recording, desired)
                 plan = replace(
                     plan,
@@ -380,7 +390,7 @@ class SturnusClient(commands.Bot):
         elif plan.action is ReconfigureAction.DEFER_TEARDOWN:
             assert recording is not None
             if force:
-                await self._end_session_now(recording)
+                await self._end_session_now(guild_id, recording)
                 await self._teardown(guild_id, recording)
                 plan = replace(
                     plan,
@@ -494,8 +504,8 @@ class SturnusClient(commands.Bot):
             session_exceeds_timeouts=exceeded,
         )
 
-    def _build(self, guild_id: int, desired: GuildRuntimeConfig) -> None:
-        """Constructs a guild's recording pipeline.
+    async def _build(self, guild_id: int, desired: GuildRuntimeConfig) -> None:
+        """Constructs a guild's recording pipeline and counts who is already there.
 
         The only path on which a `RecordingService` or a
         `VoiceReceiveAdapter` is ever created, and it runs only for a
@@ -503,6 +513,13 @@ class SturnusClient(commands.Bot):
         existing objects in place, so there is no window in which an
         adapter -- and with it a live voice connection -- can be dropped
         without anyone left to disconnect it.
+
+        The `_sync_participants` at the end is not an optimisation: a
+        pipeline built from an empty headcount only ever learns who is in
+        the channel from the *next* voice-state update, so an
+        administrator who fixed the configuration while three people sat
+        waiting in the channel got a bot that reported itself configured
+        and recorded nothing until somebody left and rejoined.
         """
         service = RecordingService(
             guild_id=guild_id,
@@ -524,6 +541,7 @@ class SturnusClient(commands.Bot):
             guild_id,
             desired.channel_id,
         )
+        await self._sync_participants(self.get_guild(guild_id), self._guilds[guild_id])
 
     def _channel_name(self, guild_id: int, channel_id: int) -> str | None:
         """The voice channel's name, resolved here because only we can.
@@ -562,6 +580,13 @@ class SturnusClient(commands.Bot):
         only when the channel itself moved -- it is idempotent, but a role
         change alone has no connection to drop, and the adapter re-reads
         the consent role on its next `join()` anyway.
+
+        Then the same headcount `_build` takes, for the same reason and
+        with the same consequence if it is skipped: after a retarget the
+        people who matter are the ones sitting in the *new* channel (or
+        the ones in the old one who have just been given the new consent
+        role), and none of them will emit a voice-state update merely
+        because the configuration changed underneath them.
         """
         if desired.channel_id != recording.channel_id:
             await recording.voice.leave()
@@ -570,8 +595,89 @@ class SturnusClient(commands.Bot):
         )
         recording.config = desired
         recording.pending = None
+        await self._sync_participants(self.get_guild(guild_id), recording)
 
-    async def _end_session_now(self, recording: _GuildRecording) -> None:
+    def _consenting_count(self, guild: discord.Guild, recording: _GuildRecording) -> int | None:
+        """How many consenting members are sitting in the target channel right now.
+
+        Counts members carrying the consent role, never everyone present:
+        an administrator can be in the channel without the role and must
+        not, by their presence alone, start a recording nobody consented
+        to (Spec 3.1).
+
+        `None` when the answer cannot be read at all -- the configured id
+        is not a voice channel this process can see -- which is emphatically
+        not the same as zero and must not be handed to the machine as such:
+        zero is what starts the empty-grace countdown on a live session.
+        """
+        channel = guild.get_channel(recording.channel_id)
+        if not isinstance(channel, discord.VoiceChannel):
+            return None
+        return sum(
+            1
+            for participant in channel.members
+            if any(role.id == recording.role_id for role in participant.roles)
+        )
+
+    async def _sync_participants(
+        self, guild: discord.Guild | None, recording: _GuildRecording
+    ) -> None:
+        """Reports the channel's current consenting headcount and joins if it starts one.
+
+        The single place that turns "who is in the channel" into a session,
+        used by the voice-state handler and by every path that builds or
+        retargets a pipeline alike. Reading the channel's membership rather
+        than accumulating deltas is what makes it safe to call from all of
+        them: the answer is the truth at the moment it runs, so a caller
+        that has just changed which channel counts gets the right number
+        without anyone having to replay the events it missed.
+        """
+        if guild is None:
+            return
+        consented_count = self._consenting_count(guild, recording)
+        if consented_count is None:
+            return
+        was_recording = recording.service.is_recording
+        await recording.service.participants_changed(consented_count, self._clock.now())
+        if recording.service.is_recording and not was_recording:
+            await recording.voice.join(recording.channel_id)
+
+    async def _return_to_idle(self, guild_id: int, recording: _GuildRecording) -> None:
+        """Leaves the channel and puts the machine back where a session can start.
+
+        Deliberately independent of whether the `close()` that preceded it
+        succeeded. `close()` encrypts, uploads to the object store and
+        enqueues jobs, so it can fail for reasons that have nothing to do
+        with this guild's ability to record -- and it flips the service to
+        closed *before* any of that, and only ever after the machine has
+        already moved to CLOSING. A close that raised therefore used to
+        leave the machine parked in CLOSING with nothing left to call
+        `reset()`: `is_recording` false forever, `voice_packet` dropping
+        every packet, `participants_changed` unable to open a row. A guild
+        that quietly stops recording is exactly the failure this branch
+        exists to prevent, so the way back must not hang off the upload
+        having worked.
+
+        `leave()` is guarded for the same reason -- it is a gateway call,
+        and a failing one must not take `reset()` down with it.
+
+        A no-op unless the machine is actually parked in CLOSING, so it is
+        safe on a path that merely might have closed something: nothing
+        here may disconnect a session that is still recording.
+        """
+        if not recording.service.needs_reset:
+            return
+        try:
+            await recording.voice.leave()
+        except Exception:
+            log.exception(
+                "Guild %d: leaving the voice channel failed; continuing anyway so the "
+                "guild is able to record again.",
+                guild_id,
+            )
+        recording.service.reset()
+
+    async def _end_session_now(self, guild_id: int, recording: _GuildRecording) -> None:
         """Ends the session in progress deliberately, keeping every recording.
 
         The same sequence a timeout takes -- encrypt, upload, enqueue,
@@ -586,12 +692,21 @@ class SturnusClient(commands.Bot):
         administrator following that advice mid-session was left with a
         guild that recorded nothing at all until some later timeout
         fired.
+
+        The `finally` is the second half of that same lesson: a `close()`
+        that raises mid-upload leaves the machine in CLOSING just as
+        surely as a successful one, and wedges the guild in exactly the
+        same way if the recovery is skipped. The error still propagates --
+        `/config apply` renders a failed reconcile as its own third answer
+        rather than claiming the change is in effect -- but it propagates
+        out of a guild that can record again.
         """
         if not recording.service.is_recording:
             return
-        await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
-        await recording.voice.leave()
-        recording.service.reset()
+        try:
+            await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
+        finally:
+            await self._return_to_idle(guild_id, recording)
 
     async def _teardown(self, guild_id: int, recording: _GuildRecording) -> None:
         """Stops watching a guild. The lock is kept, not popped: a waiter
@@ -677,12 +792,33 @@ class SturnusClient(commands.Bot):
     ) -> None:
         """Recomputes the consenting headcount and drives the session machine.
 
-        Counts members carrying the consent role, never everyone present:
-        an administrator can be in the channel without the role and must
-        not, by their presence alone, start a recording nobody consented
-        to (Spec 3.1).
+        Runs under the guild's reconfigure lock, because reconfiguring and
+        counting participants are not independent. `_teardown` and
+        `_retarget` both `await voice.leave()`, and a join landing inside
+        that await used to interleave with it: the handler still saw the
+        pipeline in `_guilds`, opened a session row against the channel
+        being abandoned, generated its data key and reconnected the voice
+        client that had just been disconnected -- after which `_teardown`
+        popped the guild, stranding both (a session row that nothing is
+        left to close, and a voice connection nothing holds a reference to
+        and so nothing will ever disconnect). On the `_retarget` path the
+        same interleaving instead trips `RecordingService.retarget`'s
+        mid-session assertion and leaves the reconfigure half-applied.
+
+        The lock costs nothing on the event loop -- awaiting it suspends
+        this handler's task, not the loop -- and a burst of updates cannot
+        pile up behind it, because `_voice_updates_waiting` keeps at most
+        one waiter per guild: the headcount is read from the channel's
+        current membership when the waiter runs, which is at least as
+        fresh as anything a dropped update could have contributed.
+
+        Everything the handler decides on is therefore re-read *after* the
+        lock is held. The pre-lock reads are a filter and nothing more, so
+        that an update about an unrelated channel never takes the lock at
+        all.
         """
-        recording = self._guilds.get(member.guild.id)
+        guild_id = member.guild.id
+        recording = self._guilds.get(guild_id)
         if recording is None:
             return
 
@@ -692,20 +828,24 @@ class SturnusClient(commands.Bot):
         if recording.channel_id not in touched_channel_ids:
             return
 
-        channel = member.guild.get_channel(recording.channel_id)
-        if not isinstance(channel, discord.VoiceChannel):
+        if guild_id in self._voice_updates_waiting:
             return
-
-        consented_count = sum(
-            1
-            for participant in channel.members
-            if any(role.id == recording.role_id for role in participant.roles)
-        )
-
-        was_recording = recording.service.is_recording
-        await recording.service.participants_changed(consented_count, self._clock.now())
-        if recording.service.is_recording and not was_recording:
-            await recording.voice.join(recording.channel_id)
+        lock = self._reconfigure_locks.setdefault(guild_id, asyncio.Lock())
+        self._voice_updates_waiting.add(guild_id)
+        try:
+            async with lock:
+                self._voice_updates_waiting.discard(guild_id)
+                # `graceful_shutdown` leaves every channel without taking
+                # the lock, so a join arriving during it must not rejoin
+                # one behind its back.
+                if self._shutting_down:
+                    return
+                recording = self._guilds.get(guild_id)
+                if recording is None:
+                    return
+                await self._sync_participants(member.guild, recording)
+        finally:
+            self._voice_updates_waiting.discard(guild_id)
 
     async def _tick_loop(self) -> None:
         """Checks every guild's session for a timeout roughly every 10 seconds.
@@ -751,13 +891,13 @@ class SturnusClient(commands.Bot):
         deaf after its first session: `tick()` on its own only closes a
         session, and closing left `is_recording` false forever, since
         nothing ever put the machine's `SessionMachine` back in `IDLE`.
-        Calling `reset()` here, right after `close()` has finished
-        encrypting, uploading and enqueuing, is what lets the very next
-        consenting participant open a fresh session -- its own row, its
-        own data key, its own writers -- on the same `RecordingService`
-        instance, so the voice adapter's reference to it never goes stale.
-        `_apply_pending` follows immediately, because that same instant is
-        the only one at which a deferred channel or role change may land.
+        `_sweep_due_session` owns that half now -- the `reset()` it calls
+        is what lets the very next consenting participant open a fresh
+        session, its own row, its own data key, its own writers, on the
+        same `RecordingService` instance, so the voice adapter's reference
+        to it never goes stale. `_apply_pending` follows immediately,
+        because that same instant is the only one at which a deferred
+        channel or role change may land.
 
         Skips the guild entirely while a command is mid-reconcile rather
         than queueing behind it: the loop comes back in ten seconds
@@ -770,12 +910,56 @@ class SturnusClient(commands.Bot):
         async with lock:
             recording = self._guilds.get(guild_id)
             if recording is not None:
-                reason = await recording.service.tick(now)
-                if reason is not None:
-                    await recording.voice.leave()
-                    recording.service.reset()
-                    await self._apply_pending(guild_id, recording)
+                await self._sweep_due_session(guild_id, recording, now)
             await self._reconcile(guild_id)
+
+    async def _sweep_due_session(
+        self, guild_id: int, recording: _GuildRecording, now: datetime
+    ) -> None:
+        """Closes a session the clock says is over, then makes the guild recordable again.
+
+        The close is allowed to fail and the guild still recovers. What
+        must never happen is the machine being left in CLOSING with nobody
+        to reset it, because from that moment the guild records nothing at
+        all -- not until the next restart, since nothing else in the
+        process ever leaves that state. So the return to IDLE is keyed on
+        `needs_reset`, which is true whether `close()` finished or raised
+        halfway through, rather than on the reason `tick()` did or did not
+        get to return.
+
+        The failure is logged loudly rather than swallowed: a close that
+        raised may well have left a speaker's audio unuploaded, which is
+        worth an operator's attention even though `recover_orphans` picks
+        it up on the next start. It is not re-raised -- `_tick_all` would
+        only log it a second time, and the reconcile that follows in
+        `_tick_guild` is exactly what a guild in this state needs.
+        """
+        closed = False
+        try:
+            closed = await recording.service.tick(now) is not None
+        except Exception:
+            # Not necessarily a failed close: `tick()` could equally have
+            # raised before deciding anything, in which case nothing ever
+            # moved to CLOSING and there is nothing to recover from.
+            closed = recording.service.needs_reset
+            if closed:
+                log.exception(
+                    "Guild %d: closing the due session failed; its audio may not have "
+                    "been uploaded (recover_orphans picks that up on the next start). "
+                    "Returning the guild to a recordable state so it does not stop "
+                    "recording silently.",
+                    guild_id,
+                )
+            else:
+                log.exception(
+                    "Guild %d: the timeout sweep failed before closing anything; the "
+                    "session in progress is untouched.",
+                    guild_id,
+                )
+        if not closed:
+            return
+        await self._return_to_idle(guild_id, recording)
+        await self._apply_pending(guild_id, recording)
 
     async def graceful_shutdown(self) -> None:
         """Closes every active session before the connection is torn down.
@@ -791,9 +975,19 @@ class SturnusClient(commands.Bot):
         self._shutting_down = True
         if self._tick_task is not None:
             self._tick_task.cancel()
-        for recording in list(self._guilds.values()):
-            # No `reset()` afterwards, deliberately: the process is going
-            # away, and a machine left in CLOSING cannot offer a session
-            # that would never be recorded.
-            await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
-            await recording.voice.leave()
+        for guild_id, recording in list(self._guilds.items()):
+            # Each guild is isolated: SIGTERM gives us one pass at this,
+            # and one guild whose upload fails must not cost every guild
+            # after it in the dict the session it is still holding open.
+            try:
+                # No `reset()` afterwards, deliberately: the process is
+                # going away, and a machine left in CLOSING cannot offer a
+                # session that would never be recorded.
+                await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
+                await recording.voice.leave()
+            except Exception:
+                log.exception(
+                    "Guild %d: closing its session during shutdown failed; its audio "
+                    "may be left for recover_orphans. Other guilds are unaffected.",
+                    guild_id,
+                )

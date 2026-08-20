@@ -25,6 +25,7 @@ them to exercise the lifecycle logic.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -35,7 +36,7 @@ import discord
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from sturnus.application.ports import AudioWriter, Clock, SessionKey, VoiceReceiver
+from sturnus.application.ports import AudioStore, AudioWriter, Clock, SessionKey, VoiceReceiver
 from sturnus.application.reconfigure import GuildRuntimeConfig, ReconfigureAction
 from sturnus.application.recording import RecordingService
 from sturnus.domain import settings
@@ -299,13 +300,15 @@ def _client(
     sessions: FakeSessions | None = None,
     jobs: FakeJobs | None = None,
     recording_dir: Path | None = None,
+    audio_store: AudioStore | None = None,
 ) -> _TestClient:
     """A `SturnusClient` with every dependency these tests do not touch stubbed out.
 
     `config_store`, `sessions` and `jobs` are injectable because the
     reconcile tests drive the whole build path through the client rather
     than constructing a `RecordingService` themselves, and then need to
-    assert on what that pipeline actually persisted.
+    assert on what that pipeline actually persisted. `audio_store` joins
+    them for the tests that need the upload inside `close()` to fail.
     """
     client = _TestClient(
         clock=clock,
@@ -317,7 +320,7 @@ def _client(
         if sessions is not None
         else MagicMock(spec=SessionRepository),
         job_repo=cast(JobRepository, jobs) if jobs is not None else MagicMock(spec=JobRepository),
-        audio_store=FakeStore(),
+        audio_store=audio_store if audio_store is not None else FakeStore(),
         writer_factory=FakeAudioWriterFactory(recording_dir or Path("/tmp")),
         encryptor=FakeEncryptor(),
         readiness=ReadinessState(),
@@ -1003,3 +1006,420 @@ async def test_a_standing_deferral_is_logged_once_not_every_reconcile(
             await client.reconcile_guild(GUILD_ID)
         teardown = [r for r in caplog.records if "then Sturnus stops watching" in r.getMessage()]
         assert len(teardown) == 1
+
+
+class ExplodingStore:
+    """A `FakeStore` whose upload can be made to fail, as S3 does.
+
+    `close()` reaches the object store in the middle of its
+    encrypt-upload-enqueue sequence, so this is the realistic way to make
+    a close raise *after* the `SessionMachine` has already moved to
+    CLOSING -- the state nothing but `reset()` ever leaves.
+    """
+
+    def __init__(self) -> None:
+        self.fail = False
+        self.put_calls = 0
+
+    async def put(self, _key: str, _source: Path) -> None:
+        self.put_calls += 1
+        if self.fail:
+            raise RuntimeError("the object store is unreachable")
+
+    async def delete(self, key: str) -> None:
+        pass
+
+
+class BlockingVoiceReceiver(FakeVoiceReceiver):
+    """A `FakeVoiceReceiver` whose `leave()` can be suspended mid-await.
+
+    `_teardown` and `_retarget` both `await voice.leave()`, and that await
+    is the window a voice-state update used to slip into. Suspending it on
+    demand is what lets a test hold the reconcile open at exactly that
+    point and deliver the join that used to interleave with it.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.block_next_leave = False
+        self.entered_leave = asyncio.Event()
+        self.release_leave = asyncio.Event()
+
+    async def leave(self) -> None:
+        if self.block_next_leave:
+            self.block_next_leave = False
+            self.entered_leave.set()
+            await self.release_leave.wait()
+        await super().leave()
+
+
+def _channel_map(guild: MagicMock, channels: dict[int, discord.VoiceChannel]) -> None:
+    """Makes the mock guild answer `get_channel` per id, as a real one does.
+
+    The default `_guild` mock returns the same channel whatever it is
+    asked for, which is enough for a test that only ever has one. A test
+    that retargets needs the two channels told apart -- otherwise the
+    people waiting in the old one are counted as waiting in the new one.
+    """
+    guild.get_channel.side_effect = lambda channel_id: channels.get(channel_id)
+
+
+async def _settle() -> None:
+    """Lets every other runnable task advance as far as it can.
+
+    The race tests start a handler and then need it to reach the point
+    where it either blocks (fixed) or does its damage (broken) before
+    they assert. A few passes through the loop is what separates those
+    two outcomes; nothing here sleeps for real time.
+    """
+    for _ in range(4):
+        await asyncio.sleep(0)
+
+
+async def test_a_failed_upload_must_not_leave_a_guild_recording_nothing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The wedge the first fix round closed, reached through a failing `close()`.
+
+    `tick()` moves the `SessionMachine` to CLOSING and only then runs the
+    encrypt-upload-enqueue sequence. That sequence talks to the object
+    store, so it can fail for reasons that have nothing to do with this
+    guild -- and when it did, the `reset()` that follows was never
+    reached: the machine stayed in CLOSING, `is_recording` stayed false,
+    `participants_changed` could not open another row, and the guild
+    recorded nothing at all until the process was restarted. Nobody would
+    notice, which is what makes it the worst failure this bot has.
+
+    So the return to a recordable state must not hang off the upload
+    having worked. It must also be *audible*: the assertion on the log is
+    load-bearing, because a recovery that recorded nothing about the lost
+    upload would trade a silent wedge for a silent data loss.
+
+    Against the unfixed code this fails at `_start_session`: the service
+    is closed-but-never-reset, so Ben's arrival opens nothing.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    audio = ExplodingStore()
+    store = _configured_store()
+    client = _client(
+        clock,
+        config_store=store,
+        sessions=sessions,
+        jobs=jobs,
+        recording_dir=tmp_path,
+        audio_store=cast(AudioStore, audio),
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client.reconcile_guild(GUILD_ID)
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, anna)
+    service = client._guilds[GUILD_ID].service
+    await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
+
+    # Anna leaves, and the object store goes down before the grace period
+    # expires -- so the close this tick performs raises mid-sequence.
+    guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
+    await client.on_voice_state_update(anna, _voice_state(guild.get_channel()), _voice_state(None))
+    audio.fail = True
+    clock.advance(timedelta(seconds=61))
+
+    with caplog.at_level(logging.ERROR, logger="sturnus.infrastructure.discord.client"):
+        await client._tick_all(clock.now())
+
+    assert audio.put_calls == 1, "the close really did get as far as the upload"
+    assert sessions.closed == [], "and really did fail before closing the row"
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR], (
+        "a close that lost a recording must be visible, not swallowed"
+    )
+
+    # The guild is not wedged: the very next consenting participant records.
+    audio.fail = False
+    ben = _member(BEN, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, ben)
+
+    assert sessions.opened == [1, 2], "a second session must still be reachable"
+    assert client._guilds[GUILD_ID].service is service, "on the same pipeline"
+    assert _voice_of(client, GUILD_ID).joined == [CHANNEL_ID, CHANNEL_ID]
+
+    await service.voice_packet(BEN, "ben", ssrc=2, rtp_timestamp=RTP, pcm=pcm(960), now=clock.now())
+    guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
+    await client.on_voice_state_update(ben, _voice_state(guild.get_channel()), _voice_state(None))
+    clock.advance(timedelta(seconds=61))
+    await client._tick_all(clock.now())
+
+    assert sessions.closed == [(2, "empty")], "and closes normally once the store is back"
+    assert [job["discord_user_id"] for job in jobs.enqueued] == [BEN]
+    # Anna's encrypted recording is deliberately still on disk: the upload
+    # never confirmed, so `recover_orphans` owns it from here.
+    assert [path.name for path in tmp_path.rglob("*.enc")] == [f"{ANNA}.enc"]
+
+
+async def test_a_forced_apply_whose_upload_fails_still_leaves_the_guild_recordable(
+    tmp_path: Path,
+) -> None:
+    """The same wedge on the `end_now()` path, which `/config apply force:true` takes.
+
+    `_end_session_now` used to run `leave()` and `reset()` as plain
+    statements after the close, so a close that raised skipped both --
+    leaving a machine in CLOSING that nothing would ever return to IDLE,
+    for an administrator who had just been told by the bot to run this
+    very command.
+
+    The error still propagates (`/config apply` renders a failed reconcile
+    as its own answer rather than claiming success), but it propagates out
+    of a guild that can record again. Against the unfixed code the
+    `_start_session` below fails.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    audio = ExplodingStore()
+    store = _configured_store()
+    client = _client(
+        clock,
+        config_store=store,
+        sessions=sessions,
+        jobs=jobs,
+        recording_dir=tmp_path,
+        audio_store=cast(AudioStore, audio),
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client.reconcile_guild(GUILD_ID)
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, anna)
+    service = client._guilds[GUILD_ID].service
+    await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
+
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(NEW_CHANNEL_ID))
+    assert (await client.reconcile_guild(GUILD_ID)).action is ReconfigureAction.DEFER_RETARGET
+
+    audio.fail = True
+    with pytest.raises(RuntimeError, match="object store"):
+        await client.reconcile_guild(GUILD_ID, force=True)
+
+    assert service.needs_reset is False, "the machine must not be left parked in CLOSING"
+    assert service.is_recording is False
+
+    audio.fail = False
+    ben = _member(BEN, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, ben)
+
+    assert sessions.opened == [1, 2]
+    assert client._guilds[GUILD_ID].service is service
+
+
+async def test_members_already_in_the_channel_start_recording_without_rejoining(
+    tmp_path: Path,
+) -> None:
+    """The reported complaint: configured, three people waiting, and nothing happens.
+
+    A freshly built pipeline used to learn its headcount only from
+    *subsequent* voice-state updates, so an administrator who fixed the
+    configuration while people sat in the channel got a bot that reported
+    itself live and recorded nothing until somebody left and rejoined.
+
+    Not a single voice-state update is delivered anywhere in this test, on
+    purpose -- and what is asserted is that a session actually opens, that
+    the bot actually joins, and that audio actually lands in that session,
+    rather than that some counting function was called.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = FakeConfigStore()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    ben = _member(BEN, guild, role_ids=[ROLE_ID])
+    # An administrator sitting in on the call without the consent role,
+    # who must not be counted (Spec 3.1).
+    admin = _member(999, guild, role_ids=[NEW_ROLE_ID])
+    guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[anna, ben, admin])
+
+    await client._tick_all(clock.now())
+    assert client._guilds == {}, "nothing to build yet"
+
+    # The configuration is fixed while all three are already in the channel.
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(CHANNEL_ID))
+    store.write(GUILD_ID, settings.CONSENT_ROLE_ID, str(ROLE_ID))
+    await client._tick_all(clock.now())
+
+    service = client._guilds[GUILD_ID].service
+    assert sessions.opened == [1], "the people already waiting must start a session"
+    assert service.is_recording is True
+    assert _voice_of(client, GUILD_ID).joined == [CHANNEL_ID], "and the bot must join them"
+
+    # And it is a real recording, not just an open row.
+    await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
+    guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
+    await client.on_voice_state_update(anna, _voice_state(guild.get_channel()), _voice_state(None))
+    clock.advance(timedelta(seconds=61))
+    await client._tick_all(clock.now())
+
+    assert sessions.closed == [(1, "empty")]
+    assert sessions.participants_of(1) == {ANNA}
+    assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
+    assert list(tmp_path.rglob("*")) == []
+
+
+async def test_a_retarget_counts_the_people_already_in_the_new_channel(
+    tmp_path: Path,
+) -> None:
+    """The same omission on the retarget path: the channel moves, nobody moves.
+
+    Moving the configured channel emits no voice-state update for the
+    people already sitting in the new one, so a retargeted pipeline that
+    does not count them waits for a rejoin exactly as a freshly built one
+    did.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    _channel_map(
+        guild,
+        {
+            CHANNEL_ID: _voice_channel(CHANNEL_ID, members=[]),
+            NEW_CHANNEL_ID: _voice_channel(NEW_CHANNEL_ID, members=[anna]),
+        },
+    )
+
+    await client.reconcile_guild(GUILD_ID)
+    assert sessions.opened == [], "the configured channel is empty; nothing starts"
+
+    # The administrator points the bot at the channel Anna is already in.
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(NEW_CHANNEL_ID))
+    result = await client.reconcile_guild(GUILD_ID)
+
+    assert result.action is ReconfigureAction.RETARGET
+    assert sessions.opened == [1]
+    assert client._guilds[GUILD_ID].service.is_recording is True
+    assert _voice_of(client, GUILD_ID).joined == [NEW_CHANNEL_ID]
+
+
+async def test_a_join_during_a_teardown_cannot_strand_a_session_or_a_connection(
+    tmp_path: Path,
+) -> None:
+    """`on_voice_state_update` ran outside the per-guild reconfigure lock.
+
+    `_teardown` awaits `voice.leave()` and only afterwards drops the guild
+    from `_guilds`. A member joining inside that await used to interleave:
+    the handler still found the pipeline, opened a session row against the
+    channel being abandoned, generated its data key, and reconnected the
+    voice client the teardown had just disconnected. `_teardown` then
+    popped the guild -- stranding both. Nothing was left to tick that
+    session to a close, so its row stayed `open` forever and its audio was
+    never uploaded, and nothing held the voice connection, so nothing
+    would ever disconnect it.
+
+    Against the unfixed code this fails on the first two assertions.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client.reconcile_guild(GUILD_ID)
+
+    voice = BlockingVoiceReceiver()
+    client._guilds[GUILD_ID].voice = voice
+
+    # The configuration is cleared, and the teardown stalls inside `leave()`.
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, None)
+    voice.block_next_leave = True
+    teardown = asyncio.create_task(client.reconcile_guild(GUILD_ID))
+    await voice.entered_leave.wait()
+
+    # Anna joins at exactly that moment.
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    channel = _voice_channel(CHANNEL_ID, members=[anna])
+    guild.get_channel.return_value = channel
+    joining = asyncio.create_task(
+        client.on_voice_state_update(anna, _voice_state(None), _voice_state(channel))
+    )
+    await _settle()
+
+    voice.release_leave.set()
+    await teardown
+    await joining
+
+    assert sessions.opened == [], "a join during the teardown must not open a session row"
+    assert voice.joined == [], "and must not reconnect the connection just disconnected"
+    assert GUILD_ID not in client._guilds
+    assert voice.left == 1
+
+
+async def test_a_join_during_a_retarget_cannot_corrupt_the_reconfigure(
+    tmp_path: Path,
+) -> None:
+    """The same interleaving on `_retarget`, where it corrupts differently.
+
+    Here the join lands while the *old* channel is still what
+    `recording.channel_id` reports, so the handler opened a session
+    against the channel being left behind -- and `_retarget` then reached
+    `RecordingService.retarget`, whose mid-session assertion fired and
+    tore the reconcile in half: the voice client disconnected, the config
+    not updated, a session row open on a channel nobody is watching.
+
+    Under the lock the handler waits and then recounts against the channel
+    that is configured *now*, which is the only headcount that was ever
+    meaningful. Against the unfixed code this raises `AssertionError`.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    # Kept as a dict so the old channel's membership can change between
+    # events, the way a real one does, without reassigning a read-only
+    # `VoiceChannel.members`.
+    channels: dict[int, discord.VoiceChannel] = {
+        CHANNEL_ID: _voice_channel(CHANNEL_ID, members=[]),
+        NEW_CHANNEL_ID: _voice_channel(NEW_CHANNEL_ID, members=[]),
+    }
+    _channel_map(guild, channels)
+    await client.reconcile_guild(GUILD_ID)
+
+    voice = BlockingVoiceReceiver()
+    client._guilds[GUILD_ID].voice = voice
+
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(NEW_CHANNEL_ID))
+    voice.block_next_leave = True
+    retarget = asyncio.create_task(client.reconcile_guild(GUILD_ID))
+    await voice.entered_leave.wait()
+
+    # Anna joins the channel the bot is in the middle of leaving.
+    channels[CHANNEL_ID] = _voice_channel(CHANNEL_ID, members=[anna])
+    joining = asyncio.create_task(
+        client.on_voice_state_update(anna, _voice_state(None), _voice_state(channels[CHANNEL_ID]))
+    )
+    await _settle()
+
+    voice.release_leave.set()
+    result = await retarget
+    await joining
+
+    assert result.action is ReconfigureAction.RETARGET
+    assert client._guilds[GUILD_ID].channel_id == NEW_CHANNEL_ID
+    assert sessions.opened == [], "the abandoned channel must not open a session"
+    assert voice.joined == [], "and the new channel is empty, so nothing is joined"

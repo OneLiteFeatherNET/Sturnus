@@ -156,6 +156,20 @@ class RecordingService:
         return self._session_id is not None and not self._closed
 
     @property
+    def needs_reset(self) -> bool:
+        """True while only `reset()` can make this service recordable again.
+
+        Exactly `reset()`'s own precondition, asked rather than asserted, so
+        a caller recovering from a failed `close()` can tell "the session was
+        moved to CLOSING and never came back" from "nothing was closing at
+        all". The distinction matters: `close()` reaches the object store and
+        the job queue and can fail there, and it flips `_closed` before it
+        does, so a failure leaves precisely this state -- a machine parked in
+        CLOSING that no longer records anything until someone resets it.
+        """
+        return self._closed and self._machine.state is SessionState.CLOSING
+
+    @property
     def session_id(self) -> int | None:
         return self._session_id
 
