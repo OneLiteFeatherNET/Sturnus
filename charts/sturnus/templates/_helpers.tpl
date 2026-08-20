@@ -137,18 +137,27 @@ to be read back. Refusing to start is the loud version of the same event, and
 {{- end -}}
 {{- /*
   Scoping the secretKeyRefs is only half the property. A values file can
-  still put a credential on any component as a literal through that
-  component's own `env` map -- `--set link.env.STURNUS_MASTER_KEY=...`
-  renders the master key in plain text on the internet-facing container,
-  and the pod starts, so nothing signals it. Refuse to render instead: an
-  operator who needs a credential somewhere new adds it to the list above,
-  where the decision is reviewed, rather than routing around it from a
-  cluster values file.
+  still put a credential on a component as a literal, through either that
+  component's own `env` map or the shared `commonEnv` --
+  `--set link.env.STURNUS_MASTER_KEY=...` renders the master key in plain
+  text on the internet-facing container, and via `commonEnv` on all three
+  at once. The pod starts either way, so nothing signals it. Refuse to
+  render instead: an operator who needs a credential somewhere new adds it
+  to the list above, where the decision is reviewed, rather than routing
+  around it from a cluster values file.
+
+  Both maps are checked against the union of all three components' lists,
+  not just this component's, so a credential cannot be smuggled onto one
+  component by naming a key another component legitimately reads.
 */ -}}
 {{- $componentEnv := (index $.root.Values .component | default dict).env | default dict -}}
+{{- $shared := $.root.Values.commonEnv | default dict -}}
 {{- range $all := (concat (index $lists "bot") (index $lists "worker") (index $lists "link")) -}}
 {{- if hasKey $componentEnv $all -}}
-{{- fail (printf "sturnus.secretEnv: %s sets the credential %s as a plain env value. Credentials reach a component only through the Secret named by existingSecret; add it to the key list in _helpers.tpl if this component genuinely needs it." $.component $all) -}}
+{{- fail (printf "sturnus.secretEnv: %s.env sets the credential %s as a plain env value. Credentials reach a component only through the Secret named by existingSecret; add it to the key list in _helpers.tpl if this component genuinely needs it." $.component $all) -}}
+{{- end -}}
+{{- if hasKey $shared $all -}}
+{{- fail (printf "sturnus.secretEnv: commonEnv sets the credential %s as a plain env value, which would place it on all three components at once. Credentials reach a component only through the Secret named by existingSecret." $all) -}}
 {{- end -}}
 {{- end -}}
 {{- range (index $lists .component) }}

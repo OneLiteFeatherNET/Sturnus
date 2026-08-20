@@ -276,10 +276,12 @@ allows it for the consent role — this is not cosmetic, it is the primary
 layer of the consent protection (Spec 3.1): someone who has not consented
 cannot technically produce audio in that channel at all. The bot enforces
 a second, independent layer on top of it: `VoiceReceiveAdapter` drops any
-incoming audio packet from a user who does not hold the consent role,
-regardless of what channel permissions say — this exists specifically
-because a guild administrator bypasses channel overwrites and could
-otherwise speak in the channel without the role.
+incoming audio packet unless the speaker holds the consent role **and** a
+stored consent record matching the guild's current `policy_version`,
+regardless of what channel permissions say. It exists specifically because
+a guild administrator bypasses channel overwrites and could otherwise
+speak in the channel without the role — and because the record check is
+what makes bumping `policy_version` take effect on its own (see section 6).
 
 ### 3.3 Why non-recorded channels must also exist
 

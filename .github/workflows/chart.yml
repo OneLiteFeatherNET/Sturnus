@@ -129,14 +129,6 @@ jobs:
               check(not any(k.startswith('logs.') for k in labels),
                     f"{dep['metadata']['name']} carries a log label with no podLabels set")
 
-          # The secrets live in a Kubernetes Secret; a plaintext env value for
-          # one of them would mean the chart grew a way to leak it.
-          for name, dep in deployments.items():
-              for container in dep['spec']['template']['spec']['containers']:
-                  for env in container.get('env') or []:
-                      check('value' not in env or 'TOKEN' not in env['name'].upper(),
-                            f"{name} sets {env['name']} as a literal env value")
-
           # Every component gets exactly the secret keys its own settings
           # class declares, and no others. This is the assertion that fails
           # if a component regains a credential it does not read -- the
@@ -155,6 +147,18 @@ jobs:
                   ).stdout
               ).items()
           }
+
+          # A credential as a plaintext env value would mean the chart grew a
+          # way to leak it. Checked against the derived credential list, not
+          # a name pattern: the first version of this matched only names
+          # containing TOKEN, so STURNUS_MASTER_KEY -- the key that wraps
+          # every recording -- passed straight through it.
+          every_credential = set().union(*expected_secret_keys.values())
+          for name, dep in deployments.items():
+              for container in dep['spec']['template']['spec']['containers']:
+                  for env in container.get('env') or []:
+                      check('value' not in env or env['name'] not in every_credential,
+                            f"{name} sets the credential {env['name']} as a literal env value")
 
           check(set(deployments) == set(expected_secret_keys),
                 f'expected Deployments {sorted(expected_secret_keys)}, '
