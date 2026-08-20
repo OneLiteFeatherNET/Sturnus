@@ -141,10 +141,13 @@ embeds the database password, and a `SecretStr` field's masking is a
 convenience in tracebacks, not the thing that decides where a value is
 stored.
 
-Each component's `Secret` need only carry the credentials its own table
-lists. Handing `link` the master key or the Discord token because they
-happen to sit in the same secret file undoes the blast-radius separation
-described above.
+One `Secret` holds all seven keys; the separation is made by the chart,
+which gives each Deployment only the keys that component's own table
+lists. So provision the Secret with the full seven — it is shared — and
+rely on the wiring rather than on splitting the file. Handing `link` the
+master key or the Discord token because they happen to sit in the same
+secret undoes the blast-radius separation described above, which is
+exactly what that wiring exists to prevent.
 
 ### 1.5 The redirect URI must match the route that reaches `link`
 
@@ -188,12 +191,12 @@ openssl rand -base64 32
 ```
 
 **Reaching SOPS.** Per the design (Section 13.5), this value — along with
-the Discord token, S3 credentials, and the Outline/OAuth secrets once
-those land — is not set directly in the chart. It goes into a
-SOPS-encrypted secret file in the cluster's GitOps repository, which
-decrypts into the Kubernetes `Secret` the chart expects to already exist
-(`existingSecret: sturnus-secrets` in `values.yaml`). The chart only ever
-references that secret by name through `envFrom.secretRef` — it never
+the other six credentials listed in section 1.4 — is not set directly in
+the chart. It goes into a SOPS-encrypted secret file in the cluster's
+GitOps repository, which decrypts into the Kubernetes `Secret` the chart
+expects to already exist (`existingSecret: sturnus-secrets` in
+`values.yaml`). The chart only ever references that secret by name, and
+hands each component just the keys its own settings class reads — it never
 places a secret value into `values.yaml` or a template, and this
 repository holds none of the cluster's actual key material.
 
@@ -382,9 +385,12 @@ by `retention_until`, stamped on each job when created, and the pure
 selection `expired_jobs` picks out jobs whose `retention_until` has
 strictly passed and whose `audio_deleted_at` is still unset — the
 adapter that actually deletes from S3 and stamps `audio_deleted_at` as
-durable proof the deletion happened is separate I/O, driven by whatever
-process runs that sweep periodically; a bucket lifecycle rule is a second,
-independent line of defence, never a substitute for that database record.
+durable proof the deletion happened is separate I/O. The worker drives it,
+once an hour, alongside its job loop
+(`sweep_expired_audio` in `sturnus.entrypoints.worker`), so nothing else
+needs to: a bucket lifecycle rule is a second, independent line of
+defence, never a substitute for that database record, and never a
+replacement for this sweep.
 
 Because recordings outlive their transcription by weeks, not minutes, the
 retention period is not merely an implementation detail — **it belongs in
@@ -400,13 +406,16 @@ moment they differ, that consent is no longer active, and `/consent
 grant`/`/consent status` will show it as such and offer the consent flow
 again. Be aware of what this does and does not do on this branch today,
 though: that check gates whether `/consent grant` treats someone as
-already consented and whether `/consent status` reports them active — it
-does **not** by itself revoke the consent role or stop someone from being
-recorded. The packet-level filter that decides whether to keep someone's
-audio (`sturnus.infrastructure.discord.voice`) currently checks only
-Discord role membership, not policy version. If a hard cutover is
-required — nobody may keep recording under the old policy basis at all —
-the consent role must be explicitly removed from existing holders as
-well; bumping `policy_version` alone leaves current role-holders able to
-keep being recorded until they happen to re-run `/consent grant` or
-`/consent revoke` themselves.
+already consented and whether `/consent status` reports them active — but
+it does stop them from being recorded, without any further action.
+
+The packet-level filter checks both layers: the Discord role, per packet,
+and the stored consent record behind it
+(`sturnus.infrastructure.discord.voice` calling `ConsentCache.may_record`,
+which applies `sturnus.domain.consent.may_record` — role membership **and**
+a consent record matching the current `policy_version`). So a bump takes
+effect on its own, within the cache's five-second TTL: role-holders whose
+consent names the superseded version stop being recorded mid-session, and
+`/consent grant` under the new version is what puts them back. Removing
+the role by hand is not required for a hard cutover, and doing so only
+costs the affected members a second step when they re-consent.
