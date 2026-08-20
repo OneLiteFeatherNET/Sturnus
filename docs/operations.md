@@ -60,7 +60,7 @@ the Kubernetes `Secret` rather than from plain manifest text (see section
 | `STURNUS_OUTLINE_CLIENT_ID` | **yes** | no | OAuth client id of the Sturnus application registered in Outline. Public by design — it travels in the query string of the authorization URL every user's browser opens. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL that authorization returns to. Must be the same value `sturnus-link` is given, and must actually route to `link` — see section 1.5. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. |
-| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Empty disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Supplied through the `Secret`, and required to be present even when blank; see section 1.4 for why a value that is not a credential is stored like one. |
 | `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 The bot has no `STURNUS_OUTLINE_CLIENT_SECRET`, and that is not an
@@ -90,7 +90,7 @@ in the bot would read it.
 | `STURNUS_MAX_JOB_ATTEMPTS` | `3` | no | How many failed attempts a job gets before `JobQueue.fail` marks it `dead`. See section 5 for what a `dead` job means for the rest of its session. |
 | `STURNUS_JOB_LEASE_SECONDS` | `1800.0` | no | How long a claimed job may stay `running` before `JobQueue.claim` reclaims it for another worker. It is generous on purpose: it must exceed the longest plausible transcription, or a still-running job gets picked up a second time. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. |
-| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Empty disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Supplied through the `Secret`, and required to be present even when blank; see section 1.4 for why a value that is not a credential is stored like one. |
 | `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 Whisper's device and compute type are deliberately *not* environment-driven:
@@ -109,7 +109,7 @@ configuration change.
 | `STURNUS_OUTLINE_CLIENT_SECRET` | **yes** | **yes** | OAuth client secret for that same application. This process is the only one that holds it, because it is the only one that exchanges an authorization code for a token. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL, repeated here because the token exchange sends it again for verification. It must match the bot's value exactly — see section 1.5. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz` and `/oauth/callback` routes are served on. |
-| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Empty disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Supplied through the `Secret`, and required to be present even when blank; see section 1.4 for why a value that is not a credential is stored like one. |
 | `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 `link` holds no Discord token, no S3 credentials and no master key — by
@@ -129,6 +129,7 @@ how it gets there via SOPS):
 - `STURNUS_MASTER_KEY`
 - `STURNUS_OUTLINE_SERVICE_KEY`
 - `STURNUS_OUTLINE_CLIENT_SECRET`
+- `STURNUS_SENTRY_DSN` — for a different reason; see below
 
 Everything else is plain configuration and should be readable in the
 manifests, where it can be reviewed and diffed. That is not laxity, it is
@@ -140,17 +141,39 @@ credentials. Encrypting an address buys nothing and costs review: a wrong
 redirect URI hidden inside a SOPS blob is a great deal harder to spot than
 a wrong one sitting in a values file.
 
-`STURNUS_SENTRY_DSN` is not the eighth entry, and should not be made one.
-The key embedded in a DSN is Sentry's *public* key: it authorises submitting
-events to one project and grants no read access to anything, which is why
-Sentry itself documents putting a DSN in browser JavaScript for frontend
-projects. The worst outcome from disclosure is event spam into one project —
-handled by rate limits and key rotation, not by encryption. Adding it to the
-`Secret` would misrepresent it as a credential in the one place this project
-keeps its credential inventory (the key lists in
-`charts/sturnus/templates/_helpers.tpl`) and pull a non-credential into the
-SOPS rotation procedure. It belongs in `commonEnv` alongside
-`STURNUS_OUTLINE_CLIENT_ID`, for the same reason.
+`STURNUS_SENTRY_DSN` is the eighth entry, and it is there for a different
+reason than the other seven. Everything the earlier version of this section
+said about what a DSN *is* still holds: the key embedded in it is Sentry's
+*public* key, it authorises submitting events to one project, it grants no
+read access to anything, and Sentry documents putting one in browser
+JavaScript for frontend projects. What that reasoning missed is where this
+particular DSN would be written down.
+
+The manifests supplying it live in `OneLiteFeatherNET/Kubernetes-FLUX`,
+which is a **public** repository, and GitHub is continuously scraped for
+exactly this shape of string. A browser DSN is unavoidably public — the code
+holding it runs on the reader's machine. A server-side DSN is not, and
+publishing one anyway invites a stranger to fill the project with events.
+Being unable to *read* anything is not the same as being harmless to
+publish.
+
+So it goes through the `Secret`, and the chart's guard
+(`sturnus.secretEnv`) now refuses to render if a values file puts it back
+into `env` or `commonEnv` — the same protection the real credentials have.
+Two consequences follow, both deliberate:
+
+- **The key must be present, even when Sentry is off.** Every key in those
+  lists is wired with `optional: false`, so a missing one stops the pod
+  rather than injecting an empty string. A cluster that does not report
+  errors therefore sets `STURNUS_SENTRY_DSN=` — blank, which is the off
+  switch (`SentrySettings._blank_dsn_is_absent`) — rather than omitting the
+  line.
+- **It joins the SOPS rotation procedure**, which for this one key means
+  rotating a Sentry project key rather than a credential. That is a small
+  cost, and it is the honest place to pay it.
+
+`STURNUS_SENTRY_ENVIRONMENT` stays in `commonEnv`: it is a label, not a
+key.
 
 `STURNUS_DATABASE_URL` is the one entry on that list that is not typed
 `SecretStr` in the code — it is a plain `str`, because it is a connection

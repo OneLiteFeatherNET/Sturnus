@@ -86,21 +86,25 @@ commonEnv:
   STURNUS_OUTLINE_BASE_URL: "https://wiki.example.invalid"
   STURNUS_OUTLINE_CLIENT_ID: ""
   STURNUS_OUTLINE_REDIRECT_URI: "https://sturnus.example.invalid/oauth/callback"
-  # Error reporting (sturnus/infrastructure/observability.py). Empty is the
-  # off switch and the default: the DSN never reaches `sentry_sdk.init()`,
-  # so no instrumentation is installed at all and all three components run
-  # exactly as they do without it.
+  # STURNUS_SENTRY_DSN is deliberately absent here. It travels through the
+  # Secret named by `existingSecret`, like every other key in
+  # templates/_helpers.tpl's credential lists, and putting it back in this
+  # map makes the chart refuse to render rather than quietly publishing it.
   #
-  # A DSN is deliberately NOT in the Secret named by `existingSecret`. The
-  # key inside it is Sentry's *public* key -- write-only to one project,
-  # granting no read access, and the same value Sentry documents embedding
-  # in browser JavaScript. Putting it in the Secret would require adding it
-  # to the credential list in templates/_helpers.tpl, which is this chart's
-  # inventory of what actually is a credential, and would drag a
-  # non-credential into the SOPS rotation procedure. See
-  # docs/operations.md section 1.4.
-  STURNUS_SENTRY_DSN: ""
+  # Not because it is a credential in the usual sense -- it carries Sentry's
+  # public key, write-only to one project and granting no read access -- but
+  # because the GitOps repository supplying these values is public, and a
+  # DSN found there lets anyone fill the project with events.
+  #
+  # Empty remains the off switch: blank never reaches `sentry_sdk.init()`,
+  # so no instrumentation is installed at all (see
+  # sturnus/infrastructure/observability.py and
+  # `SentrySettings._blank_dsn_is_absent`). A cluster that does not report
+  # errors therefore sets the Secret key to the empty string rather than
+  # leaving it out. See docs/operations.md section 1.4.
+  #
   # Names the deployment in Sentry's environment filter. Set per cluster.
+  # Not a credential and not secret -- it stays here.
   STURNUS_SENTRY_ENVIRONMENT: "production"
 
 # Every component's health/readiness server listens on this container port

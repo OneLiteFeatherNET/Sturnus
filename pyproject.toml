@@ -97,6 +97,11 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# The repository root, so `scripts/` is importable. `scripts` is not part of
+# the installed package -- it holds tooling the CI jobs run -- but
+# `component_credentials.py` decides which credentials the chart hands each
+# container, which is worth a test rather than only a workflow.
+pythonpath = ["."]
 markers = [
     "slow: exercises real model inference (e.g. downloads a Whisper model from HuggingFace); deselected on pull requests, run on push to main and on a schedule -- see .github/workflows/build.yml",
 ]
