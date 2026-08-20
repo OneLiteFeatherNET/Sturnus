@@ -74,11 +74,17 @@ class CreatedDocument:
 class DocumentSink(Protocol):
     """A destination a rendered transcript can be written to (Spec 8.1).
 
-    Knows nothing of collections, spaces, or file paths -- those concepts
-    live in the configuration of whichever adapter implements this port.
+    `target` names where within the destination the document goes -- an
+    Outline collection id, a future Confluence adapter's space key, a file
+    storage path; its interpretation is up to the adapter (Spec 11's
+    `document_target`). It is a parameter to `create`, not configuration
+    fixed on the adapter at construction: `document_target` is per-guild,
+    while one process (the worker) serves every guild, so which target
+    applies is only known once a specific session -- and therefore its
+    guild -- is in hand, at document-creation time.
     """
 
-    async def create(self, title: str, body: str) -> CreatedDocument: ...
+    async def create(self, title: str, body: str, target: str) -> CreatedDocument: ...
 
 
 def render_transcript(transcript: Transcript, template_source: str, tz: tzinfo) -> str:

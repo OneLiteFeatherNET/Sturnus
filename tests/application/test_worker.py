@@ -18,10 +18,17 @@ from typing import Any
 from sturnus.application.documents import CreatedDocument
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
 from sturnus.application.worker import process_one, retry_pending_documents
+from sturnus.domain import settings as domain_settings
 from sturnus.infrastructure.db.queue import ClaimedJob
 from sturnus.infrastructure.documents.outline import PermanentDocumentError
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
+
+#: The guild every `FakeSessions` reports by default -- matches
+#: `FakeConfig`'s default guild below, so a test that overrides neither
+#: still exercises real guild-scoped config resolution rather than a
+#: hardcoded shortcut.
+GUILD = 1
 
 
 class FakeQueue:
@@ -82,12 +89,17 @@ class FakeCrypto:
 class FakeDocuments:
     def __init__(self, permanent_error: bool = False) -> None:
         self.created: list[tuple[str, str]] = []
+        #: `target` from every `create` call, recorded separately from
+        #: `created` so existing `created[i][1]`-style body assertions stay
+        #: unchanged while still letting a test check what target was used.
+        self.targets: list[str] = []
         self.permanent_error = permanent_error
 
-    async def create(self, title: str, body: str) -> CreatedDocument:
+    async def create(self, title: str, body: str, target: str) -> CreatedDocument:
         if self.permanent_error:
             raise PermanentDocumentError(404)  # collection is gone
         self.created.append((title, body))
+        self.targets.append(target)
         return CreatedDocument(id="doc-1", url="https://outline.example/doc/1")
 
 
@@ -101,13 +113,18 @@ class FakeSessions:
 
     def __init__(self) -> None:
         self.languages: dict[int, str] = {}
-        self.documented: list[tuple[int, str]] = []
+        self.documented: list[tuple[int, str, str]] = []
         self.names: dict[int, str] = {100: "speaker-100"}
         self.epochs: dict[int, datetime] = {100: T0}
         self.bounds: tuple[datetime, datetime] = (T0, T0 + timedelta(hours=1))
         #: What `closed_undocumented_sessions` reports -- empty by default,
         #: since most tests never exercise `retry_pending_documents`.
         self.pending_retry: list[int] = []
+        #: What `guild_id` reports for every session id -- matches
+        #: `FakeConfig`'s default guild (module-level `GUILD`), so
+        #: guild-scoped configuration resolves the same way in both fakes
+        #: unless a test deliberately points them at different guilds.
+        self.guild = GUILD
 
     async def detected_language(self, _session_id: int, user_id: int) -> str | None:
         return self.languages.get(user_id)
@@ -115,8 +132,8 @@ class FakeSessions:
     async def set_detected_language(self, _session_id: int, user_id: int, lang: str) -> None:
         self.languages.setdefault(user_id, lang)
 
-    async def mark_documented(self, session_id: int, _doc_id: str, url: str) -> None:
-        self.documented.append((session_id, url))
+    async def mark_documented(self, session_id: int, _doc_id: str, url: str, provider: str) -> None:
+        self.documented.append((session_id, url, provider))
 
     async def participant_names(self, _session_id: int) -> dict[int, str]:
         return self.names
@@ -129,6 +146,9 @@ class FakeSessions:
 
     async def closed_undocumented_sessions(self) -> list[int]:
         return self.pending_retry
+
+    async def guild_id(self, _session_id: int) -> int:
+        return self.guild
 
 
 class FakeJobs:
@@ -149,13 +169,47 @@ class FakeJobs:
 
 
 class FakeLinks:
-    """Satisfies `sturnus.application.assembly.LinkReader`."""
+    """Satisfies `sturnus.application.worker.LinkRepository`.
+
+    Unlike `sturnus.application.assembly.LinkReader` (one arg), `provider`
+    is a parameter of `external_identity` here, matching production: the
+    worker resolves it per guild, at document-creation time, from
+    `document_provider` (Spec 11) rather than fixing it once. `requested`
+    records every provider actually asked for, so a test can assert the
+    *configured* provider reached this call rather than some default.
+    """
 
     def __init__(self, linked: dict[int, tuple[str, str]] | None = None) -> None:
         self._linked = linked or {}
+        self.requested: list[str] = []
 
-    async def external_identity(self, discord_user_id: int) -> tuple[str, str] | None:
+    async def external_identity(
+        self, discord_user_id: int, provider: str
+    ) -> tuple[str, str] | None:
+        self.requested.append(provider)
         return self._linked.get(discord_user_id)
+
+
+class FakeConfig:
+    """Satisfies `sturnus.application.worker.ConfigReader`.
+
+    Defaults to exactly what a fully-configured guild (`GUILD`) would
+    report for the three settings `_create_session_document` resolves:
+    `document_target`, `document_provider`, `merge_gap_seconds`. A test
+    that overrides one of these -- rather than the fakes' hardcoded return
+    values `process_one` used to be exercised against -- is what proves the
+    *configured* value reaches its use, not a default baked into the fake.
+    """
+
+    def __init__(self, values: dict[tuple[int, str], str] | None = None) -> None:
+        self._values = values or {
+            (GUILD, domain_settings.DOCUMENT_TARGET): "col-default",
+            (GUILD, domain_settings.DOCUMENT_PROVIDER): "outline",
+            (GUILD, domain_settings.MERGE_GAP_SECONDS): "15",
+        }
+
+    async def get(self, guild_id: int, key: str) -> str | None:
+        return self._values.get((guild_id, key))
 
 
 def job(job_id: int = 1, session_id: int = 1, user_id: int = 100) -> ClaimedJob:
@@ -180,6 +234,7 @@ def run(tmp_path: Path, **kw: Any) -> dict[str, Any]:
         "sessions": kw.get("sessions") or FakeSessions(),
         "jobs": kw.get("jobs") or FakeJobs(),
         "links": kw.get("links") or FakeLinks(),
+        "config": kw.get("config") or FakeConfig(),
         "work_dir": tmp_path,
         "max_attempts": 3,
     }
@@ -229,7 +284,144 @@ async def test_the_last_job_of_a_session_creates_the_document(tmp_path: Path) ->
     documents, sessions = FakeDocuments(), FakeSessions()
     await process_one(**run(tmp_path, queue=queue, documents=documents, sessions=sessions))
     assert len(documents.created) == 1
-    assert sessions.documented == [(1, "https://outline.example/doc/1")]
+    assert sessions.documented == [(1, "https://outline.example/doc/1", "outline")]
+
+
+async def test_document_target_from_configuration_reaches_the_sink(tmp_path: Path) -> None:
+    """`documents.create`'s `target` must be the guild's configured
+    `document_target` (Spec 11, read via `ConfigReader`), not a value
+    baked in anywhere else -- there is no global default collection, and a
+    test that only ever exercised `FakeConfig`'s own default would not
+    catch this reaching the sink at all.
+    """
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    documents = FakeDocuments()
+    config = FakeConfig(
+        {
+            (GUILD, domain_settings.DOCUMENT_TARGET): "guild-1-collection",
+            (GUILD, domain_settings.DOCUMENT_PROVIDER): "outline",
+            (GUILD, domain_settings.MERGE_GAP_SECONDS): "15",
+        }
+    )
+    await process_one(**run(tmp_path, queue=queue, documents=documents, config=config))
+    assert documents.targets == ["guild-1-collection"]
+
+
+async def test_a_missing_document_target_does_not_crash_the_worker(tmp_path: Path) -> None:
+    """A guild that has not configured `document_target` yet (it is a
+    required key with no default, Spec 11) must not crash the worker or be
+    silently skipped forever: the transcription job itself already
+    succeeded, so this is a transient document-creation failure exactly
+    like any other -- `retry_pending_documents` tries again later, once an
+    administrator sets it.
+    """
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    documents = FakeDocuments()
+    config = FakeConfig(
+        {
+            (GUILD, domain_settings.DOCUMENT_PROVIDER): "outline",
+            (GUILD, domain_settings.MERGE_GAP_SECONDS): "15",
+        }
+    )
+    done = await process_one(**run(tmp_path, queue=queue, documents=documents, config=config))
+    assert done is True
+    assert documents.created == []
+
+
+async def test_document_provider_from_configuration_selects_the_link_lookup(
+    tmp_path: Path,
+) -> None:
+    """`assemble` must read a speaker's external identity through the
+    guild's configured `document_provider` (Spec 11), not a provider
+    hardcoded anywhere along the way -- a later Confluence adapter reads
+    its own account-link mapping only if this reaches all the way through
+    to `AccountLinkRepository.external_identity`.
+    """
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    links = FakeLinks({100: ("conf-1", "Anna Confluence")})
+    # `assemble` only asks `links` about speakers it has a transcript for
+    # (see `sturnus.application.assembly.assemble`); the default `run()`
+    # jobs fake is empty, which would make this test pass vacuously.
+    jobs = FakeJobs(
+        {100: TranscriptionResult(segments=(TranscribedSegment(0.0, 1.0, "hi"),), language="de")}
+    )
+    config = FakeConfig(
+        {
+            (GUILD, domain_settings.DOCUMENT_TARGET): "col-default",
+            (GUILD, domain_settings.DOCUMENT_PROVIDER): "confluence",
+            (GUILD, domain_settings.MERGE_GAP_SECONDS): "15",
+        }
+    )
+    sessions = FakeSessions()
+    await process_one(
+        **run(tmp_path, queue=queue, links=links, jobs=jobs, config=config, sessions=sessions)
+    )
+    assert links.requested == ["confluence"]
+    # The same configured provider must be stamped on the session row --
+    # `session.document_provider` is what a later re-publish or migration
+    # reads back to find out which sink owns `document_id`.
+    assert [provider for _, _, provider in sessions.documented] == ["confluence"]
+
+
+async def test_merge_gap_seconds_from_configuration_reaches_assemble(tmp_path: Path) -> None:
+    """`process_one` must read `merge_gap_seconds` from configuration and
+    pass it through `assemble` to `build_transcript` -- not silently keep
+    using `sturnus.domain.transcript.DEFAULT_MERGE_GAP` (15s). Proven the
+    same way `test_merge_gap_is_read_from_the_caller_not_the_domain_default`
+    (`tests/application/test_assembly.py`) proves it one layer down: the
+    same 4-second pause between two same-speaker segments renders as one
+    block under the default and two under a guild-configured 1-second gap.
+    """
+
+    def two_segments_four_seconds_apart() -> FakeJobs:
+        return FakeJobs(
+            {
+                100: TranscriptionResult(
+                    segments=(
+                        TranscribedSegment(0.0, 1.0, "first"),
+                        TranscribedSegment(5.0, 6.0, "second"),
+                    ),
+                    language="de",
+                )
+            }
+        )
+
+    default_documents = FakeDocuments()
+    default_queue = FakeQueue([job(job_id=1)])
+    default_queue.last_is_final = True
+    await process_one(
+        **run(
+            tmp_path,
+            queue=default_queue,
+            documents=default_documents,
+            jobs=two_segments_four_seconds_apart(),
+        )
+    )
+    assert default_documents.created[0][1].count("·") == 1  # one block header
+
+    configured_documents = FakeDocuments()
+    configured_queue = FakeQueue([job(job_id=2)])
+    configured_queue.last_is_final = True
+    configured_config = FakeConfig(
+        {
+            (GUILD, domain_settings.DOCUMENT_TARGET): "col-default",
+            (GUILD, domain_settings.DOCUMENT_PROVIDER): "outline",
+            (GUILD, domain_settings.MERGE_GAP_SECONDS): "1",
+        }
+    )
+    await process_one(
+        **run(
+            tmp_path,
+            queue=configured_queue,
+            documents=configured_documents,
+            jobs=two_segments_four_seconds_apart(),
+            config=configured_config,
+        )
+    )
+    assert configured_documents.created[0][1].count("·") == 2  # two block headers
 
 
 async def test_a_single_speakers_document_contains_their_transcript(tmp_path: Path) -> None:
@@ -376,7 +568,7 @@ class FailingDocuments:
     def __init__(self) -> None:
         self.calls = 0
 
-    async def create(self, _title: str, _body: str) -> CreatedDocument:
+    async def create(self, _title: str, _body: str, _target: str) -> CreatedDocument:
         self.calls += 1
         raise RuntimeError("Outline is briefly returning 502")
 
@@ -425,10 +617,10 @@ async def test_retry_pending_documents_retries_closed_undocumented_sessions() ->
             )
         }
     )
-    await retry_pending_documents(documents, sessions, jobs, FakeLinks())
+    await retry_pending_documents(documents, sessions, jobs, FakeLinks(), FakeConfig())
     assert len(documents.created) == 1
     assert "hello again" in documents.created[0][1]
-    assert sessions.documented == [(1, "https://outline.example/doc/1")]
+    assert sessions.documented == [(1, "https://outline.example/doc/1", "outline")]
 
 
 async def test_retry_pending_documents_survives_one_sessions_failure() -> None:
@@ -441,11 +633,12 @@ async def test_retry_pending_documents_survives_one_sessions_failure() -> None:
     jobs = FakeJobs(
         {100: TranscriptionResult(segments=(TranscribedSegment(0.0, 1.0, "hi"),), language="de")}
     )
-    await retry_pending_documents(documents, sessions, jobs, FakeLinks())  # must not raise
+    # must not raise
+    await retry_pending_documents(documents, sessions, jobs, FakeLinks(), FakeConfig())
     assert documents.calls == 2  # both sessions were attempted despite failing
 
 
 async def test_retry_pending_documents_does_nothing_when_nothing_is_pending() -> None:
     documents = FakeDocuments()
-    await retry_pending_documents(documents, FakeSessions(), FakeJobs(), FakeLinks())
+    await retry_pending_documents(documents, FakeSessions(), FakeJobs(), FakeLinks(), FakeConfig())
     assert documents.created == []

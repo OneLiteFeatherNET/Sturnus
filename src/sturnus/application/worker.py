@@ -28,9 +28,7 @@ here by name. This is also why a permanently-rejected document creation is
 recognised below by its exception's class *name* rather than by catching
 `sturnus.infrastructure.documents.outline.PermanentDocumentError` directly:
 importing that type here would be exactly the violation this rule exists
-to prevent, and neither that module nor `sturnus.application.documents`
-(where a shared exception type would otherwise belong) is a file this task
-may modify.
+to prevent.
 
 Once a session's last job completes, `process_one` calls
 `sturnus.application.assembly.assemble` to merge *every* participant's
@@ -42,9 +40,19 @@ handing the result to `documents.create`. `assemble` needs a `SessionReader`
 (`transcripts_for`), and a `LinkReader` (`external_identity`). `SessionStore`
 below is widened to be structurally a `SessionReader` as well as its
 original language-pinning/completion shape, so the one `sessions`
-collaborator satisfies both; `jobs` and `links` are threaded through
-`process_one` as their own parameters, typed with `assembly`'s own
-`JobReader`/`LinkReader` protocols rather than duplicating them here.
+collaborator satisfies both; `jobs` is threaded through `process_one` as
+its own parameter, typed with `assembly`'s own `JobReader` protocol rather
+than duplicating it here.
+
+`links` is typed with this module's own `LinkRepository`, not `assembly`'s
+`LinkReader`, and `config` (`ConfigReader`) is threaded through alongside
+it: `document_target`, `document_provider`, and `merge_gap_seconds` are all
+per-guild settings (Spec 11) that this one process cannot resolve until a
+session -- and therefore its guild -- is in hand, so they are read inside
+`_create_session_document` rather than once at process start. `_BoundLinks`
+adapts one call's resolved provider back down to the plain `LinkReader`
+shape `assemble` itself calls, so `assemble` stays ignorant of
+configuration entirely.
 """
 
 from __future__ import annotations
@@ -53,11 +61,11 @@ import asyncio
 import logging
 import shutil
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Protocol, cast
 
-from sturnus.application.assembly import JobReader, LinkReader, assemble, serialize_transcript
+from sturnus.application.assembly import JobReader, assemble, serialize_transcript
 from sturnus.application.documents import (
     CreatedDocument,
     DocumentSink,
@@ -65,6 +73,8 @@ from sturnus.application.documents import (
     render_transcript,
 )
 from sturnus.application.transcription import TranscriptionEngine
+from sturnus.domain import settings as domain_settings
+from sturnus.domain.transcript import DEFAULT_MERGE_GAP
 
 log = logging.getLogger(__name__)
 
@@ -116,6 +126,51 @@ class Decryptor(Protocol):
     def decrypt_to(self, source: Path, target: Path, wrapped: bytes, key_id: str) -> None: ...
 
 
+class ConfigReader(Protocol):
+    """Where per-guild runtime configuration is read from (Spec 11).
+
+    Matches `sturnus.infrastructure.db.config_store.ConfigStore.get`
+    structurally: falls back to that key's entry in `sturnus.domain.
+    settings.DEFAULTS` when nothing is stored, and to `None` for a key
+    with no default (e.g. `document_target`) that a guild never set.
+    """
+
+    async def get(self, guild_id: int, key: str) -> str | None: ...
+
+
+class LinkRepository(Protocol):
+    """Where a speaker's external identity is read from, keyed by provider.
+
+    Unlike `sturnus.application.assembly.LinkReader`, `provider` is a
+    parameter of `external_identity` here rather than fixed once at
+    construction: the worker serves every guild from one process, and
+    which provider's account-link mapping applies is itself per-guild
+    configuration (Spec 11's `document_provider`) that cannot be resolved
+    until a session's guild is known. `_BoundLinks` below adapts one
+    resolved provider back down to the narrower `LinkReader` shape
+    `assemble` actually calls.
+    """
+
+    async def external_identity(
+        self, discord_user_id: int, provider: str
+    ) -> tuple[str, str] | None: ...
+
+
+class _BoundLinks:
+    """Adapts `LinkRepository` to `sturnus.application.assembly.LinkReader`
+    for one already-resolved provider, so `assemble` -- which knows
+    nothing about per-guild configuration -- can keep calling
+    `external_identity` with just a Discord user id.
+    """
+
+    def __init__(self, links: LinkRepository, provider: str) -> None:
+        self._links = links
+        self._provider = provider
+
+    async def external_identity(self, discord_user_id: int) -> tuple[str, str] | None:
+        return await self._links.external_identity(discord_user_id, self._provider)
+
+
 class SessionStore(Protocol):
     """The session-scoped bookkeeping this job needs.
 
@@ -133,13 +188,24 @@ class SessionStore(Protocol):
 
     async def set_detected_language(self, session_id: int, user_id: int, lang: str) -> None: ...
 
-    async def mark_documented(self, session_id: int, doc_id: str, url: str) -> None: ...
+    async def mark_documented(
+        self, session_id: int, doc_id: str, url: str, provider: str
+    ) -> None: ...
 
     async def participant_names(self, session_id: int) -> dict[int, str]: ...
 
     async def audio_epoch(self, session_id: int, user_id: int) -> datetime | None: ...
 
     async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]: ...
+
+    async def guild_id(self, session_id: int) -> int:
+        """The guild a session belongs to.
+
+        Needed to resolve per-guild configuration (`document_target`,
+        `document_provider`, `merge_gap_seconds`, Spec 11) at
+        document-creation time -- see `_create_session_document`.
+        """
+        ...
 
     async def closed_undocumented_sessions(self) -> list[int]:
         """Closed sessions whose jobs are all terminal but which never got documented.
@@ -170,7 +236,8 @@ async def _create_session_document(
     documents: DocumentSink,
     sessions: SessionStore,
     jobs: JobReader,
-    links: LinkReader,
+    links: LinkRepository,
+    config: ConfigReader,
     session_id: int,
     template_source: str,
 ) -> None:
@@ -185,19 +252,56 @@ async def _create_session_document(
     field), so this keeps the same UTC anchor the previous, single-speaker
     version of this function already used rather than inventing one.
 
-    A permanently-rejected creation (an unretryable rejection from the
-    document sink, e.g. a deleted collection) is swallowed here rather than
-    re-raised: the transcription job this belongs to already completed
-    successfully before this is ever called, so there is nothing left to
-    fail or retry -- only the document never gets created, which is logged
-    instead.
+    Also resolves three guild-scoped settings (Spec 11) here, at
+    document-creation time, rather than once at process start -- the
+    worker serves every guild from one process and cannot know which
+    guild's values apply until a session, and therefore its guild, is
+    known:
+
+    - `document_target`: where `documents.create` writes the document (an
+      Outline collection id today). Required, with no default -- a guild
+      that never configured it has nothing to create a document *into*, so
+      this raises rather than guessing. The caller's own retry path
+      (`process_one`'s document-creation handler, `retry_pending_documents`)
+      already treats any non-`PermanentDocumentError` failure here as
+      transient and tries again later, which is exactly right for "an
+      administrator has not configured this yet" -- unlike a rejected
+      token or a deleted collection, this can and does resolve itself.
+    - `document_provider`: which provider's account-link mapping a
+      speaker's external identity is read from, via `_BoundLinks`.
+    - `merge_gap_seconds`: how long a pause may be before one speaker's
+      blocks split, forwarded to `assemble`.
     """
-    transcript = await assemble(session_id, sessions, jobs, links, UTC)
+    guild = await sessions.guild_id(session_id)
+
+    target = await config.get(guild, domain_settings.DOCUMENT_TARGET)
+    if target is None:
+        raise RuntimeError(
+            f"guild {guild} has no {domain_settings.DOCUMENT_TARGET!r} configured; "
+            "cannot create a document until an administrator sets it"
+        )
+
+    provider = await config.get(guild, domain_settings.DOCUMENT_PROVIDER)
+    # `DEFAULTS` supplies "outline" when a guild never set this explicitly
+    # (see `ConfigReader`'s docstring) -- unlike `document_target`, this
+    # key always resolves to a value.
+    assert provider is not None
+
+    merge_gap_value = await config.get(guild, domain_settings.MERGE_GAP_SECONDS)
+    merge_gap = (
+        timedelta(seconds=int(merge_gap_value))
+        if merge_gap_value is not None
+        else DEFAULT_MERGE_GAP
+    )
+
+    transcript = await assemble(
+        session_id, sessions, jobs, _BoundLinks(links, provider), UTC, merge_gap
+    )
 
     body = render_transcript(transcript, template_source, UTC)
     title = document_title(transcript, UTC)
     try:
-        created: CreatedDocument = await documents.create(title, body)
+        created: CreatedDocument = await documents.create(title, body, target)
     except Exception as exc:
         # Recognised by class name, not by `except PermanentDocumentError`:
         # that type lives in `sturnus.infrastructure.documents.outline`,
@@ -206,7 +310,7 @@ async def _create_session_document(
             raise
         log.warning("Document sink permanently rejected creation for session %d", session_id)
         return
-    await sessions.mark_documented(session_id, created.id, created.url)
+    await sessions.mark_documented(session_id, created.id, created.url, provider)
 
 
 async def process_one(
@@ -217,7 +321,8 @@ async def process_one(
     documents: DocumentSink,
     sessions: SessionStore,
     jobs: JobReader,
-    links: LinkReader,
+    links: LinkRepository,
+    config: ConfigReader,
     work_dir: Path,
     max_attempts: int,
     template_source: str = _FALLBACK_TEMPLATE,
@@ -319,7 +424,7 @@ async def process_one(
     if is_last:
         try:
             await _create_session_document(
-                documents, sessions, jobs, links, job.session_id, template_source
+                documents, sessions, jobs, links, config, job.session_id, template_source
             )
         except Exception as exc:
             # The job itself already completed successfully -- see this
@@ -341,7 +446,8 @@ async def retry_pending_documents(
     documents: DocumentSink,
     sessions: SessionStore,
     jobs: JobReader,
-    links: LinkReader,
+    links: LinkRepository,
+    config: ConfigReader,
     template_source: str = _FALLBACK_TEMPLATE,
 ) -> None:
     """Retries document creation for closed sessions that never got documented.
@@ -367,7 +473,7 @@ async def retry_pending_documents(
     for session_id in await sessions.closed_undocumented_sessions():
         try:
             await _create_session_document(
-                documents, sessions, jobs, links, session_id, template_source
+                documents, sessions, jobs, links, config, session_id, template_source
             )
         except Exception as exc:
             log.warning("Retrying document creation failed for session %d: %s", session_id, exc)

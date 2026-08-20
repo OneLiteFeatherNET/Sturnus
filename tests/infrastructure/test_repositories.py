@@ -1,11 +1,11 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.application.assembly import serialize_transcript
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
+from sturnus.entrypoints.worker import _WorkerSessionStore
 from sturnus.infrastructure.db.models import AccountLink, Base, Session
 from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import (
@@ -86,6 +86,27 @@ async def test_session_lifecycle(factory: async_sessionmaker[AsyncSession]) -> N
     await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
 
     assert await repo.find_open_session(GUILD) is None
+
+
+async def test_guild_id_returns_the_owning_guild(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Lets the worker resolve per-guild configuration (Spec 11) for a
+    session it only has the id of -- without this, `document_target`,
+    `document_provider`, and `merge_gap_seconds` could never be looked up
+    at document-creation time.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    assert await repo.guild_id(session_id) == GUILD
+
+
+async def test_guild_id_raises_for_an_unknown_session(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SessionRepository(factory)
+    with pytest.raises(ValueError, match="does not exist"):
+        await repo.guild_id(999)
 
 
 async def test_session_row_carries_the_key_after_opening(
@@ -282,6 +303,72 @@ async def test_external_identity_only_reads_its_own_provider(
     assert await repo.external_identity(ANNA) is None
 
 
+async def test_external_identity_per_call_provider_overrides_construction(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The worker resolves `document_provider` per guild, at document-creation
+    time, so `external_identity` must accept it per call rather than only
+    the provider fixed at construction (Spec 11's `document_provider`) --
+    one process serves every guild, and guilds may configure different
+    providers.
+    """
+    async with factory() as session:
+        session.add_all(
+            [
+                AccountLink(
+                    discord_user_id=ANNA,
+                    provider="outline",
+                    external_user_id="out-1",
+                    display_name="Anna Outline",
+                    linked_at=T0,
+                ),
+                AccountLink(
+                    discord_user_id=ANNA,
+                    provider="confluence",
+                    external_user_id="conf-1",
+                    display_name="Anna Confluence",
+                    linked_at=T0,
+                ),
+            ]
+        )
+        await session.commit()
+
+    # Constructed with no fixed provider at all -- exactly how the worker
+    # constructs it, since it cannot know any guild's provider up front.
+    repo = AccountLinkRepository(factory)
+    assert await repo.external_identity(ANNA, provider="outline") == ("out-1", "Anna Outline")
+    assert await repo.external_identity(ANNA, provider="confluence") == (
+        "conf-1",
+        "Anna Confluence",
+    )
+
+
+async def test_external_identity_per_call_provider_wins_over_construction(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A per-call provider must override, not merely supplement, whatever was
+    fixed at construction -- the worker's guild-resolved provider is always
+    the one that governs which mapping is read.
+    """
+    async with factory() as session:
+        session.add(
+            AccountLink(
+                discord_user_id=ANNA,
+                provider="confluence",
+                external_user_id="conf-1",
+                display_name="Anna Confluence",
+                linked_at=T0,
+            )
+        )
+        await session.commit()
+
+    repo = AccountLinkRepository(factory, provider="outline")
+    assert await repo.external_identity(ANNA, provider="confluence") == (
+        "conf-1",
+        "Anna Confluence",
+    )
+
+
 # ---------------------------------------------------------------------------
 # `AccountLinkRepository.save` / `.delete` -- the write side. These used to
 # live in `sturnus.infrastructure.db.link_state` behind a second class of
@@ -337,19 +424,38 @@ async def test_delete_reports_whether_anything_was_removed(
 # ---------------------------------------------------------------------------
 
 
-async def _mark_documented(factory: async_sessionmaker[AsyncSession], session_id: int) -> None:
-    """Sets `status`/`document_url` directly -- the real write path
-    (`_WorkerSessionStore.mark_documented` in `sturnus.entrypoints.worker`)
-    lives outside this module's repositories, so a test needing a
-    `documented` row writes it directly instead.
+async def _mark_documented(
+    factory: async_sessionmaker[AsyncSession], session_id: int, provider: str = "outline"
+) -> None:
+    """Writes a `documented` row through the real write path.
+
+    That path is `_WorkerSessionStore.mark_documented` in
+    `sturnus.entrypoints.worker` rather than one of this module's
+    repositories, so going through it here both sets up the sweeps' rows
+    and keeps the adapter itself covered.
     """
+    await _WorkerSessionStore(factory).mark_documented(
+        session_id, "doc-1", "https://outline.example/doc/1", provider
+    )
+
+
+async def test_mark_documented_records_the_provider_it_was_given(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`session.document_provider` is what a re-publish or a migration reads
+    back to learn which sink owns `document_id`, so it must record the
+    provider the caller resolved from configuration (Spec 11) -- not the
+    Outline default that held while Outline was the only sink.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await _mark_documented(factory, session_id, provider="confluence")
+
     async with factory() as session:
-        await session.execute(
-            update(Session)
-            .where(Session.id == session_id)
-            .values(status="documented", document_url="https://outline.example/doc/1")
-        )
-        await session.commit()
+        stored = await session.get(Session, session_id)
+        assert stored is not None
+        assert stored.document_provider == "confluence"
 
 
 async def test_candidates_for_announcement_returns_documented_sessions(

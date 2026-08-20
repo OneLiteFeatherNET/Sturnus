@@ -227,6 +227,20 @@ class SessionRepository:
             )
             return status
 
+    async def guild_id(self, session_id: int) -> int:
+        """Returns the guild a session belongs to.
+
+        Lets a caller resolve per-guild configuration (Spec 11's
+        `document_target`, `document_provider`, `merge_gap_seconds`) once a
+        session is in hand -- the worker serves every guild from one
+        process, so none of those can be read until this is known.
+        """
+        async with self._session_factory() as session:
+            value = await session.scalar(select(Session.guild_id).where(Session.id == session_id))
+        if value is None:
+            raise ValueError(f"session {session_id} does not exist")
+        return value
+
     async def find_open_session(self, guild_id: int) -> int | None:
         """Returns the id of the guild's session whose status is not `closed`, or None."""
         async with self._session_factory() as session:
@@ -408,13 +422,21 @@ class AccountLinkRepository:
     external (e.g. Outline) account.
 
     Two call shapes coexist here because the read side and the write side
-    are used by two different processes with two different needs:
+    are used by different callers with different needs:
 
-    - **Read** (`external_identity`): the bot reads with `provider` fixed at
-      construction from configuration (Spec 11's `document_provider`), not
-      passed per call -- so a later Confluence adapter is wired up with its
-      own `AccountLinkRepository(session_factory, provider="confluence")`
-      and reads its own mapping rows rather than Outline's.
+    - **Read** (`external_identity`): the bot fixes `provider` at
+      construction (`AccountLinkRepository(session_factory, provider=
+      "outline")`) because it only ever reads back the one Outline mapping
+      it links against (`/link status`); a later Confluence adapter used
+      the same way would construct its own `AccountLinkRepository(
+      session_factory, provider="confluence")`. The worker instead reads
+      *every* guild's protocol from one process, and which provider's
+      mapping applies is itself per-guild configuration (Spec 11's
+      `document_provider`) unknowable at construction time -- so
+      `external_identity` also accepts `provider` per call, overriding
+      whatever (if anything) was fixed at construction. Exactly one of the
+      two must be supplied; a caller that always passes it per call is free
+      to construct without one, the same way write-only callers already do.
     - **Write** (`save`/`delete`): the link service's OAuth callback (Spec
       8.4) and the `/link remove` command take `provider` per call instead,
       because the caller only learns which provider a link is for from the
@@ -429,21 +451,25 @@ class AccountLinkRepository:
         self._session_factory = session_factory
         self._provider = provider
 
-    async def external_identity(self, discord_user_id: int) -> tuple[str, str] | None:
-        """Returns `(external_user_id, display_name)` for this provider, or `None`.
+    async def external_identity(
+        self, discord_user_id: int, provider: str | None = None
+    ) -> tuple[str, str] | None:
+        """Returns `(external_user_id, display_name)` for `provider`, or `None`.
 
-        Requires `provider` to have been fixed at construction (see the
-        class docstring's "Read" case).
+        `provider` given here wins over whatever was fixed at construction
+        (see the class docstring's "Read" case); at least one of the two
+        must be available, or this is a caller bug.
         """
-        assert self._provider is not None, (
-            "external_identity() requires AccountLinkRepository to have been "
-            "constructed with a provider"
+        resolved_provider = provider if provider is not None else self._provider
+        assert resolved_provider is not None, (
+            "external_identity() requires a provider, either passed per call or fixed "
+            "at AccountLinkRepository construction"
         )
         async with self._session_factory() as session:
             row = await session.execute(
                 select(AccountLink.external_user_id, AccountLink.display_name).where(
                     AccountLink.discord_user_id == discord_user_id,
-                    AccountLink.provider == self._provider,
+                    AccountLink.provider == resolved_provider,
                 )
             )
             result = row.first()

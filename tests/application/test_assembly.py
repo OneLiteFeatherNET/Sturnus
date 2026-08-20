@@ -96,6 +96,29 @@ async def test_a_session_with_no_transcripts_yields_an_empty_transcript() -> Non
     assert transcript.blocks == ()
 
 
+async def test_merge_gap_is_read_from_the_caller_not_the_domain_default() -> None:
+    """`assemble` must forward a caller-supplied `merge_gap` to
+    `build_transcript` rather than always falling back to
+    `sturnus.domain.transcript.DEFAULT_MERGE_GAP` (15s, Spec 11's
+    `merge_gap_seconds` default): a test that only exercises the domain
+    default would pass even if this parameter were silently dropped.
+    """
+    jobs = FakeJobs({ANNA: result((0.0, 1.0, "first"), (5.0, 6.0, "second"))})
+
+    # A 4-second gap between "first" and "second" is well inside the
+    # 15-second domain default -- they merge into one block there.
+    default_gap = await assemble(1, FakeSessions(), jobs, FakeLinks(), tz=UTC)
+    assert len(default_gap.blocks) == 1
+
+    # The same 4-second gap, against a caller-configured 1-second limit,
+    # must split into two blocks -- proving the configured value, not the
+    # default, actually governed the merge.
+    configured_gap = await assemble(
+        1, FakeSessions(), jobs, FakeLinks(), tz=UTC, merge_gap=timedelta(seconds=1)
+    )
+    assert len(configured_gap.blocks) == 2
+
+
 async def test_display_names_come_from_the_session_not_from_now() -> None:
     """Names are frozen at recording time (Spec 8.3)."""
     transcript = await assemble(

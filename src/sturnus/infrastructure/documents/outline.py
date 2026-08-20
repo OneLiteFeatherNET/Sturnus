@@ -93,6 +93,13 @@ class OutlineSink(DocumentSink):
 
     `transport` exists purely so tests can substitute `httpx.MockTransport`
     -- production code never passes it and gets a real network transport.
+
+    Deliberately holds no collection id: `base_url` and `api_token` are one
+    Outline instance's connection details, true for every guild the worker
+    serves, but the collection a given document belongs to is `document_target`
+    (Spec 11) -- per-guild configuration this adapter cannot know at
+    construction time. `create`'s `target` parameter carries it instead; see
+    `sturnus.application.documents.DocumentSink`'s docstring for why.
     """
 
     def __init__(
@@ -100,16 +107,14 @@ class OutlineSink(DocumentSink):
         *,
         base_url: str,
         api_token: str,
-        collection_id: str,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._api_token = api_token
-        self._collection_id = collection_id
         self._transport = transport
 
-    async def create(self, title: str, body: str) -> CreatedDocument:
-        payload = _build_payload(title=title, body=body, collection_id=self._collection_id)
+    async def create(self, title: str, body: str, target: str) -> CreatedDocument:
+        payload = _build_payload(title=title, body=body, collection_id=target)
         log.debug(
             "Creating Outline document (title length=%d, body length=%d)",
             len(title),

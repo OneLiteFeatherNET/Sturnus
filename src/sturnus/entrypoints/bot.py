@@ -23,7 +23,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from sturnus.application.ports import Clock
-from sturnus.application.publishing import announce_ready_sessions
+from sturnus.application.publishing import SessionReader, announce_ready_sessions
 from sturnus.application.recovery import recover_orphans
 from sturnus.config import get_settings
 from sturnus.domain import settings as domain_settings
@@ -86,7 +86,8 @@ class _DiscordAnnouncer:
 
 async def _publish_loop(
     client: discord.Client,
-    sessions: SessionRepository,
+    sessions: SessionReader,
+    link_states: LinkStateStore,
     stop: asyncio.Event,
     poll_seconds: float = _PUBLISH_POLL_SECONDS,
 ) -> None:
@@ -94,20 +95,36 @@ async def _publish_loop(
     Defect 3): `sturnus.application.publishing.sessions_to_announce` exists
     but nothing outside its own tests calls it -- this is that call.
 
+    Also purges expired rows from `oauth_state` on the same interval, via
+    `link_states.purge_expired` (`sturnus.infrastructure.db.link_state.
+    LinkStateStore`). That method existed with its own passing unit tests
+    but no caller anywhere in the process, so every abandoned `/link start`
+    left its row behind forever. It belongs in this loop rather than a
+    fourth one of its own: `bot.py` already constructs `LinkStateStore`
+    here (to *issue* states from `/link start`) and already runs this
+    exact poll/stop-event loop, so folding the purge in needs no new task
+    and no new lifecycle to manage -- only one more per-guild-agnostic
+    sweep alongside the one this loop already does.
+
     Waits for the gateway connection before its first sweep -- `get_channel`
     needs the client's channel cache populated, which only happens once
-    `on_ready` has run. `announce_ready_sessions` already survives one
-    session's own failure and continues past it; the `try`/`except` here is
-    one layer up, for a failure reading candidates in the first place (a
-    database hiccup), so it does not kill this loop outright.
+    `on_ready` has run. Both sweeps below survive their own errors
+    independently, the same way `announce_ready_sessions` already survives
+    one session's own failure: one sweep failing (a database hiccup) must
+    not stop the other, or kill this loop outright.
     """
     await client.wait_until_ready()
     announcer = _DiscordAnnouncer(client)
     while not stop.is_set():
+        now = datetime.now(UTC)
         try:
-            await announce_ready_sessions(sessions, announcer, datetime.now(UTC))
+            await announce_ready_sessions(sessions, announcer, now)
         except Exception as exc:
             log.warning("Publish sweep failed; will retry next interval: %s", exc)
+        try:
+            await link_states.purge_expired(now)
+        except Exception as exc:
+            log.warning("Expired link-state purge failed; will retry next interval: %s", exc)
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
 
@@ -241,7 +258,7 @@ async def _run() -> None:
         loop.add_signal_handler(sig, stop.set)
 
     client_task = asyncio.create_task(client.start(settings.discord_token.get_secret_value()))
-    publish_task = asyncio.create_task(_publish_loop(client, session_repo, stop))
+    publish_task = asyncio.create_task(_publish_loop(client, session_repo, link_states, stop))
     try:
         await stop.wait()
     finally:

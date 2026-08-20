@@ -79,6 +79,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sturnus.application.retention import sweep_expired_audio
 from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file
+from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.models import Session, SessionParticipant
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, JobQueue
 from sturnus.infrastructure.db.repositories import (
@@ -161,7 +162,6 @@ class WorkerSettings(BaseSettings):
     master_key_id: str
     outline_base_url: str
     outline_service_key: SecretStr
-    outline_collection_id: str
     whisper_model: str = "large-v3-turbo"
     whisper_default_language: str = "en"
     model_cache_dir: Path | None = None
@@ -225,12 +225,13 @@ class _WorkerSessionStore:
     `session_participant.detected_language` and `session.*` columns that
     repository already owns, through the same async ORM.
 
-    `participant_names`/`audio_epoch`/`session_bounds` -- the rest of the
-    widened `SessionStore` shape, needed by `sturnus.application.assembly.
-    assemble` -- delegate to a `SessionRepository` instance instead of
-    re-implementing those queries: that repository already owns them, and
-    duplicating its SQL here would just be a second place for them to
-    drift out of sync.
+    `participant_names`/`audio_epoch`/`session_bounds`/`guild_id` -- the
+    rest of the widened `SessionStore` shape, needed by
+    `sturnus.application.assembly.assemble` and by `_create_session_document`
+    to resolve per-guild configuration -- delegate to a `SessionRepository`
+    instance instead of re-implementing those queries: that repository
+    already owns them, and duplicating its SQL here would just be a second
+    place for them to drift out of sync.
     """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -245,6 +246,9 @@ class _WorkerSessionStore:
 
     async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]:
         return await self._sessions.session_bounds(session_id)
+
+    async def guild_id(self, session_id: int) -> int:
+        return await self._sessions.guild_id(session_id)
 
     async def closed_undocumented_sessions(self) -> list[int]:
         return await self._sessions.closed_undocumented_sessions()
@@ -275,14 +279,14 @@ class _WorkerSessionStore:
             )
             await session.commit()
 
-    async def mark_documented(self, session_id: int, doc_id: str, url: str) -> None:
+    async def mark_documented(self, session_id: int, doc_id: str, url: str, provider: str) -> None:
         async with self._session_factory() as session:
             await session.execute(
                 update(Session)
                 .where(Session.id == session_id)
                 .values(
                     status="documented",
-                    document_provider="outline",
+                    document_provider=provider,
                     document_id=doc_id,
                     document_url=url,
                 )
@@ -347,6 +351,7 @@ async def _document_retry_loop(
     sessions: _WorkerSessionStore,
     jobs: JobRepository,
     links: AccountLinkRepository,
+    config: ConfigStore,
     template_source: str,
     stop: asyncio.Event,
 ) -> None:
@@ -357,7 +362,7 @@ async def _document_retry_loop(
     """
     while not stop.is_set():
         try:
-            await retry_pending_documents(documents, sessions, jobs, links, template_source)
+            await retry_pending_documents(documents, sessions, jobs, links, config, template_source)
         except Exception as exc:
             log.warning("Document retry sweep failed; will retry next interval: %s", exc)
         with contextlib.suppress(TimeoutError):
@@ -401,14 +406,15 @@ async def _run() -> None:
     documents = OutlineSink(
         base_url=settings.outline_base_url,
         api_token=settings.outline_service_key.get_secret_value(),
-        collection_id=settings.outline_collection_id,
     )
     sessions = _WorkerSessionStore(session_factory)
     jobs = JobRepository(session_factory)
-    # "outline" matches the literal `mark_documented` already writes into
-    # `session.document_provider` -- the only document provider this
-    # worker supports today.
-    links = AccountLinkRepository(session_factory, "outline")
+    # No fixed provider: `document_provider` is per-guild configuration
+    # (Spec 11), read per document -- see
+    # `sturnus.application.worker._create_session_document` -- rather than
+    # assumed to be "outline" for every guild this one process serves.
+    links = AccountLinkRepository(session_factory)
+    config_store = ConfigStore(session_factory)
     template_source = _load_template()
 
     readiness = ReadinessState(discord_connected=True)  # this process has no gateway to wait on
@@ -434,7 +440,7 @@ async def _run() -> None:
     # main loop.
     retention_task = asyncio.create_task(_retention_sweep_loop(jobs, store, stop))
     document_retry_task = asyncio.create_task(
-        _document_retry_loop(documents, sessions, jobs, links, template_source, stop)
+        _document_retry_loop(documents, sessions, jobs, links, config_store, template_source, stop)
     )
 
     log.info("Worker started; polling the transcription queue")
@@ -454,6 +460,7 @@ async def _run() -> None:
                 sessions=sessions,
                 jobs=jobs,
                 links=links,
+                config=config_store,
                 work_dir=settings.work_dir,
                 max_attempts=settings.max_job_attempts,
                 template_source=template_source,

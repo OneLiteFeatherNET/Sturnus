@@ -32,11 +32,17 @@ the other.
 from __future__ import annotations
 
 import json
-from datetime import datetime, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from typing import Protocol
 
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult, to_absolute
-from sturnus.domain.transcript import Segment, SpeakerIdentity, Transcript, build_transcript
+from sturnus.domain.transcript import (
+    DEFAULT_MERGE_GAP,
+    Segment,
+    SpeakerIdentity,
+    Transcript,
+    build_transcript,
+)
 
 
 class SessionReader(Protocol):
@@ -99,6 +105,7 @@ async def assemble(
     jobs: JobReader,
     links: LinkReader,
     tz: tzinfo,
+    merge_gap: timedelta = DEFAULT_MERGE_GAP,
 ) -> Transcript:
     """Builds the whole session's `Transcript` from its jobs' stored transcriptions.
 
@@ -107,6 +114,14 @@ async def assemble(
     `Transcript` this returns already carries the timezone its reader
     lives in rather than leaving that conversion to whichever caller
     consumes it next.
+
+    `merge_gap` is forwarded to `build_transcript` unchanged, defaulting to
+    the same `DEFAULT_MERGE_GAP` `build_transcript` itself would use if
+    called directly. How long a pause may be before one speaker's blocks
+    split is a judgement, not a fact (Spec 11's `merge_gap_seconds`), so
+    the real caller (`sturnus.application.worker._create_session_document`)
+    reads it from per-guild configuration and passes it in here instead of
+    relying on this default.
     """
     started_at, ended_at = await sessions.session_bounds(session_id)
     names = await sessions.participant_names(session_id)
@@ -130,4 +145,4 @@ async def assemble(
         )
         segments.extend(to_absolute(result, epoch.astimezone(tz), speaker))
 
-    return build_transcript(segments, started_at.astimezone(tz), ended_at.astimezone(tz))
+    return build_transcript(segments, started_at.astimezone(tz), ended_at.astimezone(tz), merge_gap)
