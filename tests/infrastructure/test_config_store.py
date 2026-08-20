@@ -74,3 +74,40 @@ async def test_rejected_set_does_not_change_the_stored_value(store: ConfigStore)
     with pytest.raises(ValueError):
         await store.set(GUILD, settings.MAX_SESSION_HOURS, "bogus", T0)
     assert await store.get(GUILD, settings.MAX_SESSION_HOURS) == "6"
+
+
+async def test_snapshot_merges_stored_values_over_the_defaults(store: ConfigStore) -> None:
+    """One query for the whole guild -- what the per-tick reconcile reads."""
+    await store.set(GUILD, settings.IDLE_TIMEOUT_MINUTES, "45", T0)
+    await store.set(GUILD, settings.VOICE_CHANNEL_ID, "12345", T0)
+
+    snapshot = await store.snapshot(GUILD)
+
+    assert snapshot[settings.IDLE_TIMEOUT_MINUTES] == "45"
+    assert snapshot[settings.VOICE_CHANNEL_ID] == "12345"
+    assert snapshot[settings.MAX_SESSION_HOURS] == settings.DEFAULTS[settings.MAX_SESSION_HOURS]
+
+
+async def test_snapshot_omits_keys_with_neither_a_value_nor_a_default(store: ConfigStore) -> None:
+    """Absence is the signal that a guild cannot record, so it must survive.
+
+    `voice_channel_id` and `consent_role_id` have no defaults; a snapshot
+    that invented one for them would make an unconfigured guild look
+    configured to the reconcile pass.
+    """
+    snapshot = await store.snapshot(GUILD)
+    assert settings.VOICE_CHANNEL_ID not in snapshot
+    assert settings.CONSENT_ROLE_ID not in snapshot
+
+
+async def test_snapshot_agrees_with_get_for_every_known_key(store: ConfigStore) -> None:
+    """The reconcile path must not resolve values differently from `/config show`."""
+    await store.set(GUILD, settings.EMPTY_GRACE_SECONDS, "90", T0)
+    snapshot = await store.snapshot(GUILD)
+    for key in frozenset(settings.DEFAULTS) | settings.REQUIRED_KEYS:
+        assert snapshot.get(key) == await store.get(GUILD, key)
+
+
+async def test_snapshot_is_per_guild(store: ConfigStore) -> None:
+    await store.set(GUILD, settings.VOICE_CHANNEL_ID, "12345", T0)
+    assert settings.VOICE_CHANNEL_ID not in await store.snapshot(GUILD + 1)
