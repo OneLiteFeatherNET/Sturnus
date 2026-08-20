@@ -4,6 +4,8 @@
 test it breaks inside the running event loop.
 """
 
+import logging
+
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
@@ -66,3 +68,29 @@ def test_models_and_migration_do_not_drift(clean_database: str) -> None:
         diff = compare_metadata(context, Base.metadata)
 
     assert diff == [], f"models and migration have drifted: {diff}"
+
+
+def test_running_migrations_does_not_silence_the_application_loggers(
+    clean_database: str,
+) -> None:
+    """The worker migrates in-process, and `fileConfig` is a global.
+
+    `migrations/env.py` calls `logging.config.fileConfig`, whose default
+    `disable_existing_loggers=True` sets `disabled = True` on every logger
+    not named in `alembic.ini`. `sturnus.entrypoints.worker._run_migrations`
+    runs this at worker startup, when every `sturnus.*` logger already
+    exists -- so with the default the worker logs nothing for the rest of
+    its life, and reports nothing to Sentry either, since
+    `LoggingIntegration` hooks `Logger.callHandlers` and
+    `Logger.handle` never gets there for a disabled logger.
+    """
+    application_logger = logging.getLogger("sturnus.infrastructure.observability")
+    assert application_logger.disabled is False
+
+    command.upgrade(_alembic_config(clean_database), "head")
+
+    assert application_logger.disabled is False, (
+        "alembic's fileConfig disabled the application loggers; the worker "
+        "runs migrations in-process and would go silent after startup"
+    )
+    assert logging.getLogger("asyncio").disabled is False

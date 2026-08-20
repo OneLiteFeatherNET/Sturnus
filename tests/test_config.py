@@ -3,7 +3,7 @@ import base64
 import pytest
 from pydantic import ValidationError
 
-from sturnus.config import Settings
+from sturnus.config import SentrySettings, Settings
 
 # KeyWrapper requires the master key to base64-decode to exactly 32 bytes,
 # which makes any valid fixture look like a real key to a secret scanner.
@@ -104,3 +104,51 @@ def test_an_optional_setting_may_still_be_blank(monkeypatch: pytest.MonkeyPatch)
     for k, v in _env().items():
         monkeypatch.setenv(k, v)
     assert Settings().health_port == 8080
+
+
+def test_sentry_is_absent_unless_a_dsn_is_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No DSN means no Sentry, which is what an operator who has not opted
+    in gets. `sturnus.infrastructure.observability.init_sentry` branches on
+    exactly this."""
+    monkeypatch.delenv("STURNUS_SENTRY_DSN", raising=False)
+    settings = SentrySettings()
+    assert settings.sentry_dsn is None
+    assert settings.sentry_environment == "production"
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n"])
+def test_a_blank_sentry_dsn_is_treated_as_absent(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    """`STURNUS_SENTRY_DSN=""` is what the chart ships by default, and
+    pydantic turns it into `SecretStr('')` rather than `None` -- the
+    blank-required-value check above does not apply, because the field is
+    optional. Left as `SecretStr('')` it would reach `sentry_sdk.init()`,
+    which for an empty DSN installs every monkey-patch the SDK has and then
+    sends nothing: all of the risk, none of the reporting.
+    """
+    monkeypatch.setenv("STURNUS_SENTRY_DSN", blank)
+    assert SentrySettings().sentry_dsn is None
+
+
+def test_a_real_sentry_dsn_survives(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("STURNUS_SENTRY_DSN", "https://key@sentry.example/7")
+    monkeypatch.setenv("STURNUS_SENTRY_ENVIRONMENT", "staging")
+    settings = SentrySettings()
+    assert settings.sentry_dsn is not None
+    assert settings.sentry_dsn.get_secret_value() == "https://key@sentry.example/7"
+    assert settings.sentry_environment == "staging"
+
+
+def test_sentry_settings_do_not_require_the_rest_of_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reason this is its own class: it constructs with nothing set, so
+    `init_sentry` can run before `Settings()`/`WorkerSettings()`/
+    `LinkSettings()` and a settings `ValidationError` is itself reportable
+    rather than being the one failure Sentry can never see.
+    """
+    for key in _env():
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.delenv("STURNUS_SENTRY_DSN", raising=False)
+    assert SentrySettings().sentry_dsn is None

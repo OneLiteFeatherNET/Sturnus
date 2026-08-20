@@ -86,6 +86,22 @@ commonEnv:
   STURNUS_OUTLINE_BASE_URL: "https://wiki.example.invalid"
   STURNUS_OUTLINE_CLIENT_ID: ""
   STURNUS_OUTLINE_REDIRECT_URI: "https://sturnus.example.invalid/oauth/callback"
+  # Error reporting (sturnus/infrastructure/observability.py). Empty is the
+  # off switch and the default: the DSN never reaches `sentry_sdk.init()`,
+  # so no instrumentation is installed at all and all three components run
+  # exactly as they do without it.
+  #
+  # A DSN is deliberately NOT in the Secret named by `existingSecret`. The
+  # key inside it is Sentry's *public* key -- write-only to one project,
+  # granting no read access, and the same value Sentry documents embedding
+  # in browser JavaScript. Putting it in the Secret would require adding it
+  # to the credential list in templates/_helpers.tpl, which is this chart's
+  # inventory of what actually is a credential, and would drag a
+  # non-credential into the SOPS rotation procedure. See
+  # docs/operations.md section 1.4.
+  STURNUS_SENTRY_DSN: ""
+  # Names the deployment in Sentry's environment filter. Set per cluster.
+  STURNUS_SENTRY_ENVIRONMENT: "production"
 
 # Every component's health/readiness server listens on this container port
 # (see sturnus/infrastructure/health.py); the container image is the same
