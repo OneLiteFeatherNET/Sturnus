@@ -50,6 +50,14 @@ def test_a_linked_speaker_is_rendered_as_a_mention() -> None:
     not attacker-controlled, unlike the display name beside it -- must
     reach the mention verbatim, or Outline treats it as malformed and never
     resolves it to a notification.
+
+    The two-segment `mention://user/<uuid>` shape is deliberate and load-
+    bearing: Outline also accepts a three-segment
+    `mention://<node-id>/<type>/<user-id>` form, and older builds accept ONLY
+    that one. `docs/verification/outline-mentions.md` records which builds
+    parse which, against the version this deployment runs. A build that does
+    not parse the form emitted here renders the mention as an ordinary link --
+    no chip, no notification, no error.
     """
     out = render(block(LINKED, 0, "hello"))
     assert "@[Max Example](mention://user/c9a1b2e3-4f5a-4b3c-8d2e-1a2b3c4d5e6f)" in out
