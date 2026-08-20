@@ -10,6 +10,11 @@ dependencies = [
     "sqlalchemy>=2.0.44",
     "asyncpg>=0.31.0",
     "alembic>=1.14.0",
+    # asyncpg drives the application's own queries, but Alembic runs its
+    # migrations synchronously and the worker runs them at startup before
+    # anything else (`sturnus.entrypoints.worker`), so the sync driver is a
+    # runtime dependency of the shipped image, not just of the test suite.
+    "psycopg[binary]>=3.2",
     "pydantic-settings>=2.12.0",
     "cryptography>=44.0",
     "soxr>=0.5",
@@ -36,7 +41,6 @@ build-backend = "uv_build"
 lint = ["mypy>=1.19.0", "ruff>=0.14.7"]
 test = [
     "moto[s3]>=5.0",
-    "psycopg[binary]>=3.2",
     "pytest>=9.0.1",
     "pytest-asyncio>=1.3.0",
     "testcontainers[postgres]>=4.9.0",
