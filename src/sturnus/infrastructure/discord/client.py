@@ -103,10 +103,17 @@ class SturnusClient(commands.Bot):
         tick_interval_seconds: float = TICK_INTERVAL_SECONDS,
     ) -> None:
         intents = discord.Intents.default()
-        # Both are privileged intents that must also be turned on for this
-        # application in the Discord developer portal, or the gateway
-        # rejects the connection outright.
+        # `members` is a privileged intent and must also be turned on for
+        # this application in the Discord developer portal ("Server Members
+        # Intent"), or the gateway rejects the connection outright. It is
+        # the only one: discord.py's `Intents.default()` is everything
+        # except `presences`, `members` and `message_content`, which are
+        # exactly Discord's three privileged intents.
         intents.members = True
+        # Already on via `default()`. Set explicitly because the whole bot
+        # depends on it -- a future switch to a narrower intent set should
+        # have to delete this line deliberately rather than lose voice
+        # events by omission. There is no portal switch for this one.
         intents.voice_states = True
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
 
