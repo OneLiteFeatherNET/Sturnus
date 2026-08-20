@@ -187,9 +187,18 @@ class SturnusClient(commands.Bot):
         retention = await self._config_store.get(guild.id, settings.AUDIO_RETENTION_DAYS)
         assert retention is not None, "audio_retention_days has a default and is never unset"
 
+        # Resolved here rather than in the worker, which writes the protocol
+        # but holds no Discord connection and would see only the id. `None`
+        # when the channel is not in cache -- the protocol then falls back to
+        # a bare link, which is worse than a name but better than no
+        # recording.
+        channel = guild.get_channel(int(voice_channel_id))
+        channel_name = channel.name if channel is not None else None
+
         service = RecordingService(
             guild_id=guild.id,
             channel_id=int(voice_channel_id),
+            channel_name=channel_name,
             timeouts=timeouts,
             sessions=self._session_repo,
             jobs=self._job_repo,

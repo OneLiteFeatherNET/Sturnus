@@ -70,6 +70,11 @@ class Session(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     guild_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     channel_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    #: The channel's name when the session opened. The worker writes the
+    #: protocol and has no Discord connection, so it cannot look this up;
+    #: the bot records it here. Nullable: sessions from before this column
+    #: existed have none, and a later rename must not rewrite old protocols.
+    channel_name: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     end_reason: Mapped[str | None] = mapped_column(Text)

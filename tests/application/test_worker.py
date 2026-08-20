@@ -147,6 +147,9 @@ class FakeSessions:
     async def closed_undocumented_sessions(self) -> list[int]:
         return self.pending_retry
 
+    async def channel_ref(self, _session_id: int) -> tuple[int, int, str | None]:
+        return (self.guild, 4711, "meeting-raum")
+
     async def guild_id(self, _session_id: int) -> int:
         return self.guild
 
@@ -642,3 +645,45 @@ async def test_retry_pending_documents_does_nothing_when_nothing_is_pending() ->
     documents = FakeDocuments()
     await retry_pending_documents(documents, FakeSessions(), FakeJobs(), FakeLinks(), FakeConfig())
     assert documents.created == []
+
+
+async def test_the_document_is_written_in_the_guilds_timezone(tmp_path: Path) -> None:
+    """The protocol's title carries the local start, not the cluster's."""
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    documents = FakeDocuments()
+    config = FakeConfig(
+        {
+            (GUILD, domain_settings.DOCUMENT_TARGET): "col-1",
+            (GUILD, domain_settings.DOCUMENT_PROVIDER): "outline",
+            (GUILD, domain_settings.TIMEZONE): "Europe/Berlin",
+        }
+    )
+    await process_one(**run(tmp_path, queue=queue, documents=documents, config=config))
+
+    # FakeSessions' bounds start at 20:00 UTC, which is 22:00 in Berlin.
+    assert documents.created, "no document was created"
+    assert "22:00" in documents.created[0][0]
+
+
+async def test_an_unusable_timezone_falls_back_to_utc_rather_than_failing(
+    tmp_path: Path,
+) -> None:
+    """A typo in configuration must not cost the protocol entirely: a wrong
+    offset is recoverable, a missing document is not. The warning names the
+    guild so someone can fix it.
+    """
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    documents = FakeDocuments()
+    config = FakeConfig(
+        {
+            (GUILD, domain_settings.DOCUMENT_TARGET): "col-1",
+            (GUILD, domain_settings.DOCUMENT_PROVIDER): "outline",
+            (GUILD, domain_settings.TIMEZONE): "Mars/Olympus_Mons",
+        }
+    )
+    await process_one(**run(tmp_path, queue=queue, documents=documents, config=config))
+
+    assert documents.created, "an unusable timezone must not prevent the document"
+    assert "20:00" in documents.created[0][0]

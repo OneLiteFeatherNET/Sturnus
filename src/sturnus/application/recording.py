@@ -41,7 +41,9 @@ def audio_key(session_id: int, discord_user_id: int) -> str:
 class SessionRecorder(Protocol):
     """What `RecordingService` needs to persist about a session's rows."""
 
-    async def open_session(self, guild_id: int, channel_id: int, now: datetime) -> int: ...
+    async def open_session(
+        self, guild_id: int, channel_id: int, channel_name: str | None, now: datetime
+    ) -> int: ...
 
     async def add_participant(
         self, session_id: int, discord_user_id: int, display_name: str, now: datetime
@@ -127,9 +129,14 @@ class RecordingService:
         writers: AudioWriterFactory,
         encryptor: Encryptor,
         retention_days: int,
+        channel_name: str | None = None,
     ) -> None:
         self._guild_id = guild_id
         self._channel_id = channel_id
+        #: Recorded onto the session row so the protocol can name the room.
+        #: Optional because a caller that cannot resolve it should still be
+        #: able to record -- a protocol without the channel name beats none.
+        self._channel_name = channel_name
         self._machine = SessionMachine(timeouts)
         self._clock = SpeakerClock()
         self._sessions = sessions
@@ -158,7 +165,7 @@ class RecordingService:
         self._machine.participants_changed(consented_count, now)
         if was_idle and self._machine.state is SessionState.RECORDING:
             self._session_id = await self._sessions.open_session(
-                self._guild_id, self._channel_id, now
+                self._guild_id, self._channel_id, self._channel_name, now
             )
             self._data_key = self._encryptor.new_session_key()
             # The session row is the source of truth for which key encrypted

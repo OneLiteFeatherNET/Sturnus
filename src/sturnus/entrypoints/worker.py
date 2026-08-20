@@ -245,6 +245,17 @@ class _WorkerSessionStore:
     async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]:
         return await self._sessions.session_bounds(session_id)
 
+    async def channel_ref(self, session_id: int) -> tuple[int, int, str | None]:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(Session.guild_id, Session.channel_id, Session.channel_name).where(
+                        Session.id == session_id
+                    )
+                )
+            ).one()
+            return int(row[0]), int(row[1]), row[2]
+
     async def guild_id(self, session_id: int) -> int:
         return await self._sessions.guild_id(session_id)
 

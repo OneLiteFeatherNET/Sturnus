@@ -324,6 +324,17 @@ this document for whoever reads it least carefully.
    ```
 3. Re-run `/config show` until "All required keys are set." appears.
 
+Worth setting even though it is not required: `timezone` decides the times
+written into the protocol and its title. It defaults to `Europe/Berlin` and
+takes any IANA name (`Europe/London`, `UTC`). This one is easy to leave
+wrong, because a wrong offset does not look wrong -- every hour reads as a
+plausible meeting time. An unusable value falls back to UTC with a warning
+naming the guild, rather than costing the protocol.
+
+```
+/config set timezone Europe/Berlin
+```
+
 Until every required key (`voice_channel_id`, `consent_role_id`,
 `document_target`, `policy_version`, `policy_url`, `admin_role_id`) is set,
 the bot logs a warning naming the guild and skips building that guild's

@@ -96,11 +96,14 @@ class SessionRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
 
-    async def open_session(self, guild_id: int, channel_id: int, now: datetime) -> int:
+    async def open_session(
+        self, guild_id: int, channel_id: int, channel_name: str | None, now: datetime
+    ) -> int:
         async with self._session_factory() as session:
             record = Session(
                 guild_id=guild_id,
                 channel_id=channel_id,
+                channel_name=channel_name,
                 started_at=now,
                 ended_at=None,
                 end_reason=None,
