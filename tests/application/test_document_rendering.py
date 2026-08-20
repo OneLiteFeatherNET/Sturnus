@@ -193,3 +193,70 @@ def test_a_protocol_without_a_channel_still_renders() -> None:
     assert "Channel:" not in out
     assert "hallo" in out
     assert "**Date:**" in out
+
+
+def test_the_attribution_and_the_words_are_separate_paragraphs() -> None:
+    """A single newline is a *soft* break, which Markdown renders inline.
+
+    The template writes a blank line between the speaker's name and what
+    they said, but `trim_blocks=True` ate the newline that ended the
+    attribution line, leaving one where two were written. The published
+    protocol therefore read `...(TheMeinerLP | Phillipp) Thank you.` -- the
+    name running straight into the sentence.
+
+    Asserted on the exact byte sequence rather than on `in`, because `in`
+    passes for both the broken and the fixed rendering.
+    """
+    out = render(block(GUEST, 3, "Erstens."))
+
+    attribution = f"[guestuser](https://discord.com/users/{GUEST.discord_user_id})"
+    assert f"{attribution}\n\nErstens" in out
+    assert f"{attribution}\nErstens" not in out
+
+
+def test_the_channel_and_the_date_are_separate_paragraphs() -> None:
+    """The same soft-break defect, in the header.
+
+    Here nothing ate anything -- the template simply wrote one newline
+    between two lines that have to be two. `**Channel:** ... **Date:** ...`
+    on one line is legible but reads as a single run-on fact.
+    """
+    out = render_transcript(
+        transcript(block(GUEST, 3, "Erstens.")), TEMPLATE, tz=UTC, channel=CHANNEL
+    )
+
+    assert f"]({CHANNEL.url})\n\n**Date:**" in out
+    assert f"]({CHANNEL.url})\n**Date:**" not in out
+
+
+def test_the_participants_list_stays_tight() -> None:
+    """No blank line between the items.
+
+    A blank line makes it a "loose" list, which Markdown wraps each item in
+    a paragraph for and renders with a gap between them. The blank line the
+    transcript needs is exactly the one this list must not have -- fixing
+    one by hand is how the other breaks.
+    """
+    out = render(block(LINKED, 3, "Erstens."), block(GUEST, 90, "Zweitens."))
+
+    listing = out.split("## Participants", 1)[1].split("## Transcript", 1)[0]
+    items = [line for line in listing.splitlines() if line.startswith("- ")]
+    assert len(items) == 2
+    # Only the gaps *between* items. The blank line separating the heading
+    # from the first item is required and must not be caught here.
+    body = listing.strip("\n")
+    assert "\n\n- " not in body
+
+
+def test_a_speaker_is_rendered_the_same_way_in_both_places() -> None:
+    """The macro's reason for existing, asserted rather than assumed.
+
+    The two renderings used to be the same conditional written out twice,
+    which is two chances to drift -- and a mention that resolves in the
+    participant list but not in the transcript is worse than one that fails
+    in both, because nobody goes looking for it.
+    """
+    out = render(block(LINKED, 3, "Erstens."))
+
+    mention = f"@[Max Example](mention://user/{LINKED.external_user_id})"
+    assert out.count(mention) == 2
