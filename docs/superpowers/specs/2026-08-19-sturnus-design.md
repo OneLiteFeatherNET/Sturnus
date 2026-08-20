@@ -209,6 +209,7 @@ The bot observes `on_voice_state_update` for the configured channel.
 | `empty_grace_seconds` elapses | `GRACE` → `CLOSING` |
 | `idle_timeout_minutes` with no audio at all | `RECORDING` → `CLOSING` |
 | `max_session_hours` reached | `RECORDING` → `CLOSING` |
+| Every stream stops decoding, or capture itself dies | `RECORDING` → `CLOSING` with `decode_failure` / `capture_failure` |
 
 `CLOSING` closes the recording files, uploads them to S3, enqueues one
 transcription job per speaker, sets the session to `closed`, and leaves the
@@ -257,6 +258,74 @@ speaker stream's buffers the same length and exactly in sync, which turns
 merging into a trivial operation on a shared timeline instead of an
 error-prone heuristic. The padding costs memory, but no compute time:
 `vad_filter=True` lets Whisper skip over the silence.
+
+**Sturnus decodes Opus itself, and the library does not** (added 2026-08-20,
+after an incident). Sturnus's sink returns `True` from `wants_opus()`, so
+`discord-ext-voice-recv` constructs no `discord.opus.Decoder` and never reaches
+`_decode_packet`. That line let an `OpusError: corrupted stream` escape into
+`PacketRouter.run()`, which stops capture for *every* speaker in its `finally`;
+one unreadable frame ended a live recording that then closed with no audio and
+no transcription job, while everyone in the channel believed they were being
+recorded.
+
+The policy that replaces it:
+
+- **A frame that will not decode costs that frame and nothing else.** It is
+  discarded, and because audio is placed by RTP-derived absolute time rather
+  than by byte count, the gap becomes real silence in exactly the right place —
+  nothing after it shifts.
+- **Decoders are per speaker.** Opus is stateful; one stream falling apart says
+  nothing about the one next to it, and no failure of one speaker's stream ever
+  ends a session.
+- **The accounting is one counter and one threshold.** Per stream: how many
+  frames in a row would not decode. Crossing it logs one ERROR naming the SSRC,
+  the libopus error code and how much audio is missing. There is no state
+  machine, and there are no per-speaker escalation tiers — a single failing
+  speaker never ends anything.
+- **The one exception is total failure.** If *every* live stream is over that
+  threshold at once, the session closes with `EndReason.DECODE_FAILURE` rather
+  than producing empty files while telling everyone they are recorded. That is
+  the original incident in a different costume, and it is the only decode
+  failure that ends anything. A stream that has barely started has not crossed
+  the threshold, so it is not failing, so it blocks the verdict: it is evidence
+  something might still work.
+  Declaring total failure by mistake ends a real recording; declining to declare
+  it costs empty files the per-stream errors are already shouting about.
+- **A failure that is not an `OpusError` is accounted for exactly like one.**
+  Whatever the decoder raises, the frame counts against that stream's failure
+  run. A stream that looks fine while every frame of it is thrown away — dead,
+  and reporting fine — is the incident's own shape.
+- **Capture dying is itself an end reason.** If the library's `after=` hook
+  fires, or `join()` fails outright, the session closes with
+  `EndReason.CAPTURE_FAILURE`. Nothing will arrive again, the machine's own
+  timers know nothing about that, and without this the session runs on to
+  `idle_timeout` and closes looking exactly like a meeting where nobody spoke —
+  the row that let the original incident go unnoticed for hours.
+- **A capture-side end holds the guild out of the channel for fifteen minutes.**
+  Leaving the channel is itself a voice-state update, so acting on that event
+  is how a persistent fault feeds itself: leave, rejoin, fail, leave again — a
+  run of empty sessions, each one announcing to everyone present that they are
+  being recorded. The guard lapses on the tick loop, not on the next
+  voice-state update, and then recounts the channel itself: capture failing is
+  not something the people in the channel did, and none of them has any reason
+  to leave and come back afterwards. A guard that only somebody else's action
+  can lift is an outage wearing a timeout's clothes.
+- **We conceal what the network lost, never what our decoder could not read.**
+  Packet-loss concealment fills in lost frames for a capped run; a decode
+  failure is filled with real silence, because inventing audio to cover our own
+  error would put synthesised sound into a record people were told they are in.
+
+**Unattributed audio is never recorded, and always reported** (Spec 3.1). A
+speaker already talking when the bot connects has no SSRC-to-user mapping —
+Discord sends it only with its speaking event — so no consent record can be
+checked for them. Their frames are not decoded, not buffered and not written,
+and one WARNING per SSRC says so. Identity is never inferred: a guess in front
+of a consent gate is not an acceptable trade for a second of audio.
+
+What this deliberately does *not* do — a bounded hand-off, a non-blocking
+consent lookup, notices into the channel, voice metrics — is recorded with what
+was observed in `docs/verification/voice-receive-spike.md`, under *Known
+limitations*.
 
 ### 6.2 Time reconstruction
 

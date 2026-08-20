@@ -28,7 +28,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import discord
 from discord.ext import commands
@@ -81,6 +81,17 @@ TICK_INTERVAL_SECONDS = 10.0
 # which actually fired here.
 SHUTDOWN_END_REASON = EndReason.SHUTDOWN
 
+#: The end reasons that mean "we could not hear", as opposed to "there was
+#: nothing to hear". Both are properties of this process's connection to
+#: this channel rather than of the meeting, and both survive a rejoin.
+CAPTURE_FAILURE_REASONS = frozenset({EndReason.CAPTURE_FAILURE, EndReason.DECODE_FAILURE})
+
+#: How long a guild waits before another session may start after capture
+#: failed. Long enough that a persistent fault is visibly a fault rather
+#: than a flutter, short enough that a genuinely transient one costs a
+#: meeting's opening minutes rather than the rest of the day.
+REJOIN_COOLDOWN = timedelta(minutes=15)
+
 
 @dataclass
 class _GuildRecording:
@@ -107,6 +118,11 @@ class _GuildRecording:
     #: than `pending=None` overloaded: "nothing is waiting" and "stopping
     #: is waiting" are different states.
     pending_teardown: bool = False
+    #: Set when a session ended because capture failed; while it is in the
+    #: future, no new session opens for this guild. Cleared by the tick
+    #: loop once it has passed -- a guard that only an operator can clear
+    #: turns a transient fault into an outage.
+    blocked_until: datetime | None = None
 
     @property
     def channel_id(self) -> int:
@@ -631,8 +647,23 @@ class SturnusClient(commands.Bot):
         them: the answer is the truth at the moment it runs, so a caller
         that has just changed which channel counts gets the right number
         without anyone having to replay the events it missed.
+
+        The single place a session can start is also the single place the
+        capture-failure guard is enforced. The bot's own `leave()` emits a
+        voice-state update, so a guild that has just stopped being able to
+        hear would otherwise be handed straight back its own departure and
+        rejoin into the same fault; and a deferred channel change landing
+        in the meantime must not smuggle a session past the guard either.
         """
         if guild is None:
+            return
+        if recording.blocked_until is not None:
+            log.info(
+                "Not counting channel %d: capture failed there and no session will "
+                "start before %s.",
+                recording.channel_id,
+                recording.blocked_until.isoformat(),
+            )
             return
         consented_count = self._consenting_count(guild, recording)
         if consented_count is None:
@@ -640,7 +671,28 @@ class SturnusClient(commands.Bot):
         was_recording = recording.service.is_recording
         await recording.service.participants_changed(consented_count, self._clock.now())
         if recording.service.is_recording and not was_recording:
+            await self._start_capture(recording)
+
+    async def _start_capture(self, recording: _GuildRecording) -> None:
+        """Joins the voice channel, or ends the session it could not capture.
+
+        A `join` that raises used to leave the session row open with no
+        capture behind it at all: nothing would ever arrive, so it closed
+        at the idle timeout looking exactly like a meeting where nobody
+        spoke. Arming `CAPTURE_FAILURE` instead means the next tick closes
+        it, leaves the channel and resets, and the row says we could not
+        hear rather than that there was nothing to hear.
+        """
+        try:
             await recording.voice.join(recording.channel_id)
+        except Exception:
+            log.exception(
+                "Could not start voice capture in channel %d; ending the session as %s "
+                "instead of leaving it open with nothing arriving.",
+                recording.channel_id,
+                EndReason.CAPTURE_FAILURE.value,
+            )
+            recording.service.request_close(EndReason.CAPTURE_FAILURE)
 
     async def _return_to_idle(self, guild_id: int, recording: _GuildRecording) -> None:
         """Leaves the channel and puts the machine back where a session can start.
@@ -816,6 +868,12 @@ class SturnusClient(commands.Bot):
         lock is held. The pre-lock reads are a filter and nothing more, so
         that an update about an unrelated channel never takes the lock at
         all.
+
+        An update arriving while this guild is waiting out a capture
+        failure ends up doing nothing: `_sync_participants` holds that
+        guard, because the bot's own `leave()` produces one of these
+        events and acting on it is precisely how a persistent fault would
+        keep restarting itself.
         """
         guild_id = member.guild.id
         recording = self._guilds.get(guild_id)
@@ -903,6 +961,13 @@ class SturnusClient(commands.Bot):
         than queueing behind it: the loop comes back in ten seconds
         anyway, and queueing would let ticks pile up behind one slow
         database call.
+
+        Lifting a capture-failure cooldown belongs here, last, for the
+        same reason the cooldown exists at all: capture failing is not
+        something the people in the channel did, so recovery must not
+        wait on one of them leaving and coming back. Last, because the
+        recount it performs should use the configuration the reconcile
+        above has just settled on rather than the one before it.
         """
         lock = self._reconfigure_locks.setdefault(guild_id, asyncio.Lock())
         if lock.locked():
@@ -912,6 +977,13 @@ class SturnusClient(commands.Bot):
             if recording is not None:
                 await self._sweep_due_session(guild_id, recording, now)
             await self._reconcile(guild_id)
+            recording = self._guilds.get(guild_id)
+            if (
+                recording is not None
+                and recording.blocked_until is not None
+                and now >= recording.blocked_until
+            ):
+                await self._end_capture_cooldown(guild_id, recording)
 
     async def _sweep_due_session(
         self, guild_id: int, recording: _GuildRecording, now: datetime
@@ -933,10 +1005,20 @@ class SturnusClient(commands.Bot):
         it up on the next start. It is not re-raised -- `_tick_all` would
         only log it a second time, and the reconcile that follows in
         `_tick_guild` is exactly what a guild in this state needs.
+
+        The reason is kept rather than reduced to a boolean, because two
+        of them -- a capture that died and a set of streams that all
+        stopped decoding -- say that this process cannot hear this
+        channel, which is a reason not to walk straight back into it.
+        Armed before `_apply_pending`, so a deferred channel change
+        landing in the same breath cannot start a session behind the
+        guard's back.
         """
+        reason: EndReason | None = None
         closed = False
         try:
-            closed = await recording.service.tick(now) is not None
+            reason = await recording.service.tick(now)
+            closed = reason is not None
         except Exception:
             # Not necessarily a failed close: `tick()` could equally have
             # raised before deciding anything, in which case nothing ever
@@ -959,7 +1041,47 @@ class SturnusClient(commands.Bot):
         if not closed:
             return
         await self._return_to_idle(guild_id, recording)
+        if reason is not None and reason in CAPTURE_FAILURE_REASONS:
+            self._begin_capture_cooldown(recording, reason, now)
         await self._apply_pending(guild_id, recording)
+
+    def _begin_capture_cooldown(
+        self, recording: _GuildRecording, reason: EndReason, now: datetime
+    ) -> None:
+        """Stops this guild rejoining straight back into the same fault.
+
+        A session that ended because nothing could be heard is not a
+        session that ended. Leaving the channel is itself a voice-state
+        update, so without this the very next event reopens a session
+        row, rejoins with fresh decoders, meets the same fault and closes
+        again -- an endless run of empty sessions, every one of them
+        announcing to the channel that it is being recorded.
+        """
+        recording.blocked_until = now + REJOIN_COOLDOWN
+        log.error(
+            "The session in channel %d ended with %s; not recording there again before %s. "
+            "Investigate before then: a rejoin would meet the same fault.",
+            recording.channel_id,
+            reason.value,
+            recording.blocked_until.isoformat(),
+        )
+
+    async def _end_capture_cooldown(self, guild_id: int, recording: _GuildRecording) -> None:
+        """Lifts the guard and picks the channel back up, if anyone is still in it.
+
+        Deliberately driven from the tick rather than from the next
+        voice-state update: the people who were in the channel when
+        capture died are still in it, and nothing about waiting out a
+        cooldown makes one of them leave and come back. A guard that can
+        only lapse on somebody else's action is an outage wearing a
+        timeout's clothes.
+        """
+        log.info(
+            "The capture-failure cooldown for channel %d has passed; recording may resume.",
+            recording.channel_id,
+        )
+        recording.blocked_until = None
+        await self._sync_participants(self.get_guild(guild_id), recording)
 
     async def graceful_shutdown(self) -> None:
         """Closes every active session before the connection is torn down.

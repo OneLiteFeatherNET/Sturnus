@@ -40,7 +40,7 @@ from sturnus.application.ports import AudioStore, AudioWriter, Clock, SessionKey
 from sturnus.application.reconfigure import GuildRuntimeConfig, ReconfigureAction
 from sturnus.application.recording import RecordingService
 from sturnus.domain import settings
-from sturnus.domain.session import SessionTimeouts
+from sturnus.domain.session import EndReason, SessionTimeouts
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import (
@@ -49,7 +49,11 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
-from sturnus.infrastructure.discord.client import SturnusClient, _GuildRecording
+from sturnus.infrastructure.discord.client import (
+    REJOIN_COOLDOWN,
+    SturnusClient,
+    _GuildRecording,
+)
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState
 
@@ -220,11 +224,14 @@ class FakeConfigStore:
 class FakeVoiceReceiver:
     """Satisfies the `VoiceReceiver` port without a real gateway connection."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, join_fails: bool = False) -> None:
         self.joined: list[int] = []
         self.left = 0
+        self.join_fails = join_fails
 
     async def join(self, channel_id: int) -> None:
+        if self.join_fails:
+            raise RuntimeError("the gateway said no")
         self.joined.append(channel_id)
 
     async def leave(self) -> None:
@@ -1423,3 +1430,170 @@ async def test_a_join_during_a_retarget_cannot_corrupt_the_reconfigure(
     assert client._guilds[GUILD_ID].channel_id == NEW_CHANNEL_ID
     assert sessions.opened == [], "the abandoned channel must not open a session"
     assert voice.joined == [], "and the new channel is empty, so nothing is joined"
+
+
+def _service(sessions: FakeSessions, jobs: FakeJobs, root: Path) -> RecordingService:
+    """The guild's recording pipeline, with everything below it faked."""
+    return RecordingService(
+        guild_id=GUILD_ID,
+        channel_id=CHANNEL_ID,
+        timeouts=SessionTimeouts(
+            empty_grace_seconds=60, idle_timeout_minutes=15, max_session_hours=4
+        ),
+        sessions=sessions,
+        jobs=jobs,
+        store=FakeStore(),
+        writers=FakeAudioWriterFactory(root),
+        encryptor=FakeEncryptor(),
+        retention_days=30,
+    )
+
+
+def _capture_guild(
+    client: SturnusClient,
+    sessions: FakeSessions,
+    voice: FakeVoiceReceiver,
+    tmp_path: Path,
+) -> tuple[discord.Member, discord.VoiceChannel]:
+    """Registers one configured guild whose channel holds a single consenting member.
+
+    The pipeline is handed in ready-made rather than built through
+    `reconcile_guild`, because these tests need to hold the voice
+    connection themselves -- one of them needs a `join` that fails. The
+    stored configuration matches it exactly, so the reconcile every tick
+    performs is a no-op and the guard is the only thing under test.
+
+    Returns that member and the channel they are in. Nobody leaves it in
+    either test below: staying is the point -- the fault is the bot's,
+    not theirs.
+    """
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    client._guilds[GUILD_ID] = _GuildRecording(
+        config=_runtime_config(),
+        service=_service(sessions, FakeJobs(), tmp_path),
+        voice=voice,
+    )
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    occupied = _voice_channel(CHANNEL_ID, members=[anna])
+    guild.get_channel.return_value = occupied
+    return anna, occupied
+
+
+async def test_a_join_that_fails_ends_the_session_rather_than_leaving_it_open(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A session with no capture behind it must not look like a quiet meeting.
+
+    `join` raising used to propagate into discord.py's event dispatcher
+    and leave the session row open with nothing listening: no frame and no
+    speaking event would ever arrive, so it closed at the idle timeout,
+    indistinguishable in the database from a channel where nobody spoke.
+    That row is the whole reason the production incident went unnoticed for
+    hours, so a capture that never started gets its own end reason.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    voice = FakeVoiceReceiver(join_fails=True)
+    client = _client(clock, config_store=_configured_store())
+    anna, occupied = _capture_guild(client, sessions, voice, tmp_path)
+
+    with caplog.at_level(logging.ERROR, logger="sturnus.infrastructure.discord.client"):
+        await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
+
+    assert len(caplog.records) == 1, "a capture that never started is never silent"
+    assert sessions.opened == [1], "the session row was already open by then"
+
+    clock.advance(timedelta(seconds=1))
+    await client._tick_all(clock.now())
+
+    assert sessions.closed == [(1, "capture_failure")], "not idle_timeout, fifteen minutes later"
+    assert voice.left == 1
+    assert client._guilds[GUILD_ID].service.is_recording is False
+
+
+async def test_a_capture_side_end_does_not_open_another_session_straight_after(
+    tmp_path: Path,
+) -> None:
+    """The bot's own leave() must not be what starts the next session.
+
+    Closing a session makes the bot leave the channel, and leaving is
+    itself a voice-state update. Without the guard the very next event
+    opens a fresh session row, rejoins with fresh decoders, meets the
+    same fault and closes again -- a run of empty sessions, each one
+    announcing to everyone present that they are being recorded.
+
+    Fails without the guard: `sessions.opened` reaches `[1, 2]` on the
+    voice-state update the bot's own departure produced.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    voice = FakeVoiceReceiver()
+    client = _client(clock, config_store=_configured_store())
+    anna, occupied = _capture_guild(client, sessions, voice, tmp_path)
+
+    await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
+    assert sessions.opened == [1]
+    assert voice.joined == [CHANNEL_ID]
+
+    # Every stream stops decoding, so the adapter arms a close that is
+    # nothing like a timeout.
+    client._guilds[GUILD_ID].service.request_close(EndReason.DECODE_FAILURE)
+    clock.advance(timedelta(seconds=1))
+    await client._tick_all(clock.now())
+
+    assert sessions.closed == [(1, "decode_failure")]
+    assert voice.left == 1
+
+    # The bot leaving is itself a voice-state update, and Anna is still there.
+    clock.advance(timedelta(seconds=1))
+    await client.on_voice_state_update(anna, _voice_state(occupied), _voice_state(occupied))
+
+    assert sessions.opened == [1], "a rejoin would meet the same fault"
+    assert voice.joined == [CHANNEL_ID]
+
+    # Nor do the ticks in between quietly do it instead.
+    clock.advance(timedelta(seconds=30))
+    await client._tick_all(clock.now())
+
+    assert sessions.opened == [1]
+    assert voice.joined == [CHANNEL_ID]
+
+
+async def test_the_guard_lapses_on_the_tick_with_no_voice_state_update_at_all(
+    tmp_path: Path,
+) -> None:
+    """Recovery must not wait for somebody to happen to join or leave.
+
+    Capture failing is not something the people in the channel did, and
+    none of them has any reason to leave and come back afterwards. A
+    guard that can only lapse inside `on_voice_state_update` therefore
+    leaves a guild whose membership does not change again blocked
+    forever -- a transient fault turned into an outage.
+
+    Fails without the tick-driven lapse: no voice-state update is
+    dispatched after the failure anywhere in this test, so
+    `sessions.opened` stays `[1]`.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    voice = FakeVoiceReceiver()
+    client = _client(clock, config_store=_configured_store())
+    anna, occupied = _capture_guild(client, sessions, voice, tmp_path)
+
+    await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
+    client._guilds[GUILD_ID].service.request_close(EndReason.CAPTURE_FAILURE)
+    clock.advance(timedelta(seconds=1))
+    await client._tick_all(clock.now())
+
+    assert sessions.closed == [(1, "capture_failure")]
+    assert sessions.opened == [1]
+
+    clock.advance(REJOIN_COOLDOWN + timedelta(seconds=1))
+    await client._tick_all(clock.now())
+
+    assert sessions.opened == [1, 2], "a pause, not a giving up"
+    assert voice.joined == [CHANNEL_ID, CHANNEL_ID]
+    assert client._guilds[GUILD_ID].service.is_recording is True
+    assert client._guilds[GUILD_ID].blocked_until is None

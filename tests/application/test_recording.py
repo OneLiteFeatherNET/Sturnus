@@ -114,11 +114,16 @@ class FakeAudioWriter:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._file = self.path.open("wb")
         self._closed = False
+        #: Where each packet was placed on the timeline. The real adapter
+        #: turns this into padding; here it is kept so tests can assert on
+        #: the placement itself.
+        self.placed_at: list[datetime] = []
 
     def write(self, _at: datetime, pcm: bytes) -> None:
         if self._closed:
             raise RuntimeError("writer is closed")
         self._file.write(pcm)
+        self.placed_at.append(_at)
 
     def close(self) -> None:
         if not self._closed:
@@ -562,3 +567,49 @@ async def test_end_now_without_a_session_does_nothing(tmp_path: Path) -> None:
     assert sessions.opened == []
     assert sessions.closed == []
     assert jobs.enqueued == []
+
+
+async def test_request_close_ends_the_session_through_the_next_tick(tmp_path: Path) -> None:
+    """What the capture path does when nothing decodes any more.
+
+    It does not close the session behind the orchestrator's back; it asks,
+    and the reason comes back out of `tick()` so the caller still gets its
+    one chance to leave the channel and reset.
+    """
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions)
+    await svc.participants_changed(1, T0)
+    await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
+
+    svc.request_close(EndReason.DECODE_FAILURE)
+    reason = await svc.tick(T0 + timedelta(seconds=1))
+
+    assert reason is EndReason.DECODE_FAILURE
+    assert sessions.closed == [(1, EndReason.DECODE_FAILURE.value)]
+    assert svc.is_recording is False
+
+
+async def test_speaker_stream_ended_retires_that_ssrcs_reference_point(tmp_path: Path) -> None:
+    """An SSRC is per-connection, not per-user.
+
+    A participant who reconnects comes back under a new one, and Discord
+    may reissue an abandoned one; a stale reference would place the next
+    stream's packets against the wrong origin. Anna's second stream
+    therefore starts a fresh reference at its own arrival time rather than
+    being placed hours before it, from an RTP value that means nothing to
+    it.
+    """
+    svc = service(tmp_path)
+    await svc.participants_changed(1, T0)
+    await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
+
+    svc.speaker_stream_ended(1)
+
+    later = T0 + timedelta(minutes=5)
+    await svc.voice_packet(ANNA, "anna", 1, 0, pcm(960), later)
+
+    writer = svc._writers[ANNA]
+    assert isinstance(writer, FakeAudioWriter)
+    # Without the reset, an RTP timestamp of 0 against a reference of
+    # 48_000 would place this packet a second *before* the epoch.
+    assert writer.placed_at[-1] == later
