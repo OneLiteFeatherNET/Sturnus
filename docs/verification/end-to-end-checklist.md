@@ -95,6 +95,59 @@ normal course of things; these are not.
   recording channel's text chat — this is your latency measurement's end
   point.
 
+## 1a. The crash drills
+
+Plan 2 Task 11 Step 5 asks for these, and they are the only chance to
+exercise the crash path against a real bot: `recover_orphans` has unit
+tests, but nothing has ever run it against a recording a real Discord
+session left behind. Do them **in the same session**, mid-conversation,
+not as a separate run — an orphan only exists while a recording is in
+progress.
+
+- [ ] **Timeline anchoring.** Before restarting anything, have one
+  participant join the channel and stay **silent for at least 20 seconds**
+  before speaking. Afterwards, check that speaker's `audio_started_at`
+  against both times: it must be close to when they first *spoke*, not
+  when they *joined* (Spec 6.3). A recording anchored at join time shifts
+  that speaker's whole transcript by the length of their silence, and the
+  error is invisible in a single-speaker recording — it only shows up as
+  misalignment against the other speaker.
+
+- [ ] **Graceful restart (`SIGTERM`).** Mid-conversation, send `SIGTERM`
+  to the bot (`kubectl delete pod`, or `kill` locally). Confirm: the
+  session is closed cleanly rather than left in `RECORDING`, the audio
+  captured so far is uploaded, and a `transcription_job` row exists for
+  it. Then confirm the bot rejoins on restart.
+
+- [ ] **Hard kill (`SIGKILL`) and recovery.** Rejoin, speak again, then
+  `kill -9` the bot. Nothing gets a chance to flush, so a partial
+  recording is left on the recording volume. Restart, and confirm from the
+  logs that recovery finds it — the bot logs "Recovered N orphaned recording(s) left behind by a previous process" — and that the
+  leftover recording is uploaded and enqueued rather than silently
+  discarded or left to fill the volume.
+  - [ ] Confirm the recovered audio actually decrypts: its session key
+    must have been written when the session opened, not at enqueue time.
+    A job whose `.enc` file cannot be decrypted is the failure this path
+    exists to prevent.
+
+## 1b. Three questions only a live channel can answer
+
+From `voice-receive-spike.md`, which closed the library question but left
+these. They cost nothing extra during a run that is happening anyway, and
+question 2 can still change a design decision.
+
+- [ ] **Is the PCM really 48 kHz 16-bit stereo?** `to_mono_16k` assumes
+  it and the library's docstring does not say. Confirm against real
+  packets.
+- [ ] **Is `source` populated on a speaker's very first packet**, or does
+  the SSRC mapping arrive slightly later? Spec 6.3 anchors a speaker's
+  recording at their first packet, so a late mapping shifts their whole
+  timeline. Check by comparing the first packet's timestamp for each
+  speaker against when they were heard to start.
+- [ ] **What happens on reconnect** — does the same user get a new SSRC,
+  as Spec 6.2 assumes, and how quickly does the mapping follow? The
+  `SIGTERM` drill above forces a reconnect, so this can be observed there.
+
 ## 2. What to measure
 
 - [ ] **Latency**: time from session end (both participants gone, grace
@@ -182,6 +235,13 @@ first time real numbers exist for any of them. Record what you actually
 measured, not a plausibility check against the estimate.
 
 - [ ] Measured latency (§2) and its ratio to speaking time: ____________
+- [ ] **Timeline anchoring (§1a)**: the silent participant's join time,
+  first-speech time, and the `audio_started_at` actually recorded — all
+  three, so the gap is visible rather than asserted: ____________
+- [ ] **Answers to the three spike questions (§1b)**, especially whether
+  `source` was populated on the first packet. Write the answers back into
+  `voice-receive-spike.md`'s "Still open" section, which is where the next
+  reader will look for them: ____________
 - [ ] Transcription quality on real German speech — a subjective read is
   fine (e.g. "correct except for two proper nouns"), but be specific
   about what was wrong, not just "mostly good": ____________
