@@ -83,8 +83,8 @@ in the bot would read it.
 | `STURNUS_MASTER_KEY_ID` | **yes** | no | Label recorded as `encryption_key_id` when a data key is wrapped. Not key material. |
 | `STURNUS_OUTLINE_BASE_URL` | **yes** | no | Base URL of the Outline instance the finished protocol is posted to. |
 | `STURNUS_OUTLINE_SERVICE_KEY` | **yes** | **yes** | Outline API token `OutlineSink` authenticates with when creating documents. Note the name — it is `OUTLINE_SERVICE_KEY`, not an `API_TOKEN` variant. A token that is invalid, lacks access, or points at a collection that does not exist surfaces as `PermanentDocumentError`; see section 5. |
-| `STURNUS_WHISPER_MODEL` | `large-v3-turbo` | no | faster-whisper model to load. Larger models are more accurate and markedly slower, and this deployment transcribes on CPU (see the chart's `worker.resources`), so the difference is measured in minutes per recording rather than seconds. |
-| `STURNUS_WHISPER_DEFAULT_LANGUAGE` | `en` | no | Language reported when faster-whisper's own detection comes up empty. It matters more than a fallback usually does: the first transcription for a speaker in a session pins that speaker's language, and every later job for them reuses it. |
+| `STURNUS_WHISPER_MODEL` | `large-v3` | no | faster-whisper model to load. Larger models are more accurate and markedly slower, and this deployment transcribes on CPU (see the chart's `worker.resources`), so the difference is measured in minutes per recording rather than seconds. It is deliberately not `large-v3-turbo`: turbo is a distilled decoder with four layers instead of thirty-two, and what it gives up is concentrated outside English. Transcription happens offline, per speaker, after the meeting, so the time it costs is time nobody is waiting on — the memory it costs is real, and the chart's `worker.resources` comment works it out. |
+| `STURNUS_WHISPER_DEFAULT_LANGUAGE` | `de` | no | Language reported when faster-whisper's own detection comes up empty. This is the floor under the per-guild `transcription_language` (section 4.1), not the usual setting to reach for — it is consulted only for a guild that asked for detection (`transcription_language auto`) and got nothing back. It still matters more than a fallback usually does: the first transcription for a speaker in such a session pins that speaker's language, and every later job for them reuses it. |
 | `STURNUS_MODEL_CACHE_DIR` | unset | no | Where model weights are cached. When set, the worker exports it as `HF_HOME` before loading the model, so the download lands on a persistent volume; left unset, every cold start re-downloads several gigabytes of weights. |
 | `STURNUS_WORK_DIR` | `/tmp` | no | Scratch directory the encrypted recording is downloaded and decrypted into before transcription. It must be large enough for the biggest single recording — the chart sizes the corresponding volume with `worker.tmpSizeLimit`. |
 | `STURNUS_MAX_JOB_ATTEMPTS` | `3` | no | How many failed attempts a job gets before `JobQueue.fail` marks it `dead`. See section 5 for what a `dead` job means for the rest of its session. |
@@ -94,10 +94,26 @@ in the bot would read it.
 | `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 Whisper's device and compute type are deliberately *not* environment-driven:
-the worker constructs `WhisperEngine` with `"cpu"` and `int8` hardcoded,
-because Spec 7 sizes this deployment for CPU inference. There is no
-`STURNUS_WHISPER_DEVICE` to set — moving to GPU is a code change, not a
+the worker constructs `WhisperEngine` with `"cpu"` and `int8_float32`
+hardcoded, because Spec 7 sizes this deployment for CPU inference. There is
+no `STURNUS_WHISPER_DEVICE` to set — moving to GPU is a code change, not a
 configuration change.
+
+`int8_float32` rather than plain `int8`: the weights are quantised to int8
+either way, and the suffix names the type everything else runs in.
+CTranslate2 treats bare `int8` as an alias and picks that float type for
+whichever machine it finds itself on, which would leave transcription
+quality depending on the node the pod was scheduled to. It also falls back
+silently rather than refusing a compute type it cannot provide, so a wrong
+value here costs accuracy with nothing in the logs to say so.
+
+Neither the decoding parameters (`beam_size`, `condition_on_previous_text`,
+the VAD filter and the two hallucination thresholds) is configurable
+either. They are quality decisions with one right answer for this workload,
+argued in `sturnus/infrastructure/whisper.py` and pinned by
+`tests/infrastructure/test_whisper.py`; what *is* per-guild is the language
+and the vocabulary, and those are runtime configuration rather than
+environment variables — see section 4.1.
 
 ### 1.3 `sturnus-link` (`sturnus.entrypoints.link.LinkSettings`)
 
@@ -376,6 +392,40 @@ naming the guild, rather than costing the protocol.
 /config set timezone Europe/Berlin
 ```
 
+Worth setting for the same reason, and for a bigger one: `transcription_language`
+decides what language the recordings are transcribed as. It defaults to
+`de`. The alternative is not "no language" but detection, and detection is
+weak exactly where it is used here — it runs on one speaker's track with
+the silence already cut out of it, so a participant whose first
+contribution is a three-second "ja, genau" gives it almost nothing to work
+with. Whatever it guesses is then pinned for that speaker for the rest of
+the session, so one unlucky guess is not one bad job, it is every job for
+that person from then on. Naming the language removes the guess.
+
+```
+/config set transcription_language de
+```
+
+A guild that genuinely meets in more than one language sets it to `auto`,
+which is what asks for detection-and-pinning explicitly. There is no third
+state: clearing the key restores the `de` default rather than removing it.
+
+`transcription_prompt` is the vocabulary Whisper is biased towards while
+decoding — Whisper's `initial_prompt`. It defaults to OneLiteFeather's own
+project names and stack, written as an ordinary German sentence so the
+style it biases towards is punctuated prose as well. Proper nouns are both
+what a general model reliably gets wrong and what a protocol is read for: a
+decision minuted about the wrong project is worse than no minutes. Set it
+if your names are different ones:
+
+```
+/config set transcription_prompt "Protokoll eines Meetings über Foo, Bar und Baz."
+```
+
+Keep it a sentence rather than a word list, keep it in the transcription
+language, and keep it short — Whisper only sees the last ~224 tokens of it,
+and a long prompt bleeds its own wording into the transcript.
+
 Until every required key (`voice_channel_id`, `consent_role_id`,
 `document_target`, `policy_version`, `policy_url`, `admin_role_id`) is set,
 the bot logs a warning naming the guild and skips building that guild's
@@ -404,9 +454,14 @@ when it detects this.
 
 **Live immediately, and never were stale.** `admin_role_id`,
 `policy_version`, `policy_url` (read per command invocation, and by the
-consent cache with a five-second TTL), and `document_target`,
-`document_provider`, `merge_gap_seconds` (read per job by the *worker*
-process, not the bot at all).
+consent cache with a five-second TTL), and `transcription_language`,
+`transcription_prompt`, `document_target`, `document_provider`,
+`merge_gap_seconds` (read per job by the *worker* process, not the bot at
+all). The two transcription keys apply to the next job the worker claims,
+which means a session already recording is still transcribed with the new
+value — and a job that has already run is not redone. Changing them
+because a protocol came out wrong therefore affects the next meeting, not
+the one you are looking at.
 
 **Deferred until the recording in progress ends.** `voice_channel_id` and
 `consent_role_id`. These decide which channel a session's row names and

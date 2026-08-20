@@ -201,6 +201,15 @@ In Discord, as an administrator:
    the target collection id, and `policy_url`, which must point at a real
    privacy policy naming the retention period. Participants consent to
    what that document says.
+
+   Two more keys are worth a look here even though they default to
+   something sensible: `transcription_language` (default `de`) and
+   `transcription_prompt`, which defaults to OneLiteFeather's own project
+   names. Both decide what the protocol actually *says*, and both are
+   cheap to get right now and awkward to notice later — a wrong language
+   is pinned per speaker for a whole session, and a name the model has
+   never seen comes out as the nearest word it has. Section 4 of
+   `operations.md` explains both.
 3. Have one person run `/consent grant` and `/link start` to confirm both
    flows end where they should.
 

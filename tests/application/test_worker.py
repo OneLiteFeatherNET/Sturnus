@@ -50,17 +50,34 @@ class FakeQueue:
 
 
 class FakeEngine:
-    def __init__(self, text: str = "spoken words", fail: bool = False) -> None:
+    """`detected` is what the engine *reports back*, which is not the same
+    as what it was asked for: it is deliberately different from the
+    language the transcription tests configure, so a test asserting that a
+    configured language is never overwritten by detection cannot pass by
+    the two happening to agree.
+    """
+
+    def __init__(
+        self, text: str = "spoken words", fail: bool = False, detected: str = "de"
+    ) -> None:
         self.text = text
         self.fail = fail
+        self.detected = detected
         self.calls: list[tuple[Path, str | None]] = []
+        #: `initial_prompt` from every call, recorded separately from
+        #: `calls` so the existing `calls[i][1]` language assertions stay
+        #: as they are.
+        self.prompts: list[str | None] = []
 
-    async def transcribe(self, path: Path, language: str | None) -> TranscriptionResult:
+    async def transcribe(
+        self, path: Path, language: str | None, initial_prompt: str | None
+    ) -> TranscriptionResult:
         self.calls.append((path, language))
+        self.prompts.append(initial_prompt)
         if self.fail:
             raise RuntimeError("model exploded")
         return TranscriptionResult(
-            segments=(TranscribedSegment(0.0, 1.0, self.text),), language="de"
+            segments=(TranscribedSegment(0.0, 1.0, self.text),), language=self.detected
         )
 
 
@@ -213,6 +230,23 @@ class FakeConfig:
 
     async def get(self, guild_id: int, key: str) -> str | None:
         return self._values.get((guild_id, key))
+
+
+def guild_config(extra: dict[str, str] | None = None) -> FakeConfig:
+    """A `FakeConfig` for `GUILD` whose document settings are already right.
+
+    The transcription keys (`transcription_language`, `transcription_prompt`)
+    are absent unless a test names them, which is what keeps the
+    unconfigured path -- detect once, then pin per speaker -- exercised by
+    every test that does not care about them.
+    """
+    values: dict[tuple[int, str], str] = {
+        (GUILD, domain_settings.DOCUMENT_TARGET): "col-default",
+        (GUILD, domain_settings.DOCUMENT_PROVIDER): "outline",
+        (GUILD, domain_settings.MERGE_GAP_SECONDS): "15",
+    }
+    values.update({(GUILD, key): value for key, value in (extra or {}).items()})
+    return FakeConfig(values)
 
 
 def job(job_id: int = 1, session_id: int = 1, user_id: int = 100) -> ClaimedJob:
@@ -546,6 +580,107 @@ async def test_a_later_job_pins_the_stored_language(tmp_path: Path) -> None:
     sessions.languages[100] = "de"
     await process_one(**run(tmp_path, engine=engine, sessions=sessions))
     assert engine.calls[0][1] == "de"
+
+
+async def test_the_guilds_configured_language_is_what_gets_transcribed(
+    tmp_path: Path,
+) -> None:
+    """`transcription_language` (Spec 11) is passed straight to the engine.
+
+    Naming the language is what stops the engine detecting one, and
+    detection on a per-speaker track is a coin flip whenever the speaker's
+    first job is short.
+    """
+    engine = FakeEngine()
+    config = guild_config({domain_settings.TRANSCRIPTION_LANGUAGE: "de"})
+    await process_one(**run(tmp_path, engine=engine, config=config))
+    assert engine.calls[0][1] == "de"
+
+
+async def test_a_configured_language_is_never_pinned_as_a_detection(
+    tmp_path: Path,
+) -> None:
+    """Writing the configured value into `detected_language` would make the
+    column mean two different things and would freeze the configuration as
+    it stood on a session's first job: a guild that corrects the setting
+    mid-session would keep getting the old language until the session ends.
+    """
+    engine, sessions = FakeEngine(detected="nl"), FakeSessions()
+    config = guild_config({domain_settings.TRANSCRIPTION_LANGUAGE: "de"})
+    await process_one(**run(tmp_path, engine=engine, sessions=sessions, config=config))
+    assert sessions.languages == {}
+
+
+async def test_a_configured_language_wins_over_an_earlier_detection(
+    tmp_path: Path,
+) -> None:
+    """The stored detection is a guess; the configured value is a decision.
+
+    This is the ordering that stops one bad detection -- pinned by an
+    earlier job of the same session, before an administrator noticed and
+    configured the language -- from governing every job after it.
+    """
+    engine, sessions = FakeEngine(), FakeSessions()
+    sessions.languages[100] = "nl"
+    config = guild_config({domain_settings.TRANSCRIPTION_LANGUAGE: "de"})
+    await process_one(**run(tmp_path, engine=engine, sessions=sessions, config=config))
+    assert engine.calls[0][1] == "de"
+
+
+async def test_auto_asks_for_detection_and_pins_what_came_back(tmp_path: Path) -> None:
+    """`auto` is how a genuinely multilingual guild opts back in.
+
+    Without it the detect-and-pin path would be unreachable in production,
+    since `transcription_language` has a default and clearing the key
+    restores it rather than removing it.
+    """
+    engine, sessions = FakeEngine(detected="nl"), FakeSessions()
+    config = guild_config({domain_settings.TRANSCRIPTION_LANGUAGE: "auto"})
+    await process_one(**run(tmp_path, engine=engine, sessions=sessions, config=config))
+    assert engine.calls[0][1] is None
+    assert sessions.languages[100] == "nl"
+
+
+async def test_a_blank_configured_language_asks_for_detection(tmp_path: Path) -> None:
+    """`guild_config` is a table operators are told they may edit with SQL,
+    which `ConfigStore.set`'s validation never sees. A blank value has to
+    mean something, and the alternative -- handing `""` to the engine,
+    which rejects it -- turns one careless `UPDATE` into every job of that
+    guild failing.
+    """
+    engine = FakeEngine()
+    config = guild_config({domain_settings.TRANSCRIPTION_LANGUAGE: "  "})
+    await process_one(**run(tmp_path, engine=engine, config=config))
+    assert engine.calls[0][1] is None
+
+
+async def test_a_configured_language_is_stripped_before_the_engine_sees_it(
+    tmp_path: Path,
+) -> None:
+    """`" de "` is not a language code faster-whisper knows, and a value
+    typed with a trailing space is not a decision to fail every job.
+    """
+    engine = FakeEngine()
+    config = guild_config({domain_settings.TRANSCRIPTION_LANGUAGE: " de "})
+    await process_one(**run(tmp_path, engine=engine, config=config))
+    assert engine.calls[0][1] == "de"
+
+
+async def test_the_guilds_vocabulary_prompt_reaches_the_engine(tmp_path: Path) -> None:
+    """`transcription_prompt` (Spec 11) is per-guild for the same reason
+    `document_target` is: one worker process serves every guild, and whose
+    project names matter is not knowable until a session is in hand.
+    """
+    engine = FakeEngine()
+    config = guild_config({domain_settings.TRANSCRIPTION_PROMPT: "Ducula, Guira, Minestom."})
+    await process_one(**run(tmp_path, engine=engine, config=config))
+    assert engine.prompts == ["Ducula, Guira, Minestom."]
+
+
+async def test_a_guild_with_no_prompt_configured_biases_nothing(tmp_path: Path) -> None:
+    engine = FakeEngine()
+    await process_one(**run(tmp_path, engine=engine, config=guild_config()))
+    assert engine.prompts == [None]
 
 
 async def test_the_audio_object_is_not_deleted_after_transcription(tmp_path: Path) -> None:

@@ -267,7 +267,13 @@ worker:
   replicaCount: 1
   env:
     STURNUS_MODEL_CACHE_DIR: /data/model-cache
-    STURNUS_WHISPER_MODEL: large-v3-turbo
+    # Not `large-v3-turbo`: turbo is a distilled decoder, four layers where
+    # this has thirty-two, and the accuracy it trades away lands outside
+    # English -- which is the only place these meetings happen. It is a
+    # latency trade, and nothing here is waiting on latency: transcription
+    # is offline, per speaker, after the meeting. `worker.resources` below
+    # is where that decision is actually paid for.
+    STURNUS_WHISPER_MODEL: large-v3
   # Larger than bot/link's: `process_one` downloads the encrypted object and
   # decrypts it to a WAV before transcribing, both under its work directory
   # (`sturnus.application.worker.process_one`, which creates a
@@ -278,25 +284,80 @@ worker:
   # Setting STURNUS_WORK_DIR to anything outside this mount points the worker
   # at the read-only root filesystem, so the two have to move together.
   tmpSizeLimit: 4Gi
+  # Sized for large-v3 at int8_float32 with beam_size 8, which is a
+  # different budget from the large-v3-turbo/beam 5 these numbers were set
+  # for. Three parts, added up rather than guessed at:
+  #
+  #   * The weights, resident for the life of the process. 1.55B
+  #     parameters quantised to one byte each is ~1.55GB, against ~0.81GB
+  #     for turbo's 809M. (The checkpoint on the cache volume below is
+  #     float16 and twice that; it is quantised while loading, not kept.)
+  #   * The decoding buffers, which exist only while a job runs and are
+  #     the part that actually scales: the cached attention keys and
+  #     values are held per beam, per decoder layer, and large-v3 has 32
+  #     decoder layers where turbo has 4. faster-whisper's own published
+  #     CPU benchmark for this architecture (large-v2 -- same 1.55B
+  #     parameters, same layer counts -- int8, beam 5) peaks at ~2.9GB
+  #     all in, i.e. ~1.35GB on top of the weights. beam_size 8 scales
+  #     that share by 8/5, so ~2.2GB.
+  #   * The process itself -- interpreter, numpy, soxr, boto3, SQLAlchemy,
+  #     one decrypted WAV read through it. A few hundred MB; call it 0.5GB.
+  #
+  # ~4.25GB at peak, and measured at **4.11GB** on an x86 CPU pinned to
+  # four threads, transcribing 4.7 minutes of German speech -- close enough
+  # to the arithmetic above to trust it for longer jobs, since only the
+  # second item grows with the audio. For comparison the previous
+  # configuration (large-v3-turbo, int8, beam 5) peaked at 1.96GB, which is
+  # why the old 2560Mi limit held.
+  #
+  # The request is 4Gi (steady state between jobs is
+  # closer to 2GB -- the second item is transient), and the limit 6Gi. The
+  # limit is the number worth being generous with: exceeding it is an
+  # OOMKill in the middle of a transcription, which fails the job, and
+  # headroom on a node that has the memory costs nothing until it is
+  # needed. cpu stays at 4: large-v3 needs more *time* than turbo, not
+  # more parallelism, and the ceiling that time has to stay under is
+  # STURNUS_JOB_LEASE_SECONDS (1800s), not this.
+  #
+  # Measured, that ceiling is further away than it looks. The same run
+  # transcribed 282s of speech in 145s -- 1.94x faster than real time,
+  # against 4.6x for the old configuration. `vad_filter` means only the
+  # *speech* in a track is decoded, not its padded length, so 1800s of
+  # lease covers roughly 58 minutes of one person actually talking. Beyond
+  # that the lease expires mid-job; with `replicas: 1` (hardcoded in the
+  # Deployment template) and the worker processing one job at a time,
+  # nothing else can claim it, so the only consequence today is that a
+  # restart may reclaim a job that was still running. Raising the worker
+  # beyond one replica is what would turn this into two workers
+  # transcribing the same recording, and is the moment to revisit the
+  # lease.
   resources:
     requests:
       cpu: "4"
-      memory: 2Gi
+      memory: 4Gi
     limits:
       cpu: "4"
-      memory: 2560Mi
-  # The model (faster-whisper large-v3-turbo) downloads on first start on a
-  # cold cache volume, which takes minutes -- not seconds. A startupProbe
-  # gives that its own, generous budget: liveness and readiness are not
+      memory: 6Gi
+  # The model (faster-whisper large-v3) downloads on first start on a cold
+  # cache volume, which takes minutes -- not seconds. A startupProbe gives
+  # that its own, generous budget: liveness and readiness are not
   # evaluated at all until it succeeds, so a slow download cannot be mistaken
   # for a hung process and cannot trigger a restart loop. Once the startup
   # probe succeeds, liveness/readiness take over on their normal cadence.
+  # The budget is what it is because `sturnus.entrypoints.worker` builds
+  # the engine -- download, then quantise 1.55B parameters down to int8 --
+  # *before* it starts the health server, so nothing answers /healthz until
+  # that has finished.
   startupProbe:
     httpGet:
       path: /healthz
       port: health
     periodSeconds: 10
-    failureThreshold: 60 # 10 minutes to cover a cold-cache model download
+    # 20 minutes. Twice what it was, because large-v3's float16 checkpoint
+    # is ~3.1GB against large-v3-turbo's ~1.6GB and the quantisation at the
+    # end of it is longer too. This only ever costs anything on a cold
+    # cache volume: it is a ceiling, not a wait.
+    failureThreshold: 120
   livenessProbe:
     httpGet:
       path: /healthz
@@ -309,7 +370,11 @@ worker:
     periodSeconds: 10
   persistence:
     # Holds the downloaded model weights so a restart doesn't repeat the
-    # download; ~1.6GB for large-v3-turbo in int8 (Spec 7) plus headroom.
+    # download. What lands here is the float16 checkpoint as published,
+    # ~3.1GB for large-v3 (Spec 7) -- the int8 quantisation happens in
+    # memory at load time and is never written back. Plenty of headroom at
+    # 10Gi, and worth keeping: a resize is far more disruptive than the
+    # unused gigabytes are expensive.
     size: 10Gi
     storageClassName: ""
     accessMode: ReadWriteOnce

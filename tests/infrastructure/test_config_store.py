@@ -111,3 +111,46 @@ async def test_snapshot_agrees_with_get_for_every_known_key(store: ConfigStore) 
 async def test_snapshot_is_per_guild(store: ConfigStore) -> None:
     await store.set(GUILD, settings.VOICE_CHANNEL_ID, "12345", T0)
     assert settings.VOICE_CHANNEL_ID not in await store.snapshot(GUILD + 1)
+
+
+async def test_the_transcription_language_is_a_key_an_administrator_can_set(
+    store: ConfigStore,
+) -> None:
+    """`set` rejects every key it does not know, so a setting the worker
+    reads but `DEFAULTS` never names is one nobody can change: `/config
+    set` answers "unknown configuration key" while the worker goes on
+    using the built-in value forever.
+    """
+    await store.set(GUILD, settings.TRANSCRIPTION_LANGUAGE, "en", T0)
+    assert await store.get(GUILD, settings.TRANSCRIPTION_LANGUAGE) == "en"
+
+
+async def test_clearing_the_transcription_language_restores_german(store: ConfigStore) -> None:
+    """Clearing restores the default rather than removing the value, which
+    is why `auto` exists as a spelling (`settings.DETECT_LANGUAGE`) -- there
+    is no state in which no language is configured.
+    """
+    await store.set(GUILD, settings.TRANSCRIPTION_LANGUAGE, "en", T0)
+    await store.set(GUILD, settings.TRANSCRIPTION_LANGUAGE, None, T0)
+    assert await store.get(GUILD, settings.TRANSCRIPTION_LANGUAGE) == "de"
+
+
+async def test_a_guild_that_configured_nothing_still_gets_the_projects_vocabulary(
+    store: ConfigStore,
+) -> None:
+    """The prompt is only worth having if it carries the names Whisper
+    actually gets wrong, and a guild that never runs `/config set` is the
+    normal case -- so the default has to be the real vocabulary, not an
+    empty string waiting for someone to fill it in.
+    """
+    prompt = await store.get(GUILD, settings.TRANSCRIPTION_PROMPT)
+    assert prompt is not None
+    for name in ("Ducula", "Guira", "Minestom", "Outline"):
+        assert name in prompt
+
+
+async def test_the_transcription_prompt_is_a_key_an_administrator_can_set(
+    store: ConfigStore,
+) -> None:
+    await store.set(GUILD, settings.TRANSCRIPTION_PROMPT, "Nur eigene Wörter.", T0)
+    assert await store.get(GUILD, settings.TRANSCRIPTION_PROMPT) == "Nur eigene Wörter."

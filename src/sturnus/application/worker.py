@@ -13,10 +13,37 @@ Spec 12.2 keeps the object for `audio_retention_days` so a poor
 transcription can be redone from the original audio; that deletion belongs
 to the retention sweep (`sturnus.application.retention`), not to this job.
 
-Language pinning (Spec 7): a speaker's first job asks the engine to detect
-the language and persists what it found; every later job for that same
-speaker passes the stored language back in, so one protocol never mixes
-languages mid-session because the engine's guess drifted.
+Language (Spec 7, Spec 11). Two things can decide what language a
+recording is transcribed as, and the order between them is the whole
+point. `transcription_language` is per-guild configuration and wins
+outright: when a guild names a language it is handed to the engine, no
+detection runs, and *nothing* is written to `detected_language`. Both
+halves of that matter. A configured setting that a guess may override is
+a trap, and here it would be a self-locking one -- `set_detected_language`
+pins the first job's guess for the rest of the session, so the guess would
+go on beating the configuration on every later job of that session, and
+the column would stop meaning "what the engine detected" and start meaning
+"what was configured when this session's first job ran", with no way to
+tell the two apart in the data.
+
+Detection remains available, and is what an unconfigured guild and a guild
+that sets the value to `auto` (`sturnus.domain.settings.DETECT_LANGUAGE`)
+both get: then, and only then, a speaker's first job asks the engine to
+detect the language and persists what it found, and every later job for
+that same speaker passes the stored language back in, so one protocol
+never mixes languages mid-session because the engine's guess drifted.
+That the guess needs pinning at all is the measure of how weak it is: it
+is made on one speaker's track, which `vad_filter` has already reduced to
+the fragments where that person actually spoke, so a participant whose
+first contribution is a three-second agreement is close to a coin flip
+between several languages -- and whichever one comes back then governs
+every remaining job for them.
+
+`transcription_prompt` (Spec 11) is the vocabulary the engine is biased
+towards while decoding -- an organisation's project names, which is
+precisely what a general model has never seen and will replace with
+something it has. It is read here, per job, for the same reason the
+document settings below are.
 
 Dependency-rule note: this module lives in `sturnus.application`, which must
 never import `sturnus.infrastructure` (tests/test_architecture.py). Every
@@ -46,10 +73,13 @@ than duplicating it here.
 
 `links` is typed with this module's own `LinkRepository`, not `assembly`'s
 `LinkReader`, and `config` (`ConfigReader`) is threaded through alongside
-it: `document_target`, `document_provider`, and `merge_gap_seconds` are all
-per-guild settings (Spec 11) that this one process cannot resolve until a
-session -- and therefore its guild -- is in hand, so they are read inside
-`_create_session_document` rather than once at process start. `_BoundLinks`
+it: `transcription_language`, `transcription_prompt`, `document_target`,
+`document_provider`, and `merge_gap_seconds` are all per-guild settings
+(Spec 11) that this one process cannot resolve until a session -- and
+therefore its guild -- is in hand. The first two are read in `process_one`
+itself, just before the engine is called; the last three inside
+`_create_session_document`. None of them is read once at process start,
+because one worker serves every guild. `_BoundLinks`
 adapts one call's resolved provider back down to the plain `LinkReader`
 shape `assemble` itself calls, so `assemble` stays ignorant of
 configuration entirely.
@@ -211,9 +241,11 @@ class SessionStore(Protocol):
     async def guild_id(self, session_id: int) -> int:
         """The guild a session belongs to.
 
-        Needed to resolve per-guild configuration (`document_target`,
-        `document_provider`, `merge_gap_seconds`, Spec 11) at
-        document-creation time -- see `_create_session_document`.
+        Needed to resolve per-guild configuration (Spec 11) twice per job:
+        `transcription_language` and `transcription_prompt` before the
+        engine is called (`process_one`), and `document_target`,
+        `document_provider` and `merge_gap_seconds` when a session's last
+        job creates the document (`_create_session_document`).
         """
         ...
 
@@ -240,6 +272,32 @@ class _ClaimedJobShape(Protocol):
     s3_key: str
     encryption_key_id: str
     wrapped_data_key: bytes
+
+
+def _configured_language(configured: str | None) -> str | None:
+    """The language a guild named, or `None` when it asked for detection.
+
+    Three stored values mean "detect", and the caller has no reason to
+    tell them apart: `auto` (`sturnus.domain.settings.DETECT_LANGUAGE`),
+    nothing at all, and blank. The last two are unreachable through
+    `/config` -- the key has a default and clearing restores it -- but
+    neither is unreachable in practice: `ConfigReader` is a protocol, and
+    `guild_config` is a table an operator is told they may edit with SQL
+    (`docs/operations.md` section 4.1), which `ConfigStore.set`'s
+    validation never sees. A blank value has to mean *something*, and the
+    alternative is passing `""` to the engine, which rejects it -- turning
+    one careless `UPDATE` into every job of that guild failing.
+
+    Surrounding whitespace is stripped for the same reason: `" de "` is
+    not a language code faster-whisper knows, and a value typed with a
+    trailing space is not a decision to fail every job.
+    """
+    if configured is None:
+        return None
+    named = configured.strip()
+    if not named or named.casefold() == domain_settings.DETECT_LANGUAGE:
+        return None
+    return named
 
 
 async def _guild_timezone(config: ConfigReader, guild: int) -> tzinfo:
@@ -372,7 +430,11 @@ async def process_one(
     1. Claim -- nothing claimed means there is no work; the caller backs off.
     2. Download the encrypted object to a scratch directory under `work_dir`.
     3. Unwrap the data key and decrypt to a plaintext WAV, still on disk.
-    4. Transcribe -- language pinning per Spec 7 (see the module docstring).
+    4. Resolve the guild's `transcription_language` and
+       `transcription_prompt` (Spec 11), then transcribe -- configured
+       language first, detection and per-speaker pinning only when the
+       guild asked for it (Spec 7; see the module docstring for the order
+       and why it is that way round).
     5. Store the transcript on the job; ask whether it was the session's last.
     6. If it was: assemble every participant's stored transcript into one
        document (`_create_session_document`, `sturnus.application.assembly.
@@ -428,14 +490,37 @@ async def process_one(
                 job.encryption_key_id,
             )
 
-            pinned_language = await sessions.detected_language(job.session_id, job.discord_user_id)
+            # Both settings are the guild's (Spec 11), so the guild has to
+            # be resolved first: one worker process serves all of them and
+            # only the session names one. Two extra reads per job, against
+            # a transcription measured in minutes.
+            guild = await sessions.guild_id(job.session_id)
+            configured_language = await config.get(guild, domain_settings.TRANSCRIPTION_LANGUAGE)
+            prompt = await config.get(guild, domain_settings.TRANSCRIPTION_PROMPT)
+
+            # A configured language beats a stored detection outright, and
+            # the stored detection is not even read when there is one --
+            # see this module's docstring for why that order is the point
+            # rather than a detail.
+            named_language = _configured_language(configured_language)
+            pinned_language = (
+                named_language
+                if named_language is not None
+                else await sessions.detected_language(job.session_id, job.discord_user_id)
+            )
             try:
-                result = await engine.transcribe(wav_path, pinned_language)
+                result = await engine.transcribe(wav_path, pinned_language, prompt)
             except Exception as exc:
                 log.warning("Transcription failed for job %d", job.id)
                 await queue.fail(job.id, str(exc), max_attempts)
                 return True
 
+            # Reached only when the guild asked for detection *and* this is
+            # the first job for this speaker: a named language is never
+            # `None`, which is exactly what keeps configuration out of
+            # `detected_language`. Dropping the condition altogether would
+            # write the configured language into that column on every job
+            # and pin it there, which is the trap the docstring describes.
             if pinned_language is None:
                 await sessions.set_detected_language(
                     job.session_id, job.discord_user_id, result.language
