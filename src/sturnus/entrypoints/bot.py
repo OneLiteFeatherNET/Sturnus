@@ -41,6 +41,7 @@ from sturnus.infrastructure.discord.link_cog import PROVIDER as OUTLINE_PROVIDER
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState, start_health_server
 from sturnus.infrastructure.objectstore import S3AudioStore
+from sturnus.infrastructure.observability import init_sentry
 from sturnus.infrastructure.recording_adapters import CryptoEncryptor, FileAudioWriterFactory
 
 log = logging.getLogger(__name__)
@@ -163,7 +164,6 @@ async def _wait_for_schema(
 
 
 async def _run() -> None:
-    logging.basicConfig(level=logging.INFO)
     settings = get_settings()
 
     engine = create_async_engine(settings.database_url)
@@ -274,6 +274,13 @@ async def _run() -> None:
 
 
 def main() -> None:
+    # Both run before `_run`, and so before `get_settings()` reads the
+    # environment: with a DSN configured, a settings `ValidationError` is
+    # then itself reported instead of being the one failure Sentry can never
+    # see. Without a DSN, `init_sentry` returns having touched nothing at all
+    # -- see `sturnus.infrastructure.observability`.
+    logging.basicConfig(level=logging.INFO)
+    init_sentry("bot")
     asyncio.run(_run())
 
 

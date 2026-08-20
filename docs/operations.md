@@ -60,6 +60,8 @@ the Kubernetes `Secret` rather than from plain manifest text (see section
 | `STURNUS_OUTLINE_CLIENT_ID` | **yes** | no | OAuth client id of the Sturnus application registered in Outline. Public by design — it travels in the query string of the authorization URL every user's browser opens. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL that authorization returns to. Must be the same value `sturnus-link` is given, and must actually route to `link` — see section 1.5. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 The bot has no `STURNUS_OUTLINE_CLIENT_SECRET`, and that is not an
 oversight: building an authorization URL needs only the public client id,
@@ -88,6 +90,8 @@ in the bot would read it.
 | `STURNUS_MAX_JOB_ATTEMPTS` | `3` | no | How many failed attempts a job gets before `JobQueue.fail` marks it `dead`. See section 5 for what a `dead` job means for the rest of its session. |
 | `STURNUS_JOB_LEASE_SECONDS` | `1800.0` | no | How long a claimed job may stay `running` before `JobQueue.claim` reclaims it for another worker. It is generous on purpose: it must exceed the longest plausible transcription, or a still-running job gets picked up a second time. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 Whisper's device and compute type are deliberately *not* environment-driven:
 the worker constructs `WhisperEngine` with `"cpu"` and `int8` hardcoded,
@@ -105,6 +109,8 @@ configuration change.
 | `STURNUS_OUTLINE_CLIENT_SECRET` | **yes** | **yes** | OAuth client secret for that same application. This process is the only one that holds it, because it is the only one that exchanges an authorization code for a token. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL, repeated here because the token exchange sends it again for verification. It must match the bot's value exactly — see section 1.5. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz` and `/oauth/callback` routes are served on. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 `link` holds no Discord token, no S3 credentials and no master key — by
 construction, not by omission. It is the only publicly reachable component,
@@ -133,6 +139,18 @@ user's own browser opens — and `STURNUS_OUTLINE_BASE_URL`,
 credentials. Encrypting an address buys nothing and costs review: a wrong
 redirect URI hidden inside a SOPS blob is a great deal harder to spot than
 a wrong one sitting in a values file.
+
+`STURNUS_SENTRY_DSN` is not the eighth entry, and should not be made one.
+The key embedded in a DSN is Sentry's *public* key: it authorises submitting
+events to one project and grants no read access to anything, which is why
+Sentry itself documents putting a DSN in browser JavaScript for frontend
+projects. The worst outcome from disclosure is event spam into one project —
+handled by rate limits and key rotation, not by encryption. Adding it to the
+`Secret` would misrepresent it as a credential in the one place this project
+keeps its credential inventory (the key lists in
+`charts/sturnus/templates/_helpers.tpl`) and pull a non-credential into the
+SOPS rotation procedure. It belongs in `commonEnv` alongside
+`STURNUS_OUTLINE_CLIENT_ID`, for the same reason.
 
 `STURNUS_DATABASE_URL` is the one entry on that list that is not typed
 `SecretStr` in the code — it is a plain `str`, because it is a connection
@@ -373,6 +391,41 @@ not increasing is not a database contention problem — it means nothing is
 calling `claim()` at all. Check that the worker process is actually
 running and check its `/readyz` endpoint before looking any further at
 individual jobs.
+
+**What a Sentry issue contains, and what it deliberately does not.** When
+`STURNUS_SENTRY_DSN` is set, an issue carries: the exception type, the
+module, a stack trace with five lines of surrounding *source* per frame, the
+`component` tag (`bot`/`worker`/`link`), the release
+(`sturnus@<version>`), the pod name, and — for errors raised from a log call
+— the log message's uninterpolated format string, e.g. `job %s failed`.
+
+It does not carry local variables, breadcrumbs, request data, or the
+interpolated log line and its arguments. **Exception messages are redacted
+to `<redacted>` unless the exception is an `OSError`** (so
+`ConnectionRefusedError: [Errno 111] refused` survives, as do the DNS, TLS
+and timeout failures that matter for a process talking to Discord, S3,
+Postgres and Outline) **or subclasses
+`sturnus.domain.errors.DiagnosticSafeError`**, the explicit opt-in whose
+docstring carries the contract.
+
+That is a deliberate trade, not an oversight, and it should not be undone
+during an incident. Sturnus records people talking; Spec 3 makes consent a
+precondition for processing any of it and Spec 12.4 requires that neither
+audio nor transcript content appears in logs, and Sentry is a second system
+holding a copy of whatever it is sent. Under this configuration
+Sentry receives strictly less than the pod log does. **So when a message is
+`<redacted>`, read it with `kubectl logs` on the pod named in the issue** —
+the information has moved, not vanished. The enforcement lives in
+`sturnus.infrastructure.observability` (an allowlist, so anything a future
+SDK version adds is dropped by default) and in ruff's `G` ruleset, which
+forbids f-string logging so that the format string Sentry does see stays a
+literal written in reviewable source.
+
+One consequence worth knowing: `sentry_sdk` calls the scrubbing hook inside
+its own exception guard, so a bug there makes Sentry go *quiet* rather than
+leak. "No issues since the deploy" is therefore not by itself proof that
+nothing is wrong — force one error in a non-production namespace after a
+deploy and confirm it lands.
 
 **After a bot restart.** On startup the bot recovers whatever a previous
 process left on disk under `STURNUS_RECORDING_DIR` and logs `Recovered N

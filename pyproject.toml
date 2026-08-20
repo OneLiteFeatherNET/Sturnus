@@ -26,6 +26,13 @@ dependencies = [
     "jinja2>=3.1",
     "httpx>=0.28",
     "faster-whisper>=1.1",
+    # Error reporting (sturnus.infrastructure.observability). A runtime
+    # dependency rather than an optional extra because one image serves
+    # operators with and without a Sentry instance: optionality has to be a
+    # runtime decision (is STURNUS_SENTRY_DSN set?), not an install-time one.
+    # Without a DSN `sentry_sdk.init()` is never called, so nothing is
+    # patched and the processes behave exactly as they do without it.
+    "sentry-sdk>=2.68",
 ]
 
 [project.scripts]
@@ -58,7 +65,16 @@ target-version = "py312"
 extend-exclude = ["docs", "migrations/versions"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B", "SIM", "ARG"]
+# `G` (flake8-logging-format) and `LOG` are privacy controls here, not style
+# rules. Sentry's logging integration forwards `LogRecord.msg` -- the raw
+# format string -- and `sturnus.infrastructure.observability` keeps only that
+# field. That guarantee holds only while `msg` is a literal written in
+# reviewable source: `log.error(f"failed for {transcript}")` would put the
+# transcript itself into `msg`, and no scrubbing hook can tell it apart from
+# a template. `G001`-`G004` forbid exactly those spellings (`.format()`,
+# `%`, `+`, f-string), leaving `%s`-style lazy formatting as the only way to
+# get runtime values into a log line. Zero violations across the tree today.
+select = ["E", "F", "I", "UP", "B", "SIM", "ARG", "G", "LOG"]
 
 [tool.mypy]
 python_version = "3.12"
