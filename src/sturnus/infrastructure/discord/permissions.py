@@ -38,34 +38,50 @@ def _config_store(interaction: discord.Interaction) -> ConfigStore | None:
     return store if isinstance(store, ConfigStore) else None
 
 
-def require_admin() -> Callable[[T], T]:
-    """App-command check: guild administrators, or holders of the configured admin role.
+def _parse_role_id(stored: str) -> int | None:
+    """Parses a stored admin role id, treating anything unparseable as unset.
+
+    `admin_role_id` is validated as an integer by `ConfigStore.set` going
+    forward, but this check must stay defensive regardless: it is the gate
+    that decides who may run administrative commands, and it must fail
+    closed and legibly -- never by raising `ValueError` out of a value that
+    predates validation, or reached storage some other way.
+    """
+    try:
+        return int(stored)
+    except ValueError:
+        return None
+
+
+async def _has_admin_access(interaction: discord.Interaction) -> bool:
+    """The check predicate behind `require_admin()`; a free function so it is testable directly.
 
     Raises `NoPrivateMessage` outside a guild and `MissingRole` for a guild
     member who is neither an administrator nor a holder of the role stored
     under `admin_role_id`. A guild that has not configured `admin_role_id`
-    yet rejects every non-administrator, rather than granting access to
-    nobody-in-particular.
+    yet -- or whose stored value cannot be parsed -- rejects every
+    non-administrator, rather than granting access to nobody-in-particular.
     """
-
-    async def predicate(interaction: discord.Interaction) -> bool:
-        member = interaction.user
-        if isinstance(member, discord.User):
-            raise app_commands.NoPrivateMessage()
-        if member.guild_permissions.administrator:
-            return True
-
-        role_id: int | None = None
-        store = _config_store(interaction)
-        if store is not None:
-            stored = await store.get(member.guild.id, settings.ADMIN_ROLE_ID)
-            if stored is not None:
-                role_id = int(stored)
-
-        if role_id is None or discord.utils.get(member.roles, id=role_id) is None:
-            raise app_commands.MissingRole(
-                role_id if role_id is not None else settings.ADMIN_ROLE_ID
-            )
+    member = interaction.user
+    if isinstance(member, discord.User):
+        raise app_commands.NoPrivateMessage()
+    if member.guild_permissions.administrator:
         return True
 
-    return app_commands.check(predicate)
+    role_id: int | None = None
+    store = _config_store(interaction)
+    if store is not None:
+        stored = await store.get(member.guild.id, settings.ADMIN_ROLE_ID)
+        if stored is not None:
+            role_id = _parse_role_id(stored)
+
+    if role_id is None or discord.utils.get(member.roles, id=role_id) is None:
+        raise app_commands.MissingRole(
+            role_id if role_id is not None else settings.ADMIN_ROLE_ID
+        )
+    return True
+
+
+def require_admin() -> Callable[[T], T]:
+    """App-command check: guild administrators, or holders of the configured admin role."""
+    return app_commands.check(_has_admin_access)

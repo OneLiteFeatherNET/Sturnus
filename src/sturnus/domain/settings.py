@@ -48,5 +48,6 @@ INTEGER_KEYS: frozenset[str] = frozenset(
         PUBLISH_POLL_SECONDS,
         AUDIO_RETENTION_DAYS,
         MERGE_GAP_SECONDS,
+        ADMIN_ROLE_ID,
     }
 )

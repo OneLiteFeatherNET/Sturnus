@@ -1,4 +1,4 @@
-"""Guided setup for the five required configuration keys (Spec 10.1).
+"""Guided setup for the six required configuration keys (Spec 10.1).
 
 Setting each key one at a time through `/config set` means typing a channel
 id and a role id by hand -- which needs Discord's developer mode turned on
@@ -28,7 +28,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from sturnus.application.ports import Clock
-from sturnus.application.setup_plan import PermissionChange, SetupPlan, plan_setup
+from sturnus.application.setup_plan import PermissionChange, RoleAction, SetupPlan, plan_setup
 from sturnus.domain import settings
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.discord.permissions import require_admin
@@ -53,7 +53,10 @@ class SetupCog(commands.Cog):
         channel="Voice channel Sturnus should record",
         policy_url="URL of the recording/consent policy shown to participants",
         policy_version="Version identifier of the policy currently in force",
-        consent_role="Role that grants recording consent; a new role is created if omitted",
+        consent_role=(
+            "Role that grants recording consent; if omitted, the already-configured "
+            "role is kept, or a new one is created if none exists"
+        ),
     )
     @app_commands.guild_only()
     @require_admin()
@@ -81,24 +84,42 @@ class SetupCog(commands.Cog):
             key: await self._store.get_stored(guild.id, key) for key in settings.REQUIRED_KEYS
         }
 
+        # Omitting `consent_role` must never be the destructive path (Spec
+        # 10.1): the most natural way to re-run `/setup` is to repeat it
+        # with fewer arguments, so when the argument is absent this looks up
+        # whatever role is already configured and confirms it still exists
+        # in the guild -- a role deleted out from under a stale stored id
+        # is not usable and falls through to creating a new one, same as a
+        # guild that never configured one at all.
+        stored_role: discord.Role | None = None
+        if consent_role is None:
+            stored_role_id = current.get(settings.CONSENT_ROLE_ID)
+            if stored_role_id is not None:
+                try:
+                    stored_role = guild.get_role(int(stored_role_id))
+                except ValueError:
+                    stored_role = None
+
+        # The role in effect for this call before any creation below: the
+        # explicitly typed argument if given, otherwise the still-valid
+        # stored role, otherwise nothing yet.
+        role = consent_role if consent_role is not None else stored_role
+
         everyone_overwrite = channel.overwrites_for(guild.default_role)
         everyone_may_speak = everyone_overwrite.speak is not False
-        if consent_role is not None:
-            role_may_speak = channel.overwrites_for(consent_role).speak is True
-        else:
-            role_may_speak = False
+        role_may_speak = role is not None and channel.overwrites_for(role).speak is True
 
         plan = plan_setup(
             current=current,
             channel_id=channel.id,
             role_id=consent_role.id if consent_role is not None else None,
+            stored_role_valid=stored_role is not None,
             policy_url=policy_url,
             policy_version=policy_version,
             everyone_may_speak=everyone_may_speak,
             role_may_speak=role_may_speak,
         )
 
-        role = consent_role
         role_error: str | None = None
         if plan.role_to_create is not None:
             try:
@@ -118,9 +139,11 @@ class SetupCog(commands.Cog):
         # permission edit failed would leave the guild worse off than
         # before this command ran.
         writes = dict(plan.writes)
-        if role is not None and role is not consent_role:
+        if plan.role_to_create is not None and role_error is None and role is not None:
             # A role was just created; its id is only known now, so
-            # plan_setup could not have included it in `writes`.
+            # plan_setup could not have included it in `writes`. (A reused
+            # stored role, by contrast, is already correctly stored --
+            # nothing to write.)
             writes[settings.CONSENT_ROLE_ID] = str(role.id)
 
         now = self._clock.now()
@@ -136,7 +159,9 @@ class SetupCog(commands.Cog):
             missing.append(settings.CONSENT_ROLE_ID)
 
         await interaction.followup.send(
-            _render_summary(writes, applied, permission_errors, role_error, missing),
+            _render_summary(
+                writes, applied, permission_errors, role_error, missing, plan.role_action, role
+            ),
             ephemeral=True,
         )
 
@@ -198,13 +223,20 @@ def _render_summary(
     permission_errors: list[str],
     role_error: str | None,
     missing: list[str],
+    role_action: RoleAction,
+    role: discord.Role | None,
 ) -> str:
     """Builds the ephemeral reply: what changed, what did not, what is still missing.
 
-    Names keys, never values: today's five required keys hold nothing
+    Names keys, never values: today's six required keys hold nothing
     sensitive, but this summary is written so that stays true even if a
     future key does -- it reports *that* `policy_url` was written, not what
     it was written to.
+
+    `role_action` is named explicitly (Spec 10.1): a re-run that silently
+    replaced an already-working consent role with a fresh, empty one is
+    exactly the failure this command must never repeat, so it always says
+    plainly whether the role was reused, created, or explicitly replaced.
     """
     lines: list[str] = ["**Setup result**"]
 
@@ -212,6 +244,8 @@ def _render_summary(
         lines.append("Configuration written: " + ", ".join(f"`{key}`" for key in sorted(writes)))
     else:
         lines.append("Configuration: nothing needed writing, everything was already correct.")
+
+    lines.append(_role_action_line(role_action, role))
 
     lines.extend(applied_permissions)
     lines.extend(f"⚠️ {error}" for error in permission_errors)
@@ -224,6 +258,24 @@ def _render_summary(
         lines.append("All required configuration is now set.")
 
     return "\n".join(lines)
+
+
+def _role_action_line(role_action: RoleAction, role: discord.Role | None) -> str:
+    """Names, in plain language, which of the three consent-role outcomes happened.
+
+    `role` is `None` here only when a creation was requested but failed
+    (see `role_error` at the call site) -- that case is worded around the
+    warning already printed above it, rather than claiming a role exists.
+    """
+    if role_action == "created":
+        if role is None:
+            return "Consent role: creation was requested (see warning below)."
+        return f"Consent role: created {role.mention}."
+    if role_action == "reused":
+        mention = role.mention if role is not None else "the stored role"
+        return f"Consent role: kept the existing {mention} -- nothing changed."
+    mention = role.mention if role is not None else "the supplied role"
+    return f"Consent role: set to the explicitly supplied {mention}."
 
 
 __all__ = ["SetupCog", "SetupPlan"]

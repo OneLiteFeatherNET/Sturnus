@@ -1,6 +1,6 @@
 """The decisions behind `/setup`, separated from Discord (Spec 10.1).
 
-`/setup` exists so the five required configuration keys can be set from
+`/setup` exists so the six required configuration keys can be set from
 typed command parameters -- Discord renders native pickers for a channel
 and a role, instead of an administrator hand-typing ids copied out of
 developer mode. It also configures the channel's voice permissions itself:
@@ -20,6 +20,7 @@ not a rewrite.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from sturnus.domain import settings
 
@@ -42,6 +43,13 @@ class PermissionChange:
     allow_speak: bool | None
 
 
+#: What `/setup` decided about the consent role: an existing stored role was
+#: kept (`"reused"`), a new one needs creating (`"created"`), or an
+#: explicitly supplied role took over (`"replaced"`) -- whether or not that
+#: supplied role happens to match what was already stored.
+RoleAction = Literal["reused", "created", "replaced"]
+
+
 @dataclass(frozen=True)
 class SetupPlan:
     """The difference between the desired state and what is already configured.
@@ -49,15 +57,16 @@ class SetupPlan:
     `writes` holds only the keys whose value actually changes -- an unchanged
     value is left out so applying the plan never rewrites what is already
     correct. `permission_changes` is empty when the channel's overwrites
-    already match the desired policy. `role_to_create` is set only when no
-    consent role was given at all, since a role missing from Discord cannot
-    be assigned an id to write. `missing` lists required keys that setup
-    cannot fill in on its own.
+    already match the desired policy. `role_to_create` is set only when
+    `role_action` is `"created"`, since a role missing from Discord cannot be
+    assigned an id to write. `missing` lists required keys that setup cannot
+    fill in on its own.
     """
 
     writes: dict[str, str]
     permission_changes: list[PermissionChange]
     role_to_create: str | None
+    role_action: RoleAction
     missing: list[str]
 
 
@@ -69,6 +78,7 @@ def plan_setup(
     current: dict[str, str | None],
     channel_id: int,
     role_id: int | None,
+    stored_role_valid: bool,
     policy_url: str,
     policy_version: str,
     everyone_may_speak: bool,
@@ -88,6 +98,17 @@ def plan_setup(
     names an Outline collection -- so it is never guessed here. If the
     caller reports it unset, it is reported in `missing`, exactly like a
     guild that has never run `/setup` at all.
+
+    `role_id` is the consent role explicitly supplied to `/setup`'s
+    `consent_role` parameter this call, or `None` if that argument was
+    omitted -- omitting it must never itself be destructive (Spec 10.1),
+    so it never means "create a new role" the way it once did. What
+    happens when it is omitted is governed by `stored_role_valid`: `True`
+    means `current[settings.CONSENT_ROLE_ID]` names a role the caller has
+    confirmed still exists in the guild, so it is kept as-is; `False` means
+    there is nothing usable to keep, and a new role is requested. Discord
+    role existence cannot be checked from here -- there is no guild object
+    in this module -- so the caller resolves that before calling in.
     """
     writes: dict[str, str] = {}
 
@@ -100,10 +121,17 @@ def plan_setup(
     _maybe_write(settings.POLICY_VERSION, policy_version)
 
     role_to_create: str | None = None
-    if role_id is None:
-        role_to_create = _DEFAULT_ROLE_NAME
-    else:
+    role_action: RoleAction
+    if role_id is not None:
+        role_action = "replaced"
         _maybe_write(settings.CONSENT_ROLE_ID, str(role_id))
+    elif stored_role_valid:
+        role_action = "reused"
+        # The stored id is already correct and still valid -- nothing to
+        # write, nothing to create.
+    else:
+        role_action = "created"
+        role_to_create = _DEFAULT_ROLE_NAME
 
     permission_changes: list[PermissionChange] = []
     if everyone_may_speak:
@@ -129,5 +157,6 @@ def plan_setup(
         writes=writes,
         permission_changes=permission_changes,
         role_to_create=role_to_create,
+        role_action=role_action,
         missing=missing,
     )
