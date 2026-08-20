@@ -396,7 +396,10 @@ closing — after its audio is encrypted, uploaded and enqueued. **The
 recording is never lost.** The wait is bounded by `max_session_hours`
 (default 4 h). `/config show` names the keys still waiting, and `/config
 apply force:true` ends the session in progress deliberately — uploading
-and transcribing it normally — and applies the change at once.
+and transcribing it normally — and applies the change at once. A deferral
+can equally be withdrawn: put the old value back (or re-set a key you
+cleared) before the session ends and nothing is applied — the pipeline
+keeps running untouched and `/config show` stops naming the key.
 
 **Needs a pod restart.** `publish_poll_seconds` only. The publish sweep
 runs on one process-wide interval taken from that setting's *default*

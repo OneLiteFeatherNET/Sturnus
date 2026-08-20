@@ -372,15 +372,7 @@ class SturnusClient(commands.Bot):
                     deferred_keys=(),
                 )
             else:
-                recording.pending = desired
-                log.info(
-                    "Guild %d: channel/role change is stored but a session is "
-                    "recording in channel %d; it takes effect when that session "
-                    "ends (at the latest after max_session_hours=%d).",
-                    guild_id,
-                    recording.channel_id,
-                    recording.config.timeouts.max_session_hours,
-                )
+                self._defer_retarget(guild_id, recording, desired)
         elif plan.action is ReconfigureAction.TEARDOWN:
             assert recording is not None
             await self._teardown(guild_id, recording)
@@ -397,16 +389,90 @@ class SturnusClient(commands.Bot):
                     deferred_keys=(),
                 )
             else:
-                recording.pending_teardown = True
-                log.info(
-                    "Guild %d: configuration was cleared while a session is "
-                    "recording; the recording finishes and uploads normally, "
-                    "then Sturnus stops watching.",
-                    guild_id,
-                )
+                self._defer_teardown(guild_id, recording)
 
         live = self._guilds.get(guild_id)
+        if live is not None:
+            self._forget_stale_deferrals(guild_id, live, plan.action)
         return self._result(plan, live, became_live)
+
+    def _defer_retarget(
+        self, guild_id: int, recording: _GuildRecording, desired: GuildRuntimeConfig
+    ) -> None:
+        """Parks an identity change until the session ends, announcing it once.
+
+        This runs on every reconcile pass for as long as the session lasts
+        -- every ten seconds from the tick loop alone -- so the log line
+        belongs to the *transition* into waiting, not to the waiting. A
+        deferral standing for a four hour session would otherwise emit the
+        same sentence some 1400 times.
+
+        The stored snapshot is refreshed on every pass regardless: only its
+        identity is deferred (`_apply_pending` takes nothing else from it),
+        but keeping it current means it never describes a configuration
+        that has since been replaced.
+        """
+        if recording.pending is None or recording.pending.identity != desired.identity:
+            log.info(
+                "Guild %d: channel/role change is stored but a session is "
+                "recording in channel %d; it takes effect when that session "
+                "ends (at the latest after max_session_hours=%d).",
+                guild_id,
+                recording.channel_id,
+                recording.config.timeouts.max_session_hours,
+            )
+        recording.pending = desired
+
+    def _defer_teardown(self, guild_id: int, recording: _GuildRecording) -> None:
+        """Parks a teardown until the session ends, announcing it once.
+
+        Same reasoning as `_defer_retarget`: the transition is news, the
+        state persisting is not.
+        """
+        if not recording.pending_teardown:
+            log.info(
+                "Guild %d: configuration was cleared while a session is "
+                "recording; the recording finishes and uploads normally, "
+                "then Sturnus stops watching.",
+                guild_id,
+            )
+        recording.pending_teardown = True
+
+    def _forget_stale_deferrals(
+        self, guild_id: int, recording: _GuildRecording, action: ReconfigureAction
+    ) -> None:
+        """Retracts a deferral this pass no longer asks for.
+
+        `pending` and `pending_teardown` are decisions taken by an earlier
+        pass, and an administrator is free to undo what prompted them:
+        clear `voice_channel_id` mid-session and set it again, or move the
+        channel and move it back. Nothing else ever retracts them --
+        `_apply_pending` only ever *acts* on them -- so without this the
+        pipeline is torn down (or retargeted) the instant the recording
+        ends, for a change the database has not asked for since, and
+        `/config show` announces that teardown for the whole session
+        meanwhile.
+
+        Keyed on the plan rather than on comparing configurations again:
+        `plan_reconfigure` has just made exactly that comparison, and any
+        action other than the matching deferral means the reason to wait
+        is gone.
+        """
+        if action is not ReconfigureAction.DEFER_TEARDOWN and recording.pending_teardown:
+            recording.pending_teardown = False
+            log.info(
+                "Guild %d: the cleared configuration was restored before the recording "
+                "ended; the teardown is cancelled and Sturnus keeps watching channel %d.",
+                guild_id,
+                recording.channel_id,
+            )
+        if action is not ReconfigureAction.DEFER_RETARGET and recording.pending is not None:
+            recording.pending = None
+            log.info(
+                "Guild %d: the deferred channel/role change no longer applies -- the "
+                "stored configuration changed again before it could land.",
+                guild_id,
+            )
 
     def _result(
         self,
@@ -509,13 +575,23 @@ class SturnusClient(commands.Bot):
         """Ends the session in progress deliberately, keeping every recording.
 
         The same sequence a timeout takes -- encrypt, upload, enqueue,
-        close the row -- so `force` ends a recording early but never
-        discards one.
+        close the row, leave the channel, `reset()` -- so `force` ends a
+        recording early but never discards one, and leaves the pipeline as
+        ready for the next session as a timed-out one would.
+
+        `end_now()` rather than `close()`: closing alone leaves the
+        `SessionMachine` in RECORDING, so the `reset()` below used to
+        raise. The command that reaches this is `/config apply
+        force:true`, which the bot's own reply recommends -- an
+        administrator following that advice mid-session was left with a
+        guild that recorded nothing at all until some later timeout
+        fired.
         """
-        if recording.service.is_recording:
-            await recording.service.close(SHUTDOWN_END_REASON, self._clock.now())
-            await recording.voice.leave()
-            recording.service.reset()
+        if not recording.service.is_recording:
+            return
+        await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
+        await recording.voice.leave()
+        recording.service.reset()
 
     async def _teardown(self, guild_id: int, recording: _GuildRecording) -> None:
         """Stops watching a guild. The lock is kept, not popped: a waiter
@@ -716,6 +792,8 @@ class SturnusClient(commands.Bot):
         if self._tick_task is not None:
             self._tick_task.cancel()
         for recording in list(self._guilds.values()):
-            if recording.service.is_recording:
-                await recording.service.close(SHUTDOWN_END_REASON, self._clock.now())
+            # No `reset()` afterwards, deliberately: the process is going
+            # away, and a machine left in CLOSING cannot offer a session
+            # that would never be recorded.
+            await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
             await recording.voice.leave()

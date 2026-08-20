@@ -131,6 +131,30 @@ class SessionMachine:
         self.end_reason = reason
         return reason
 
+    def end_now(self, reason: EndReason) -> None:
+        """Moves a running session to CLOSING for a reason the clock never reports.
+
+        `tick()` is the only other way into CLOSING, and it can only ever
+        decide one of its own timeout reasons. Two reasons are genuinely
+        external and unobservable from in here: `SIGTERM` (Spec 6.4), and
+        an administrator ending the recording deliberately so a deferred
+        channel or role change can land now (`/config apply force:true`).
+        This is their edge into the same state, so both leave the machine
+        exactly where a timeout would have -- which is what makes the
+        ordinary `close()` -> `reset()` sequence, and with it a further
+        session on the same objects, usable for them too. Without it a
+        caller could only call `close()`, leaving the machine in RECORDING
+        and `reset()`'s guard to fire.
+
+        Idempotent, and a no-op when there is no session to end: CLOSING
+        keeps the reason already decided, and IDLE has nothing to close.
+        Leaving CLOSING is `reset()`'s job alone, here as everywhere.
+        """
+        if self.state is SessionState.IDLE or self.state is SessionState.CLOSING:
+            return
+        self.state = SessionState.CLOSING
+        self.end_reason = reason
+
     def reset(self) -> None:
         """Returns the machine from CLOSING to IDLE, ready for a new session.
 
@@ -143,9 +167,13 @@ class SessionMachine:
         shutting down for good (Spec 6.4's `SHUTDOWN` reason) must be free
         to leave the machine in CLOSING rather than implicitly offering a
         session that will never be recorded.
+
+        The reason may equally have come from `end_now()` rather than
+        `tick()` -- both leave CLOSING behind them, deliberately, so that
+        an externally ended session is as reusable as a timed-out one.
         """
         assert self.state is SessionState.CLOSING, (
-            "reset() must only follow a reason reported by tick()"
+            "reset() must only follow a reason reported by tick() or end_now()"
         )
         self.state = SessionState.IDLE
         self.started_at = None

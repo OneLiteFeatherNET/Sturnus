@@ -265,6 +265,34 @@ class RecordingService:
             await self.close(reason, now)
         return reason
 
+    async def end_now(self, reason: EndReason, now: datetime) -> None:
+        """Ends the session in progress on an outside decision, losing nothing.
+
+        The counterpart of `tick()` for the two reasons the clock never
+        reports: an orderly shutdown, and an administrator ending the
+        recording so a deferred channel or role change can apply
+        immediately (`/config apply force:true`). It takes exactly the same
+        route out -- encrypt, upload, enqueue, close the row -- so an early
+        end is still a complete recording.
+
+        `close()` on its own is *not* that route: it finalizes the files
+        but leaves the `SessionMachine` in RECORDING, because only `tick()`
+        and `end_now()` move it to CLOSING. A caller that closed and then
+        `reset()` -- which it must, if this instance is ever to record
+        again -- would trip `SessionMachine.reset`'s guard, leave the
+        service closed-but-never-reset, and with it a guild that captures
+        nothing until some later timeout happens to fire. Moving the
+        machine first, here, in one place, is what stops every caller
+        having to know that.
+
+        A no-op when nothing is recording, so it is safe on any path that
+        merely might have a session open.
+        """
+        if not self.is_recording:
+            return
+        self._machine.end_now(reason)
+        await self.close(reason, now)
+
     async def close(self, reason: EndReason, now: datetime) -> None:
         """Finalizes the session: encrypt, upload, enqueue, close -- idempotently.
 

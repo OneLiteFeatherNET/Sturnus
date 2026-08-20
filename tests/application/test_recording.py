@@ -521,3 +521,44 @@ async def test_due_reason_does_not_close_the_session(tmp_path: Path) -> None:
     assert svc.due_reason(T0 + timedelta(hours=2)) is EndReason.MAX_DURATION
     assert svc.is_recording is True
     assert sessions.closed == []
+
+
+async def test_end_now_uploads_everything_and_leaves_the_service_reusable(
+    tmp_path: Path,
+) -> None:
+    """`/config apply force:true` ends a recording early; it never discards one.
+
+    Both halves matter. The recording must take the ordinary route out --
+    encrypt, upload, enqueue, close the row -- and the service must be left
+    exactly as ready for the next session as a timed-out one is. `close()`
+    alone gives only the first: it leaves the machine in RECORDING, so the
+    `reset()` that follows used to raise and the guild recorded nothing at
+    all afterwards.
+    """
+    sessions, jobs = FakeSessions(), FakeJobs()
+    svc = service(tmp_path, sessions=sessions, jobs=jobs)
+    await svc.participants_changed(1, T0)
+    await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
+
+    await svc.end_now(EndReason.SHUTDOWN, T0 + timedelta(minutes=5))
+
+    assert sessions.closed == [(1, "shutdown")]
+    assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
+    assert svc.is_recording is False
+
+    svc.reset()
+    await svc.participants_changed(1, T0 + timedelta(minutes=6))
+    assert sessions.opened == [1, 2], "the service must be able to record again"
+    assert svc.is_recording is True
+
+
+async def test_end_now_without_a_session_does_nothing(tmp_path: Path) -> None:
+    """Safe on any path that merely might have a session open, e.g. shutdown."""
+    sessions, jobs = FakeSessions(), FakeJobs()
+    svc = service(tmp_path, sessions=sessions, jobs=jobs)
+
+    await svc.end_now(EndReason.SHUTDOWN, T0)
+
+    assert sessions.opened == []
+    assert sessions.closed == []
+    assert jobs.enqueued == []

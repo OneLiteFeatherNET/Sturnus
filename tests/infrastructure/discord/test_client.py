@@ -25,6 +25,7 @@ them to exercise the lifecycle logic.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -783,3 +784,222 @@ async def test_a_tunable_changed_while_an_identity_change_waits_is_not_rolled_ba
     assert client._guilds[GUILD_ID].channel_id == NEW_CHANNEL_ID
     assert client._guilds[GUILD_ID].config.retention_days == 7, "the retune must survive"
     assert jobs.enqueued[0]["retention_until"] == clock.now() + timedelta(days=7)
+
+
+async def test_forcing_the_apply_ends_the_session_and_still_uploads_it(tmp_path: Path) -> None:
+    """`/config apply force:true` is the command the bot itself recommends.
+
+    `render_apply_result` tells an administrator to run it whenever a
+    channel change is waiting, and promises the recording "is still
+    uploaded and transcribed". Before the fix the force branch raised
+    `AssertionError` out of `_end_session_now`: `RecordingService.close()`
+    leaves the `SessionMachine` in `RECORDING` (only `tick()` ever moves it
+    to `CLOSING`), so the `reset()` that follows tripped its own guard. The
+    guild was then left with a service that was closed but never reset --
+    `is_recording` false, `voice_packet` dropping every packet,
+    `participants_changed` unable to open a row -- so it recorded nothing
+    until some later timeout happened to fire, or forever.
+
+    Both halves of the promise are asserted here: the forced end succeeds
+    *and* everything captured so far reaches the job queue.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client.reconcile_guild(GUILD_ID)
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, anna)
+    service = client._guilds[GUILD_ID].service
+    await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
+
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(NEW_CHANNEL_ID))
+    assert (await client.reconcile_guild(GUILD_ID)).action is ReconfigureAction.DEFER_RETARGET
+
+    result = await client.reconcile_guild(GUILD_ID, force=True)
+
+    # The forced end worked ...
+    assert result.action is ReconfigureAction.RETARGET
+    assert result.deferred_keys == ()
+    assert settings.VOICE_CHANNEL_ID in result.applied_keys
+    assert client._guilds[GUILD_ID].channel_id == NEW_CHANNEL_ID
+    assert client._guilds[GUILD_ID].pending is None
+    # ... and the audio captured so far went the ordinary way out.
+    assert sessions.closed == [(1, "shutdown")]
+    assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
+    assert jobs.enqueued[0]["session_id"] == 1
+    assert list(tmp_path.rglob("*")) == [], "no plaintext or orphaned audio left behind"
+
+    # And the guild is not wedged: the very next participant records again.
+    ben = _member(BEN, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, ben)
+    assert sessions.opened == [1, 2]
+    assert client._guilds[GUILD_ID].service is service
+    assert _voice_of(client, GUILD_ID).joined[-1] == NEW_CHANNEL_ID
+
+
+async def test_forcing_the_apply_after_a_cleared_key_ends_and_uploads_the_session(
+    tmp_path: Path,
+) -> None:
+    """The same forced end, on the teardown branch rather than the retarget one."""
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client.reconcile_guild(GUILD_ID)
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, anna)
+    service = client._guilds[GUILD_ID].service
+    await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
+
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, None)
+    result = await client.reconcile_guild(GUILD_ID, force=True)
+
+    assert result.action is ReconfigureAction.TEARDOWN
+    assert result.deferred_keys == ()
+    assert GUILD_ID not in client._guilds
+    assert sessions.closed == [(1, "shutdown")]
+    assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
+    assert list(tmp_path.rglob("*")) == []
+
+
+async def test_restoring_a_cleared_key_mid_session_cancels_the_pending_teardown(
+    tmp_path: Path,
+) -> None:
+    """A teardown that is no longer wanted must stop being announced -- and stop happening.
+
+    Before the fix nothing ever cleared `pending_teardown`: `/config show`
+    kept promising a teardown that the restored key had already cancelled,
+    and `_apply_pending` then destroyed the pipeline anyway the moment the
+    session ended, only for the next reconcile to build it again.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client.reconcile_guild(GUILD_ID)
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, anna)
+    service = client._guilds[GUILD_ID].service
+    voice = _voice_of(client, GUILD_ID)
+    await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
+
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, None)
+    assert (await client.reconcile_guild(GUILD_ID)).action is ReconfigureAction.DEFER_TEARDOWN
+    assert client.running_state(GUILD_ID).pending_teardown is True
+
+    # The administrator changes their mind during the same session.
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(CHANNEL_ID))
+    result = await client.reconcile_guild(GUILD_ID)
+
+    assert result.action is ReconfigureAction.NOTHING
+    assert client._guilds[GUILD_ID].pending_teardown is False
+    assert client.running_state(GUILD_ID).pending_teardown is False
+
+    guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
+    await client.on_voice_state_update(anna, _voice_state(guild.get_channel()), _voice_state(None))
+    clock.advance(timedelta(seconds=61))
+    await client._tick_all(clock.now())
+
+    assert sessions.closed == [(1, "empty")]
+    assert len(jobs.enqueued) == 1
+    assert GUILD_ID in client._guilds, "the teardown was cancelled, so nothing may be torn down"
+    assert client._guilds[GUILD_ID].service is service, "the pipeline must not be rebuilt"
+    assert _voice_of(client, GUILD_ID) is voice
+    assert len(client.voices) == 1, "a rebuild would leak a voice connection"
+
+
+async def test_reverting_a_deferred_identity_change_clears_the_pending_key(
+    tmp_path: Path,
+) -> None:
+    """A deferred change that is undone in the database must stop being reported."""
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client.reconcile_guild(GUILD_ID)
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, anna)
+    service = client._guilds[GUILD_ID].service
+    await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
+
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(NEW_CHANNEL_ID))
+    await client.reconcile_guild(GUILD_ID)
+    assert client.running_state(GUILD_ID).pending_keys == (settings.VOICE_CHANNEL_ID,)
+
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(CHANNEL_ID))
+    result = await client.reconcile_guild(GUILD_ID)
+
+    assert result.action is ReconfigureAction.NOTHING
+    assert client._guilds[GUILD_ID].pending is None
+    assert client.running_state(GUILD_ID).pending_keys == ()
+
+    guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
+    await client.on_voice_state_update(anna, _voice_state(guild.get_channel()), _voice_state(None))
+    clock.advance(timedelta(seconds=61))
+    await client._tick_all(clock.now())
+
+    assert client._guilds[GUILD_ID].channel_id == CHANNEL_ID, "the reverted channel must not land"
+    assert client._guilds[GUILD_ID].service is service
+
+
+async def test_a_standing_deferral_is_logged_once_not_every_reconcile(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A guild reconciles every ten seconds; a deferral must log the transition only.
+
+    Before the fix both deferral branches logged at INFO on every pass, so
+    one deferred channel change emitted the same line 360 times an hour for
+    as long as the session lasted.
+    """
+    clock = FakeClock(T0)
+    sessions, jobs = FakeSessions(), FakeJobs()
+    store = _configured_store()
+    client = _client(
+        clock, config_store=store, sessions=sessions, jobs=jobs, recording_dir=tmp_path
+    )
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    _in_guild(client, guild)
+    await client.reconcile_guild(GUILD_ID)
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    await _start_session(client, guild, anna)
+    await client._guilds[GUILD_ID].service.voice_packet(
+        ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0
+    )
+
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, str(NEW_CHANNEL_ID))
+    with caplog.at_level(logging.INFO, logger="sturnus.infrastructure.discord.client"):
+        for _ in range(4):
+            await client.reconcile_guild(GUILD_ID)
+        deferred = [
+            r for r in caplog.records if "takes effect when that session ends" in r.getMessage()
+        ]
+        assert len(deferred) == 1, "the transition is news; the state repeating is not"
+
+        caplog.clear()
+        store.write(GUILD_ID, settings.VOICE_CHANNEL_ID, None)
+        for _ in range(4):
+            await client.reconcile_guild(GUILD_ID)
+        teardown = [r for r in caplog.records if "then Sturnus stops watching" in r.getMessage()]
+        assert len(teardown) == 1

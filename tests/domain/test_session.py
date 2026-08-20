@@ -252,3 +252,59 @@ def test_due_reason_reports_without_deciding() -> None:
 
 def test_due_reason_is_none_while_idle() -> None:
     assert machine().due_reason(T0) is None
+
+
+def test_end_now_closes_a_running_session_with_the_given_reason() -> None:
+    """The edge into CLOSING for a reason the clock can never report.
+
+    `SIGTERM` and `/config apply force:true` are both decisions taken
+    outside the machine. Before this existed the caller could only run its
+    own close sequence and leave the machine in RECORDING, so the `reset()`
+    that has to follow -- if the same objects are to record again -- tripped
+    its own guard.
+    """
+    m = machine()
+    m.participants_changed(1, T0)
+
+    m.end_now(EndReason.SHUTDOWN)
+
+    closing: SessionState = m.state
+    assert closing is SessionState.CLOSING
+    assert m.end_reason is EndReason.SHUTDOWN
+    assert m.tick(T0 + timedelta(hours=9)) is None, "already closing; nothing left to decide"
+
+    m.reset()
+    assert m.state is SessionState.IDLE
+
+
+def test_end_now_from_grace_closes_too() -> None:
+    """The empty-channel window is still a session with audio in it."""
+    m = machine()
+    m.participants_changed(1, T0)
+    m.participants_changed(0, T0 + timedelta(seconds=5))
+    grace: SessionState = m.state
+    assert grace is SessionState.GRACE
+
+    m.end_now(EndReason.SHUTDOWN)
+
+    assert m.state is SessionState.CLOSING
+    assert m.end_reason is EndReason.SHUTDOWN
+
+
+def test_end_now_while_idle_starts_nothing() -> None:
+    m = machine()
+    m.end_now(EndReason.SHUTDOWN)
+    assert m.state is SessionState.IDLE
+    assert m.end_reason is None
+
+
+def test_end_now_keeps_the_reason_a_tick_already_decided() -> None:
+    """A timeout that already fired is the honest reason; forcing does not rewrite it."""
+    m = machine()
+    m.participants_changed(1, T0)
+    assert m.tick(T0 + timedelta(hours=5)) is EndReason.MAX_DURATION
+
+    m.end_now(EndReason.SHUTDOWN)
+
+    assert m.state is SessionState.CLOSING
+    assert m.end_reason is EndReason.MAX_DURATION

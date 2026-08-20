@@ -160,15 +160,22 @@ class ConfigCog(
                 "This command can only be used in a server.", ephemeral=True
             )
             return
+        # Everything below is I/O: a database write, then a full reconcile
+        # pass that re-reads the guild's configuration and may build a
+        # whole recording pipeline. Discord fails the interaction if the
+        # *initial* response has not gone out within three seconds, and
+        # then reports "The application did not respond" over a `/config
+        # set` that in fact wrote the value -- the worst of both. Deferring
+        # first buys fifteen minutes, exactly as `/setup` and `/config
+        # apply` already do.
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             await self._store.set(guild_id, key, value, discord.utils.utcnow())
         except ValueError as exc:
-            await interaction.response.send_message(f"Rejected: {exc}", ephemeral=True)
+            await interaction.followup.send(f"Rejected: {exc}", ephemeral=True)
             return
         result = await self._reconcile_quietly(guild_id)
-        await interaction.response.send_message(
-            render_write_result(key, value, result), ephemeral=True
-        )
+        await interaction.followup.send(render_write_result(key, value, result), ephemeral=True)
 
     @app_commands.command(
         name="clear", description="Clear a configuration key, restoring its default."
@@ -187,11 +194,13 @@ class ConfigCog(
                 f"Unknown configuration key: `{key}`.", ephemeral=True
             )
             return
+        # The key check above is a frozenset lookup and answers instantly;
+        # from here on it is a write plus a reconcile, so the same
+        # three-second deadline applies as in `set` above.
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await self._store.set(guild_id, key, None, discord.utils.utcnow())
         result = await self._reconcile_quietly(guild_id)
-        await interaction.response.send_message(
-            render_write_result(key, None, result), ephemeral=True
-        )
+        await interaction.followup.send(render_write_result(key, None, result), ephemeral=True)
 
     @app_commands.command(
         name="show", description="List every configuration key and what is still missing."
