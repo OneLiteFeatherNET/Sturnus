@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.4.0...v0.5.0) (2026-08-20)
+
+
+### Features
+
+* **worker:** transcribe for the language and the vocabulary of the room ([#44](https://github.com/OneLiteFeatherNET/Sturnus/issues/44)) ([8822b6b](https://github.com/OneLiteFeatherNET/Sturnus/commit/8822b6b2193008be487b5d2c61133525b818a408))
+
+
+### Bug Fixes
+
+* **chart:** route the Sentry DSN through the Secret ([#40](https://github.com/OneLiteFeatherNET/Sturnus/issues/40)) ([dc4e4fb](https://github.com/OneLiteFeatherNET/Sturnus/commit/dc4e4fb342f38e47061db07ef01cc87a4b2dfade))
+* **protocol:** give the attribution and the words their own paragraphs ([#42](https://github.com/OneLiteFeatherNET/Sturnus/issues/42)) ([4ba2716](https://github.com/OneLiteFeatherNET/Sturnus/commit/4ba27160439bdb4e00cf4f323918bba0c4bb8ec4))
+* **worker:** stop Silero VAD from throwing away every transcript ([#45](https://github.com/OneLiteFeatherNET/Sturnus/issues/45)) ([21d79be](https://github.com/OneLiteFeatherNET/Sturnus/commit/21d79be445ac72a9830510d4c5a64f668368b9fc))
+
 ## [0.4.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.3.1...v0.4.0) (2026-08-20)
 
 
