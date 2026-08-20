@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "sturnus.fullname" . }}-worker
+  labels:
+    {{- include "sturnus.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  accessModes:
+    - {{ .Values.worker.persistence.accessMode }}
+  {{- with .Values.worker.persistence.storageClassName }}
+  storageClassName: {{ . }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.worker.persistence.size }}

@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sturnus.fullname" . }}-bot
+  labels:
+    {{- include "sturnus.componentLabels" (dict "root" . "component" "bot") | nindent 4 }}
+spec:
+  # Fixed at 1, not a values knob: two instances would hold two Discord
+  # gateway connections and record every session twice (Spec 4.1).
+  replicas: 1
+  # Recreate, not RollingUpdate: a rolling update briefly runs the old and
+  # the new pod together, which is exactly the double-recording situation
+  # `replicas: 1` alone is meant to prevent. Recreate tears the old pod down
+  # completely -- letting its SIGTERM handler flush the in-progress
+  # recording (Spec 6.4) -- before the new one starts.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "sturnus.componentSelectorLabels" (dict "root" . "component" "bot") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sturnus.componentLabels" (dict "root" . "component" "bot") | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "sturnus.serviceAccountName" . }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Sized to exceed the time to flush, encrypt and upload a session on
+      # SIGTERM (see the comment on bot.terminationGracePeriodSeconds in
+      # values.yaml) -- the default 30s would silently discard exactly what
+      # that handler exists to save.
+      terminationGracePeriodSeconds: {{ .Values.bot.terminationGracePeriodSeconds }}
+      # Pinned to the region: the RWO recording PVC already binds this pod
+      # to a single zone, so nothing is gained by letting the scheduler
+      # place it outside that region and cross-region networking cost is
+      # avoided (Spec 13.5).
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: {{ .Values.region.key }}
+                    operator: In
+                    values:
+                      - {{ .Values.region.value | quote }}
+      containers:
+        - name: bot
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: {{ include "sturnus.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            {{- toYaml .Values.bot.command | nindent 12 }}
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          env:
+            {{- range $k, $v := .Values.commonEnv }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- range $k, $v := .Values.bot.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.healthPort }}
+              protocol: TCP
+          {{- with .Values.bot.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.bot.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.bot.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: recordings
+              mountPath: {{ .Values.bot.env.STURNUS_RECORDING_DIR }}
+      volumes:
+        - name: recordings
+          persistentVolumeClaim:
+            claimName: {{ include "sturnus.fullname" . }}-bot
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

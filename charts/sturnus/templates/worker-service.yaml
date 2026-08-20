@@ -1,0 +1,17 @@
+{{- if .Values.worker.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "sturnus.fullname" . }}-worker
+  labels:
+    {{- include "sturnus.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  type: {{ .Values.worker.service.type }}
+  ports:
+    - name: health
+      port: {{ .Values.healthPort }}
+      targetPort: health
+      protocol: TCP
+  selector:
+    {{- include "sturnus.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 4 }}
+{{- end }}

@@ -1,0 +1,13 @@
+{{- if .Values.bot.pdb.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "sturnus.fullname" . }}-bot
+  labels:
+    {{- include "sturnus.componentLabels" (dict "root" . "component" "bot") | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.bot.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "sturnus.componentSelectorLabels" (dict "root" . "component" "bot") | nindent 6 }}
+{{- end }}
