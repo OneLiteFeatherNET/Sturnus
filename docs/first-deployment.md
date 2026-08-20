@@ -59,10 +59,18 @@ There is no Sturnus bot application yet. At
    toggle — `discord.py`'s `Intents.default()` already includes them. If
    you are looking for a "Voice States Intent" switch, it does not exist.
 4. **OAuth2 → URL Generator**: scopes `bot` and `applications.commands`.
-   Bot permissions: **View Channel**, **Connect**, **Manage Roles**.
+   Bot permissions: **View Channel**, **Connect**, **Send Messages**,
+   **Manage Roles** — the bitmask is `269487104`.
 
-   `Manage Roles` is what `/setup` needs to set the recording channel's
-   `Speak` overwrites. `Speak` itself is not needed — the bot only listens.
+   `Send Messages` is easy to miss and fails late: everything works —
+   recording, transcription, the Outline document — and only posting the
+   link back to the channel fails, from the publish loop rather than from
+   anything the operator was watching (`_DiscordAnnouncer.post` in
+   `sturnus.entrypoints.bot`).
+
+   `Manage Roles` covers both things `/setup` does: setting the channel's
+   `Speak` overwrites, and creating the consent role if it does not exist
+   yet. `Speak` itself is not needed — the bot only listens.
 5. Open the generated URL and invite the bot to the server.
 
 **Role position matters.** Discord will not let the bot edit a role
