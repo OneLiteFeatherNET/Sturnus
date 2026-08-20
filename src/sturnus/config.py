@@ -10,13 +10,45 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr
+from pydantic import SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-class Settings(BaseSettings):
+class StrictSettings(BaseSettings):
+    """Settings that refuse to start on a blank required value.
+
+    Shared by all three processes' settings classes. Pydantic accepts the
+    empty string for a required `str` or `SecretStr`, so a variable present
+    but unset -- a placeholder never filled in, a secret key holding no
+    value -- produces a process that starts, passes its readiness probe, and
+    fails only when something first uses the value. `link` with a blank
+    OAuth client id is healthy right up until a participant runs
+    `/link start` and Outline rejects them.
+
+    Failing at startup instead names the variable while an operator is still
+    looking at the deployment.
+    """
+
     model_config = SettingsConfigDict(env_prefix="STURNUS_", frozen=True)
 
+    @model_validator(mode="after")
+    def _reject_blank_required_values(self) -> StrictSettings:
+        for name, field in type(self).model_fields.items():
+            if not field.is_required():
+                continue
+            value = getattr(self, name)
+            text = value.get_secret_value() if isinstance(value, SecretStr) else value
+            if isinstance(text, str) and not text.strip():
+                prefix = type(self).model_config.get("env_prefix", "")
+                raise ValueError(
+                    f"{prefix}{name.upper()} is set but empty. It is required, "
+                    f"so leaving it blank would start this process in a state "
+                    f"that only fails once the value is first used."
+                )
+        return self
+
+
+class Settings(StrictSettings):
     discord_token: SecretStr
     database_url: str
     s3_endpoint: str

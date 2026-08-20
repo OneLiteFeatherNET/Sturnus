@@ -61,3 +61,46 @@ def test_secrets_are_not_exposed_by_repr(monkeypatch: pytest.MonkeyPatch) -> Non
     assert "discord-secret-value" not in rendered
     assert "s3-secret-value" not in rendered
     assert _FAKE_MASTER_KEY_B64 not in rendered
+
+
+@pytest.mark.parametrize(
+    "blank",
+    ["STURNUS_OUTLINE_CLIENT_ID", "STURNUS_DISCORD_TOKEN", "STURNUS_MASTER_KEY"],
+)
+def test_a_blank_required_setting_is_rejected(monkeypatch: pytest.MonkeyPatch, blank: str) -> None:
+    """Present-but-empty is the failure mode a missing-value check misses.
+
+    Pydantic accepts `""` for a required `str` or `SecretStr`, so a
+    placeholder never filled in -- `STURNUS_OUTLINE_CLIENT_ID=` in a secret
+    file, say -- starts the process, passes its readiness probe, and fails
+    only when something first uses the value. For the OAuth client id that
+    is when a participant runs `/link start`, and the error surfaces from
+    Outline rather than from Sturnus.
+    """
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv(blank, "")
+    with pytest.raises(ValidationError) as excinfo:
+        Settings()
+    # The message has to name the variable: an operator reading a crashed
+    # pod's logs needs to know which one to go and fill in.
+    assert blank in str(excinfo.value)
+
+
+def test_whitespace_does_not_satisfy_a_required_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stray space in a secret file is as empty as no value at all."""
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("STURNUS_OUTLINE_CLIENT_ID", "   ")
+    with pytest.raises(ValidationError):
+        Settings()
+
+
+def test_an_optional_setting_may_still_be_blank(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The check covers required fields only -- an optional one with a
+    default is free to be whatever it is, and must not be dragged in."""
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    assert Settings().health_port == 8080

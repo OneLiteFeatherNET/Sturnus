@@ -71,13 +71,13 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from pydantic import SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.application.retention import sweep_expired_audio
 from sturnus.application.worker import process_one, retry_pending_documents
+from sturnus.config import StrictSettings
 from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.models import Session, SessionParticipant
@@ -144,14 +144,12 @@ def _load_template() -> str:
     )
 
 
-class WorkerSettings(BaseSettings):
+class WorkerSettings(StrictSettings):
     """Everything the worker process needs, and nothing it does not.
 
     No `discord_token`: unlike `sturnus.config.Settings`, every field here
     is something this specific process actually uses.
     """
-
-    model_config = SettingsConfigDict(env_prefix="STURNUS_", frozen=True)
 
     database_url: str
     s3_endpoint: str
