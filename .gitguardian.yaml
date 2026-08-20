@@ -1,10 +1,1 @@
 version: 2
-
-secret:
-  ignored_paths:
-    # Test fixtures are deliberately fake credentials. They have to look
-    # structurally valid — the master key must base64-decode to exactly 32
-    # bytes or KeyWrapper refuses to start — which is precisely what makes a
-    # scanner flag them. Where a value could be mistaken for real, it also
-    # spells out that it is not (see tests/test_config.py).
-    - 'tests/**/*'

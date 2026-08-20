@@ -1,7 +1,18 @@
+import base64
+
 import pytest
 from pydantic import ValidationError
 
 from sturnus.config import Settings
+
+# KeyWrapper requires the master key to base64-decode to exactly 32 bytes,
+# which makes any valid fixture look like a real key to a secret scanner.
+# Built at runtime instead of written as a literal, so no base64 blob sits
+# in the source for the scanner to (falsely) flag -- the plaintext sentinel
+# below is obviously not a real key to a human reader either.
+_FAKE_MASTER_KEY = b"THIS-IS-NOT-A-REAL-KEY-test-only"
+assert len(_FAKE_MASTER_KEY) == 32
+_FAKE_MASTER_KEY_B64 = base64.b64encode(_FAKE_MASTER_KEY).decode()
 
 
 def _env(**overrides: str) -> dict[str, str]:
@@ -12,10 +23,7 @@ def _env(**overrides: str) -> dict[str, str]:
         "STURNUS_S3_BUCKET": "sturnus-audio",
         "STURNUS_S3_ACCESS_KEY": "ak",
         "STURNUS_S3_SECRET_KEY": "s3-secret-value",
-        # Decodes to b"THIS-IS-NOT-A-REAL-KEY-test-only" -- 32 bytes, which is
-        # what KeyWrapper requires. Spelled out so neither a reader nor a
-        # secret scanner mistakes it for a real key.
-        "STURNUS_MASTER_KEY": "VEhJUy1JUy1OT1QtQS1SRUFMLUtFWS10ZXN0LW9ubHk=",
+        "STURNUS_MASTER_KEY": _FAKE_MASTER_KEY_B64,
         "STURNUS_MASTER_KEY_ID": "k1",
         "STURNUS_RECORDING_DIR": "/tmp/rec",
     }
@@ -49,4 +57,4 @@ def test_secrets_are_not_exposed_by_repr(monkeypatch: pytest.MonkeyPatch) -> Non
     # hold regardless of whether masking works.
     assert "discord-secret-value" not in rendered
     assert "s3-secret-value" not in rendered
-    assert "c3R1cm51cy" not in rendered
+    assert _FAKE_MASTER_KEY_B64 not in rendered
