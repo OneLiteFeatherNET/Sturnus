@@ -78,7 +78,7 @@ async def test_guilds_do_not_share_consent(factory: async_sessionmaker[AsyncSess
 
 async def test_session_lifecycle(factory: async_sessionmaker[AsyncSession]) -> None:
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     assert await repo.find_open_session(GUILD) == session_id
 
     await repo.add_participant(session_id, ANNA, "anna", T0)
@@ -97,7 +97,7 @@ async def test_guild_id_returns_the_owning_guild(
     at document-creation time.
     """
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     assert await repo.guild_id(session_id) == GUILD
 
 
@@ -119,7 +119,7 @@ async def test_session_row_carries_the_key_after_opening(
     -- unrecoverable.
     """
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     assert await repo.session_key(session_id) is None
 
     await repo.record_session_key(session_id, "k1", b"wrapped-bytes")
@@ -132,7 +132,7 @@ async def test_session_key_is_none_for_a_session_without_one(
 ) -> None:
     """Covers both a session that predates the column and one that crashed early."""
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     assert await repo.session_key(session_id) is None
 
 
@@ -141,7 +141,7 @@ async def test_adding_a_participant_twice_is_harmless(
 ) -> None:
     """Someone may leave and rejoin within one session."""
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await repo.add_participant(session_id, ANNA, "anna", T0)
     await repo.add_participant(session_id, ANNA, "anna-renamed", T0 + timedelta(minutes=1))
     # The first display name wins: it is the one in force when recording began.
@@ -152,7 +152,7 @@ async def test_adding_a_participant_twice_is_harmless(
 async def test_audio_epoch_is_written_once(factory: async_sessionmaker[AsyncSession]) -> None:
     """The epoch marks the first packet; a later packet must not move it."""
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await repo.add_participant(session_id, ANNA, "anna", T0)
     await repo.set_audio_epoch(session_id, ANNA, T0 + timedelta(seconds=3))
     await repo.set_audio_epoch(session_id, ANNA, T0 + timedelta(seconds=9))
@@ -162,7 +162,7 @@ async def test_audio_epoch_is_written_once(factory: async_sessionmaker[AsyncSess
 async def test_job_enqueue(factory: async_sessionmaker[AsyncSession]) -> None:
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await sessions.add_participant(session_id, ANNA, "anna", T0)
 
     job_id = await jobs.enqueue(
@@ -180,7 +180,7 @@ async def test_session_bounds_returns_start_and_end_of_a_closed_session(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
     assert await repo.session_bounds(session_id) == (T0, T0 + timedelta(hours=1))
 
@@ -190,7 +190,7 @@ async def test_session_bounds_raises_while_the_session_is_still_open(
 ) -> None:
     """An open session has no end yet; inventing one would misrepresent how long it ran."""
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     with pytest.raises(ValueError, match="open"):
         await repo.session_bounds(session_id)
 
@@ -218,7 +218,7 @@ async def test_transcripts_for_returns_each_speakers_stored_transcript(
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
     queue = JobQueue(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     anna_job = await _enqueue_job(sessions, jobs, session_id, ANNA)
     ben_job = await _enqueue_job(sessions, jobs, session_id, BEN)
 
@@ -240,7 +240,7 @@ async def test_transcripts_for_skips_dead_and_unfinished_jobs(
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
     queue = JobQueue(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     anna_job = await _enqueue_job(sessions, jobs, session_id, ANNA)
     await _enqueue_job(sessions, jobs, session_id, BEN)  # left pending
 
@@ -448,7 +448,7 @@ async def test_mark_documented_records_the_provider_it_was_given(
     Outline default that held while Outline was the only sink.
     """
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
     await _mark_documented(factory, session_id, provider="confluence")
 
@@ -462,7 +462,7 @@ async def test_candidates_for_announcement_returns_documented_sessions(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
     await _mark_documented(factory, session_id)
 
@@ -476,7 +476,7 @@ async def test_candidates_for_announcement_excludes_a_session_still_open(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repo = SessionRepository(factory)
-    await repo.open_session(GUILD, CHANNEL, T0)
+    await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     assert await repo.candidates_for_announcement() == []
 
 
@@ -484,7 +484,7 @@ async def test_mark_announced_stamps_the_session(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     repo = SessionRepository(factory)
-    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
     await _mark_documented(factory, session_id)
 
@@ -500,7 +500,7 @@ async def test_closed_undocumented_sessions_finds_a_session_whose_jobs_are_all_t
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
     queue = JobQueue(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
     await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
     await queue.complete(job_id, "hello")
@@ -513,7 +513,7 @@ async def test_closed_undocumented_sessions_excludes_a_session_with_a_pending_jo
 ) -> None:
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await _enqueue_job(sessions, jobs, session_id, ANNA)
     await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
 
@@ -524,7 +524,7 @@ async def test_closed_undocumented_sessions_excludes_a_session_with_no_jobs(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     sessions = SessionRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
 
     assert await sessions.closed_undocumented_sessions() == []
@@ -536,7 +536,7 @@ async def test_closed_undocumented_sessions_excludes_an_already_documented_sessi
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
     queue = JobQueue(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
     await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
     await queue.complete(job_id, "hello")
@@ -550,7 +550,7 @@ async def test_candidates_for_retention_returns_undeleted_jobs(
 ) -> None:
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
 
     candidates = await jobs.candidates_for_retention()
@@ -563,7 +563,7 @@ async def test_mark_audio_deleted_excludes_the_job_from_later_candidates(
 ) -> None:
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
 
     await jobs.mark_audio_deleted(job_id, T0 + timedelta(days=31))

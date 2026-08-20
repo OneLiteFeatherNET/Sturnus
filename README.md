@@ -43,6 +43,11 @@ uv run sturnus-worker  # transcription + document publishing
 uv run sturnus-link    # OAuth account-link callback
 ```
 
+Deploying to a cluster for the first time needs several things nobody can
+generate for you — a Discord application, two Outline credentials, an
+encryption key whose loss is unrecoverable. [docs/first-deployment.md](docs/first-deployment.md)
+is the checklist, in the order the steps actually depend on each other.
+
 Run the checks the same way CI does:
 
 ```bash

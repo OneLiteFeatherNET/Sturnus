@@ -41,6 +41,26 @@ class ConfigStore:
                 )
             )
 
+    async def snapshot(self, guild_id: int) -> dict[str, str]:
+        """Reads every effective value for a guild in a single query.
+
+        Exists because the reconcile pass now runs once per guild every ten
+        seconds (`SturnusClient._tick_guild`): the five separate `get()`
+        round-trips the one-shot startup path used to make would become
+        five queries per guild per tick, on the same task as the readiness
+        heartbeat. This is one `SELECT` of a handful of rows instead.
+
+        Stored values win over `DEFAULTS`, exactly as `get` resolves them;
+        keys with neither are simply absent, so the caller can still tell
+        "unset" from "set to the default".
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(GuildConfig.key, GuildConfig.value).where(GuildConfig.guild_id == guild_id)
+            )
+            stored = {key: value for key, value in rows.all()}
+        return {**settings.DEFAULTS, **stored}
+
     async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None:
         """Sets a value; `None` removes it and restores the default.
 

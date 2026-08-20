@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- The organisation's mark is a feather in a full spectrum on black.
+         A starling's plumage is iridescent — black that throws green,
+         violet and blue depending on the light — so the house palette and
+         the bird are the same idea, and the gradient does both jobs. -->
+    <linearGradient id="iridescence" x1="0.05" y1="0.15" x2="0.95" y2="0.9">
+      <stop offset="0%" stop-color="#1BC755"/>
+      <stop offset="22%" stop-color="#06C5E8"/>
+      <stop offset="46%" stop-color="#114CC8"/>
+      <stop offset="68%" stop-color="#B119B9"/>
+      <stop offset="88%" stop-color="#D52A23"/>
+      <stop offset="100%" stop-color="#F7CC2E"/>
+    </linearGradient>
+    <linearGradient id="field" x1="0" y1="0" x2="0.7" y2="1">
+      <stop offset="0%" stop-color="#131260"/>
+      <stop offset="100%" stop-color="#0B0B1F"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="512" height="512" rx="116" fill="url(#field)"/>
+
+  <!-- Head and body in profile, facing right, as one closed silhouette so
+       it survives being scaled to 32 px: crown, nape, back, tail, belly,
+       breast, throat, then up to the beak and over the forehead. -->
+  <path fill="url(#iridescence)"
+        d="M300 140
+           C258 132 214 152 196 190
+           C186 212 180 226 166 240
+           C132 274 118 316 128 352
+           C138 388 172 406 216 406
+           L318 406
+           C362 406 392 376 392 336
+           C392 306 376 282 350 268
+           C336 260 328 250 326 236
+           L326 196
+           C324 168 316 148 300 140
+           Z"/>
+
+  <!-- The speckles the bird is named for. Light, so they read against every
+       part of the spectrum the body passes through. -->
+  <g fill="#FFFFFF" opacity="0.7">
+    <circle cx="238" cy="248" r="7"/>
+    <circle cx="286" cy="286" r="6"/>
+    <circle cx="200" cy="300" r="6"/>
+    <circle cx="252" cy="336" r="7"/>
+    <circle cx="316" cy="330" r="6"/>
+    <circle cx="176" cy="360" r="5"/>
+    <circle cx="296" cy="382" r="5"/>
+    <circle cx="222" cy="396" r="6"/>
+  </g>
+
+  <!-- Beak: long, straight, sharply pointed. House yellow, which is also
+       the starling's own colour in breeding season. -->
+  <path fill="#F7CC2E" d="M330 190 L446 214 L330 238 Z"/>
+  <path fill="#D9A81C" d="M330 214 L446 214 L330 238 Z" opacity="0.5"/>
+
+  <!-- Eye, high and forward on the head. -->
+  <circle cx="300" cy="186" r="14" fill="#0B0B1F"/>
+  <circle cx="303" cy="184" r="5" fill="#FFFFFF" opacity="0.9"/>
+
+  <!-- What it hears and gives back. Two arcs only: at 32 px a third is mud. -->
+  <g fill="none" stroke="#06C5E8" stroke-linecap="round">
+    <path d="M392 292 a 54 54 0 0 1 0 82" stroke-width="16" opacity="0.85"/>
+    <path d="M428 274 a 94 94 0 0 1 0 118" stroke-width="14" opacity="0.45"/>
+  </g>
+</svg>

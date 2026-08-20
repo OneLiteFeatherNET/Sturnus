@@ -64,7 +64,9 @@ class FakeSessions:
     def __init__(self) -> None:
         self.closed: list[tuple[int, str]] = []
 
-    async def open_session(self, _guild_id: int, _channel_id: int, _now: datetime) -> int:
+    async def open_session(
+        self, _guild_id: int, _channel_id: int, _channel_name: str | None, _now: datetime
+    ) -> int:
         return 1
 
     async def record_session_key(self, _sid: int, _key_id: str, _wrapped: bytes) -> None:

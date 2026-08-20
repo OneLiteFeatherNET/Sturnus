@@ -1,7 +1,13 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from sturnus.application.documents import document_title, escape_markdown, render_transcript
+from sturnus.application.documents import (
+    ChannelRef,
+    document_title,
+    escape_markdown,
+    render_transcript,
+)
 from sturnus.domain.transcript import SpeakerIdentity, Transcript, TranscriptBlock
 from sturnus.infrastructure.templates.markdown import (
     escape_markdown as infrastructure_escape_markdown,
@@ -130,3 +136,60 @@ def test_the_application_and_infrastructure_escaping_agree() -> None:
     # the exact same function object, not a second, independently maintained
     # copy of the character set that happens to agree today.
     assert infrastructure_escape_markdown is escape_markdown
+
+
+# ---------------------------------------------------------------------------
+# The heading: where the meeting was held, when, and for how long.
+# ---------------------------------------------------------------------------
+
+BERLIN = ZoneInfo("Europe/Berlin")
+CHANNEL = ChannelRef(752527676903784518, 1166491913877196960, "Meeting-Raum")
+
+
+def test_times_are_written_in_the_configured_timezone() -> None:
+    """A protocol is read by the people who were in the room, so the times in
+    it are theirs. UTC would be wrong in a way that does not look wrong --
+    any hour reads as a plausible meeting time.
+    """
+    out = render_transcript(transcript(block(LINKED, 0, "hallo")), TEMPLATE, BERLIN, CHANNEL)
+    # T0 is 20:00 UTC, which is 22:00 in Berlin in August (CEST).
+    assert "**22:00:00**" in out
+    assert "**20:00:00**" not in out
+
+
+def test_the_heading_links_the_channel_the_meeting_was_held_in() -> None:
+    out = render_transcript(transcript(block(LINKED, 0, "hallo")), TEMPLATE, BERLIN, CHANNEL)
+    assert "https://discord.com/channels/752527676903784518/1166491913877196960" in out
+    assert "Meeting" in out
+
+
+def test_a_channel_without_a_known_name_still_links() -> None:
+    """Sessions recorded before the name was captured have none. The heading
+    falls back to the id rather than disappearing: a link that opens the
+    right channel beats no channel at all.
+    """
+    ref = ChannelRef(752527676903784518, 1166491913877196960)
+    out = render_transcript(transcript(block(LINKED, 0, "hallo")), TEMPLATE, BERLIN, ref)
+    assert "1166491913877196960" in out
+    assert ref.url in out
+
+
+def test_the_date_is_rendered_as_an_outline_date_mention() -> None:
+    """Outline turns `mention://date/<YYYY-MM-DD>` into a date chip
+    (MentionType.Date, present since well before the deployed version).
+    Date only -- the deployed parser accepts no time component, so an ISO
+    datetime would degrade to a plain link.
+    """
+    out = render_transcript(transcript(block(LINKED, 0, "hallo")), TEMPLATE, BERLIN, CHANNEL)
+    assert "(mention://date/2026-08-19)" in out
+    assert "T22:00" not in out
+
+
+def test_a_protocol_without_a_channel_still_renders() -> None:
+    """`channel` is optional so a caller that cannot resolve it still gets a
+    protocol; the heading simply omits the line.
+    """
+    out = render_transcript(transcript(block(LINKED, 0, "hallo")), TEMPLATE, BERLIN)
+    assert "Channel:" not in out
+    assert "hallo" in out
+    assert "**Date:**" in out

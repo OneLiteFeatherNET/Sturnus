@@ -90,6 +90,7 @@ from sturnus.infrastructure.db.repositories import (
 from sturnus.infrastructure.documents.outline import OutlineSink
 from sturnus.infrastructure.health import ReadinessState, start_health_server
 from sturnus.infrastructure.objectstore import S3AudioStore
+from sturnus.infrastructure.observability import init_sentry
 from sturnus.infrastructure.whisper import WhisperEngine
 
 log = logging.getLogger(__name__)
@@ -245,6 +246,17 @@ class _WorkerSessionStore:
     async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]:
         return await self._sessions.session_bounds(session_id)
 
+    async def channel_ref(self, session_id: int) -> tuple[int, int, str | None]:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(Session.guild_id, Session.channel_id, Session.channel_name).where(
+                        Session.id == session_id
+                    )
+                )
+            ).one()
+            return int(row[0]), int(row[1]), row[2]
+
     async def guild_id(self, session_id: int) -> int:
         return await self._sessions.guild_id(session_id)
 
@@ -368,7 +380,6 @@ async def _document_retry_loop(
 
 
 async def _run() -> None:
-    logging.basicConfig(level=logging.INFO)
     settings = WorkerSettings()
 
     if settings.model_cache_dir is not None:
@@ -478,6 +489,13 @@ async def _run() -> None:
 
 
 def main() -> None:
+    # Both run before `_run`, and so before `WorkerSettings()` reads the
+    # environment: with a DSN configured, a settings `ValidationError` is
+    # then itself reported instead of being the one failure Sentry can never
+    # see. Without a DSN, `init_sentry` returns having touched nothing at all
+    # -- see `sturnus.infrastructure.observability`.
+    logging.basicConfig(level=logging.INFO)
+    init_sentry("worker")
     asyncio.run(_run())
 
 

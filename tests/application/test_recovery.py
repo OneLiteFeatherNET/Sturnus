@@ -36,7 +36,9 @@ class FakeSessions:
         #: `"documented"` -- for the sessions this test wants to pre-exist.
         self._status: dict[int, str] = dict(status or {})
 
-    async def open_session(self, _guild_id: int, _channel_id: int, _now: datetime) -> int:
+    async def open_session(
+        self, _guild_id: int, _channel_id: int, _channel_name: str | None, _now: datetime
+    ) -> int:
         raise AssertionError("recovery must never open a new session")
 
     async def add_participant(

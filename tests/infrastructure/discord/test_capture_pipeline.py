@@ -67,6 +67,7 @@ class FakeSessions:
         self,
         guild_id: int,  # noqa: ARG002
         channel_id: int,  # noqa: ARG002
+        channel_name: str | None,  # noqa: ARG002
         now: datetime,  # noqa: ARG002
     ) -> int:
         return 1

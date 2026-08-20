@@ -34,6 +34,7 @@ from sturnus.infrastructure.db.models import AccountLink, OAuthState
 from sturnus.infrastructure.db.repositories import AccountLinkRepository
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.linkserver import build_app
+from sturnus.infrastructure.observability import init_sentry
 
 log = logging.getLogger(__name__)
 
@@ -93,12 +94,10 @@ async def _wait_for_schema(
 
 
 async def _run() -> None:
-    logging.basicConfig(level=logging.INFO)
     settings = LinkSettings()
 
     engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
-    await _wait_for_schema(engine)
 
     states = LinkStateStore(session_factory)
     links = AccountLinkRepository(session_factory)
@@ -109,11 +108,22 @@ async def _run() -> None:
         redirect_uri=settings.outline_redirect_uri,
     )
 
+    # The wait for the worker's migrations happens *after* this server is
+    # listening, not before. Waiting first leaves the health port closed for
+    # as long as the wait takes, and the liveness probe kills the pod while
+    # it is doing exactly what it should -- which is what happened on the
+    # first deployment, where the tables did not exist until the worker had
+    # run. `/healthz` now answers immediately and `/readyz` reports 503
+    # until the schema is there, so Kubernetes holds traffic back without
+    # restarting anything.
+    schema_ready = False
+
     app = build_app(
         oauth=oauth,
         states=states,
         links=links,
         now=lambda: datetime.now(UTC),
+        schema_ready=lambda: schema_ready,
     )
 
     runner = web.AppRunner(app)
@@ -125,6 +135,10 @@ async def _run() -> None:
     site = web.TCPSite(runner, "0.0.0.0", settings.health_port)
     await site.start()
     log.info("Link service listening on port %d", settings.health_port)
+
+    await _wait_for_schema(engine)
+    schema_ready = True
+    log.info("Database schema is present; ready to serve account links")
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -140,6 +154,13 @@ async def _run() -> None:
 
 
 def main() -> None:
+    # Both run before `_run`, and so before `LinkSettings()` reads the
+    # environment: with a DSN configured, a settings `ValidationError` is
+    # then itself reported instead of being the one failure Sentry can never
+    # see. Without a DSN, `init_sentry` returns having touched nothing at all
+    # -- see `sturnus.infrastructure.observability`.
+    logging.basicConfig(level=logging.INFO)
+    init_sentry("link")
     asyncio.run(_run())
 
 

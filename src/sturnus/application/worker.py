@@ -61,12 +61,14 @@ import asyncio
 import logging
 import shutil
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Protocol, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sturnus.application.assembly import JobReader, assemble, serialize_transcript
 from sturnus.application.documents import (
+    ChannelRef,
     CreatedDocument,
     DocumentSink,
     document_title,
@@ -198,6 +200,14 @@ class SessionStore(Protocol):
 
     async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]: ...
 
+    async def channel_ref(self, session_id: int) -> tuple[int, int, str | None]:
+        """`(guild_id, channel_id, channel_name)` for the protocol's heading.
+
+        The name is whatever the bot saw when the session opened, and may
+        be `None` for sessions recorded before it was captured.
+        """
+        ...
+
     async def guild_id(self, session_id: int) -> int:
         """The guild a session belongs to.
 
@@ -230,6 +240,29 @@ class _ClaimedJobShape(Protocol):
     s3_key: str
     encryption_key_id: str
     wrapped_data_key: bytes
+
+
+async def _guild_timezone(config: ConfigReader, guild: int) -> tzinfo:
+    """The timezone the protocol's times are written in (Spec 11).
+
+    Falls back to UTC on an unusable value rather than failing the job: a
+    protocol with the wrong offset is a smaller loss than no protocol at
+    all, and the log line says which guild to go and fix. The default is
+    Europe/Berlin, so reaching UTC here means someone set something odd.
+    """
+    name = await config.get(guild, domain_settings.TIMEZONE)
+    if name is None:
+        return UTC
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        log.warning(
+            "Guild %d has an unusable %s (%r); writing this protocol in UTC",
+            guild,
+            domain_settings.TIMEZONE,
+            name,
+        )
+        return UTC
 
 
 async def _create_session_document(
@@ -298,8 +331,13 @@ async def _create_session_document(
         session_id, sessions, jobs, _BoundLinks(links, provider), UTC, merge_gap
     )
 
-    body = render_transcript(transcript, template_source, UTC)
-    title = document_title(transcript, UTC)
+    # `assemble` works in UTC deliberately -- ordering and merging must not
+    # depend on a local offset -- and only the rendering is localised.
+    tz = await _guild_timezone(config, guild)
+    ref_guild, ref_channel, ref_name = await sessions.channel_ref(session_id)
+    channel = ChannelRef(ref_guild, ref_channel, ref_name)
+    body = render_transcript(transcript, template_source, tz, channel)
+    title = document_title(transcript, tz)
     try:
         created: CreatedDocument = await documents.create(title, body, target)
     except Exception as exc:

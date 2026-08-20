@@ -87,12 +87,46 @@ class DocumentSink(Protocol):
     async def create(self, title: str, body: str, target: str) -> CreatedDocument: ...
 
 
-def render_transcript(transcript: Transcript, template_source: str, tz: tzinfo) -> str:
+@dataclass(frozen=True)
+class ChannelRef:
+    """Where a meeting was held, as the protocol names it.
+
+    Carried separately from `Transcript` because it is about the meeting
+    rather than about what was said, and because the name is a snapshot: the
+    bot records it when the session opens, so a channel renamed afterwards
+    does not rewrite the protocols of meetings held under the old name.
+    """
+
+    guild_id: int
+    channel_id: int
+    name: str | None = None
+
+    @property
+    def url(self) -> str:
+        """The Discord deep link that opens this channel."""
+        return f"https://discord.com/channels/{self.guild_id}/{self.channel_id}"
+
+    @property
+    def label(self) -> str:
+        """What to show: the name when known, the id when it is not."""
+        return self.name if self.name else str(self.channel_id)
+
+
+def render_transcript(
+    transcript: Transcript,
+    template_source: str,
+    tz: tzinfo,
+    channel: ChannelRef | None = None,
+) -> str:
     """Renders `transcript` through `template_source`, localised to `tz`.
 
     The timezone is a parameter rather than a constant: a protocol read by
     people in one place should carry local times, and hardcoding UTC would
-    make every timestamp subtly wrong for its readers.
+    make every timestamp subtly wrong for its readers -- wrong in a way that
+    does not look wrong, since any hour reads as a plausible meeting time.
+
+    `channel` is optional so a caller that cannot resolve it still gets a
+    protocol; the template simply omits the heading.
     """
     blocks: list[_BlockContext] = [
         {
@@ -102,8 +136,21 @@ def render_transcript(transcript: Transcript, template_source: str, tz: tzinfo) 
         }
         for block in transcript.blocks
     ]
+    local_start = transcript.session_started_at.astimezone(tz)
+    duration = transcript.session_ended_at - transcript.session_started_at
     template = _build_environment().from_string(template_source)
-    return template.render(participants=transcript.participants, blocks=blocks)
+    return template.render(
+        participants=transcript.participants,
+        blocks=blocks,
+        channel=channel,
+        # Outline renders `mention://date/<YYYY-MM-DD>` as a date chip
+        # (MentionType.Date). Date only: the version deployed here parses no
+        # time component, so an ISO datetime would degrade to a plain link.
+        date_iso=local_start.strftime("%Y-%m-%d"),
+        date_label=local_start.strftime("%d.%m.%Y"),
+        started=local_start.strftime("%H:%M"),
+        duration_minutes=max(1, round(duration.total_seconds() / 60)),
+    )
 
 
 def document_title(transcript: Transcript, tz: tzinfo) -> str:

@@ -7,6 +7,8 @@ without a voice channel, a database or an object store.
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from sturnus.application.ports import SessionKey
 from sturnus.application.recording import RecordingService
 from sturnus.domain.session import EndReason, SessionTimeouts
@@ -24,6 +26,7 @@ def pcm(frames: int) -> bytes:
 class FakeSessions:
     def __init__(self) -> None:
         self.opened: list[int] = []
+        self.channel_names: list[str | None] = []
         self.participants: dict[int, str] = {}
         self.epochs: dict[int, datetime] = {}
         self.closed: list[tuple[int, str]] = []
@@ -31,10 +34,13 @@ class FakeSessions:
         self.status: dict[int, str] = {}
         self._next = 1
 
-    async def open_session(self, _guild_id: int, _channel_id: int, _now: datetime) -> int:
+    async def open_session(
+        self, _guild_id: int, _channel_id: int, channel_name: str | None, _now: datetime
+    ) -> int:
         sid = self._next
         self._next += 1
         self.opened.append(sid)
+        self.channel_names.append(channel_name)
         self.status[sid] = "open"
         return sid
 
@@ -105,19 +111,19 @@ class FakeAudioWriter:
     def __init__(self, path: Path, epoch: datetime) -> None:
         self.path = path
         self.epoch = epoch
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("wb")
+        self._closed = False
         #: Where each packet was placed on the timeline. The real adapter
         #: turns this into padding; here it is kept so tests can assert on
         #: the placement itself.
         self.placed_at: list[datetime] = []
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("wb")
-        self._closed = False
 
     def write(self, _at: datetime, pcm: bytes) -> None:
         if self._closed:
             raise RuntimeError("writer is closed")
-        self.placed_at.append(_at)
         self._file.write(pcm)
+        self.placed_at.append(_at)
 
     def close(self) -> None:
         if not self._closed:
@@ -167,6 +173,7 @@ def service(
     store: FakeStore | None = None,
     writers: FakeAudioWriterFactory | None = None,
     encryptor: FakeEncryptor | None = None,
+    channel_name: str | None = None,
 ) -> RecordingService:
     return RecordingService(
         guild_id=GUILD,
@@ -180,6 +187,7 @@ def service(
         writers=writers or FakeAudioWriterFactory(tmp_path),
         encryptor=encryptor or FakeEncryptor(),
         retention_days=30,
+        channel_name=channel_name,
     )
 
 
@@ -398,6 +406,167 @@ async def test_returning_participant_keeps_the_same_session(tmp_path: Path) -> N
     await svc.participants_changed(1, T0 + timedelta(seconds=30))
     assert sessions.opened == [1]
     assert svc.session_id == 1
+
+
+async def test_the_channel_name_is_recorded_when_the_session_opens(tmp_path: Path) -> None:
+    """The worker writes the protocol and has no Discord connection, so the
+    name has to be captured here or not at all. Capturing it at open time
+    also means a channel renamed later does not rewrite the protocols of
+    meetings held under the old name.
+    """
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions, channel_name="Meeting-Raum")
+
+    await svc.participants_changed(1, T0)
+
+    assert sessions.channel_names == ["Meeting-Raum"]
+
+
+async def test_apply_tunables_mid_session_changes_the_retention_that_close_stamps(
+    tmp_path: Path,
+) -> None:
+    """A retention change reaches the session in progress -- intentionally.
+
+    `_retention_days` is read at exactly one point, `close()`, when it
+    stamps `retention_until` on the jobs it enqueues. The value in force
+    when a recording is *filed* is the one that governs it, so a change
+    made while it is still recording applies to it.
+    """
+    jobs = FakeJobs()
+    svc = service(tmp_path, jobs=jobs)
+    await svc.participants_changed(1, T0)
+    await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
+
+    svc.apply_tunables(
+        SessionTimeouts(empty_grace_seconds=60, idle_timeout_minutes=15, max_session_hours=4),
+        retention_days=7,
+    )
+
+    assert svc.is_recording is True, "a tunable change must not close the session"
+    assert svc.session_id == 1, "nor open a new one"
+    closed_at = T0 + timedelta(minutes=5)
+    await svc.close(EndReason.EMPTY, closed_at)
+    assert jobs.enqueued[0]["retention_until"] == closed_at + timedelta(days=7)
+
+
+async def test_apply_tunables_mid_session_changes_the_next_timeout_decision(
+    tmp_path: Path,
+) -> None:
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions)
+    await svc.participants_changed(1, T0)
+    await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
+    assert await svc.tick(T0 + timedelta(minutes=10)) is None
+
+    svc.apply_tunables(
+        SessionTimeouts(empty_grace_seconds=60, idle_timeout_minutes=5, max_session_hours=4),
+        retention_days=30,
+    )
+
+    assert await svc.tick(T0 + timedelta(minutes=10)) is EndReason.IDLE_TIMEOUT
+    # It closed through the ordinary path: the row is closed and the audio
+    # was uploaded and enqueued, not discarded.
+    assert sessions.closed == [(1, "idle_timeout")]
+
+
+async def test_retarget_between_sessions_moves_the_next_session_row(tmp_path: Path) -> None:
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions)
+    assert svc.channel_id == CHANNEL
+
+    svc.retarget(999, "Anderer-Raum")
+
+    assert svc.channel_id == 999
+    await svc.participants_changed(1, T0)
+    assert sessions.opened == [1]
+
+
+async def test_retarget_carries_the_channel_name_to_the_next_session(tmp_path: Path) -> None:
+    """The name has to follow the channel, or the header names the wrong room.
+
+    Two features that landed separately meet here: the protocol header
+    names the channel, and reconfiguration moves an idle service to a new
+    channel in place. Without the name travelling along, the next protocol
+    would be headed with the room the recording did not come from -- a
+    header that is confidently wrong, which is worse than the `None`
+    fallback to a bare link.
+    """
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions, channel_name="Alter-Raum")
+
+    svc.retarget(999, "Neuer-Raum")
+    await svc.participants_changed(1, T0)
+
+    assert svc.channel_id == 999
+    assert sessions.channel_names == ["Neuer-Raum"]
+
+
+async def test_retarget_refuses_while_recording(tmp_path: Path) -> None:
+    """The guard that keeps a session row from disagreeing with its own audio.
+
+    `_channel_id` is written onto the `sessions` row by `open_session`.
+    Moving it mid-session would produce a protocol whose header names one
+    channel while the audio came from another.
+    """
+    svc = service(tmp_path)
+    await svc.participants_changed(1, T0)
+    with pytest.raises(AssertionError, match="mid-session"):
+        svc.retarget(999, "Anderer-Raum")
+
+
+async def test_due_reason_does_not_close_the_session(tmp_path: Path) -> None:
+    sessions = FakeSessions()
+    svc = service(tmp_path, sessions=sessions)
+    await svc.participants_changed(1, T0)
+    svc.apply_tunables(
+        SessionTimeouts(empty_grace_seconds=60, idle_timeout_minutes=15, max_session_hours=1),
+        retention_days=30,
+    )
+
+    assert svc.due_reason(T0 + timedelta(hours=2)) is EndReason.MAX_DURATION
+    assert svc.is_recording is True
+    assert sessions.closed == []
+
+
+async def test_end_now_uploads_everything_and_leaves_the_service_reusable(
+    tmp_path: Path,
+) -> None:
+    """`/config apply force:true` ends a recording early; it never discards one.
+
+    Both halves matter. The recording must take the ordinary route out --
+    encrypt, upload, enqueue, close the row -- and the service must be left
+    exactly as ready for the next session as a timed-out one is. `close()`
+    alone gives only the first: it leaves the machine in RECORDING, so the
+    `reset()` that follows used to raise and the guild recorded nothing at
+    all afterwards.
+    """
+    sessions, jobs = FakeSessions(), FakeJobs()
+    svc = service(tmp_path, sessions=sessions, jobs=jobs)
+    await svc.participants_changed(1, T0)
+    await svc.voice_packet(ANNA, "anna", 1, RTP, pcm(960), T0)
+
+    await svc.end_now(EndReason.SHUTDOWN, T0 + timedelta(minutes=5))
+
+    assert sessions.closed == [(1, "shutdown")]
+    assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
+    assert svc.is_recording is False
+
+    svc.reset()
+    await svc.participants_changed(1, T0 + timedelta(minutes=6))
+    assert sessions.opened == [1, 2], "the service must be able to record again"
+    assert svc.is_recording is True
+
+
+async def test_end_now_without_a_session_does_nothing(tmp_path: Path) -> None:
+    """Safe on any path that merely might have a session open, e.g. shutdown."""
+    sessions, jobs = FakeSessions(), FakeJobs()
+    svc = service(tmp_path, sessions=sessions, jobs=jobs)
+
+    await svc.end_now(EndReason.SHUTDOWN, T0)
+
+    assert sessions.opened == []
+    assert sessions.closed == []
+    assert jobs.enqueued == []
 
 
 async def test_request_close_ends_the_session_through_the_next_tick(tmp_path: Path) -> None:

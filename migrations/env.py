@@ -8,9 +8,20 @@ from sqlalchemy import engine_from_config, pool
 config = context.config
 
 # Interpret the config file for Python logging.
-# This line sets up loggers basically.
+#
+# `disable_existing_loggers=False` is load-bearing, not a preference.
+# `fileConfig` defaults it to True, which sets `disabled = True` on every
+# logger that already exists and is not named in `alembic.ini` -- and
+# `logging.Logger.handle` returns immediately for a disabled logger. This
+# module is not only imported by the `alembic` CLI: the worker runs
+# migrations in-process at startup (`_run_migrations` in
+# `sturnus.entrypoints.worker`), by which point every `sturnus.*` logger
+# already exists. With the default, the worker would fall silent for the
+# rest of its life the moment it finished migrating -- and Sentry with it,
+# because `LoggingIntegration` hooks `Logger.callHandlers`, which a disabled
+# logger never reaches. See `tests/infrastructure/test_migrations.py`.
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 import os  # noqa: E402
 

@@ -60,6 +60,8 @@ the Kubernetes `Secret` rather than from plain manifest text (see section
 | `STURNUS_OUTLINE_CLIENT_ID` | **yes** | no | OAuth client id of the Sturnus application registered in Outline. Public by design — it travels in the query string of the authorization URL every user's browser opens. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL that authorization returns to. Must be the same value `sturnus-link` is given, and must actually route to `link` — see section 1.5. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 The bot has no `STURNUS_OUTLINE_CLIENT_SECRET`, and that is not an
 oversight: building an authorization URL needs only the public client id,
@@ -88,6 +90,8 @@ in the bot would read it.
 | `STURNUS_MAX_JOB_ATTEMPTS` | `3` | no | How many failed attempts a job gets before `JobQueue.fail` marks it `dead`. See section 5 for what a `dead` job means for the rest of its session. |
 | `STURNUS_JOB_LEASE_SECONDS` | `1800.0` | no | How long a claimed job may stay `running` before `JobQueue.claim` reclaims it for another worker. It is generous on purpose: it must exceed the longest plausible transcription, or a still-running job gets picked up a second time. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 Whisper's device and compute type are deliberately *not* environment-driven:
 the worker constructs `WhisperEngine` with `"cpu"` and `int8` hardcoded,
@@ -105,6 +109,8 @@ configuration change.
 | `STURNUS_OUTLINE_CLIENT_SECRET` | **yes** | **yes** | OAuth client secret for that same application. This process is the only one that holds it, because it is the only one that exchanges an authorization code for a token. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL, repeated here because the token exchange sends it again for verification. It must match the bot's value exactly — see section 1.5. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz` and `/oauth/callback` routes are served on. |
+| `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Unset or empty — the chart's default — disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Not a credential; see section 1.4. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
 
 `link` holds no Discord token, no S3 credentials and no master key — by
 construction, not by omission. It is the only publicly reachable component,
@@ -133,6 +139,18 @@ user's own browser opens — and `STURNUS_OUTLINE_BASE_URL`,
 credentials. Encrypting an address buys nothing and costs review: a wrong
 redirect URI hidden inside a SOPS blob is a great deal harder to spot than
 a wrong one sitting in a values file.
+
+`STURNUS_SENTRY_DSN` is not the eighth entry, and should not be made one.
+The key embedded in a DSN is Sentry's *public* key: it authorises submitting
+events to one project and grants no read access to anything, which is why
+Sentry itself documents putting a DSN in browser JavaScript for frontend
+projects. The worst outcome from disclosure is event spam into one project —
+handled by rate limits and key rotation, not by encryption. Adding it to the
+`Secret` would misrepresent it as a credential in the one place this project
+keeps its credential inventory (the key lists in
+`charts/sturnus/templates/_helpers.tpl`) and pull a non-credential into the
+SOPS rotation procedure. It belongs in `commonEnv` alongside
+`STURNUS_OUTLINE_CLIENT_ID`, for the same reason.
 
 `STURNUS_DATABASE_URL` is the one entry on that list that is not typed
 `SecretStr` in the code — it is a plain `str`, because it is a connection
@@ -324,11 +342,79 @@ this document for whoever reads it least carefully.
    ```
 3. Re-run `/config show` until "All required keys are set." appears.
 
+Worth setting even though it is not required: `timezone` decides the times
+written into the protocol and its title. It defaults to `Europe/Berlin` and
+takes any IANA name (`Europe/London`, `UTC`). This one is easy to leave
+wrong, because a wrong offset does not look wrong -- every hour reads as a
+plausible meeting time. An unusable value falls back to UTC with a warning
+naming the guild, rather than costing the protocol.
+
+```
+/config set timezone Europe/Berlin
+```
+
 Until every required key (`voice_channel_id`, `consent_role_id`,
 `document_target`, `policy_version`, `policy_url`, `admin_role_id`) is set,
 the bot logs a warning naming the guild and skips building that guild's
-recording pipeline entirely (`SturnusClient._configure_guild`) — it will
-not join the voice channel or record anything for that guild.
+recording pipeline entirely (`SturnusClient._desired_config`) — it will
+not join the voice channel or record anything for that guild. It re-checks
+every ten seconds, so the pipeline appears as soon as the keys are there;
+no restart is involved (see 4.1).
+
+### 4.1 Changing configuration at runtime
+
+The bot reconciles every guild against `guild_config` roughly every ten
+seconds (`SturnusClient._tick_guild`), and immediately whenever `/config
+set`, `/config clear` or `/setup` writes something. Configuration changes
+therefore take effect without restarting the pod — with the exceptions
+below, which the commands themselves also say out loud.
+
+**Live immediately, even in the middle of a recording.**
+`empty_grace_seconds`, `idle_timeout_minutes`, `max_session_hours`,
+`audio_retention_days`. Each is read at exactly one point — the next
+timeout check, or the moment the session is filed — so the new value is
+simply the one used next. Shortening a timeout below the age of the
+session in progress closes that session on the next tick; that happens
+through the ordinary path (encrypt → upload → enqueue), so it ends the
+recording earlier but never discards it. `/config set` warns explicitly
+when it detects this.
+
+**Live immediately, and never were stale.** `admin_role_id`,
+`policy_version`, `policy_url` (read per command invocation, and by the
+consent cache with a five-second TTL), and `document_target`,
+`document_provider`, `merge_gap_seconds` (read per job by the *worker*
+process, not the bot at all).
+
+**Deferred until the recording in progress ends.** `voice_channel_id` and
+`consent_role_id`. These decide which channel a session's row names and
+which role both the headcount and the per-packet filter agree on;
+swapping them mid-session would mean a protocol whose header names one
+channel while its audio came from another, an orphaned plaintext file on
+the PVC, and a voice connection nobody would ever disconnect. The change
+is stored right away and applied the instant the session has finished
+closing — after its audio is encrypted, uploaded and enqueued. **The
+recording is never lost.** The wait is bounded by `max_session_hours`
+(default 4 h). `/config show` names the keys still waiting, and `/config
+apply force:true` ends the session in progress deliberately — uploading
+and transcribing it normally — and applies the change at once. A deferral
+can equally be withdrawn: put the old value back (or re-set a key you
+cleared) before the session ends and nothing is applied — the pipeline
+keeps running untouched and `/config show` stops naming the key.
+
+**Needs a pod restart.** `publish_poll_seconds` only. The publish sweep
+runs on one process-wide interval taken from that setting's *default*
+rather than per-guild scheduling (a deliberate simplification, see
+`_PUBLISH_POLL_SECONDS` in `sturnus.entrypoints.bot`), so a per-guild
+value for it is not read at runtime at all. `/config set
+publish_poll_seconds` says so instead of pretending it applied.
+
+**After editing `guild_config` directly with SQL.** `ConfigStore.set`
+validates integer keys; a raw `UPDATE` does not. An unparseable value is
+logged once and the guild keeps its last known-good configuration rather
+than falling back to defaults (which would silently un-configure a
+working guild). Run `/config apply` to re-read immediately instead of
+waiting for the next tick; `/config show` will tell you whether what is
+stored is actually what is running.
 
 ## 5. Troubleshooting
 
@@ -401,6 +487,77 @@ not increasing is not a database contention problem — it means nothing is
 calling `claim()` at all. Check that the worker process is actually
 running and check its `/readyz` endpoint before looking any further at
 individual jobs.
+
+**What a Sentry issue contains, and what it deliberately does not.** When
+`STURNUS_SENTRY_DSN` is set, an issue carries: the exception type, the
+module, a stack trace with five lines of surrounding *source* per frame, the
+`component` tag (`bot`/`worker`/`link`), the release
+(`sturnus@<version>`), the pod name, and — for errors raised from one of
+*Sturnus's own* log calls — that log message's uninterpolated format string,
+e.g. `job %s failed`.
+
+It does not carry local variables, breadcrumbs, request data, or the
+interpolated log line and its arguments. Two things are narrower than they
+look, and both are deliberate:
+
+- **The log format string survives only for the `sturnus` logger
+  namespace.** That guarantee rests on ruff's `G` ruleset, which only
+  governs the log calls written in this repository. Records the SDK captures
+  from anywhere else are dropped whole — most importantly asyncio's "Task
+  exception was never retrieved", whose message asyncio composes itself out
+  of `repr(task)` and which therefore embeds the raised exception's own
+  message. An issue from a third-party logger has no message line; read the
+  pod log.
+- **`OSError` messages are rebuilt from `errno` and `strerror`.** So
+  `ConnectionRefusedError: [Errno 111] Connection refused` survives, as do
+  the DNS, TLS and timeout failures that matter for a process talking to
+  Discord, S3, Postgres and Outline — but the filename `OSError.__str__`
+  normally appends becomes `<redacted>`, because the file an `OSError` here
+  is most likely to name is
+  `<recording_dir>/session-<session_id>/<discord_user_id>.wav`, which says
+  who was recorded and when. An `OSError` carrying no errno at all (the
+  free-form `OSError("cannot open ...")` form) is redacted entirely.
+
+Otherwise **exception messages are redacted to `<redacted>` unless the
+exception subclasses `sturnus.domain.errors.DiagnosticSafeError`**, the
+explicit opt-in whose docstring carries the contract.
+
+That is a deliberate trade, not an oversight, and it should not be undone
+during an incident. Sturnus records people talking; Spec 3 makes consent a
+precondition for processing any of it and Spec 12.4 requires that neither
+audio nor transcript content appears in logs, and Sentry is a second system
+holding a copy of whatever it is sent. Under this configuration
+Sentry receives strictly less than the pod log does. **So when a message is
+`<redacted>`, read it with `kubectl logs` on the pod named in the issue** —
+the information has moved, not vanished. The enforcement lives in
+`sturnus.infrastructure.observability` (an allowlist, so anything a future
+SDK version adds is dropped by default) and in ruff's `G` ruleset, which
+forbids f-string logging so that the format string Sentry does see stays a
+literal written in reviewable source.
+
+**A DSN Sentry rejects turns reporting off, not the process.** `init_sentry`
+runs before the event loop in all three `main()`s, so an unparseable
+`STURNUS_SENTRY_DSN` used to raise `BadDsn` out of `main()` and
+CrashLoopBackOff bot, worker and link — an outage of the recording caused by
+a typo in optional telemetry. It is now caught, and the process runs on
+without reporting. The log line to grep for is
+
+```
+sentry error reporting is DISABLED for component <bot|worker|link>: the SDK
+rejected the configured DSN (...)
+```
+
+at `ERROR`, from `sturnus.infrastructure.observability`. The DSN itself is
+never echoed, only the SDK's own reason (unsupported scheme, missing
+hostname, missing public key, invalid project). Its counterpart on success is
+`sentry error reporting enabled for component <...>` at `INFO`; if neither
+line appears, no DSN was configured.
+
+One consequence worth knowing: `sentry_sdk` calls the scrubbing hook inside
+its own exception guard, so a bug there makes Sentry go *quiet* rather than
+leak. "No issues since the deploy" is therefore not by itself proof that
+nothing is wrong — force one error in a non-production namespace after a
+deploy and confirm it lands.
 
 **After a bot restart.** On startup the bot recovers whatever a previous
 process left on disk under `STURNUS_RECORDING_DIR` and logs `Recovered N

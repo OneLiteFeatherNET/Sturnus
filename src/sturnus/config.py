@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr, model_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -46,6 +46,52 @@ class StrictSettings(BaseSettings):
                     f"that only fails once the value is first used."
                 )
         return self
+
+
+class SentrySettings(StrictSettings):
+    """Whether, and where, to report errors -- read before anything else.
+
+    Its own class rather than three fields on `Settings`/`WorkerSettings`/
+    `LinkSettings` for two reasons.
+
+    *Ordering.* Nothing here is required, so this class always constructs.
+    That lets `sturnus.infrastructure.observability.init_sentry` run as the
+    first thing each `main()` does, before the process's real settings are
+    read -- so a configuration failure (a missing `STURNUS_MASTER_KEY`, an
+    unparseable `STURNUS_HEALTH_PORT`) is itself reported. Hanging the DSN
+    off `WorkerSettings` would make the one failure that most needs
+    reporting the one failure that could never be reported.
+
+    *Blast radius.* The per-process asymmetry of the other three classes is a
+    security decision (Spec 13.2); observability is orthogonal to it and has
+    no business widening any of them.
+
+    The blank-to-`None` normalisation below is load-bearing, not padding.
+    Two verified facts meet here:
+
+    1. `STURNUS_SENTRY_DSN=""` yields `SecretStr('')`, not `None`, and
+       `StrictSettings._reject_blank_required_values` does not apply because
+       the field is not required. A chart default of `""` -- which is what
+       every cluster that has not opted in will have -- lands exactly there.
+    2. `sentry_sdk.init(dsn="")` does not mean "off". It builds a live client
+       that reports `is_active() is True` with no transport: fully
+       monkey-patched (`logging.Logger.callHandlers`, `sys.excepthook`,
+       `threading.Thread.run`, `atexit`), sending nothing.
+
+    So blank must become `None`, and `None` must mean *do not call `init()`
+    at all*. `sentry_sdk.is_initialized()` / `is_active()` cannot stand in
+    for that test.
+    """
+
+    sentry_dsn: SecretStr | None = None
+    sentry_environment: str = "production"
+
+    @field_validator("sentry_dsn", mode="after")
+    @classmethod
+    def _blank_dsn_is_absent(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None or not value.get_secret_value().strip():
+            return None
+        return value
 
 
 class Settings(StrictSettings):
