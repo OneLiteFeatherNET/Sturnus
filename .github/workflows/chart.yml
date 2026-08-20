@@ -1,0 +1,130 @@
+name: chart
+
+# Separate from `build`, which covers the Python package: a chart defect has
+# its own failure mode. Helm accepts values a chart never declares and drops
+# them silently, so a Kubernetes-FLUX release can set a value that reaches
+# nothing and the deployment still comes up -- just without whatever that
+# value was meant to do. Rendering here is what turns that into a red check.
+on:
+  pull_request:
+    paths:
+      - 'charts/**'
+      - '.github/workflows/chart.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'charts/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: chart-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint charts/sturnus
+
+      - name: Render with defaults
+        run: helm template sturnus charts/sturnus > /tmp/default.yaml
+
+      # The values the cluster actually deploys with, kept here rather than in
+      # the FLUX repository so a chart change that stops honouring one of them
+      # fails in this repository, where the chart is edited. Mirrors
+      # apps/clusters/feathre-core/base-apps/sturnus/release.yaml in
+      # OneLiteFeatherNET/Kubernetes-FLUX.
+      - name: Render with the cluster's values
+        run: |
+          cat > /tmp/cluster-values.yaml <<'EOF'
+          podLabels:
+            logs.onelitefeather.net/env: prod
+          commonEnv:
+            STURNUS_S3_ENDPOINT: "http://rook-ceph-rgw-feather-s3.rook-ceph-fr01.svc:80"
+            STURNUS_S3_BUCKET: "sturnus-audio"
+          region:
+            key: topology.kubernetes.io/region
+            value: fr-rosenau
+          httpRoute:
+            enabled: false
+          EOF
+          helm template sturnus charts/sturnus -f /tmp/cluster-values.yaml > /tmp/cluster.yaml
+
+      # Each assertion below is a defect that reached main once.
+      - name: Assert the rendered manifests hold
+        run: |
+          python3 - <<'PY'
+          import sys, yaml
+
+          def load(path):
+              with open(path) as fh:
+                  return [d for d in yaml.safe_load_all(fh) if d]
+
+          failures = []
+
+          def check(ok, msg):
+              if not ok:
+                  failures.append(msg)
+
+          default = load('/tmp/default.yaml')
+          cluster = load('/tmp/cluster.yaml')
+
+          deployments = {d['metadata']['name']: d for d in cluster
+                         if d['kind'] == 'Deployment'}
+          check(len(deployments) == 3,
+                f'expected 3 Deployments, rendered {sorted(deployments)}')
+
+          # A Deployment that mounts a ReadWriteOnce claim cannot roll: the new
+          # pod blocks on a multi-attach error while the old one holds the
+          # volume, and the rollout never completes.
+          rwo_claims = {p['metadata']['name'] for p in cluster
+                        if p['kind'] == 'PersistentVolumeClaim'
+                        and p['spec']['accessModes'] == ['ReadWriteOnce']}
+          for name, dep in deployments.items():
+              spec = dep['spec']['template']['spec']
+              claims = {v['persistentVolumeClaim']['claimName']
+                        for v in spec.get('volumes', [])
+                        if 'persistentVolumeClaim' in v}
+              if claims & rwo_claims:
+                  strategy = dep['spec'].get('strategy', {}).get('type')
+                  check(strategy == 'Recreate',
+                        f'{name} mounts a ReadWriteOnce claim {sorted(claims & rwo_claims)} '
+                        f'but its strategy is {strategy!r}, not Recreate')
+
+          # podLabels must reach every pod, and must never reach a selector:
+          # selectors are immutable on a live Deployment.
+          for name, dep in deployments.items():
+              pod_labels = dep['spec']['template']['metadata']['labels']
+              check(pod_labels.get('logs.onelitefeather.net/env') == 'prod',
+                    f'{name} pods do not carry the cluster log label; '
+                    f'podLabels is not wired into this component')
+              selector = dep['spec']['selector']['matchLabels']
+              check(not any(k.startswith('logs.') for k in selector),
+                    f'{name} leaks podLabels into selector.matchLabels {selector}')
+
+          # Without podLabels nothing extra may appear -- the value has to be
+          # opt-in, or a chart user gets labels they never asked for.
+          for dep in (d for d in default if d['kind'] == 'Deployment'):
+              labels = dep['spec']['template']['metadata']['labels']
+              check(not any(k.startswith('logs.') for k in labels),
+                    f"{dep['metadata']['name']} carries a log label with no podLabels set")
+
+          # The secrets live in a Kubernetes Secret; a plaintext env value for
+          # one of them would mean the chart grew a way to leak it.
+          for name, dep in deployments.items():
+              for container in dep['spec']['template']['spec']['containers']:
+                  for env in container.get('env') or []:
+                      check('value' not in env or 'TOKEN' not in env['name'].upper(),
+                            f"{name} sets {env['name']} as a literal env value")
+
+          if failures:
+              print('\n'.join(f'::error::{f}' for f in failures))
+              sys.exit(1)
+          print(f'{len(deployments)} Deployments rendered and asserted')
+          PY
