@@ -248,10 +248,10 @@ measured, not a plausibility check against the estimate.
 - [ ] CPU and memory for the bot pod under load: ____________
 - [ ] CPU and memory for the worker pod under load (this is the one most
   likely to differ sharply from the spec's estimate, since transcription
-  is the heaviest step). The chart's `worker.resources` comment works out
-  ~4.25GB at peak for large-v3 at int8_float32 with beam_size 8, on paper
-  and never yet measured — this is the measurement it is waiting for, and
-  the limit is 6Gi: ____________
+  is the heaviest step). Expect ~4.1GB at peak for large-v3 at
+  int8_float32 with beam_size 8 — measured off-cluster on four CPU threads,
+  so this is the confirmation that it holds on a worker node, not a first
+  look. The limit is 6Gi: ____________
 - [ ] **[Plan 4]** CPU and memory for the link-service pod under load:
   ____________
 - [ ] Actual recording size per speaker-hour (extrapolate from this

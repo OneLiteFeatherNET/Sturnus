@@ -303,7 +303,14 @@ worker:
   #   * The process itself -- interpreter, numpy, soxr, boto3, SQLAlchemy,
   #     one decrypted WAV read through it. A few hundred MB; call it 0.5GB.
   #
-  # ~4.25GB at peak. The request is 4Gi (steady state between jobs is
+  # ~4.25GB at peak, and measured at **4.11GB** on an x86 CPU pinned to
+  # four threads, transcribing 4.7 minutes of German speech -- close enough
+  # to the arithmetic above to trust it for longer jobs, since only the
+  # second item grows with the audio. For comparison the previous
+  # configuration (large-v3-turbo, int8, beam 5) peaked at 1.96GB, which is
+  # why the old 2560Mi limit held.
+  #
+  # The request is 4Gi (steady state between jobs is
   # closer to 2GB -- the second item is transient), and the limit 6Gi. The
   # limit is the number worth being generous with: exceeding it is an
   # OOMKill in the middle of a transcription, which fails the job, and
@@ -311,6 +318,19 @@ worker:
   # needed. cpu stays at 4: large-v3 needs more *time* than turbo, not
   # more parallelism, and the ceiling that time has to stay under is
   # STURNUS_JOB_LEASE_SECONDS (1800s), not this.
+  #
+  # Measured, that ceiling is further away than it looks. The same run
+  # transcribed 282s of speech in 145s -- 1.94x faster than real time,
+  # against 4.6x for the old configuration. `vad_filter` means only the
+  # *speech* in a track is decoded, not its padded length, so 1800s of
+  # lease covers roughly 58 minutes of one person actually talking. Beyond
+  # that the lease expires mid-job; with `replicas: 1` (hardcoded in the
+  # Deployment template) and the worker processing one job at a time,
+  # nothing else can claim it, so the only consequence today is that a
+  # restart may reclaim a job that was still running. Raising the worker
+  # beyond one replica is what would turn this into two workers
+  # transcribing the same recording, and is the moment to revisit the
+  # lease.
   resources:
     requests:
       cpu: "4"
