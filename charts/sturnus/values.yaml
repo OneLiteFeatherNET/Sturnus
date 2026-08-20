@@ -17,12 +17,32 @@ imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+# Extra labels applied to every pod of all three components, on top of
+# the standard app.kubernetes.io/* set. The cluster's log collection
+# selects on a label of its own (`logs.onelitefeather.net/env`), so a
+# deployment that cannot set one silently produces uncollected logs --
+# Helm ignores values a chart does not declare rather than rejecting
+# them, so the omission would surface as missing logs, not as an error.
+podLabels: {}
+
 # Name of a Kubernetes Secret that already exists in the namespace (managed
-# outside this chart, via SOPS -- Spec 13.5) and holds every credential the
-# process config in `sturnus.config.Settings` reads from the environment:
-# STURNUS_DISCORD_TOKEN, STURNUS_DATABASE_URL, STURNUS_S3_ACCESS_KEY,
-# STURNUS_S3_SECRET_KEY, STURNUS_MASTER_KEY -- plus, once the link component's
-# own settings land, the Outline service key and the OAuth client secret.
+# outside this chart, via SOPS -- Spec 13.5). It must hold exactly these
+# seven keys; each component reads the subset its own settings class
+# declares, and a missing one fails that pod at startup with a pydantic
+# ValidationError naming the field:
+#
+#   STURNUS_DISCORD_TOKEN         bot
+#   STURNUS_DATABASE_URL          bot, worker, link
+#   STURNUS_S3_ACCESS_KEY         bot, worker
+#   STURNUS_S3_SECRET_KEY         bot, worker
+#   STURNUS_MASTER_KEY            bot, worker
+#   STURNUS_OUTLINE_SERVICE_KEY   worker
+#   STURNUS_OUTLINE_CLIENT_SECRET link
+#
+# The non-secret Outline settings (base URL, OAuth client id, redirect URI)
+# are NOT here -- they belong in `commonEnv` below. docs/operations.md
+# section 1 carries the full per-component table.
+#
 # This chart only ever references the Secret by name via `envFrom.secretRef`;
 # it never places a secret value into values.yaml or a template.
 existingSecret: sturnus-secrets
@@ -48,6 +68,17 @@ commonEnv:
   # rotated without re-encrypting existing material (see config.py). Not a
   # credential itself, so it is plain config rather than Secret material.
   STURNUS_MASTER_KEY_ID: "v1"
+  # All three components need the Outline base URL; `bot` and `link` also
+  # need the OAuth client id and the redirect URI. None of the three is a
+  # credential -- an OAuth client id is public by design and the other two
+  # are addresses -- so they are plain config rather than Secret material.
+  # The defaults below are placeholders in the chart's own example domain:
+  # override all three per cluster, and make the redirect URI match the
+  # route that actually reaches `link`, or the OAuth flow fails on a
+  # redirect_uri mismatch after the user has already consented.
+  STURNUS_OUTLINE_BASE_URL: "https://wiki.example.invalid"
+  STURNUS_OUTLINE_CLIENT_ID: ""
+  STURNUS_OUTLINE_REDIRECT_URI: "https://sturnus.example.invalid/oauth/callback"
 
 # Every component's health/readiness server listens on this container port
 # (see sturnus/infrastructure/health.py); the container image is the same
@@ -201,20 +232,24 @@ httpRoute:
 
 worker:
   command: ["sturnus-worker"]
+  # Safe to raise: the job queue hands each job to exactly one worker
+  # (`FOR UPDATE SKIP LOCKED`). But the model cache below is a
+  # ReadWriteOnce volume, so replicas beyond the first only schedule onto
+  # the node already holding it -- give each replica its own claim before
+  # spreading them across nodes.
   replicaCount: 1
   env:
     STURNUS_MODEL_CACHE_DIR: /data/model-cache
     STURNUS_WHISPER_MODEL: large-v3-turbo
-  # Larger than bot/link's: `process_one` (plan 3, task 9 -- not yet landed
-  # on this branch as of this hardening pass) downloads the encrypted
-  # object and decrypts it to a temporary WAV before transcribing, and the
-  # plan's own language ("temporary directory", "temporary WAV", removed in
-  # a `finally`) is exactly Python's `tempfile` module, which resolves to
-  # /tmp (or $TMPDIR) by default. Sized for one speaker's decrypted
-  # recording plus the encrypted download and interpreter scratch, not just
-  # the latter. If the worker entrypoint ends up writing its working
-  # directory somewhere other than /tmp, this mount and size need revisiting
-  # against that actual path.
+  # Larger than bot/link's: `process_one` downloads the encrypted object and
+  # decrypts it to a WAV before transcribing, both under its work directory
+  # (`sturnus.application.worker.process_one`, which creates a
+  # `job-<id>-<uuid>` directory per job). That directory is
+  # `sturnus.entrypoints.worker`'s `work_dir`, which defaults to /tmp --
+  # the path mounted below. Sized for one speaker's decrypted recording plus
+  # the encrypted download and interpreter scratch, not just the latter.
+  # Setting STURNUS_WORK_DIR to anything outside this mount points the worker
+  # at the read-only root filesystem, so the two have to move together.
   tmpSizeLimit: 4Gi
   resources:
     requests:

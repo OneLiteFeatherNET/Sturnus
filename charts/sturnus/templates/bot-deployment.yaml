@@ -22,6 +22,9 @@ spec:
     metadata:
       labels:
         {{- include "sturnus.componentLabels" (dict "root" . "component" "bot") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
