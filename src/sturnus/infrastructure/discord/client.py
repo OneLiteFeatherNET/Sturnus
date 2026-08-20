@@ -33,6 +33,7 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.discord.about_cog import AboutCog
 from sturnus.infrastructure.discord.config_cog import ConfigCog
 from sturnus.infrastructure.discord.consent_cog import ConsentCog
 from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter
@@ -105,6 +106,10 @@ class SturnusClient(commands.Bot):
         """Loads the cogs and syncs the command tree; runs once before login completes."""
         await self.add_cog(ConsentCog(self._consent_repo, self._config_store, self._clock))
         await self.add_cog(ConfigCog(self._config_store))
+        # The AGPL's section 13 obliges us to offer the source to people who
+        # interact with this over a network. They never receive a binary, so a
+        # LICENSE file in the repository does not reach them — /about does.
+        await self.add_cog(AboutCog())
         await self.tree.sync()
         self._tick_task = asyncio.create_task(self._tick_loop())
 

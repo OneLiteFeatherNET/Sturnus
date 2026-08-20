@@ -76,9 +76,7 @@ async def _has_admin_access(interaction: discord.Interaction) -> bool:
             role_id = _parse_role_id(stored)
 
     if role_id is None or discord.utils.get(member.roles, id=role_id) is None:
-        raise app_commands.MissingRole(
-            role_id if role_id is not None else settings.ADMIN_ROLE_ID
-        )
+        raise app_commands.MissingRole(role_id if role_id is not None else settings.ADMIN_ROLE_ID)
     return True
 
 

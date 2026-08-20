@@ -5,6 +5,7 @@ description = "Discord voice transcription with Outline document output"
 readme = "README.md"
 requires-python = ">=3.12"
 authors = [{ name = "OneLiteFeather" }]
+license = "AGPL-3.0-or-later"
 dependencies = [
     "sqlalchemy>=2.0.44",
     "asyncpg>=0.31.0",

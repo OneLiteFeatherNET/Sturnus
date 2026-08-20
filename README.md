@@ -51,6 +51,16 @@ uv run mypy
 uv run ruff check
 ```
 
+## License
+
+Sturnus is licensed under the GNU Affero General Public License v3.0 or
+later (AGPL-3.0-or-later). See [LICENSE](LICENSE) for the full text. The
+AGPL was chosen deliberately because Sturnus is a self-hosted network
+service: anyone interacting with a modified deployment over Discord is
+entitled, under section 13 of the license, to receive that deployment's
+corresponding source. The bot's `/about` command exists to make that
+offer directly to users.
+
 ## Documentation
 
 - [docs/operations.md](docs/operations.md) — environment variables, the
