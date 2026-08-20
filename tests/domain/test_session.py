@@ -198,3 +198,54 @@ def test_idle_still_closes_after_a_return_without_speech() -> None:
     m.participants_changed(0, T0 + timedelta(minutes=1))
     m.participants_changed(1, T0 + timedelta(minutes=1, seconds=30))
     assert m.tick(T0 + timedelta(minutes=16, seconds=31)) is EndReason.IDLE_TIMEOUT
+
+
+def test_requested_close_is_reported_by_the_next_tick() -> None:
+    """The one end reason no clock can decide.
+
+    Every other reason is a time condition the machine evaluates itself.
+    That nothing decodes any more is knowable only to the capture path,
+    so it is pushed in -- but it still leaves through `tick()`, so the
+    caller's existing close/leave/reset sequence handles it unchanged.
+    """
+    m = machine()
+    m.participants_changed(1, T0)
+
+    m.request_close(EndReason.DECODE_FAILURE)
+
+    assert m.tick(T0 + timedelta(seconds=1)) is EndReason.DECODE_FAILURE
+    assert m.state is SessionState.CLOSING
+    assert m.end_reason is EndReason.DECODE_FAILURE
+    # Reported exactly once, like every other reason.
+    assert m.tick(T0 + timedelta(seconds=2)) is None
+
+
+def test_a_requested_close_outranks_a_timeout_that_is_also_due() -> None:
+    """A session that stopped decoding did not idle out; the row must say so."""
+    m = machine()
+    m.participants_changed(1, T0)
+    m.request_close(EndReason.DECODE_FAILURE)
+
+    assert m.tick(T0 + timedelta(minutes=30)) is EndReason.DECODE_FAILURE
+
+
+def test_requesting_a_close_on_an_idle_session_does_nothing() -> None:
+    m = machine()
+
+    m.request_close(EndReason.DECODE_FAILURE)
+
+    assert m.state is SessionState.IDLE
+    assert m.tick(T0) is None
+
+
+def test_reset_clears_a_requested_close() -> None:
+    """Otherwise the next session would close the moment it opened."""
+    m = machine()
+    m.participants_changed(1, T0)
+    m.request_close(EndReason.DECODE_FAILURE)
+    m.tick(T0 + timedelta(seconds=1))
+    m.reset()
+
+    m.participants_changed(1, T0 + timedelta(minutes=1))
+
+    assert m.tick(T0 + timedelta(minutes=2)) is None

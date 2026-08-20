@@ -258,6 +258,42 @@ merging into a trivial operation on a shared timeline instead of an
 error-prone heuristic. The padding costs memory, but no compute time:
 `vad_filter=True` lets Whisper skip over the silence.
 
+**Sturnus decodes Opus itself, and the library does not** (added 2026-08-20,
+after an incident). Sturnus's sink returns `True` from `wants_opus()`, so
+`discord-ext-voice-recv` constructs no `discord.opus.Decoder` and never reaches
+`_decode_packet`. That line let an `OpusError: corrupted stream` escape into
+`PacketRouter.run()`, which stops capture for *every* speaker in its `finally`;
+one unreadable frame ended a live recording that then closed with no audio and
+no transcription job, while everyone in the channel believed they were being
+recorded.
+
+The policy that replaces it:
+
+- **A frame that will not decode costs that frame and nothing else.** It is
+  discarded, and because audio is placed by RTP-derived absolute time rather
+  than by byte count, the gap becomes real silence in exactly the right place —
+  nothing after it shifts.
+- **Decoders are per speaker.** Opus is stateful; one stream falling apart says
+  nothing about the one next to it, and no failure of one speaker's stream ever
+  ends a session.
+- **The one exception is total failure.** If *no* stream decodes anything, the
+  session closes with `EndReason.DECODE_FAILURE` rather than producing empty
+  files while telling everyone they are recorded. That is the original incident
+  in a different costume, and it is the only decode failure that ends anything.
+- **We conceal what the network lost, never what our decoder could not read.**
+  Packet-loss concealment fills in lost frames for a capped run; a decode
+  failure is filled with real silence, because inventing audio to cover our own
+  error would put synthesised sound into a record people were told they are in.
+
+**Unattributed audio is never recorded, and always reported** (Spec 3.1). A
+speaker already talking when the bot connects has no SSRC-to-user mapping —
+Discord sends it only with its speaking event — so no consent record can be
+checked for them. Their frames are not decoded, not buffered and not written.
+They are counted, logged, and reported once into the channel with a request to
+pause and speak again, which is what makes Discord send the mapping. Identity is
+never inferred: a guess in front of a consent gate is not an acceptable trade
+for a second of audio.
+
 ### 6.2 Time reconstruction
 
 RTP timestamps run at 48000 ticks per second for Opus/48 kHz. The starting

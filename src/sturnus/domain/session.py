@@ -32,6 +32,13 @@ class EndReason(StrEnum):
     #: An orderly shutdown (e.g. `SIGTERM`) closed the session while it
     #: was still recording, before any of the machine's own timeouts fired.
     SHUTDOWN = "shutdown"
+    #: Every speaker's audio stopped decoding at once, so the session was
+    #: producing empty files while everyone in the channel believed they
+    #: were being recorded. A *single* speaker failing to decode is never
+    #: this -- it costs that person some audio and nothing else. This is
+    #: only the total case, and it exists because continuing to pretend
+    #: is the very failure the decode work was done to eliminate.
+    DECODE_FAILURE = "decode_failure"
 
 
 @dataclass(frozen=True)
@@ -63,6 +70,7 @@ class SessionMachine:
         self.end_reason: EndReason | None = None
         self._last_audio_at: datetime | None = None
         self._grace_since: datetime | None = None
+        self._requested_reason: EndReason | None = None
 
     def participants_changed(self, consented_count: int, now: datetime) -> None:
         """Reports how many consenting participants are in the channel."""
@@ -84,6 +92,24 @@ class SessionMachine:
     def audio_received(self, now: datetime) -> None:
         _require_aware(now)
         self._last_audio_at = now
+
+    def request_close(self, reason: EndReason) -> None:
+        """Arms a close that the next `tick()` reports, from outside the clock.
+
+        Every other reason this machine produces is a *time* condition it
+        can evaluate itself. This one cannot be: only the capture path
+        knows that nothing is decoding any more. Routing it through the
+        machine, rather than letting the caller close the session
+        directly, keeps a single exit -- the reason still comes back from
+        `tick()`, so the client's existing "close, leave the channel,
+        reset" sequence handles it with no new path to get wrong.
+
+        Idempotent, and a no-op on a session that is IDLE or already
+        CLOSING: there is nothing to end.
+        """
+        if self.state in (SessionState.IDLE, SessionState.CLOSING):
+            return
+        self._requested_reason = reason
 
     def tick(self, now: datetime) -> EndReason | None:
         """Checks the time conditions. Returns the reason once the session closes.
@@ -123,9 +149,16 @@ class SessionMachine:
         self.end_reason = None
         self._last_audio_at = None
         self._grace_since = None
+        self._requested_reason = None
 
     def _due_reason(self, now: datetime) -> EndReason | None:
         assert self.started_at is not None
+        # Checked before the timeouts: an explicitly requested close is a
+        # statement about the present, not a deadline that may or may not
+        # have passed, and reporting a timeout instead would record the
+        # wrong reason on the session row.
+        if self._requested_reason is not None:
+            return self._requested_reason
         if now - self.started_at > timedelta(hours=self._timeouts.max_session_hours):
             return EndReason.MAX_DURATION
         if self._grace_since is not None and now - self._grace_since > timedelta(

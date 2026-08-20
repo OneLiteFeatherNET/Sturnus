@@ -10,6 +10,7 @@ database -- that is exactly what `ReadinessState` decouples it from.
 from aiohttp.test_utils import TestClient, TestServer
 
 from sturnus.infrastructure.health import ReadinessState, health_app
+from sturnus.infrastructure.metrics import Counters
 
 
 async def test_healthz_is_always_ok() -> None:
@@ -46,7 +47,24 @@ async def test_version_reports_the_installed_package_version() -> None:
         assert "version" in body
 
 
-async def test_metrics_is_reachable() -> None:
-    async with TestClient(TestServer(health_app(ReadinessState()))) as client:
+async def test_metrics_is_reachable_before_anything_has_been_counted() -> None:
+    """An empty exposition is a valid Prometheus response, not a 404."""
+    async with TestClient(TestServer(health_app(ReadinessState(), Counters()))) as client:
         response = await client.get("/metrics")
         assert response.status == 200
+        assert await response.text() == ""
+
+
+async def test_metrics_renders_what_has_been_counted() -> None:
+    """The voice counters are how a silent capture failure becomes visible.
+
+    Logs and a message in the channel are the other two answers; this one
+    is the one that can be alerted on without a human reading anything.
+    """
+    counters = Counters()
+    counters.inc("sturnus_voice_frames_discarded_total", 7.0)
+
+    async with TestClient(TestServer(health_app(ReadinessState(), counters))) as client:
+        response = await client.get("/metrics")
+        assert response.status == 200
+        assert "sturnus_voice_frames_discarded_total 7" in await response.text()

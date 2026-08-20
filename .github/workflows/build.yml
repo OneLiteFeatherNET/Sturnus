@@ -50,6 +50,14 @@ jobs:
       - name: uv.lock must pin the same version as pyproject.toml
         run: python3 scripts/check_lock_version.py
       - run: uv sync --all-groups --locked
+      # Sturnus decodes Opus itself now (src/sturnus/infrastructure/discord/decoding.py),
+      # so libopus is a *test-time* dependency and not only a runtime one: the
+      # decode-resilience tests construct a real discord.opus.Decoder and feed it
+      # deliberately corrupt frames. The Dockerfile already installs the same
+      # package for the shipped image; this makes the previously undeclared
+      # dependency explicit for CI too.
+      - name: Install libopus (see Dockerfile — decoding tests need the real codec)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libopus0
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run mypy

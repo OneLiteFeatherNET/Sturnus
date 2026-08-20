@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from aiohttp import web
 
 from sturnus import __version__
+from sturnus.infrastructure.metrics import COUNTERS, Counters, render_prometheus
 
 
 @dataclass
@@ -33,8 +34,15 @@ class ReadinessState:
         return self.discord_connected and self.database_reachable
 
 
-def health_app(state: ReadinessState) -> web.Application:
-    """Builds the aiohttp application serving `/healthz`, `/readyz`, `/metrics`, `/version`."""
+def health_app(state: ReadinessState, counters: Counters | None = None) -> web.Application:
+    """Builds the aiohttp application serving `/healthz`, `/readyz`, `/metrics`, `/version`.
+
+    `counters` defaults to the process-wide instance every production
+    caller shares, so nothing has to be threaded through four
+    constructors; a test passes its own and asserts on it without touching
+    global state.
+    """
+    exported = counters if counters is not None else COUNTERS
 
     async def healthz(_request: web.Request) -> web.Response:
         # Liveness only: the process is running and its event loop answers
@@ -56,10 +64,9 @@ def health_app(state: ReadinessState) -> web.Application:
         )
 
     async def metrics(_request: web.Request) -> web.Response:
-        # No metrics backend is wired up yet; an empty exposition is still
-        # a valid Prometheus response, so the endpoint doesn't 404 while
-        # nothing has been instrumented.
-        return web.Response(text="", content_type="text/plain")
+        # An empty exposition is still a valid Prometheus response, which
+        # is what this returns before anything has been counted.
+        return web.Response(text=render_prometheus(exported.snapshot()), content_type="text/plain")
 
     async def version(_request: web.Request) -> web.Response:
         return web.json_response({"version": __version__})
@@ -76,14 +83,16 @@ def health_app(state: ReadinessState) -> web.Application:
     return app
 
 
-async def start_health_server(state: ReadinessState, port: int) -> web.AppRunner:
+async def start_health_server(
+    state: ReadinessState, port: int, counters: Counters | None = None
+) -> web.AppRunner:
     """Starts the health app on `port` and returns the runner so it can be torn down.
 
     Bound to `0.0.0.0`: this listens inside the pod network, not on a
     public interface, so the wide bind is scoped by Kubernetes networking
     rather than by the application.
     """
-    app = health_app(state)
+    app = health_app(state, counters)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)

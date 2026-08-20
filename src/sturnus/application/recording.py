@@ -198,6 +198,30 @@ class RecordingService:
         writer.write(at, pcm)
         self._machine.audio_received(now)
 
+    def request_close(self, reason: EndReason) -> None:
+        """Arms an out-of-band close that the next `tick()` acts on.
+
+        The capture side calls this when every speaker's audio has stopped
+        decoding: the session would otherwise run to its idle timeout
+        writing empty files while everyone in the channel believes they
+        are being recorded. Routed through the machine so the close still
+        comes back out of `tick()` and the caller's existing close/leave/
+        reset sequence handles it unchanged.
+        """
+        self._machine.request_close(reason)
+
+    def speaker_stream_ended(self, ssrc: int) -> None:
+        """Retires one SSRC's RTP reference point after that stream ends.
+
+        SSRCs are per-connection, not per-user: a participant who
+        reconnects comes back under a new one, and Discord may reissue an
+        abandoned one. Keeping a stale reference would place the next
+        stream's packets against the wrong origin. Called from the voice
+        adapter on the library's `voice_member_disconnect` event, which is
+        also where the decoder for that SSRC is evicted.
+        """
+        self._clock.reset(ssrc)
+
     async def tick(self, now: datetime) -> EndReason | None:
         """Forwards to the machine and closes the session once it reports a reason."""
         reason = self._machine.tick(now)
