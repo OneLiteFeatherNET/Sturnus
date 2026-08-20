@@ -13,6 +13,8 @@
     // Prose specs, plans, and verification checklists, not maintained documentation.
     "docs/**",
     // Ephemeral per-task briefs and fix reports, not maintained documentation.
-    ".superpowers/**"
+    ".superpowers/**",
+    // Manual verification transcripts, kept as run records rather than docs.
+    "scripts/**"
   ]
 }
