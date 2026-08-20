@@ -1,0 +1,94 @@
+name: image
+
+# The unit tests run against the dev environment, where every dependency
+# group is installed, so a package the shipped image needs but does not
+# declare passes every one of them and fails first in the cluster. That is
+# how `psycopg` -- which Alembic needs to run the worker's migrations at
+# startup -- shipped declared only under the `test` group: the worker
+# CrashLoopBackOff'd on ModuleNotFoundError, and since it owns the schema,
+# nothing else came up either.
+#
+# So this builds the real image and starts all three entrypoints in it.
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'src/**'
+      - '.github/workflows/image.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'Dockerfile'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - 'src/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  entrypoints:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t sturnus:ci .
+
+      # Each entrypoint is given a complete configuration pointing at a host
+      # that does not resolve. A correctly built image gets as far as trying
+      # to connect and fails there; an image missing a dependency, an entry
+      # point, or a data file fails earlier and differently. The distinction
+      # between those two failures is the whole test.
+      - name: Every entrypoint must reach its first connection attempt
+        run: |
+          set -euo pipefail
+          cat > /tmp/env <<'EOF'
+          STURNUS_DISCORD_TOKEN=not-a-real-token
+          STURNUS_DATABASE_URL=postgresql+asyncpg://u:p@unresolvable.invalid/db
+          STURNUS_S3_ENDPOINT=https://s3.invalid
+          STURNUS_S3_BUCKET=bucket
+          STURNUS_S3_ACCESS_KEY=not-a-real-key
+          STURNUS_S3_SECRET_KEY=not-a-real-key
+          STURNUS_MASTER_KEY=not-a-real-key
+          STURNUS_MASTER_KEY_ID=v1
+          STURNUS_RECORDING_DIR=/data/recordings
+          STURNUS_OUTLINE_BASE_URL=https://wiki.invalid
+          STURNUS_OUTLINE_CLIENT_ID=client-id
+          STURNUS_OUTLINE_CLIENT_SECRET=not-a-real-secret
+          STURNUS_OUTLINE_REDIRECT_URI=https://sturnus.invalid/oauth/callback
+          STURNUS_OUTLINE_SERVICE_KEY=not-a-real-key
+          EOF
+
+          failed=0
+          for entrypoint in sturnus-bot sturnus-worker sturnus-link; do
+            echo "::group::$entrypoint"
+            out=$(docker run --rm --env-file /tmp/env --entrypoint sh sturnus:ci \
+                    -c "timeout 25 $entrypoint 2>&1" || true)
+            echo "$out"
+            echo "::endgroup::"
+
+            # A missing dependency, a missing console script, or a data file
+            # left out of the image all land here.
+            if grep -qE "ModuleNotFoundError|ImportError|No such file or directory|not found" <<<"$out"; then
+              echo "::error::$entrypoint failed on a packaging error, not on configuration or connectivity. The image is missing something it needs at runtime."
+              failed=1
+              continue
+            fi
+
+            # A required setting missing from the list above means the image's
+            # settings classes and this list have drifted apart.
+            if grep -q "Field required" <<<"$out"; then
+              echo "::error::$entrypoint reports a required setting that this job does not provide. Add it here and to docs/operations.md section 1."
+              failed=1
+              continue
+            fi
+            echo "$entrypoint reached its first connection attempt"
+          done
+          exit $failed
