@@ -23,15 +23,21 @@ what succeeded and what did not.
 
 from __future__ import annotations
 
+import logging
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 from sturnus.application.ports import Clock
+from sturnus.application.reconfigure import Reconfigure, ReconfigureResult
 from sturnus.application.setup_plan import PermissionChange, RoleAction, SetupPlan, plan_setup
 from sturnus.domain import settings
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.discord.config_cog import render_write_result
 from sturnus.infrastructure.discord.permissions import require_admin
+
+log = logging.getLogger(__name__)
 
 #: Reason recorded on the audit log for every permission change setup makes.
 _AUDIT_REASON = "Sturnus /setup: consent protection (Spec 3.1)"
@@ -40,9 +46,14 @@ _AUDIT_REASON = "Sturnus /setup: consent protection (Spec 3.1)"
 class SetupCog(commands.Cog):
     """Admin-only `/setup` command; every reply is ephemeral."""
 
-    def __init__(self, store: ConfigStore, clock: Clock) -> None:
+    def __init__(self, store: ConfigStore, clock: Clock, reconcile: Reconfigure) -> None:
         self._store = store
         self._clock = clock
+        #: `/setup` writes the two keys that decide whether a guild can
+        #: record at all, so it has exactly the same obligation `/config
+        #: set` has: apply them without a restart, and say what took
+        #: effect rather than confirming a write and implying the rest.
+        self._reconcile = reconcile
         super().__init__()
 
     @app_commands.command(
@@ -150,6 +161,12 @@ class SetupCog(commands.Cog):
         for key, value in writes.items():
             await self._store.set(guild.id, key, value, now)
 
+        try:
+            result: ReconfigureResult | None = await self._reconcile(guild.id)
+        except Exception:
+            log.exception("Reconcile after /setup failed for guild %d", guild.id)
+            result = None
+
         applied, permission_errors = await self._apply_permission_changes(
             channel, guild.default_role, role, plan.permission_changes
         )
@@ -160,7 +177,14 @@ class SetupCog(commands.Cog):
 
         await interaction.followup.send(
             _render_summary(
-                writes, applied, permission_errors, role_error, missing, plan.role_action, role
+                writes,
+                applied,
+                permission_errors,
+                role_error,
+                missing,
+                plan.role_action,
+                role,
+                result,
             ),
             ephemeral=True,
         )
@@ -225,6 +249,7 @@ def _render_summary(
     missing: list[str],
     role_action: RoleAction,
     role: discord.Role | None,
+    result: ReconfigureResult | None,
 ) -> str:
     """Builds the ephemeral reply: what changed, what did not, what is still missing.
 
@@ -257,7 +282,25 @@ def _render_summary(
     else:
         lines.append("All required configuration is now set.")
 
+    lines.extend(_effect_lines(writes, result))
+
     return "\n".join(lines)
+
+
+def _effect_lines(writes: dict[str, str], result: ReconfigureResult | None) -> list[str]:
+    """Says, per written key, whether it is in force yet.
+
+    Reuses `/config set`'s own wording (`render_write_result`) rather than
+    a second phrasing of the same four outcomes: two renderings of "this
+    is deferred behind a recording" would drift, and the one that drifts
+    is the one that starts lying.
+    """
+    if not writes:
+        return []
+    lines = ["**In effect**"]
+    for key in sorted(writes):
+        lines.append(f"- {render_write_result(key, writes[key], result)}")
+    return lines
 
 
 def _role_action_line(role_action: RoleAction, role: discord.Role | None) -> str:

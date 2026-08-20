@@ -85,17 +85,46 @@ class SessionMachine:
         _require_aware(now)
         self._last_audio_at = now
 
+    def retime(self, timeouts: SessionTimeouts) -> None:
+        """Swaps the timeouts in force, valid in *any* state, mid-session included.
+
+        Safe because of one invariant, which anything added to
+        `SessionTimeouts` must preserve: the timeouts are read **only**
+        inside `_due_reason`, which runs on the next `tick()`/`due_reason()`
+        and nowhere else. Nothing is captured at construction, no
+        transition already taken is revisited, and no bookkeeping
+        (`started_at`, `_last_audio_at`, `_grace_since`) is touched -- a
+        swap therefore changes the *next* decision and nothing in flight.
+        A future field that is captured at construction time would break
+        that guarantee and must not be added without revisiting this.
+
+        Shortening a timeout below the running session's elapsed time is
+        deliberately allowed: the session then closes on the very next
+        `tick()`, but through the ordinary path -- `tick()` reports a
+        reason, and the caller's `close()` still encrypts, uploads and
+        enqueues everything recorded so far. A recording is never
+        discarded by a configuration change, only ended earlier.
+        """
+        self._timeouts = timeouts
+
+    def due_reason(self, now: datetime) -> EndReason | None:
+        """Reports what `tick()` would decide right now, without deciding it.
+
+        Pure: no state changes, so a caller can ask "would this close the
+        session?" -- e.g. an admin command reporting that the value just
+        set is already exceeded -- without closing it as a side effect.
+        """
+        _require_aware(now)
+        if self.state in (SessionState.IDLE, SessionState.CLOSING):
+            return None
+        return self._due_reason(now)
+
     def tick(self, now: datetime) -> EndReason | None:
         """Checks the time conditions. Returns the reason once the session closes.
 
         Reports each closure exactly once; further calls return None.
         """
-        _require_aware(now)
-        if self.state in (SessionState.IDLE, SessionState.CLOSING):
-            return None
-        assert self.started_at is not None
-
-        reason = self._due_reason(now)
+        reason = self.due_reason(now)
         if reason is None:
             return None
         self.state = SessionState.CLOSING

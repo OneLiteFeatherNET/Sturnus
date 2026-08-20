@@ -159,6 +159,59 @@ class RecordingService:
     def session_id(self) -> int | None:
         return self._session_id
 
+    @property
+    def channel_id(self) -> int:
+        """The voice channel this service opens its session rows against."""
+        return self._channel_id
+
+    def apply_tunables(self, timeouts: SessionTimeouts, retention_days: int) -> None:
+        """Adopts new timeouts and retention immediately, session in progress or not.
+
+        Both values are read at exactly one point each and nowhere else:
+        `_retention_days` only inside `close()`, when it stamps
+        `retention_until` on the jobs it enqueues, and the timeouts only
+        inside the machine's `_due_reason`, on the next `tick()` (see
+        `SessionMachine.retime`). Neither is captured anywhere at
+        construction, so swapping them touches nothing in flight -- no
+        writer, no file, no open session row.
+
+        That a mid-session retention change applies to the session in
+        progress is the intended semantics, not an accident: the value in
+        force when a recording is *filed* is the one that governs it.
+        """
+        self._retention_days = retention_days
+        self._machine.retime(timeouts)
+
+    def retarget(self, channel_id: int, channel_name: str | None) -> None:
+        """Points future sessions at a different voice channel. Idle only.
+
+        `_channel_id` is read once per session, by `open_session` on the
+        IDLE -> RECORDING edge, so changing it between sessions is
+        invisible to everything else. Changing it *during* one would leave
+        the already-written `sessions` row naming one channel while the
+        audio kept arriving from another -- a protocol whose header lies
+        about where it came from. The caller must therefore wait for the
+        session to end (see `SturnusClient._apply_pending`), which is what
+        this assertion enforces rather than silently allowing.
+
+        `channel_name` is required rather than defaulted: a caller that
+        moves the channel and forgets the name would leave the next
+        protocol headed with the room the recording did not come from,
+        which is worse than the `None` fallback to a bare link.
+        """
+        assert not self.is_recording, "retarget() must not run mid-session"
+        self._channel_id = channel_id
+        self._channel_name = channel_name
+
+    def due_reason(self, now: datetime) -> EndReason | None:
+        """What `tick()` would decide right now, without deciding it.
+
+        Lets a caller that has just shortened a timeout report honestly
+        that the session in progress already exceeds it, without being
+        the thing that closes it.
+        """
+        return self._machine.due_reason(now)
+
     async def participants_changed(self, consented_count: int, now: datetime) -> None:
         """Forwards to the machine; opens a session row on the IDLE -> RECORDING edge."""
         was_idle = self._machine.state is SessionState.IDLE

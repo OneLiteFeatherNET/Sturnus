@@ -356,8 +356,62 @@ naming the guild, rather than costing the protocol.
 Until every required key (`voice_channel_id`, `consent_role_id`,
 `document_target`, `policy_version`, `policy_url`, `admin_role_id`) is set,
 the bot logs a warning naming the guild and skips building that guild's
-recording pipeline entirely (`SturnusClient._configure_guild`) — it will
-not join the voice channel or record anything for that guild.
+recording pipeline entirely (`SturnusClient._desired_config`) — it will
+not join the voice channel or record anything for that guild. It re-checks
+every ten seconds, so the pipeline appears as soon as the keys are there;
+no restart is involved (see 4.1).
+
+### 4.1 Changing configuration at runtime
+
+The bot reconciles every guild against `guild_config` roughly every ten
+seconds (`SturnusClient._tick_guild`), and immediately whenever `/config
+set`, `/config clear` or `/setup` writes something. Configuration changes
+therefore take effect without restarting the pod — with the exceptions
+below, which the commands themselves also say out loud.
+
+**Live immediately, even in the middle of a recording.**
+`empty_grace_seconds`, `idle_timeout_minutes`, `max_session_hours`,
+`audio_retention_days`. Each is read at exactly one point — the next
+timeout check, or the moment the session is filed — so the new value is
+simply the one used next. Shortening a timeout below the age of the
+session in progress closes that session on the next tick; that happens
+through the ordinary path (encrypt → upload → enqueue), so it ends the
+recording earlier but never discards it. `/config set` warns explicitly
+when it detects this.
+
+**Live immediately, and never were stale.** `admin_role_id`,
+`policy_version`, `policy_url` (read per command invocation, and by the
+consent cache with a five-second TTL), and `document_target`,
+`document_provider`, `merge_gap_seconds` (read per job by the *worker*
+process, not the bot at all).
+
+**Deferred until the recording in progress ends.** `voice_channel_id` and
+`consent_role_id`. These decide which channel a session's row names and
+which role both the headcount and the per-packet filter agree on;
+swapping them mid-session would mean a protocol whose header names one
+channel while its audio came from another, an orphaned plaintext file on
+the PVC, and a voice connection nobody would ever disconnect. The change
+is stored right away and applied the instant the session has finished
+closing — after its audio is encrypted, uploaded and enqueued. **The
+recording is never lost.** The wait is bounded by `max_session_hours`
+(default 4 h). `/config show` names the keys still waiting, and `/config
+apply force:true` ends the session in progress deliberately — uploading
+and transcribing it normally — and applies the change at once.
+
+**Needs a pod restart.** `publish_poll_seconds` only. The publish sweep
+runs on one process-wide interval taken from that setting's *default*
+rather than per-guild scheduling (a deliberate simplification, see
+`_PUBLISH_POLL_SECONDS` in `sturnus.entrypoints.bot`), so a per-guild
+value for it is not read at runtime at all. `/config set
+publish_poll_seconds` says so instead of pretending it applied.
+
+**After editing `guild_config` directly with SQL.** `ConfigStore.set`
+validates integer keys; a raw `UPDATE` does not. An unparseable value is
+logged once and the guild keeps its last known-good configuration rather
+than falling back to defaults (which would silently un-configure a
+working guild). Run `/config apply` to re-read immediately instead of
+waiting for the next tick; `/config show` will tell you whether what is
+stored is actually what is running.
 
 ## 5. Troubleshooting
 

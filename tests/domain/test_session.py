@@ -198,3 +198,57 @@ def test_idle_still_closes_after_a_return_without_speech() -> None:
     m.participants_changed(0, T0 + timedelta(minutes=1))
     m.participants_changed(1, T0 + timedelta(minutes=1, seconds=30))
     assert m.tick(T0 + timedelta(minutes=16, seconds=31)) is EndReason.IDLE_TIMEOUT
+
+
+def test_retime_changes_the_next_decision_mid_recording() -> None:
+    """The invariant behind `retime`: timeouts are read only on the next tick."""
+    m = machine()
+    m.participants_changed(1, T0)
+    m.audio_received(T0)
+    assert m.tick(T0 + timedelta(minutes=10)) is None
+
+    m.retime(SessionTimeouts(empty_grace_seconds=60, idle_timeout_minutes=5, max_session_hours=4))
+
+    assert m.state is SessionState.RECORDING, "retiming must not touch the session itself"
+    assert m.started_at == T0, "nor its bookkeeping"
+    assert m.tick(T0 + timedelta(minutes=10)) is EndReason.IDLE_TIMEOUT
+
+
+def test_retime_to_an_already_exceeded_value_closes_on_the_next_tick() -> None:
+    """Deliberate, and it goes through the ordinary path -- nothing is discarded.
+
+    `tick()` reporting a reason is what makes the caller run `close()`,
+    which encrypts, uploads and enqueues everything recorded so far.
+    Shortening a timeout ends a recording earlier; it never drops one.
+    """
+    m = machine()
+    m.participants_changed(1, T0)
+    m.retime(SessionTimeouts(empty_grace_seconds=60, idle_timeout_minutes=15, max_session_hours=1))
+    assert m.tick(T0 + timedelta(hours=2)) is EndReason.MAX_DURATION
+    assert m.state is SessionState.CLOSING
+
+
+def test_retime_while_closing_does_not_resurrect_the_session() -> None:
+    m = machine()
+    m.participants_changed(1, T0)
+    assert m.tick(T0 + timedelta(hours=5)) is EndReason.MAX_DURATION
+    m.retime(SessionTimeouts(empty_grace_seconds=60, idle_timeout_minutes=15, max_session_hours=9))
+    assert m.state is SessionState.CLOSING
+    assert m.tick(T0 + timedelta(hours=6)) is None
+
+
+def test_due_reason_reports_without_deciding() -> None:
+    """What lets `/config set` warn honestly without being the thing that closes."""
+    m = machine()
+    m.participants_changed(1, T0)
+    m.retime(SessionTimeouts(empty_grace_seconds=60, idle_timeout_minutes=15, max_session_hours=1))
+
+    assert m.due_reason(T0 + timedelta(hours=2)) is EndReason.MAX_DURATION
+    assert m.state is SessionState.RECORDING, "asking must not close the session"
+    assert m.end_reason is None
+    # ... and asking twice is still just asking.
+    assert m.due_reason(T0 + timedelta(hours=2)) is EndReason.MAX_DURATION
+
+
+def test_due_reason_is_none_while_idle() -> None:
+    assert machine().due_reason(T0) is None
