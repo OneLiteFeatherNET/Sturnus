@@ -25,16 +25,18 @@ them to exercise the lifecycle logic.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import discord
+import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.ports import AudioWriter, Clock, SessionKey
 from sturnus.application.recording import RecordingService
-from sturnus.domain.session import EndReason, SessionTimeouts
+from sturnus.domain.session import SessionTimeouts
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import (
@@ -43,11 +45,7 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
-from sturnus.infrastructure.discord.client import (
-    REJOIN_COOLDOWN,
-    SturnusClient,
-    _GuildRecording,
-)
+from sturnus.infrastructure.discord.client import SturnusClient, _GuildRecording
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState
 
@@ -170,11 +168,14 @@ class FakeEncryptor:
 class FakeVoiceReceiver:
     """Satisfies the `VoiceReceiver` port without a real gateway connection."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, join_fails: bool = False) -> None:
         self.joined: list[int] = []
         self.left = 0
+        self.join_fails = join_fails
 
     async def join(self, channel_id: int) -> None:
+        if self.join_fails:
+            raise RuntimeError("the gateway said no")
         self.joined.append(channel_id)
 
     async def leave(self) -> None:
@@ -343,19 +344,17 @@ async def test_two_consecutive_sessions_through_the_client(tmp_path: Path) -> No
     assert list(tmp_path.rglob("*")) == []  # both sessions cleaned up after themselves
 
 
-async def test_capture_failure_does_not_rejoin_straight_back_into_itself(
-    tmp_path: Path,
+async def test_a_join_that_fails_ends_the_session_rather_than_leaving_it_open(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A session that ended because nothing could be heard must not start another.
+    """A session with no capture behind it must not look like a quiet meeting.
 
-    Closing the session makes the bot leave the channel, and leaving is
-    itself a voice-state update. Without a cooldown the very next event
-    opens a fresh session row, rejoins with fresh decoders, meets the
-    same fault and closes again -- a loop of empty sessions, each one
-    announcing to everyone present that they are being recorded.
-
-    The cooldown is a pause, not a giving up: once it has passed, the
-    next participant starts a real session again.
+    `join` raising used to propagate into discord.py's event dispatcher
+    and leave the session row open with nothing listening: no frame and no
+    speaking event would ever arrive, so it closed at the idle timeout,
+    indistinguishable in the database from a channel where nobody spoke.
+    That row is the whole reason the production incident went unnoticed for
+    hours, so a capture that never started gets its own end reason.
     """
     clock = FakeClock(T0)
     sessions = FakeSessions()
@@ -372,7 +371,7 @@ async def test_capture_failure_does_not_rejoin_straight_back_into_itself(
         encryptor=FakeEncryptor(),
         retention_days=30,
     )
-    voice = FakeVoiceReceiver()
+    voice = FakeVoiceReceiver(join_fails=True)
     client = _client(clock)
     client._guilds[GUILD_ID] = _GuildRecording(
         channel_id=CHANNEL_ID, role_id=ROLE_ID, service=service, voice=voice
@@ -381,31 +380,17 @@ async def test_capture_failure_does_not_rejoin_straight_back_into_itself(
     empty_channel = _voice_channel(CHANNEL_ID, members=[])
     guild = _guild(GUILD_ID, empty_channel)
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
-    occupied = _voice_channel(CHANNEL_ID, members=[anna])
+    guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[anna])
 
-    guild.get_channel.return_value = occupied
-    await client.on_voice_state_update(anna, _voice_state(None), _voice_state(empty_channel))
-    assert voice.joined == [CHANNEL_ID]
+    with caplog.at_level(logging.ERROR, logger="sturnus.infrastructure.discord.client"):
+        await client.on_voice_state_update(anna, _voice_state(None), _voice_state(empty_channel))
 
-    # Capture dies: every stream stops decoding, so the adapter arms a
-    # close that is nothing like a timeout.
-    service.request_close(EndReason.DECODE_FAILURE)
+    assert len(caplog.records) == 1, "a capture that never started is never silent"
+    assert sessions.opened == [1], "the session row was already open by then"
+
     clock.advance(timedelta(seconds=1))
     await client._tick_all(clock.now())
 
-    assert sessions.closed == [(1, "decode_failure")]
+    assert sessions.closed == [(1, "capture_failure")], "not idle_timeout, fifteen minutes later"
     assert voice.left == 1
-
-    # The bot leaving is itself a voice-state update.
-    clock.advance(timedelta(seconds=1))
-    await client.on_voice_state_update(anna, _voice_state(occupied), _voice_state(occupied))
-
-    assert voice.joined == [CHANNEL_ID], "rejoining would meet the same fault"
-    assert sessions.opened == [1], "and would leave another empty session row behind"
     assert service.is_recording is False
-
-    clock.advance(REJOIN_COOLDOWN + timedelta(seconds=1))
-    await client.on_voice_state_update(anna, _voice_state(occupied), _voice_state(occupied))
-
-    assert voice.joined == [CHANNEL_ID, CHANNEL_ID], "a pause, not a giving up"
-    assert sessions.opened == [1, 2]

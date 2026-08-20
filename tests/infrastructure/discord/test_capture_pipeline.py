@@ -180,7 +180,6 @@ def build_sink(emitted: list[CaptureMessage]) -> RecordingSink:
         decoder=ResilientOpusDecoder(),
         clock=FakeClock(),
         emit=emitted.append,
-        counters=None,
     )
 
 

@@ -80,13 +80,12 @@ The design answer, implemented in `sturnus.infrastructure.discord.sink`:
 - **Unattributed audio is never decoded, never buffered, never written.** No
   consent record can be verified for an identity we do not know, and buffering
   unattributed speech in RAM is the wrong trade both legally and operationally.
-- **It is never silent, either.** It is counted
-  (`sturnus_voice_frames_unattributed_total`), logged at WARNING with the SSRC
-  and frame count, and reported once into the channel.
-- **The report is also the fix.** `VoiceReceiveAdapter.join` posts a one-time
-  notice asking anyone who was already speaking to pause and speak again —
-  stopping and restarting speech is precisely what makes Discord emit op 5, and
-  the bot has no way to request the mapping directly.
+- **It is never silent, either.** `RecordingSink._note_unattributed` logs one
+  WARNING per SSRC — once, however long the stream goes on, and capped at 256
+  distinct SSRCs, so a stuck stream at 50 frames a second cannot become a log
+  flood. The line names what a human has to do about it: pause and speak again.
+- **Nothing tells the affected participant, though.** See *Known limitations*
+  below: only the operator reading logs finds out.
 
 Identity *inference* (attributing an unmapped SSRC by elimination when exactly
 one channel member and exactly one SSRC are unaccounted for) was considered and
@@ -136,12 +135,16 @@ only when the sink returns `False`, and `_process_packet` calls
 wants Opus makes that line unreachable, through the library's documented public
 API, with no monkey-patching and nothing that a version bump can break quietly.
 
-- `sturnus.domain.stream_health` — what an accumulating run of failures *means*.
 - `sturnus.infrastructure.discord.decoding` — one `discord.opus.Decoder` per
   SSRC, mirroring `PacketRouter.decoders`; the only module importing
-  `discord.opus`.
+  `discord.opus`. It also holds the whole failure policy, which is one counter
+  and one threshold: consecutive unreadable frames per stream, one ERROR when a
+  stream crosses it, and — only when *every* live stream is over it —
+  `EndReason.DECODE_FAILURE` on the session row.
 - `sturnus.infrastructure.discord.sink` — `wants_opus() -> True`, a `write()`
   that cannot raise, and the consent gate ahead of the decoder.
+- `sturnus.infrastructure.discord.voice` — the thread hop, and turning capture
+  death into `EndReason.CAPTURE_FAILURE` instead of an idle timeout.
 
 `VoiceData.opus` is `packet.decrypted_data`, already stripped of RTP extension
 headers by `PacketDecryptor` before the router sees it, so it needs no further
@@ -164,8 +167,89 @@ client emitted LBRR at all; on every other loss the library was already doing
 the PLC we kept. Against that, the alternative was the whole session ending for
 every speaker.
 
-This is measured rather than argued: `sturnus_voice_frames_lost_total` and
-`sturnus_voice_frames_decoded_total` are exported on `/metrics`. **Named
-trigger:** if `frames_lost / frames_seen` exceeds roughly 2 % on a real session,
+**Named trigger:** if participants report audible dropouts on real sessions,
 implement FEC by holding one frame back per SSRC — latency is free here, since
-Sturnus transcribes offline after the session closes.
+Sturnus transcribes offline after the session closes. There is no counter to
+decide that from yet; see *Known limitations*.
+
+## Known limitations
+
+Each of these was addressed by machinery that was written on
+`fix/voice-decode-resilience` and then taken back out, because the branch had
+grown well past the one defect it exists to fix and the additions were producing
+their own silent failures faster than review could close them. The concerns are
+real; the implementations were not yet worth their surface. They are written
+down here so they survive as work to do rather than as something nobody noticed.
+
+### A database outage stalls the frame drain
+
+`_record` awaits `ConsentCache.may_record`, and `ConsentCache` reads through to
+the database whenever an entry is missing or older than its five-second TTL.
+The drain is a single consumer, and everything queued behind it is somebody's
+audio, so one slow query stalls capture for **every** speaker in the channel for
+as long as it takes, not just the packet in hand.
+
+*What was tried:* a non-blocking `verdict()` that answered from cache and
+refreshed beside the drain. It made the failure worse in a way that matters
+more: with the database down nothing was ever cached, every frame got a `None`
+verdict, nothing was recorded, no ERROR was logged, no notice reached the
+channel, and the session closed as `idle_timeout` — a database outage turned
+into a silent stop, which is strictly worse than a stall you can see. A
+non-blocking cache is still probably right; it needs a loud, distinguishable
+failure of its own, and its own review.
+
+### An audio backlog is unbounded
+
+The hand-off from the extension's threads to the event loop is a plain
+`asyncio.Queue` with no maximum. If the loop falls far enough behind, frames
+accumulate in memory with nothing to stop them.
+
+*What was tried:* a two-lane `CaptureChannel` — a bounded audio lane that
+dropped the newest frame under load, and a separate unbounded control lane so an
+alarm could not be discarded along with the audio it was reporting on. The
+separate lane brought its own failure mode: a control message can overtake the
+audio ahead of it, which reorders `SpeakerStreamEnded` ahead of the frames it
+should follow and corrupts that SSRC's RTP reference point. Bounding the audio
+is worth doing. Reordering it against control messages is not, and the two need
+to be separated before either lands.
+
+### Capture failure can loop
+
+A session that ends with `capture_failure` or `decode_failure` makes the bot
+leave the channel, and leaving is itself a voice-state update. If the fault is
+persistent, the next event opens a fresh session row, rejoins, meets the same
+fault and closes again — a run of empty sessions, each one telling everyone
+present that they are being recorded.
+
+*What was tried:* a 15-minute per-guild rejoin cooldown with `blocked_until`
+bookkeeping on `_GuildRecording`. It works, but it is a second scheduling
+mechanism living beside the session machine's own, and it belongs in a change
+about rejoin policy rather than in one about Opus decoding.
+
+### Nobody in the channel is told
+
+Every failure here is visible to an operator — WARNING or ERROR in the log, and
+an end reason on the session row that says "we could not hear" rather than
+"nobody spoke". None of it reaches the people in the voice channel: a
+participant whose audio is unattributed, or who is in a session that just
+stopped capturing, learns nothing.
+
+*What was tried:* debounced `channel.send` notices posted from side tasks, plus
+a join-time hint asking anyone who was already speaking to pause and speak again
+(which is what makes Discord emit op 5 and supply the missing SSRC mapping).
+That hint is genuinely the only way to recover an already-speaking participant,
+so it is the piece most worth bringing back. It needs the task lifecycle,
+debounce and rate-limit handling to be reviewed on their own terms — a
+rate-limited `channel.send` awaited on the drain would stall every speaker's
+audio behind a courtesy message.
+
+### There are no voice metrics
+
+`/metrics` serves an empty Prometheus exposition. Frames decoded, discarded
+(by libopus error code), lost and unattributed are all counted nowhere, so
+questions like "is FEC worth implementing" and "how often does this actually
+happen" can only be answered from logs.
+
+*What was tried:* a small dependency-free counter registry wired into the sink,
+the decoder and `/metrics`. Removed with the rest of the growth, not because
+counting is wrong but because it arrived as a passenger.

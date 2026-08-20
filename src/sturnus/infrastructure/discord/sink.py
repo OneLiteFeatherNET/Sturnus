@@ -35,9 +35,10 @@ Threading: `write()` runs on the packet-router thread and listeners run on
 the sink-event-router thread, which dispatches while holding the packet
 router's lock, so the two are already mutually exclusive and sink-side
 state needs no lock of its own. The flip side is that a slow listener
-stalls routing for every speaker, so listeners only mutate small in-memory
-maps and never touch I/O or the event loop directly. Everything that has
-to reach the loop leaves as an immutable message through `emit`.
+stalls routing for every speaker, so per-frame work stays to small
+in-memory maps -- the only logging done here is edge-triggered and
+bounded. Everything that has to reach the loop leaves as an immutable
+message through `emit`.
 
 Unlike the callback this replaces, all of it is testable without a voice
 connection: see `tests/infrastructure/discord/test_sink.py`.
@@ -55,26 +56,17 @@ import discord
 from discord.ext import voice_recv
 
 from sturnus.application.ports import Clock
-from sturnus.domain.stream_health import StreamState, StreamStats
-from sturnus.infrastructure import metrics
-from sturnus.infrastructure.metrics import Counters
 
 log = logging.getLogger(__name__)
 
-#: How many unattributed frames pass between two notices for one SSRC.
-#: 250 frames is 5 s at Discord's 50 fps.
-UNATTRIBUTED_NOTICE_EVERY = 250
-#: How many notices one SSRC may ever produce, so a stuck stream cannot
-#: turn into a log flood or a wall of channel messages.
-UNATTRIBUTED_NOTICE_LIMIT = 3
 #: Backstop on the unattributed bookkeeping, for the same reason
 #: `ResilientOpusDecoder` caps its decoders: this process stays up for
 #: hours and an SSRC is not a stable identity.
 MAX_TRACKED_UNATTRIBUTED = 256
+
 #: How often an *unexpected* error inside `write()` is logged with its
 #: traceback. The first one always is; after that one in this many, so a
-#: fault that breaks every frame cannot bury a pod's log pipeline. Nothing
-#: is hidden by it -- `sturnus_voice_sink_errors_total` counts every one.
+#: fault that breaks every frame cannot bury a pod's log pipeline.
 SINK_ERROR_LOG_EVERY = 500
 
 
@@ -99,20 +91,6 @@ class CapturedFrame:
 
 
 @dataclass(frozen=True, slots=True)
-class UnattributedAudio:
-    """Audio arrived for an SSRC no member is mapped to yet.
-
-    Never decoded, never buffered, never written: no consent record can be
-    verified for an identity we do not know. But it is never silent
-    either, which is the whole point -- silence in the face of dropped
-    audio is the bug.
-    """
-
-    ssrc: int
-    frames: int
-
-
-@dataclass(frozen=True, slots=True)
 class SpeakerStreamEnded:
     """A participant's stream ended, so its RTP reference point is stale."""
 
@@ -120,17 +98,8 @@ class SpeakerStreamEnded:
 
 
 @dataclass(frozen=True, slots=True)
-class StreamStateChanged:
-    """One speaker's decode health crossed a threshold. Reported once per crossing."""
-
-    ssrc: int
-    state: StreamState
-    stats: StreamStats
-
-
-@dataclass(frozen=True, slots=True)
-class DecodeTotalFailure:
-    """Nothing decodes on any stream. The only decode failure that ends a session."""
+class DecodeFailure:
+    """Nothing decodes on any live stream. The only decode failure that ends a session."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,14 +109,7 @@ class CaptureStopped:
     error: BaseException | None
 
 
-CaptureMessage = (
-    CapturedFrame
-    | UnattributedAudio
-    | SpeakerStreamEnded
-    | StreamStateChanged
-    | DecodeTotalFailure
-    | CaptureStopped
-)
+CaptureMessage = CapturedFrame | SpeakerStreamEnded | DecodeFailure | CaptureStopped
 
 
 class OpusDecoderPool(Protocol):
@@ -166,7 +128,7 @@ class OpusDecoderPool(Protocol):
 
 
 class RecordingSink(voice_recv.AudioSink):
-    """Receives raw Opus, applies the consent gate, decodes, and emits frames.
+    """Receives raw Opus, applies the role gate, decodes, and emits frames.
 
     Knows nothing about asyncio, the database or `RecordingService`: it
     runs a fixed, short pipeline per frame on the router thread and hands
@@ -182,7 +144,6 @@ class RecordingSink(voice_recv.AudioSink):
         decoder: OpusDecoderPool,
         clock: Clock,
         emit: Callable[[CaptureMessage], None],
-        counters: Counters | None = None,
     ) -> None:
         # No destination: this sink is an endpoint, not a link in a
         # transformer chain, so it registers no child.
@@ -191,8 +152,7 @@ class RecordingSink(voice_recv.AudioSink):
         self._decoder = decoder
         self._clock = clock
         self._emit = emit
-        self._counters = counters or metrics.COUNTERS
-        self._unattributed: dict[int, int] = {}
+        self._unattributed: set[int] = set()
         self._sink_errors = 0
         self._cleaned_up = False
 
@@ -214,10 +174,9 @@ class RecordingSink(voice_recv.AudioSink):
             # Reaching here means something we did not anticipate:
             # everything expected -- a frame that will not decode, a lost
             # frame, an unmapped SSRC -- is handled below without raising.
-            # Counted always, logged with a traceback the first time and
-            # then sparsely, because at 50 frames per second per speaker
-            # an unrate-limited traceback is its own outage.
-            self._counters.inc(metrics.SINK_ERRORS)
+            # Logged with a traceback the first time and then sparsely,
+            # because at 50 frames per second per speaker an unrate-limited
+            # traceback is its own outage.
             self._sink_errors += 1
             if self._sink_errors == 1 or self._sink_errors % SINK_ERROR_LOG_EVERY == 0:
                 log.exception(
@@ -267,7 +226,7 @@ class RecordingSink(voice_recv.AudioSink):
         if ssrc is None:
             return
         self._decoder.drop(ssrc)
-        self._unattributed.pop(ssrc, None)
+        self._unattributed.discard(ssrc)
         self._emit(SpeakerStreamEnded(ssrc))
 
     def _write(
@@ -280,7 +239,7 @@ class RecordingSink(voice_recv.AudioSink):
             # already talking when the bot joined; Discord only supplies
             # the mapping with its speaking event) or the user is not a
             # guild member at all. Nothing is decoded and nothing is
-            # written -- but it is counted and reported.
+            # written -- but it is not silent either.
             self._note_unattributed(ssrc)
             return
 
@@ -300,12 +259,7 @@ class RecordingSink(voice_recv.AudioSink):
         # three-byte OPUS_SILENCE frame and is decoded normally, because
         # skipping it would desynchronise the decoder's last-packet
         # duration, which packet-loss concealment depends on.
-        frame = data.opus
-        # The decoder counts the frame -- decoded, discarded (labelled by
-        # the libopus error code, which only it knows) or lost. Counting
-        # here as well is what made
-        # `sturnus_voice_frames_decoded_total` read double.
-        pcm = self._decoder.decode(ssrc, frame)
+        pcm = self._decoder.decode(ssrc, data.opus)
         if pcm is None:
             # The frame is gone. `SpeakerWriter` places audio by
             # RTP-derived absolute time, so this becomes exactly one
@@ -325,15 +279,23 @@ class RecordingSink(voice_recv.AudioSink):
         )
 
     def _note_unattributed(self, ssrc: int) -> None:
-        """Counts unattributed audio and reports it, first frame then rate-limited."""
-        self._counters.inc(metrics.FRAMES_UNATTRIBUTED)
-        seen = self._unattributed.get(ssrc)
-        if seen is None:
-            if len(self._unattributed) >= MAX_TRACKED_UNATTRIBUTED:
-                return
-            seen = 0
-        seen += 1
-        self._unattributed[ssrc] = seen
-        notices_so_far, remainder = divmod(seen, UNATTRIBUTED_NOTICE_EVERY)
-        if seen == 1 or remainder == 0 and notices_so_far < UNATTRIBUTED_NOTICE_LIMIT:
-            self._emit(UnattributedAudio(ssrc, seen))
+        """Reports unattributed audio once per SSRC, and never more than that.
+
+        Once per SSRC and capped at `MAX_TRACKED_UNATTRIBUTED` distinct
+        ones, so a stuck stream at 50 frames a second cannot turn into a
+        log flood -- but silence in the face of dropped audio is the bug
+        this branch exists to remove, so it is never nothing.
+        """
+        if ssrc in self._unattributed:
+            return
+        if len(self._unattributed) >= MAX_TRACKED_UNATTRIBUTED:
+            return
+        self._unattributed.add(ssrc)
+        log.warning(
+            "Audio from ssrc=%s cannot be attributed to a guild member, so it is neither "
+            "decoded nor recorded: no consent record can be checked for an identity we do "
+            "not know. Discord supplies the SSRC-to-user mapping only with its speaking "
+            "event, so a participant who was already talking when the bot joined has to "
+            "pause and speak again before their audio can be recorded.",
+            ssrc,
+        )

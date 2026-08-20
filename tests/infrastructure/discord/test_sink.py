@@ -17,6 +17,7 @@ it means in production.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -26,22 +27,13 @@ from discord.ext import voice_recv
 from discord.ext.voice_recv.rtp import OPUS_SILENCE, FakePacket
 
 from sturnus.infrastructure.discord.sink import (
-    UNATTRIBUTED_NOTICE_EVERY,
-    UNATTRIBUTED_NOTICE_LIMIT,
     CapturedFrame,
     CaptureMessage,
     RecordingSink,
     SpeakerStreamEnded,
-    UnattributedAudio,
 )
-from sturnus.infrastructure.metrics import (
-    FRAMES_DECODED,
-    FRAMES_DISCARDED,
-    FRAMES_LOST,
-    FRAMES_UNATTRIBUTED,
-    SINK_ERRORS,
-    Counters,
-)
+
+SINK_LOGGER = "sturnus.infrastructure.discord.sink"
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 ROLE_ID = 42
@@ -104,7 +96,6 @@ def voice_data(
 
 def build(
     decoder: FakeDecoder | None = None,
-    counters: Counters | None = None,
 ) -> tuple[RecordingSink, list[CaptureMessage], FakeDecoder]:
     pool = decoder or FakeDecoder()
     emitted: list[CaptureMessage] = []
@@ -113,7 +104,6 @@ def build(
         decoder=pool,
         clock=FakeClock(),
         emit=emitted.append,
-        counters=counters or Counters(),
     )
     return sink, emitted, pool
 
@@ -185,35 +175,40 @@ def test_a_member_with_the_role_is_captured() -> None:
 
 
 @pytest.mark.parametrize("user", [None, "not-a-member"])
-def test_audio_that_cannot_be_attributed_is_never_decoded(user: object) -> None:
+def test_audio_that_cannot_be_attributed_is_never_decoded(
+    user: object, caplog: pytest.LogCaptureFixture
+) -> None:
     """No consent record can be checked for an identity we do not know.
 
     A speaker already talking when the bot connects has no SSRC mapping
     yet -- Discord supplies it only with its speaking event -- so their
-    frames arrive with no member attached.
+    frames arrive with no member attached. Dropped, and said out loud:
+    silence in the face of dropped audio is the bug this branch removes.
     """
-    counters = Counters()
-    sink, emitted, decoder = build(counters=counters)
+    sink, emitted, decoder = build()
 
-    sink.write(user, voice_data())  # type: ignore[arg-type]
+    with caplog.at_level(logging.WARNING, logger=SINK_LOGGER):
+        sink.write(user, voice_data())  # type: ignore[arg-type]
 
     assert decoder.frames == []
-    assert emitted == [UnattributedAudio(ANNA_SSRC, 1)]
-    assert counters.get(FRAMES_UNATTRIBUTED) == 1
+    assert emitted == []
+    assert len(caplog.records) == 1
+    assert str(ANNA_SSRC) in caplog.records[0].getMessage()
 
 
-def test_unattributed_audio_is_reported_but_never_floods() -> None:
-    """Silence in the face of dropped audio is the bug; a wall of text is not the fix."""
-    sink, emitted, _ = build()
+def test_unattributed_audio_is_reported_once_per_stream_and_never_floods(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A wall of text at 50 frames a second is not the fix for a silent drop."""
+    sink, _, _ = build()
 
-    for _ in range(UNATTRIBUTED_NOTICE_EVERY * (UNATTRIBUTED_NOTICE_LIMIT + 2)):
-        sink.write(None, voice_data())
+    with caplog.at_level(logging.WARNING, logger=SINK_LOGGER):
+        for _ in range(500):
+            sink.write(None, voice_data())
+        for _ in range(500):
+            sink.write(None, voice_data(ssrc=ANNA_SSRC + 1))
 
-    notices = [message for message in emitted if isinstance(message, UnattributedAudio)]
-    assert [notice.frames for notice in notices] == [
-        1,
-        *(UNATTRIBUTED_NOTICE_EVERY * n for n in range(1, UNATTRIBUTED_NOTICE_LIMIT)),
-    ]
+    assert len(caplog.records) == 2, "one line per SSRC, however long it goes on"
 
 
 # --- what the frame is ---
@@ -234,24 +229,6 @@ def test_a_lost_frame_reaches_the_decoder_as_an_empty_payload() -> None:
 
     assert decoder.frames == [(ANNA_SSRC, b"")]
     assert emitted == []
-
-
-def test_the_sink_does_not_count_frames_the_decoder_already_counts() -> None:
-    """`sturnus_voice_frames_decoded_total` read double when both did.
-
-    The decoder is the one place that knows *why* a frame did not make it
-    -- lost, or unreadable and with which libopus code -- so it owns all
-    three frame counters; see `test_decoding.py`. This pins that the sink
-    does not add a second increment on top.
-    """
-    counters = Counters()
-    sink, _, _ = build(counters=counters)
-
-    sink.write(member(), voice_data())
-
-    assert counters.get(FRAMES_DECODED) == 0
-    assert counters.get(FRAMES_DISCARDED) == 0
-    assert counters.get(FRAMES_LOST) == 0
 
 
 def test_a_silence_frame_is_decoded_rather_than_skipped() -> None:
@@ -284,14 +261,16 @@ def test_a_frame_that_will_not_decode_emits_nothing() -> None:
 
 
 @pytest.mark.parametrize("broken", ["decoder", "emit", "clock"])
-def test_write_never_raises_whatever_breaks_underneath_it(broken: str) -> None:
+def test_write_never_raises_whatever_breaks_underneath_it(
+    broken: str, caplog: pytest.LogCaptureFixture
+) -> None:
     """`PacketRouter._do_run` calls `write()` unguarded.
 
     An exception escaping here reaches `PacketRouter.run()`, which sets
     `reader.error` and calls `stop_listening()` in its `finally` -- the
     exact sequence that stopped capture for every speaker in production.
+    Swallowed, but never silently: the traceback is logged.
     """
-    counters = Counters()
     decoder = FakeDecoder()
     clock: object = FakeClock()
     emit: object = MagicMock()
@@ -308,12 +287,13 @@ def test_write_never_raises_whatever_breaks_underneath_it(broken: str) -> None:
         decoder=decoder,
         clock=clock,  # type: ignore[arg-type]
         emit=emit,  # type: ignore[arg-type]
-        counters=counters,
     )
 
-    sink.write(member(), voice_data())  # must not raise
+    with caplog.at_level(logging.ERROR, logger=SINK_LOGGER):
+        sink.write(member(), voice_data())  # must not raise
 
-    assert counters.get(SINK_ERRORS) == 1
+    assert len(caplog.records) == 1
+    assert caplog.records[0].exc_info is not None, "the traceback is not thrown away"
 
 
 def test_a_broken_packet_does_not_take_down_the_router_thread() -> None:

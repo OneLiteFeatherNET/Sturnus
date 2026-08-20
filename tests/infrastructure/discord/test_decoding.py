@@ -22,38 +22,24 @@ incident, in a unit test.
 
 from __future__ import annotations
 
+import logging
 import math
 import struct
 
 import pytest
 from discord.opus import OpusError, OpusNotLoaded
 
-from sturnus.domain.stream_health import DecodePolicy, StreamState, StreamStats
 from sturnus.infrastructure.discord.decoding import (
-    UNKNOWN_ERROR_LABEL,
+    FAILING_AFTER_CONSECUTIVE_FAILURES,
+    MAX_CONSECUTIVE_CONCEALED,
     ResilientOpusDecoder,
-    SpeakerDecoder,
     new_opus_decoder,
-)
-from sturnus.infrastructure.metrics import (
-    FRAMES_DECODED,
-    FRAMES_DISCARDED,
-    FRAMES_LOST,
-    Counters,
 )
 
 ANNA_SSRC, BEN_SSRC = 111, 222
 CORRUPTED_STREAM = -4
 
-#: Small enough to keep the tests readable, ordered the same way the real
-#: policy is so nothing about the escalation shape is special-cased away.
-FAST = DecodePolicy(
-    degraded_after_consecutive=3,
-    unusable_after_consecutive=6,
-    never_decoded_after=4,
-    conceal_max_consecutive=2,
-    recycle_attempts=1,
-)
+BAD = b"corrupt"
 
 
 @pytest.fixture(autouse=True)
@@ -103,18 +89,10 @@ class DecoderFactorySpy:
         return decoder
 
 
-class TransitionLog:
-    """Collects `StreamStateListener` calls."""
-
-    def __init__(self) -> None:
-        self.entries: list[tuple[int, StreamState]] = []
-
-    def __call__(self, ssrc: int, state: StreamState, stats: StreamStats) -> None:
-        del stats
-        self.entries.append((ssrc, state))
-
-    def states(self, ssrc: int) -> list[StreamState]:
-        return [state for seen, state in self.entries if seen == ssrc]
+def fail(decoder: ResilientOpusDecoder, ssrc: int, times: int) -> None:
+    """Pushes `times` unreadable frames through one stream."""
+    for _ in range(times):
+        assert decoder.decode(ssrc, BAD) is None
 
 
 # --- the defect: a frame that will not decode is skipped, capture continues ---
@@ -122,345 +100,276 @@ class TransitionLog:
 
 def test_a_bad_frame_is_skipped_and_the_next_frame_still_decodes() -> None:
     """The whole point. One unreadable frame must cost one frame, not the session."""
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST)
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    decoder = ResilientOpusDecoder(factory=factory)
 
-    results = [
-        decoder.decode(ANNA_SSRC, frame)
-        for frame in (b"a", b"corrupt", b"b", b"corrupt", b"c", b"d")
-    ]
+    results = [decoder.decode(ANNA_SSRC, frame) for frame in (b"a", BAD, b"b")]
 
-    assert results == [
-        b"pcm:d0:a",
-        None,
-        b"pcm:d0:b",
-        None,
-        b"pcm:d0:c",
-        b"pcm:d0:d",
-    ]
-    # And on the same decoder instance, with no reset in between.
-    assert len(factory.built) == 1
-
-
-# --- per-speaker isolation ---
+    assert results[0] is not None
+    assert results[1] is None, "the unreadable frame is discarded"
+    assert results[2] is not None, "and the stream keeps working afterwards"
+    assert len(factory.built) == 1, "the same decoder instance carried on"
 
 
 def test_two_speakers_never_share_a_decoder() -> None:
+    """Opus is stateful; one decoder for two streams corrupts both."""
     factory = DecoderFactorySpy()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST)
+    decoder = ResilientOpusDecoder(factory=factory)
 
     anna = decoder.decode(ANNA_SSRC, b"a")
     ben = decoder.decode(BEN_SSRC, b"a")
-    anna_again = decoder.decode(ANNA_SSRC, b"a")
 
     assert len(factory.built) == 2
-    assert anna == b"pcm:d0:a"
-    assert ben == b"pcm:d1:a"
-    assert anna_again == b"pcm:d0:a"
+    assert anna != ben, "each speaker's PCM came out of their own decoder"
 
 
 def test_one_speaker_failing_leaves_every_other_speaker_untouched() -> None:
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    transitions = TransitionLog()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST, on_state_change=transitions)
-    decoder.decode(ANNA_SSRC, b"a")
-    decoder.decode(BEN_SSRC, b"a")
+    """Isolation is what turns 'the recording died' into 'one person lost 5s'."""
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    decoder = ResilientOpusDecoder(factory=factory)
 
-    for _ in range(FAST.unusable_after_consecutive):
-        assert decoder.decode(ANNA_SSRC, b"corrupt") is None
-        assert decoder.decode(BEN_SSRC, b"b") == b"pcm:d1:b"
+    fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES * 2)
 
-    assert transitions.states(BEN_SSRC) == []
-    assert decoder.stats()[BEN_SSRC].state is StreamState.HEALTHY
-
-
-# --- lifecycle ---
+    assert decoder.decode(BEN_SSRC, b"b") is not None
 
 
 def test_dropping_a_stream_forgets_its_decoder() -> None:
+    """Mirrors the library evicting its own `PacketDecoder` on disconnect."""
     factory = DecoderFactorySpy()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST)
+    decoder = ResilientOpusDecoder(factory=factory)
+
+    decoder.decode(ANNA_SSRC, b"a")
+    decoder.drop(ANNA_SSRC)
     decoder.decode(ANNA_SSRC, b"a")
 
-    decoder.drop(ANNA_SSRC)
-    assert decoder.stats() == {}
-
-    assert decoder.decode(ANNA_SSRC, b"a") == b"pcm:d1:a"
+    assert len(factory.built) == 2, "the returning SSRC got a fresh decoder"
 
 
 def test_clear_forgets_everything_and_is_idempotent() -> None:
-    decoder = ResilientOpusDecoder(factory=DecoderFactorySpy(), policy=FAST)
+    factory = DecoderFactorySpy()
+    decoder = ResilientOpusDecoder(factory=factory)
     decoder.decode(ANNA_SSRC, b"a")
     decoder.decode(BEN_SSRC, b"a")
 
     decoder.clear()
     decoder.clear()
+    decoder.decode(ANNA_SSRC, b"a")
 
-    assert decoder.stats() == {}
+    assert len(factory.built) == 3
 
 
 def test_the_max_streams_backstop_evicts_the_least_recently_used() -> None:
-    """An alpha library missing one disconnect event must not become a leak."""
+    """A missed disconnect event must not become an unbounded decoder leak."""
     factory = DecoderFactorySpy()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST, max_streams=2)
+    decoder = ResilientOpusDecoder(factory=factory, max_streams=2)
 
     decoder.decode(1, b"a")
     decoder.decode(2, b"a")
-    decoder.decode(1, b"a")  # 1 is now the most recently used
-    decoder.decode(3, b"a")
+    decoder.decode(2, b"a")
+    decoder.decode(3, b"a")  # evicts ssrc 1, the least recently used
+    decoder.decode(2, b"a")
+    decoder.decode(1, b"a")  # rebuilt, because it was evicted
 
-    assert set(decoder.stats()) == {1, 3}
-
-
-# --- escalation ---
-
-
-def test_degraded_fires_once_however_long_the_failure_run_lasts() -> None:
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    transitions = TransitionLog()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST, on_state_change=transitions)
-    decoder.decode(ANNA_SSRC, b"a")
-
-    for _ in range(FAST.degraded_after_consecutive):
-        decoder.decode(ANNA_SSRC, b"corrupt")
-    assert transitions.states(ANNA_SSRC) == [StreamState.DEGRADED]
-
-    for _ in range(FAST.unusable_after_consecutive - FAST.degraded_after_consecutive - 1):
-        decoder.decode(ANNA_SSRC, b"corrupt")
-    assert transitions.states(ANNA_SSRC) == [StreamState.DEGRADED]
+    assert len(factory.built) == 4
 
 
-def test_unusable_rebuilds_the_decoder_exactly_once() -> None:
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    transitions = TransitionLog()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST, on_state_change=transitions)
-    decoder.decode(ANNA_SSRC, b"a")
-    assert len(factory.built) == 1
-
-    for _ in range(FAST.unusable_after_consecutive):
-        decoder.decode(ANNA_SSRC, b"corrupt")
-    assert transitions.states(ANNA_SSRC) == [StreamState.DEGRADED, StreamState.UNUSABLE]
-    assert len(factory.built) == 2, "one fresh decoder for the wedged stream"
-
-    # A second run of failures escalates again -- it stays visible -- but
-    # the rebuild budget is spent, so we do not retry forever.
-    for _ in range(FAST.unusable_after_consecutive):
-        decoder.decode(ANNA_SSRC, b"corrupt")
-    assert transitions.states(ANNA_SSRC).count(StreamState.UNUSABLE) == 2
-    assert len(factory.built) == 2
+def test_max_streams_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="max_streams"):
+        ResilientOpusDecoder(max_streams=0)
 
 
-def test_never_decoded_is_reported_instead_of_degraded_and_rebuilds_nothing() -> None:
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    transitions = TransitionLog()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST, on_state_change=transitions)
-
-    for _ in range(FAST.never_decoded_after):
-        decoder.decode(ANNA_SSRC, b"corrupt")
-
-    assert transitions.states(ANNA_SSRC) == [StreamState.NEVER_DECODED]
-    assert len(factory.built) == 1
-
-
-def test_one_failing_speaker_is_not_read_as_nothing_decoding_anywhere() -> None:
-    """The verdict must rest on every live stream, not on a convenient subset.
-
-    Anna's stream dies while Ben, who said one word and went quiet, has
-    nowhere near enough frames to be judged. Excluding Ben from the
-    verdict left it resting on the single failing stream: one bad speaker
-    read as "nothing decodes anywhere", and the whole channel's recording
-    ended for it. A stream too young to judge is evidence that something
-    might still work, so it blocks the verdict rather than being ignored.
-    """
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    fired: list[None] = []
-    decoder = ResilientOpusDecoder(
-        factory=factory, policy=FAST, on_total_failure=lambda: fired.append(None)
-    )
-
-    decoder.decode(BEN_SSRC, b"a")
-    for _ in range(FAST.unusable_after_consecutive * 3):
-        decoder.decode(ANNA_SSRC, b"corrupt")
-
-    assert decoder.stats()[BEN_SSRC].frames_seen < FAST.never_decoded_after, (
-        "Ben is exactly the briefly-quiet speaker the old rule excluded"
-    )
-    assert fired == [], "one dead speaker is never the whole channel"
-
-
-def test_total_failure_fires_once_and_only_when_nothing_decodes_anywhere() -> None:
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    fired: list[None] = []
-    decoder = ResilientOpusDecoder(
-        factory=factory, policy=FAST, on_total_failure=lambda: fired.append(None)
-    )
-
-    # Anna's stream dies completely while Ben's keeps working.
-    decoder.decode(BEN_SSRC, b"a")
-    for _ in range(FAST.unusable_after_consecutive * 3):
-        decoder.decode(ANNA_SSRC, b"corrupt")
-        decoder.decode(BEN_SSRC, b"b")
-    assert fired == [], "one dead speaker is never a session failure"
-
-    # Now Ben's stream dies too.
-    for _ in range(FAST.unusable_after_consecutive * 3):
-        decoder.decode(BEN_SSRC, b"corrupt")
-
-    assert fired == [None], "reported once, not once per frame"
-
-
-# --- packet loss ---
+# --- network loss is concealed; our own decode failures are not ---
 
 
 @pytest.mark.parametrize("lost", [None, b""])
 def test_a_lost_frame_takes_the_concealment_path(lost: bytes | None) -> None:
-    """`FakePacket.decrypted_data` is `b""`, and `decode(b"")` raises -1.
-
-    Empty must therefore never reach `decode()`; it is loss, and loss is
-    what packet-loss concealment is for.
-    """
+    """`FakePacket.decrypted_data` is `b""`, and `decode(b"")` raises -- so it must not reach it."""
     factory = DecoderFactorySpy()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST)
+    decoder = ResilientOpusDecoder(factory=factory)
     decoder.decode(ANNA_SSRC, b"a")
 
-    assert decoder.decode(ANNA_SSRC, lost) == b"plc:d0"
-    assert factory.built[0].concealed == 1
+    pcm = decoder.decode(ANNA_SSRC, lost)
+
+    assert pcm == b"plc:d0"
+    assert factory.built[0].decoded == [b"a"], "the empty payload never reached decode()"
 
 
-def test_concealment_stops_after_the_cap_and_resumes_after_a_success() -> None:
+def test_concealment_needs_a_decoder_that_has_heard_something() -> None:
+    """libopus reconstructs from its memory of the previous frame; there is none yet."""
     factory = DecoderFactorySpy()
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST)
-    decoder.decode(ANNA_SSRC, b"a")
+    decoder = ResilientOpusDecoder(factory=factory)
 
-    results = [decoder.decode(ANNA_SSRC, None) for _ in range(FAST.conceal_max_consecutive + 2)]
-    assert results == [b"plc:d0"] * FAST.conceal_max_consecutive + [None, None]
-
-    decoder.decode(ANNA_SSRC, b"b")
-    assert decoder.decode(ANNA_SSRC, None) == b"plc:d0"
-
-
-def test_a_decode_failure_is_never_concealed() -> None:
-    """We conceal what the network lost, never what our decoder could not read.
-
-    Inventing audio to paper over a decoder error would put synthesised
-    sound into a file people were told is a record of what they said.
-    """
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST)
-    decoder.decode(ANNA_SSRC, b"a")
-
-    assert decoder.decode(ANNA_SSRC, b"corrupt") is None
+    assert decoder.decode(ANNA_SSRC, b"") is None
     assert factory.built[0].concealed == 0
 
 
-# --- containment ---
+def test_concealment_stops_after_the_cap_and_resumes_after_a_success() -> None:
+    """Past a handful of frames PLC is noise; real silence is the honest answer."""
+    factory = DecoderFactorySpy()
+    decoder = ResilientOpusDecoder(factory=factory)
+    decoder.decode(ANNA_SSRC, b"a")
+
+    concealed = [decoder.decode(ANNA_SSRC, b"") for _ in range(MAX_CONSECUTIVE_CONCEALED + 2)]
+    assert [pcm is not None for pcm in concealed] == (
+        [True] * MAX_CONSECUTIVE_CONCEALED + [False, False]
+    )
+
+    decoder.decode(ANNA_SSRC, b"a")
+    assert decoder.decode(ANNA_SSRC, b"") is not None, "a real frame re-arms concealment"
+
+
+def test_a_decode_failure_is_never_concealed() -> None:
+    """Inventing audio to cover our own error would put synthesised sound in the record."""
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    decoder = ResilientOpusDecoder(factory=factory)
+    decoder.decode(ANNA_SSRC, b"a")
+
+    assert decoder.decode(ANNA_SSRC, BAD) is None
+    assert factory.built[0].concealed == 0
+
+
+# --- nothing escapes towards the packet-router thread ---
 
 
 class Exploding:
-    """A decoder whose every frame fails with something that is not an `OpusError`."""
+    """A decoder that fails in a way libopus never would."""
 
     def decode(self, data: bytes | None, *, fec: bool = False) -> bytes:  # noqa: ARG002
-        raise MemoryError("not an OpusError")
-
-
-def test_an_unexpected_decoder_error_never_escapes() -> None:
-    decoder = ResilientOpusDecoder(factory=Exploding, policy=FAST)
-
-    assert decoder.decode(ANNA_SSRC, b"a") is None
+        raise RuntimeError("ctypes went sideways")
 
 
 def test_a_non_opus_error_is_accounted_for_like_any_other_unreadable_frame() -> None:
-    """Dead and reporting fine is the incident's own shape, in a new place.
+    """Dead and reporting fine is the incident's own shape; it must not recur here.
 
-    Only `OpusError` used to be caught where the health accounting
-    happens, so anything else -- a ctypes failure, an alpha library that
-    changed shape, a bug of ours -- left through the outer guard without
-    touching `StreamHealth`. The stream then stayed `HEALTHY` with
-    `frames_seen == 0` forever while every single frame of it was thrown
-    away, and nothing ever escalated, logged a transition, or counted
-    towards the total-failure verdict.
+    A failure that is not an `OpusError` used to skip the accounting
+    entirely, so a stream where *every* frame was thrown away still looked
+    healthy with nothing counted against it -- and could therefore never
+    reach the threshold that ends the session.
     """
-    counters = Counters()
-    transitions = TransitionLog()
+    failures: list[None] = []
     decoder = ResilientOpusDecoder(
-        factory=Exploding, policy=FAST, on_state_change=transitions, counters=counters
+        factory=Exploding,
+        on_decode_failure=lambda: failures.append(None),
     )
 
-    for _ in range(FAST.never_decoded_after):
+    for _ in range(FAILING_AFTER_CONSECUTIVE_FAILURES):
         assert decoder.decode(ANNA_SSRC, b"a") is None
 
-    stats = decoder.stats()[ANNA_SSRC]
-    assert stats.frames_seen == FAST.never_decoded_after
-    assert stats.frames_discarded == FAST.never_decoded_after
-    assert stats.state is StreamState.NEVER_DECODED, "a dead stream must not report HEALTHY"
-    assert transitions.states(ANNA_SSRC) == [StreamState.NEVER_DECODED]
-    assert counters.get(FRAMES_DISCARDED, code=UNKNOWN_ERROR_LABEL) == FAST.never_decoded_after
+    assert failures == [None], "the non-OpusError frames counted towards the verdict"
 
 
-def test_every_frame_is_counted_once_and_a_discard_carries_its_error_code() -> None:
-    """`sturnus_voice_frames_discarded_total` is documented as labelled by code.
-
-    It was incremented with no labels at all, so the libopus code -- the
-    one number that says whether this is the production corrupted-stream
-    fault or something new -- never reached Prometheus. And
-    `frames_decoded_total` was incremented twice per frame, once here and
-    once in the sink's own drain, so it read about double.
-    """
-    counters = Counters()
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST, counters=counters)
-
-    decoder.decode(ANNA_SSRC, b"good")
-    decoder.decode(ANNA_SSRC, b"corrupt")
-    decoder.decode(ANNA_SSRC, b"")
-
-    assert counters.get(FRAMES_DECODED) == 1
-    assert counters.get(FRAMES_LOST) == 1
-    assert counters.get(FRAMES_DISCARDED, code=str(CORRUPTED_STREAM)) == 1
-    assert counters.get(FRAMES_DISCARDED) == 0, "an unlabelled sample would be the old bug"
+def test_an_unexpected_decoder_error_never_escapes() -> None:
+    decoder = ResilientOpusDecoder(factory=Exploding)
+    assert decoder.decode(ANNA_SSRC, b"a") is None
 
 
 def test_a_factory_that_raises_never_escapes() -> None:
-    def factory() -> object:
-        raise OpusNotLoaded
+    """A decoder we cannot even build must not reach `PacketRouter.run()`."""
 
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST)  # type: ignore[arg-type]
+    def broken() -> FakeFrameDecoder:
+        raise RuntimeError("no decoder for you")
 
+    decoder = ResilientOpusDecoder(factory=broken)
     assert decoder.decode(ANNA_SSRC, b"a") is None
 
 
 def test_a_listener_that_raises_never_escapes() -> None:
-    def boom(ssrc: int, state: StreamState, stats: StreamStats) -> None:  # noqa: ARG001
-        raise RuntimeError("listener bug")
+    def broken() -> None:
+        raise RuntimeError("listener is broken")
 
-    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
-    decoder = ResilientOpusDecoder(factory=factory, policy=FAST, on_state_change=boom)
+    decoder = ResilientOpusDecoder(factory=Exploding, on_decode_failure=broken)
+    fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES)
+    assert decoder.decode(ANNA_SSRC, b"a") is None
+
+
+# --- the one escalation: count consecutive failures, act once at the threshold ---
+
+
+def test_a_failing_stream_is_reported_once_however_long_the_run_lasts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """At 50 frames a second, one ERROR per frame would be its own outage."""
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    decoder = ResilientOpusDecoder(factory=factory)
+
+    with caplog.at_level(logging.ERROR, logger="sturnus.infrastructure.discord.decoding"):
+        fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES * 3)
+
+    reports = [record for record in caplog.records if "consecutive" in record.getMessage()]
+    assert len(reports) == 1
+    assert str(ANNA_SSRC) in reports[0].getMessage()
+    assert str(CORRUPTED_STREAM) in reports[0].getMessage(), "the libopus code is named"
+
+
+def test_a_stream_below_the_threshold_says_nothing(caplog: pytest.LogCaptureFixture) -> None:
+    """Isolated corruption on a lossy connection is a non-event."""
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    decoder = ResilientOpusDecoder(factory=factory)
+
+    with caplog.at_level(logging.WARNING, logger="sturnus.infrastructure.discord.decoding"):
+        fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES - 1)
+
+    assert caplog.records == []
+
+
+def test_one_failing_speaker_is_not_read_as_nothing_decoding_anywhere() -> None:
+    """The mistake that ended a whole channel's recording over one bad stream."""
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    failures: list[None] = []
+    decoder = ResilientOpusDecoder(factory=factory, on_decode_failure=lambda: failures.append(None))
+
+    decoder.decode(BEN_SSRC, b"b")
+    fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES * 2)
+
+    assert failures == [], "Ben is still being recorded, so the session goes on"
+
+
+def test_a_stream_too_young_to_judge_blocks_the_verdict_rather_than_being_ignored() -> None:
+    """A stream that has barely started is evidence something might still work.
+
+    Judging only the streams that had failed long enough is what once read
+    "one dead speaker while everybody else was briefly quiet" as "nothing
+    decodes anywhere" and ended the recording for the whole channel.
+    """
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    failures: list[None] = []
+    decoder = ResilientOpusDecoder(factory=factory, on_decode_failure=lambda: failures.append(None))
+
+    fail(decoder, BEN_SSRC, 1)
+    fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES * 2)
+
+    assert failures == []
+
+
+def test_nothing_decoding_anywhere_fires_exactly_once() -> None:
+    """Writing empty files while telling a channel it is recorded is the original bug."""
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    failures: list[None] = []
+    decoder = ResilientOpusDecoder(factory=factory, on_decode_failure=lambda: failures.append(None))
+
+    decoder.decode(BEN_SSRC, b"b")
+    fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES)
+    assert failures == [], "one stream is not every stream"
+
+    fail(decoder, BEN_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES)
+    assert failures == [None]
+
+    fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES * 2)
+    assert failures == [None], "reported once per session, not once per run"
+
+
+def test_a_stream_that_recovers_blocks_the_verdict_again() -> None:
+    """A speaker who decodes anything is proof the channel is not dead."""
+    factory = DecoderFactorySpy(bad=frozenset({BAD}))
+    failures: list[None] = []
+    decoder = ResilientOpusDecoder(factory=factory, on_decode_failure=lambda: failures.append(None))
+
+    decoder.decode(BEN_SSRC, b"b")
+    fail(decoder, ANNA_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES)
     decoder.decode(ANNA_SSRC, b"a")
+    fail(decoder, BEN_SSRC, FAILING_AFTER_CONSECUTIVE_FAILURES)
 
-    for _ in range(FAST.degraded_after_consecutive):
-        assert decoder.decode(ANNA_SSRC, b"corrupt") is None
-
-
-def test_a_rebuild_that_fails_spends_the_budget_instead_of_retrying_forever() -> None:
-    class OneShotFactory:
-        def __init__(self) -> None:
-            self.calls = 0
-
-        def __call__(self) -> FakeFrameDecoder:
-            self.calls += 1
-            if self.calls > 1:
-                raise OpusNotLoaded
-            return FakeFrameDecoder("d0", frozenset({b"corrupt"}))
-
-    factory = OneShotFactory()
-    speaker = SpeakerDecoder(ANNA_SSRC, factory, FAST)
-    speaker.decode(b"a")
-    for _ in range(FAST.unusable_after_consecutive):
-        speaker.decode(b"corrupt")
-
-    assert speaker.may_recycle is True
-    assert speaker.recycle() is False
-    assert speaker.may_recycle is False
+    assert failures == [], "Anna decoded a frame, so not everything is failing"
 
 
 # --- the incident, against real libopus ---
@@ -506,12 +415,6 @@ def test_real_libopus_survives_a_corrupt_frame_and_keeps_decoding() -> None:
         False,
     ]
     assert {len(result) for result in results if result is not None} == {3840}
-
-    stats = decoder.stats()[ANNA_SSRC]
-    assert stats.frames_decoded == 4
-    assert stats.frames_discarded == 2
-    assert stats.last_error_code == CORRUPTED_STREAM
-    assert stats.state is StreamState.HEALTHY, "isolated failures are not an escalation"
 
 
 def test_real_libopus_decodes_a_discord_silence_frame() -> None:
