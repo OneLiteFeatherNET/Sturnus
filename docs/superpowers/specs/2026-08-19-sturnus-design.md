@@ -209,6 +209,7 @@ The bot observes `on_voice_state_update` for the configured channel.
 | `empty_grace_seconds` elapses | `GRACE` → `CLOSING` |
 | `idle_timeout_minutes` with no audio at all | `RECORDING` → `CLOSING` |
 | `max_session_hours` reached | `RECORDING` → `CLOSING` |
+| Every stream stops decoding, or capture itself dies unrecoverably | `RECORDING` → `CLOSING` with `decode_failure` / `capture_failure` |
 
 `CLOSING` closes the recording files, uploads them to S3, enqueues one
 transcription job per speaker, sets the session to `closed`, and leaves the
@@ -280,6 +281,39 @@ The policy that replaces it:
   session closes with `EndReason.DECODE_FAILURE` rather than producing empty
   files while telling everyone they are recorded. That is the original incident
   in a different costume, and it is the only decode failure that ends anything.
+  "No stream" means every live stream, including the ones too young to judge: a
+  stream that has barely started is evidence something might still work, so it
+  blocks the verdict. Declaring total failure by mistake ends a real recording;
+  declining to declare it costs empty files the per-stream errors are already
+  shouting about.
+- **A failure that is not an `OpusError` is accounted for exactly like one.**
+  Whatever the decoder raises, the frame is counted against that stream's
+  health. A stream reporting `HEALTHY` with `frames_seen == 0` while every frame
+  of it is thrown away — dead, and reporting fine — is the incident's own shape.
+- **Capture dying is itself an end reason.** If the library's `after=` hook
+  fires and the one guarded re-listen does not bring capture back, the session
+  closes with `EndReason.CAPTURE_FAILURE`. Nothing will arrive again, the
+  machine's own timers know nothing about that, and without this the session
+  runs on to `idle_timeout` and closes looking exactly like a meeting where
+  nobody spoke — the row that let the original incident go unnoticed for hours.
+  After such a close the guild waits out `REJOIN_COOLDOWN` before another
+  session may start: leaving the channel is itself a voice-state update, and
+  rejoining immediately just meets the same fault, once per empty session.
+- **A control message never shares fate with the audio it reports on.** The
+  hand-off from the extension's threads to the event loop has two lanes: audio
+  is bounded and dropped under load, while `CaptureStopped`,
+  `DecodeTotalFailure` and the per-stream state changes are neither bounded nor
+  queued behind it. They exist *because* capture is failing, so the load that
+  produces them must not be what discards them. They need no bound of their own
+  because they are rate-limited at the source.
+- **Nothing on the frame drain awaits the network or the database.** The drain
+  is a single consumer and everything behind it is somebody's audio, so a
+  rate-limited `channel.send` or a slow consent lookup there stalls capture for
+  every speaker. Channel notices are posted from tasks of their own; consent
+  verdicts are served from cache and refreshed beside the drain. A frame that
+  arrives before that speaker's verdict is known is counted and dropped —
+  audio we cannot vouch for is not recorded, the same rule unattributed audio
+  follows.
 - **We conceal what the network lost, never what our decoder could not read.**
   Packet-loss concealment fills in lost frames for a capped run; a decode
   failure is filled with real silence, because inventing audio to cover our own

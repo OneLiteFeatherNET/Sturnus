@@ -39,6 +39,15 @@ class EndReason(StrEnum):
     #: only the total case, and it exists because continuing to pretend
     #: is the very failure the decode work was done to eliminate.
     DECODE_FAILURE = "decode_failure"
+    #: Capture itself died and could not be resumed: the library's packet
+    #: router stopped, so *no* frame of any kind arrives any more. This is
+    #: the production incident's own signature, and it has its own reason
+    #: for exactly that purpose -- without it the session runs on to its
+    #: idle timeout and closes as `IDLE_TIMEOUT`, indistinguishable in the
+    #: database from a meeting that simply ended. Someone reading the
+    #: session row afterwards must be able to tell "nobody spoke for
+    #: fifteen minutes" from "we stopped being able to hear anything".
+    CAPTURE_FAILURE = "capture_failure"
 
 
 @dataclass(frozen=True)

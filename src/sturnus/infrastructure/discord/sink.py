@@ -301,17 +301,11 @@ class RecordingSink(voice_recv.AudioSink):
         # skipping it would desynchronise the decoder's last-packet
         # duration, which packet-loss concealment depends on.
         frame = data.opus
+        # The decoder counts the frame -- decoded, discarded (labelled by
+        # the libopus error code, which only it knows) or lost. Counting
+        # here as well is what made
+        # `sturnus_voice_frames_decoded_total` read double.
         pcm = self._decoder.decode(ssrc, frame)
-        # Counted here rather than inside the decoder so that the ratio the
-        # FEC decision hangs on -- lost frames over frames seen -- comes
-        # out of the same place every frame passes through, and so a
-        # network loss is never confused with a frame we could not read.
-        if not frame:
-            self._counters.inc(metrics.FRAMES_LOST)
-        elif pcm is None:
-            self._counters.inc(metrics.FRAMES_DISCARDED)
-        else:
-            self._counters.inc(metrics.FRAMES_DECODED)
         if pcm is None:
             # The frame is gone. `SpeakerWriter` places audio by
             # RTP-derived absolute time, so this becomes exactly one

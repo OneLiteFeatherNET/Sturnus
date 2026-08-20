@@ -21,13 +21,21 @@ frame is even decoded: guild administrators bypass channel permissions and
 can speak without holding the role, and a role removed mid-session takes
 effect on the very next frame with no cache in the way. The consent-record
 check cannot run there because it may need a database read, so it stays on
-the event loop, in `_drain`, before anything reaches `RecordingService`.
+the event loop, in `_drain`, before anything reaches `RecordingService` --
+answered from `ConsentCache` without ever awaiting it.
 
-Frames cross from the router thread to the loop as immutable messages
-through one bounded queue drained by a single task, rather than as one
-`run_coroutine_threadsafe` future per packet. That preserves per-speaker
-ordering end to end, and replaces unbounded future accumulation under a
-stalled loop with a counted drop.
+**Nothing on the drain awaits an unbounded wait.** The drain is a single
+task, and everything queued behind it is somebody's audio, so a Discord
+HTTP call (`channel.send` is rate-limited, and Discord's own limits are
+measured in seconds) or a database read on that path stalls capture for
+every speaker at once. Notices are posted from tasks of their own; consent
+verdicts are read from cache and refreshed beside the drain, never on it.
+
+Frames cross from the router thread to the loop through `CaptureChannel`,
+which keeps audio and control messages in separate lanes: audio is bounded
+and dropped under load, control messages -- the ones that exist *because*
+capture is failing -- are neither. See `.capture_channel` for why sharing
+one bound reproduced the incident's own shape.
 
 Unlike the callback this replaces, the sink is now unit tested without a
 gateway connection: `tests/infrastructure/discord/test_sink.py` and
@@ -43,7 +51,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+from collections.abc import Coroutine
 from datetime import datetime, timedelta
+from typing import Any
 
 import discord
 from discord.ext import voice_recv
@@ -56,6 +66,7 @@ from sturnus.domain.stream_health import DecodePolicy, StreamState, StreamStats
 from sturnus.infrastructure import metrics
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.repositories import ConsentRepository
+from sturnus.infrastructure.discord.capture_channel import CaptureChannel
 from sturnus.infrastructure.discord.consent_cache import ConsentCache
 from sturnus.infrastructure.discord.decoding import (
     DecoderFactory,
@@ -76,10 +87,11 @@ from sturnus.infrastructure.discord.sink import (
 
 log = logging.getLogger(__name__)
 
-#: Frames the hand-off queue may hold before the router thread starts
-#: dropping. About two seconds of ten speakers talking at once. Reaching it
-#: means the event loop has stalled hard; dropping the newest frame keeps
-#: what is already queued continuous, and `SpeakerWriter` pads the gap.
+#: Frames the hand-off may hold before the router thread starts dropping.
+#: About two seconds of ten speakers talking at once. Reaching it means the
+#: event loop has stalled hard; dropping the newest frame keeps what is
+#: already queued continuous, and `SpeakerWriter` pads the gap. Control
+#: messages are not subject to it -- see `.capture_channel`.
 QUEUE_MAXSIZE = 1000
 
 #: How long between two channel messages about the same subject, and how
@@ -122,9 +134,9 @@ class VoiceReceiveAdapter:
         self._queue_maxsize = queue_maxsize
 
         self._voice_client: voice_recv.VoiceRecvClient | None = None
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue: asyncio.Queue[CaptureMessage] | None = None
+        self._capture: CaptureChannel | None = None
         self._drain_task: asyncio.Task[None] | None = None
+        self._side_tasks: set[asyncio.Task[None]] = set()
         self._channel: discord.VoiceChannel | None = None
         self._decoder: ResilientOpusDecoder | None = None
         self._guild_id: int | None = None
@@ -152,19 +164,33 @@ class VoiceReceiveAdapter:
         # channel rather than sit in it recording nothing.
         self._decoder_factory()
 
-        self._loop = asyncio.get_running_loop()
+        # Nothing that has to be torn down is built before the connection
+        # exists. Creating the hand-off and its drain task first left an
+        # orphaned task behind whenever `connect` failed -- one that would
+        # outlive the failed join and keep running against a channel
+        # nobody was ever going to speak into.
+        self._voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+
         self._guild_id = channel.guild.id
         self._consent_role_id = int(stored_role_id)
         self._channel = channel
         self._stopping = False
         self._relisten_used = False
         self._notices = {}
-        self._queue = asyncio.Queue()
-        self._drain_task = asyncio.create_task(self._drain(self._queue))
-
-        self._voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
-        self._start_listening()
-        await self._maybe_post_attribution_hint(channel)
+        self._capture = CaptureChannel(
+            asyncio.get_running_loop(),
+            frame_limit=self._queue_maxsize,
+            counters=self._counters,
+        )
+        self._drain_task = asyncio.create_task(self._drain(self._capture))
+        try:
+            self._start_listening()
+        except Exception:
+            # Connected but not listening is worse than not connected:
+            # the bot would sit in the channel recording nothing.
+            await self.leave()
+            raise
+        self._maybe_post_attribution_hint(channel)
 
     async def leave(self) -> None:
         """Stops listening and disconnects."""
@@ -186,8 +212,18 @@ class VoiceReceiveAdapter:
             with contextlib.suppress(asyncio.CancelledError):
                 await drain_task
 
-        self._queue = None
-        self._loop = None
+        # Notices in flight are cancelled and waited on rather than left
+        # to finish: a rate-limited `channel.send` can outlive the session
+        # by a long way, and a message about a recording that has already
+        # ended is worse than no message.
+        side_tasks, self._side_tasks = list(self._side_tasks), set()
+        for task in side_tasks:
+            task.cancel()
+        if side_tasks:
+            await asyncio.gather(*side_tasks, return_exceptions=True)
+        self._consent_cache.cancel_refreshes()
+
+        self._capture = None
         self._channel = None
         self._decoder = None
 
@@ -208,6 +244,7 @@ class VoiceReceiveAdapter:
             policy=self._decode_policy,
             on_state_change=self._on_state_change,
             on_total_failure=self._on_total_failure,
+            counters=self._counters,
         )
         sink = RecordingSink(
             consent_role_id=self._consent_role_id,
@@ -224,27 +261,11 @@ class VoiceReceiveAdapter:
         Never raises: it is reached from `RecordingSink.write`, and an
         exception there would propagate into `PacketRouter.run`, which
         stops capture for every speaker.
-
-        The queue's bound is enforced *here*, on the producer side, rather
-        than by `asyncio.Queue(maxsize=...)`: `call_soon_threadsafe` would
-        otherwise keep every dropped frame alive in the loop's callback
-        queue until the loop got round to rejecting it, which is the
-        accumulation the bound exists to prevent. `qsize()` read across
-        threads is a plain `len()` and is racy by however many callbacks
-        are already in flight -- a deliberate trade for a backpressure
-        heuristic that costs nothing on the hot path.
         """
-        loop = self._loop
-        queue = self._queue
-        if loop is None or queue is None:
+        capture = self._capture
+        if capture is None:
             return
-        if queue.qsize() >= self._queue_maxsize:
-            self._counters.inc(metrics.QUEUE_DROPPED)
-            return
-        # A closed loop raises RuntimeError. Nothing left to deliver to,
-        # and certainly nothing to raise about back into `write()`.
-        with contextlib.suppress(RuntimeError):
-            loop.call_soon_threadsafe(queue.put_nowait, message)
+        capture.submit(message)
 
     def _on_state_change(self, ssrc: int, state: StreamState, stats: StreamStats) -> None:
         """`StreamStateListener`; runs on the packet-router thread, so it only emits.
@@ -274,10 +295,10 @@ class VoiceReceiveAdapter:
 
     # -- loop side: everything below runs on the event loop --
 
-    async def _drain(self, queue: asyncio.Queue[CaptureMessage]) -> None:
+    async def _drain(self, capture: CaptureChannel) -> None:
         """The single consumer, so per-speaker frame order is preserved end to end."""
         while True:
-            message = await queue.get()
+            message = await capture.receive()
             try:
                 await self._handle(message)
             except asyncio.CancelledError:
@@ -292,27 +313,35 @@ class VoiceReceiveAdapter:
             case SpeakerStreamEnded():
                 self._service.speaker_stream_ended(message.ssrc)
             case StreamStateChanged():
-                await self._report_state_change(message)
+                self._report_state_change(message)
             case UnattributedAudio():
-                await self._report_unattributed(message)
+                self._report_unattributed(message)
             case DecodeTotalFailure():
-                await self._report_total_failure()
+                self._report_total_failure()
             case CaptureStopped():
-                await self._report_capture_stopped(message)
+                self._report_capture_stopped(message)
 
     async def _record(self, frame: CapturedFrame) -> None:
         """Consults the cached consent record, then forwards the frame if allowed.
 
-        Runs on the event loop (unlike the role check in the sink) since
-        the cache may need a database read. `has_role=True` is not an
-        assumption: the sink rejected the frame otherwise, on this frame,
-        synchronously.
+        The verdict is read without awaiting: everything queued behind
+        this task is somebody's audio, and a database read here would
+        stall the whole channel's capture for as long as it took. A
+        speaker whose record is not cached yet has their frame dropped and
+        counted while the refresh runs beside us -- audio we cannot vouch
+        for is not written, and the entry exists a frame or two later.
+
+        `has_consent_role=True` is not an assumption: the sink rejected
+        the frame otherwise, on this frame, synchronously.
         """
         assert self._guild_id is not None
-        allowed = await self._consent_cache.may_record(
+        verdict = self._consent_cache.verdict(
             self._guild_id, frame.discord_user_id, has_consent_role=True
         )
-        if not allowed:
+        if verdict is None:
+            self._counters.inc(metrics.FRAMES_AWAITING_CONSENT)
+            return
+        if not verdict:
             return
         await self._service.voice_packet(
             frame.discord_user_id,
@@ -322,13 +351,12 @@ class VoiceReceiveAdapter:
             frame.pcm,
             frame.captured_at,
         )
-        self._counters.inc(metrics.FRAMES_DECODED)
 
-    async def _report_state_change(self, message: StreamStateChanged) -> None:
+    def _report_state_change(self, message: StreamStateChanged) -> None:
         log_state_change(message.ssrc, message.state, message.stats)
         self._counters.inc(metrics.STREAM_STATE_CHANGES, state=message.state.value)
 
-    async def _report_unattributed(self, message: UnattributedAudio) -> None:
+    def _report_unattributed(self, message: UnattributedAudio) -> None:
         log.warning(
             "Audio from ssrc=%s cannot be attributed to a member after %d frames; "
             "it is not being decoded or recorded. Discord supplies the mapping only "
@@ -339,10 +367,10 @@ class VoiceReceiveAdapter:
         # Same debounce key as the join-time hint: the message is the
         # same instruction, and a participant should not receive it twice
         # because two code paths noticed the same problem.
-        await self._notify("attribution-hint", ATTRIBUTION_HINT)
+        self._notify("attribution-hint", ATTRIBUTION_HINT)
 
-    async def _report_total_failure(self) -> None:
-        """The only decode failure that ends a session.
+    def _report_total_failure(self) -> None:
+        """The only *decode* failure that ends a session.
 
         Per-speaker degradation never does: it costs one person some audio
         and everyone else keeps recording. But if *nothing* decodes on any
@@ -357,7 +385,7 @@ class VoiceReceiveAdapter:
         )
         self._counters.inc(metrics.DECODE_TOTAL_FAILURES)
         self._service.request_close(EndReason.DECODE_FAILURE)
-        await self._notify(
+        self._notify(
             "total-failure",
             "I can no longer decode any audio in this channel, so I am ending the "
             "recording instead of producing an empty one. Nothing further is being "
@@ -365,8 +393,20 @@ class VoiceReceiveAdapter:
             limit=1,
         )
 
-    async def _report_capture_stopped(self, message: CaptureStopped) -> None:
-        """Capture ended without us asking. One re-listen, then reporting only."""
+    def _report_capture_stopped(self, message: CaptureStopped) -> None:
+        """Capture ended without us asking. One re-listen, then the session ends.
+
+        The resumed case is a backstop and reports itself as one. The
+        unresumable case ends the session with `CAPTURE_FAILURE`, and that
+        is the point: capture is dead, so no audio and no speaking event
+        will ever arrive again, the machine's own timers know nothing
+        about it, and the session would otherwise sit open until it closed
+        as an ordinary `idle_timeout`. That row -- a normal-looking
+        session with nothing in it -- is exactly what the production
+        incident left behind, and the whole reason nobody noticed for
+        hours. Whoever reads it next must be able to tell "nobody spoke"
+        from "we could not hear".
+        """
         log.error(
             "Voice capture stopped unexpectedly (%s). This is the failure mode that "
             "silently ended a recording in production.",
@@ -394,17 +434,24 @@ class VoiceReceiveAdapter:
             except Exception:
                 log.exception("Could not resume voice capture after an unexpected stop")
 
-        await self._notify(
+        if resumed:
+            self._notify(
+                "capture-stopped",
+                "Audio capture stopped unexpectedly and I have resumed it. If this "
+                "message repeats, assume nothing further is being recorded.",
+                limit=NOTICE_LIMIT,
+            )
+            return
+
+        self._service.request_close(EndReason.CAPTURE_FAILURE)
+        self._notify(
             "capture-stopped",
-            "Audio capture stopped unexpectedly and I have resumed it. If this message "
-            "repeats, assume nothing further is being recorded."
-            if resumed
-            else "Audio capture stopped unexpectedly and could not be resumed. Nothing "
-            "further is being recorded from this point.",
+            "Audio capture stopped unexpectedly and could not be resumed. I am ending "
+            "the recording rather than leaving it open with nothing arriving.",
             limit=NOTICE_LIMIT,
         )
 
-    async def _maybe_post_attribution_hint(self, channel: discord.VoiceChannel) -> None:
+    def _maybe_post_attribution_hint(self, channel: discord.VoiceChannel) -> None:
         """Provokes the speaking event for anyone who was already talking.
 
         Discord maps an SSRC to a user only when it sends op 5, which it
@@ -418,14 +465,16 @@ class VoiceReceiveAdapter:
         others = [member for member in channel.members if not member.bot]
         if not others:
             return
-        await self._notify("attribution-hint", ATTRIBUTION_HINT, limit=1)
+        self._notify("attribution-hint", ATTRIBUTION_HINT, limit=1)
 
-    async def _notify(self, key: str, text: str, *, limit: int = NOTICE_LIMIT) -> None:
-        """Posts one debounced message into the recorded channel.
+    def _notify(self, key: str, text: str, *, limit: int = NOTICE_LIMIT) -> None:
+        """Posts one debounced message into the recorded channel, off the drain.
 
-        Failing to post must never take down the drain -- the channel may
-        deny the bot messages entirely -- so a failure is logged and
-        swallowed here rather than at the caller.
+        The debounce bookkeeping is done here and now, synchronously, so
+        two callers cannot both decide to send; the HTTP call itself
+        happens in a task of its own, because `channel.send` is
+        rate-limited by Discord and awaiting it on the drain would stall
+        every speaker's audio behind a courtesy message.
         """
         channel = self._channel
         if channel is None:
@@ -437,7 +486,21 @@ class VoiceReceiveAdapter:
         if last is not None and now - last < NOTICE_INTERVAL:
             return
         self._notices[key] = (sent + 1, now)
+        self._spawn(self._send_notice(channel, key, text))
+
+    async def _send_notice(self, channel: discord.VoiceChannel, key: str, text: str) -> None:
+        """Failing to post must never take down anything else."""
         try:
             await channel.send(text)
         except Exception:
             log.warning("Could not post the %r notice into channel %s", key, channel.id)
+
+    def _spawn(self, coro: Coroutine[Any, Any, None]) -> None:
+        """Runs one coroutine beside the drain, keeping a reference to it.
+
+        A task nobody holds a reference to can be garbage collected
+        mid-flight; `leave()` cancels whatever is still running.
+        """
+        task = asyncio.create_task(coro)
+        self._side_tasks.add(task)
+        task.add_done_callback(self._side_tasks.discard)

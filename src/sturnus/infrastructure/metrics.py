@@ -23,9 +23,13 @@ from __future__ import annotations
 
 import threading
 
-#: Frames handed to the sink that decoded cleanly.
+#: Frames that decoded cleanly. Incremented once, by
+#: `ResilientOpusDecoder`, which is the single point every frame from a
+#: consenting speaker passes through.
 FRAMES_DECODED = "sturnus_voice_frames_decoded_total"
-#: Frames that raised out of libopus and were discarded (labelled by code).
+#: Frames the decoder could not read, labelled `code` with the libopus
+#: error code (`code="-4"` is the production corrupted-stream case) or
+#: `code="unknown"` for a failure that carried no code.
 FRAMES_DISCARDED = "sturnus_voice_frames_discarded_total"
 #: Frames the network lost, which the library reported as a fake packet.
 FRAMES_LOST = "sturnus_voice_frames_lost_total"
@@ -33,8 +37,14 @@ FRAMES_LOST = "sturnus_voice_frames_lost_total"
 #: decoded, never written, because no consent record can be checked for an
 #: identity we do not know.
 FRAMES_UNATTRIBUTED = "sturnus_voice_frames_unattributed_total"
+#: Frames dropped because this speaker's stored consent record was not
+#: cached yet. The verdict is fetched off the drain, so the first frames of
+#: a speaker's first utterance can arrive before it is known -- and audio
+#: whose consent we cannot vouch for is not recorded.
+FRAMES_AWAITING_CONSENT = "sturnus_voice_frames_awaiting_consent_total"
 #: Frames dropped because the event loop fell far enough behind that the
 #: hand-off queue filled. Should never fire; if it does, this is evidence.
+#: Only ever audio: control messages are not subject to this bound.
 QUEUE_DROPPED = "sturnus_voice_queue_dropped_total"
 #: Per-stream escalations, labelled by the state that was reached.
 STREAM_STATE_CHANGES = "sturnus_voice_stream_state_changes_total"

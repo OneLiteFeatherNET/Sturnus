@@ -34,7 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.ports import AudioWriter, Clock, SessionKey
 from sturnus.application.recording import RecordingService
-from sturnus.domain.session import SessionTimeouts
+from sturnus.domain.session import EndReason, SessionTimeouts
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import (
@@ -43,7 +43,11 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
-from sturnus.infrastructure.discord.client import SturnusClient, _GuildRecording
+from sturnus.infrastructure.discord.client import (
+    REJOIN_COOLDOWN,
+    SturnusClient,
+    _GuildRecording,
+)
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState
 
@@ -337,3 +341,71 @@ async def test_two_consecutive_sessions_through_the_client(tmp_path: Path) -> No
     assert sessions.participants_of(2) == {BEN}
     assert sessions.keys.keys() == {1, 2}
     assert list(tmp_path.rglob("*")) == []  # both sessions cleaned up after themselves
+
+
+async def test_capture_failure_does_not_rejoin_straight_back_into_itself(
+    tmp_path: Path,
+) -> None:
+    """A session that ended because nothing could be heard must not start another.
+
+    Closing the session makes the bot leave the channel, and leaving is
+    itself a voice-state update. Without a cooldown the very next event
+    opens a fresh session row, rejoins with fresh decoders, meets the
+    same fault and closes again -- a loop of empty sessions, each one
+    announcing to everyone present that they are being recorded.
+
+    The cooldown is a pause, not a giving up: once it has passed, the
+    next participant starts a real session again.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    service = RecordingService(
+        guild_id=GUILD_ID,
+        channel_id=CHANNEL_ID,
+        timeouts=SessionTimeouts(
+            empty_grace_seconds=60, idle_timeout_minutes=15, max_session_hours=4
+        ),
+        sessions=sessions,
+        jobs=FakeJobs(),
+        store=FakeStore(),
+        writers=FakeAudioWriterFactory(tmp_path),
+        encryptor=FakeEncryptor(),
+        retention_days=30,
+    )
+    voice = FakeVoiceReceiver()
+    client = _client(clock)
+    client._guilds[GUILD_ID] = _GuildRecording(
+        channel_id=CHANNEL_ID, role_id=ROLE_ID, service=service, voice=voice
+    )
+
+    empty_channel = _voice_channel(CHANNEL_ID, members=[])
+    guild = _guild(GUILD_ID, empty_channel)
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    occupied = _voice_channel(CHANNEL_ID, members=[anna])
+
+    guild.get_channel.return_value = occupied
+    await client.on_voice_state_update(anna, _voice_state(None), _voice_state(empty_channel))
+    assert voice.joined == [CHANNEL_ID]
+
+    # Capture dies: every stream stops decoding, so the adapter arms a
+    # close that is nothing like a timeout.
+    service.request_close(EndReason.DECODE_FAILURE)
+    clock.advance(timedelta(seconds=1))
+    await client._tick_all(clock.now())
+
+    assert sessions.closed == [(1, "decode_failure")]
+    assert voice.left == 1
+
+    # The bot leaving is itself a voice-state update.
+    clock.advance(timedelta(seconds=1))
+    await client.on_voice_state_update(anna, _voice_state(occupied), _voice_state(occupied))
+
+    assert voice.joined == [CHANNEL_ID], "rejoining would meet the same fault"
+    assert sessions.opened == [1], "and would leave another empty session row behind"
+    assert service.is_recording is False
+
+    clock.advance(REJOIN_COOLDOWN + timedelta(seconds=1))
+    await client.on_voice_state_update(anna, _voice_state(occupied), _voice_state(occupied))
+
+    assert voice.joined == [CHANNEL_ID, CHANNEL_ID], "a pause, not a giving up"
+    assert sessions.opened == [1, 2]

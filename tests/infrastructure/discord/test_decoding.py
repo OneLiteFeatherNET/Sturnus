@@ -30,9 +30,16 @@ from discord.opus import OpusError, OpusNotLoaded
 
 from sturnus.domain.stream_health import DecodePolicy, StreamState, StreamStats
 from sturnus.infrastructure.discord.decoding import (
+    UNKNOWN_ERROR_LABEL,
     ResilientOpusDecoder,
     SpeakerDecoder,
     new_opus_decoder,
+)
+from sturnus.infrastructure.metrics import (
+    FRAMES_DECODED,
+    FRAMES_DISCARDED,
+    FRAMES_LOST,
+    Counters,
 )
 
 ANNA_SSRC, BEN_SSRC = 111, 222
@@ -255,6 +262,32 @@ def test_never_decoded_is_reported_instead_of_degraded_and_rebuilds_nothing() ->
     assert len(factory.built) == 1
 
 
+def test_one_failing_speaker_is_not_read_as_nothing_decoding_anywhere() -> None:
+    """The verdict must rest on every live stream, not on a convenient subset.
+
+    Anna's stream dies while Ben, who said one word and went quiet, has
+    nowhere near enough frames to be judged. Excluding Ben from the
+    verdict left it resting on the single failing stream: one bad speaker
+    read as "nothing decodes anywhere", and the whole channel's recording
+    ended for it. A stream too young to judge is evidence that something
+    might still work, so it blocks the verdict rather than being ignored.
+    """
+    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
+    fired: list[None] = []
+    decoder = ResilientOpusDecoder(
+        factory=factory, policy=FAST, on_total_failure=lambda: fired.append(None)
+    )
+
+    decoder.decode(BEN_SSRC, b"a")
+    for _ in range(FAST.unusable_after_consecutive * 3):
+        decoder.decode(ANNA_SSRC, b"corrupt")
+
+    assert decoder.stats()[BEN_SSRC].frames_seen < FAST.never_decoded_after, (
+        "Ben is exactly the briefly-quiet speaker the old rule excluded"
+    )
+    assert fired == [], "one dead speaker is never the whole channel"
+
+
 def test_total_failure_fires_once_and_only_when_nothing_decodes_anywhere() -> None:
     factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
     fired: list[None] = []
@@ -323,14 +356,68 @@ def test_a_decode_failure_is_never_concealed() -> None:
 # --- containment ---
 
 
-def test_an_unexpected_decoder_error_never_escapes() -> None:
-    class Exploding:
-        def decode(self, data: bytes | None, *, fec: bool = False) -> bytes:  # noqa: ARG002
-            raise MemoryError("not an OpusError")
+class Exploding:
+    """A decoder whose every frame fails with something that is not an `OpusError`."""
 
+    def decode(self, data: bytes | None, *, fec: bool = False) -> bytes:  # noqa: ARG002
+        raise MemoryError("not an OpusError")
+
+
+def test_an_unexpected_decoder_error_never_escapes() -> None:
     decoder = ResilientOpusDecoder(factory=Exploding, policy=FAST)
 
     assert decoder.decode(ANNA_SSRC, b"a") is None
+
+
+def test_a_non_opus_error_is_accounted_for_like_any_other_unreadable_frame() -> None:
+    """Dead and reporting fine is the incident's own shape, in a new place.
+
+    Only `OpusError` used to be caught where the health accounting
+    happens, so anything else -- a ctypes failure, an alpha library that
+    changed shape, a bug of ours -- left through the outer guard without
+    touching `StreamHealth`. The stream then stayed `HEALTHY` with
+    `frames_seen == 0` forever while every single frame of it was thrown
+    away, and nothing ever escalated, logged a transition, or counted
+    towards the total-failure verdict.
+    """
+    counters = Counters()
+    transitions = TransitionLog()
+    decoder = ResilientOpusDecoder(
+        factory=Exploding, policy=FAST, on_state_change=transitions, counters=counters
+    )
+
+    for _ in range(FAST.never_decoded_after):
+        assert decoder.decode(ANNA_SSRC, b"a") is None
+
+    stats = decoder.stats()[ANNA_SSRC]
+    assert stats.frames_seen == FAST.never_decoded_after
+    assert stats.frames_discarded == FAST.never_decoded_after
+    assert stats.state is StreamState.NEVER_DECODED, "a dead stream must not report HEALTHY"
+    assert transitions.states(ANNA_SSRC) == [StreamState.NEVER_DECODED]
+    assert counters.get(FRAMES_DISCARDED, code=UNKNOWN_ERROR_LABEL) == FAST.never_decoded_after
+
+
+def test_every_frame_is_counted_once_and_a_discard_carries_its_error_code() -> None:
+    """`sturnus_voice_frames_discarded_total` is documented as labelled by code.
+
+    It was incremented with no labels at all, so the libopus code -- the
+    one number that says whether this is the production corrupted-stream
+    fault or something new -- never reached Prometheus. And
+    `frames_decoded_total` was incremented twice per frame, once here and
+    once in the sink's own drain, so it read about double.
+    """
+    counters = Counters()
+    factory = DecoderFactorySpy(bad=frozenset({b"corrupt"}))
+    decoder = ResilientOpusDecoder(factory=factory, policy=FAST, counters=counters)
+
+    decoder.decode(ANNA_SSRC, b"good")
+    decoder.decode(ANNA_SSRC, b"corrupt")
+    decoder.decode(ANNA_SSRC, b"")
+
+    assert counters.get(FRAMES_DECODED) == 1
+    assert counters.get(FRAMES_LOST) == 1
+    assert counters.get(FRAMES_DISCARDED, code=str(CORRUPTED_STREAM)) == 1
+    assert counters.get(FRAMES_DISCARDED) == 0, "an unlabelled sample would be the old bug"
 
 
 def test_a_factory_that_raises_never_escapes() -> None:

@@ -71,6 +71,8 @@ from sturnus.domain.stream_health import (
     StreamState,
     StreamStats,
 )
+from sturnus.infrastructure import metrics
+from sturnus.infrastructure.metrics import Counters
 
 log = logging.getLogger(__name__)
 
@@ -81,6 +83,12 @@ log = logging.getLogger(__name__)
 #: event must not turn into an unbounded leak. 64 is far above any real
 #: voice channel's concurrent speaker count.
 DEFAULT_MAX_STREAMS = 64
+
+#: The `code` label put on `sturnus_voice_frames_discarded_total` for a
+#: failure libopus did not report a code for -- i.e. anything that left the
+#: decoder as something other than an `OpusError`. A real code is rendered
+#: as its number, so `code="-4"` is the production corrupted-stream case.
+UNKNOWN_ERROR_LABEL = "unknown"
 
 
 class FrameDecoder(Protocol):
@@ -139,10 +147,16 @@ class SpeakerDecoder:
         self._factory = factory
         self._health = StreamHealth(policy)
         self._decoder = factory()
+        self._unexpected_errors = 0
 
     @property
     def state(self) -> StreamState:
         return self._health.state
+
+    @property
+    def last_error_code(self) -> int | None:
+        """The most recent failure's libopus code, `None` if it had none."""
+        return self._health.last_error_code
 
     @property
     def may_recycle(self) -> bool:
@@ -159,13 +173,21 @@ class SpeakerDecoder:
         or `None` meaning "write nothing"; `transition` is the new stream
         state if this frame changed the verdict, otherwise `None`.
 
-        Only `OpusError` is caught. That is the whole family libopus
-        reports through `discord.opus._err_lt` -- `-1 BAD_ARG`,
-        `-2 BUFFER_TOO_SMALL`, `-3 INTERNAL_ERROR`, `-4 INVALID_PACKET`
-        (the production one), `-5 UNIMPLEMENTED`, `-6 INVALID_STATE`,
-        `-7 ALLOC_FAIL` -- and it is exactly the set that means "this
-        frame is unreadable", nothing more. `OpusNotLoaded` is *not* in
-        it and is never caught here; see `new_opus_decoder`.
+        `OpusError` is the family libopus reports through
+        `discord.opus._err_lt` -- `-1 BAD_ARG`, `-2 BUFFER_TOO_SMALL`,
+        `-3 INTERNAL_ERROR`, `-4 INVALID_PACKET` (the production one),
+        `-5 UNIMPLEMENTED`, `-6 INVALID_STATE`, `-7 ALLOC_FAIL` -- and it
+        carries a code to label the failure by. Anything else the decoder
+        raises is accounted for identically, just without a code: a frame
+        thrown away is a frame thrown away, whatever the reason, and a
+        stream whose every frame is thrown away must not go on reporting
+        `HEALTHY` with `frames_seen == 0`. That is the incident's own
+        shape -- dead, and reporting fine -- and letting a non-`OpusError`
+        bypass `StreamHealth` would have reproduced it exactly.
+
+        `OpusNotLoaded` is deliberately not special-cased here either; it
+        cannot reach this method, because `VoiceReceiveAdapter.join`
+        probes for it before connecting (see `new_opus_decoder`).
 
         The decoder instance is kept, not reset: measured, it decodes the
         very next good frame correctly.
@@ -180,6 +202,20 @@ class SpeakerDecoder:
             # read: the writer's gap padding fills this frame with real
             # silence instead.
             return None, self._health.record_discarded(error.code)
+        except Exception:
+            # A ctypes failure, an alpha library that changed shape under
+            # us, a bug of ours. Logged once per stream with its
+            # traceback -- at 50 frames a second an unrate-limited one is
+            # its own outage -- and after that the escalation the health
+            # accounting now produces is what reports it.
+            self._unexpected_errors += 1
+            if self._unexpected_errors == 1:
+                log.exception(
+                    "Opus decoding for ssrc=%s raised something other than OpusError; "
+                    "the frame is discarded and counted like any other unreadable frame",
+                    self._ssrc,
+                )
+            return None, self._health.record_discarded(None)
         self._health.record_decoded()
         return pcm, None
 
@@ -198,11 +234,15 @@ class SpeakerDecoder:
             return None
         try:
             pcm = self._decoder.decode(None, fec=False)
-        except OpusError as error:
+        except Exception as error:
             # Concealment is best-effort by definition; a failure to
             # invent a frame is not evidence about the input stream, so
-            # it is not counted as a discard.
-            log.debug("Packet-loss concealment failed for ssrc=%s: %s", self._ssrc, error)
+            # it is not counted as a discard. Not narrowed to `OpusError`
+            # either: the frame is already counted as lost by
+            # `record_lost`, and letting anything else out of here would
+            # skip the rest of this stream's accounting on the way to the
+            # outer guard.
+            log.debug("Packet-loss concealment failed for ssrc=%s: %r", self._ssrc, error)
             return None
         self._health.record_concealed()
         return pcm
@@ -248,6 +288,7 @@ class ResilientOpusDecoder:
         max_streams: int = DEFAULT_MAX_STREAMS,
         on_state_change: StreamStateListener | None = None,
         on_total_failure: Callable[[], None] | None = None,
+        counters: Counters | None = None,
     ) -> None:
         if max_streams <= 0:
             raise ValueError("max_streams must be positive")
@@ -256,6 +297,13 @@ class ResilientOpusDecoder:
         self._max_streams = max_streams
         self._on_state_change = on_state_change
         self._on_total_failure = on_total_failure
+        # Every frame from a consenting speaker passes through `decode`,
+        # and this is the only place that knows *why* one was thrown away,
+        # so the three frame counters are kept together here rather than
+        # split between here and the sink. A network loss and a frame we
+        # could not read are then impossible to confuse, and the libopus
+        # error code actually reaches Prometheus as a label.
+        self._counters = counters or metrics.COUNTERS
         # Ordered by least-recently-used, so the LRU backstop can evict in
         # O(1) without a separate bookkeeping structure.
         self._streams: OrderedDict[int, SpeakerDecoder] = OrderedDict()
@@ -317,8 +365,13 @@ class ResilientOpusDecoder:
     def _decode(self, ssrc: int, frame: bytes | None) -> bytes | None:
         stream = self._stream(ssrc)
         if not frame:
+            self._counters.inc(metrics.FRAMES_LOST)
             return stream.conceal()
         pcm, transition = stream.decode(frame)
+        if pcm is None:
+            self._counters.inc(metrics.FRAMES_DISCARDED, code=_error_label(stream.last_error_code))
+        else:
+            self._counters.inc(metrics.FRAMES_DECODED)
         if transition is not None:
             self._escalate(ssrc, stream, transition)
         return pcm
@@ -355,33 +408,51 @@ class ResilientOpusDecoder:
     def _check_total_failure(self) -> None:
         """Fires `on_total_failure` once when nothing decodes anywhere.
 
-        The one case that is *not* a per-speaker problem: if every stream
-        that has seen enough frames to be judged is `UNUSABLE` or
-        `NEVER_DECODED`, the bot is writing empty files while telling
-        everyone in the channel they are recorded -- the original bug in a
-        new costume. Recycling is already spent by the time a stream can
-        stay in one of those states, so this cannot fire while a fresh
-        decoder still has a chance.
+        The one case that is *not* a per-speaker problem: if every live
+        stream is `UNUSABLE` or `NEVER_DECODED`, the bot is writing empty
+        files while telling everyone in the channel they are recorded --
+        the original bug in a new costume. Recycling is already spent by
+        the time a stream can stay in one of those states, so this cannot
+        fire while a fresh decoder still has a chance.
+
+        "Every live stream" is the whole point, and it is where this got
+        it wrong once: judging only the streams that had seen at least
+        `never_decoded_after` frames meant one failing speaker, while
+        everybody else happened to be briefly quiet, was read as "nothing
+        decodes anywhere" and ended the recording for the whole channel.
+        A stream too young to be judged is not evidence of failure -- it
+        is evidence there is still something that might work -- so it
+        blocks the verdict rather than being excluded from it. What the
+        threshold is still needed for is the other direction: *someone*
+        must have failed long enough for the verdict to mean anything, so
+        a channel of freshly created streams cannot trip it either.
+
+        The asymmetry is deliberate. Declaring total failure by mistake
+        ends a real recording; declining to declare it costs the empty
+        files that the per-stream `NEVER_DECODED` errors are already
+        shouting about.
         """
         if self._total_failure_reported or self._on_total_failure is None:
             return
         with self._lock:
             streams = list(self._streams.values())
-        judged = [
-            stream
-            for stream in streams
-            if stream.stats.frames_seen >= self._policy.never_decoded_after
-        ]
-        if not judged:
+        if not any(
+            stream.stats.frames_seen >= self._policy.never_decoded_after for stream in streams
+        ):
             return
         dead = (StreamState.UNUSABLE, StreamState.NEVER_DECODED)
-        if any(stream.state not in dead for stream in judged):
+        if any(stream.state not in dead for stream in streams):
             return
         self._total_failure_reported = True
         try:
             self._on_total_failure()
         except Exception:
             log.exception("Total-decode-failure listener failed")
+
+
+def _error_label(code: int | None) -> str:
+    """Renders a libopus error code as a Prometheus label value."""
+    return UNKNOWN_ERROR_LABEL if code is None else str(code)
 
 
 def log_state_change(ssrc: int, state: StreamState, stats: StreamStats) -> None:

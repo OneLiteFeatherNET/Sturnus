@@ -226,16 +226,32 @@ def test_a_lost_frame_reaches_the_decoder_as_an_empty_payload() -> None:
     so a `wants_opus` sink is told about loss precisely -- it just has to
     route the empty payload to concealment rather than to `decode()`.
     """
-    counters = Counters()
-    sink, _, decoder = build(FakeDecoder(result=None), counters=counters)
+    sink, emitted, decoder = build(FakeDecoder(result=None))
     packet = FakePacket(ANNA_SSRC, 7, 960)
     assert packet.decrypted_data == b""
 
     sink.write(member(), voice_recv.VoiceData(packet, None))
 
     assert decoder.frames == [(ANNA_SSRC, b"")]
-    assert counters.get(FRAMES_LOST) == 1
+    assert emitted == []
+
+
+def test_the_sink_does_not_count_frames_the_decoder_already_counts() -> None:
+    """`sturnus_voice_frames_decoded_total` read double when both did.
+
+    The decoder is the one place that knows *why* a frame did not make it
+    -- lost, or unreadable and with which libopus code -- so it owns all
+    three frame counters; see `test_decoding.py`. This pins that the sink
+    does not add a second increment on top.
+    """
+    counters = Counters()
+    sink, _, _ = build(counters=counters)
+
+    sink.write(member(), voice_data())
+
+    assert counters.get(FRAMES_DECODED) == 0
     assert counters.get(FRAMES_DISCARDED) == 0
+    assert counters.get(FRAMES_LOST) == 0
 
 
 def test_a_silence_frame_is_decoded_rather_than_skipped() -> None:
@@ -252,15 +268,16 @@ def test_a_silence_frame_is_decoded_rather_than_skipped() -> None:
     assert len(emitted) == 1
 
 
-def test_a_frame_that_will_not_decode_emits_nothing_and_is_counted() -> None:
-    counters = Counters()
-    sink, emitted, _ = build(FakeDecoder(result=None), counters=counters)
+def test_a_frame_that_will_not_decode_emits_nothing() -> None:
+    """The frame is gone, and nothing after it shifts: `SpeakerWriter`
+    places audio by RTP-derived absolute time, so the gap becomes exactly
+    one frame of real silence in the right place.
+    """
+    sink, emitted, _ = build(FakeDecoder(result=None))
 
     sink.write(member(), voice_data())
 
     assert emitted == []
-    assert counters.get(FRAMES_DISCARDED) == 1
-    assert counters.get(FRAMES_DECODED) == 0
 
 
 # --- the invariant: nothing escapes write() ---

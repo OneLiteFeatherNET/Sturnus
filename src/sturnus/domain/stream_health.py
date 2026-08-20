@@ -154,6 +154,19 @@ class StreamHealth:
         return self._state
 
     @property
+    def last_error_code(self) -> int | None:
+        """The code of the most recent failure, or `None` if there is none.
+
+        `None` also stands for a failure libopus did not report a code for
+        -- anything that came out of the decoder as something other than
+        an `OpusError`. Exposed as a property, rather than only through
+        `stats()`, because it is read once per discarded frame to label a
+        counter and building a whole snapshot for it would be waste on the
+        hot path.
+        """
+        return self._last_error_code
+
+    @property
     def may_recycle(self) -> bool:
         """Whether a fresh decoder is worth one more try for this stream.
 

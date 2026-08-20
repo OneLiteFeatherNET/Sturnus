@@ -419,10 +419,12 @@ it does stop them from being recorded, without any further action.
 
 The packet-level filter checks both layers: the Discord role, per packet,
 and the stored consent record behind it
-(`sturnus.infrastructure.discord.voice` calling `ConsentCache.may_record`,
+(`sturnus.infrastructure.discord.voice` calling `ConsentCache.verdict`,
 which applies `sturnus.domain.consent.may_record` — role membership **and**
-a consent record matching the current `policy_version`). So a bump takes
-effect on its own, within the cache's five-second TTL: role-holders whose
+a consent record matching the current `policy_version`). That verdict is
+served from cache without ever blocking the audio drain, and a stale entry
+is refreshed beside it rather than on it, so a bump takes effect within the
+cache's five-second TTL plus one refresh: role-holders whose
 consent names the superseded version stop being recorded mid-session, and
 `/consent grant` under the new version is what puts them back. Removing
 the role by hand is not required for a hard cutover, and doing so only
