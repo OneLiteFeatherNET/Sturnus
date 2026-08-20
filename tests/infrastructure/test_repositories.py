@@ -1,11 +1,12 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.application.assembly import serialize_transcript
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
-from sturnus.infrastructure.db.models import AccountLink, Base
+from sturnus.infrastructure.db.models import AccountLink, Base, Session
 from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -326,3 +327,139 @@ async def test_delete_reports_whether_anything_was_removed(
     await write_repo.save(BEN, "outline", "ext-3", "Ben")
     assert await write_repo.delete(BEN, "outline") is True
     assert await write_repo.delete(BEN, "outline") is False
+
+
+# ---------------------------------------------------------------------------
+# `SessionRepository.candidates_for_announcement` / `.mark_announced` /
+# `.closed_undocumented_sessions`, and `JobRepository.
+# candidates_for_retention` / `.mark_audio_deleted` -- the periodic sweeps'
+# infrastructure adapters (Defect 3, Defect 4).
+# ---------------------------------------------------------------------------
+
+
+async def _mark_documented(factory: async_sessionmaker[AsyncSession], session_id: int) -> None:
+    """Sets `status`/`document_url` directly -- the real write path
+    (`_WorkerSessionStore.mark_documented` in `sturnus.entrypoints.worker`)
+    lives outside this module's repositories, so a test needing a
+    `documented` row writes it directly instead.
+    """
+    async with factory() as session:
+        await session.execute(
+            update(Session)
+            .where(Session.id == session_id)
+            .values(status="documented", document_url="https://outline.example/doc/1")
+        )
+        await session.commit()
+
+
+async def test_candidates_for_announcement_returns_documented_sessions(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await _mark_documented(factory, session_id)
+
+    candidates = await repo.candidates_for_announcement()
+    assert [c["id"] for c in candidates] == [session_id]
+    assert candidates[0]["document_url"] == "https://outline.example/doc/1"
+    assert candidates[0]["announced_at"] is None
+
+
+async def test_candidates_for_announcement_excludes_a_session_still_open(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SessionRepository(factory)
+    await repo.open_session(GUILD, CHANNEL, T0)
+    assert await repo.candidates_for_announcement() == []
+
+
+async def test_mark_announced_stamps_the_session(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, T0)
+    await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await _mark_documented(factory, session_id)
+
+    await repo.mark_announced(session_id, T0 + timedelta(minutes=5))
+
+    candidates = await repo.candidates_for_announcement()
+    assert candidates[0]["announced_at"] == T0 + timedelta(minutes=5)
+
+
+async def test_closed_undocumented_sessions_finds_a_session_whose_jobs_are_all_terminal(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    queue = JobQueue(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
+    await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await queue.complete(job_id, "hello")
+
+    assert await sessions.closed_undocumented_sessions() == [session_id]
+
+
+async def test_closed_undocumented_sessions_excludes_a_session_with_a_pending_job(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    await _enqueue_job(sessions, jobs, session_id, ANNA)
+    await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
+
+    assert await sessions.closed_undocumented_sessions() == []
+
+
+async def test_closed_undocumented_sessions_excludes_a_session_with_no_jobs(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
+
+    assert await sessions.closed_undocumented_sessions() == []
+
+
+async def test_closed_undocumented_sessions_excludes_an_already_documented_session(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    queue = JobQueue(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
+    await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await queue.complete(job_id, "hello")
+    await _mark_documented(factory, session_id)
+
+    assert await sessions.closed_undocumented_sessions() == []
+
+
+async def test_candidates_for_retention_returns_undeleted_jobs(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
+
+    candidates = await jobs.candidates_for_retention()
+    assert [c["id"] for c in candidates] == [job_id]
+    assert candidates[0]["audio_deleted_at"] is None
+
+
+async def test_mark_audio_deleted_excludes_the_job_from_later_candidates(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
+
+    await jobs.mark_audio_deleted(job_id, T0 + timedelta(days=31))
+
+    assert await jobs.candidates_for_retention() == []

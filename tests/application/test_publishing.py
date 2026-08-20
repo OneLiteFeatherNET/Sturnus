@@ -1,6 +1,6 @@
 from datetime import UTC, datetime
 
-from sturnus.application.publishing import sessions_to_announce
+from sturnus.application.publishing import announce_ready_sessions, sessions_to_announce
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 
@@ -10,12 +10,14 @@ def session(
     status: str = "documented",
     document_url: str | None = "https://outline.example/doc/1",
     announced: datetime | None = None,
+    channel_id: int = 999,
 ) -> dict[str, object]:
     return {
         "id": session_id,
         "status": status,
         "document_url": document_url,
         "announced_at": announced,
+        "channel_id": channel_id,
     }
 
 
@@ -47,3 +49,73 @@ def test_several_sessions_are_filtered_independently() -> None:
         session(5),
     ]
     assert [s["id"] for s in sessions_to_announce(sessions)] == [2, 5]
+
+
+# ---------------------------------------------------------------------------
+# `announce_ready_sessions` -- the periodic sweep that actually calls
+# `sessions_to_announce`, posts the link, and stamps `announced_at`.
+# ---------------------------------------------------------------------------
+
+
+class FakeSessions:
+    def __init__(self, candidates: list[dict[str, object]] | None = None) -> None:
+        self._candidates = candidates or []
+        self.announced: list[int] = []
+
+    async def candidates_for_announcement(self) -> list[dict[str, object]]:
+        return self._candidates
+
+    async def mark_announced(self, session_id: int, _now: datetime) -> None:
+        self.announced.append(session_id)
+
+
+class FakeAnnouncer:
+    def __init__(self, fail_channel_ids: set[int] | None = None) -> None:
+        self.posted: list[tuple[int, str]] = []
+        self._fail_channel_ids = fail_channel_ids or set()
+
+    async def post(self, channel_id: int, text: str) -> None:
+        if channel_id in self._fail_channel_ids:
+            raise RuntimeError("Discord API is briefly unreachable")
+        self.posted.append((channel_id, text))
+
+
+async def test_announce_ready_sessions_posts_and_stamps_a_ready_session() -> None:
+    sessions = FakeSessions([session(1, channel_id=42)])
+    announcer = FakeAnnouncer()
+    await announce_ready_sessions(sessions, announcer, T0)
+    assert len(announcer.posted) == 1
+    channel_id, text = announcer.posted[0]
+    assert channel_id == 42
+    assert "https://outline.example/doc/1" in text
+    assert sessions.announced == [1]
+
+
+async def test_announce_ready_sessions_skips_a_session_not_selected() -> None:
+    sessions = FakeSessions([session(1, status="open")])
+    announcer = FakeAnnouncer()
+    await announce_ready_sessions(sessions, announcer, T0)
+    assert announcer.posted == []
+    assert sessions.announced == []
+
+
+async def test_announce_ready_sessions_does_not_stamp_a_session_whose_post_failed() -> None:
+    """A failed post must be retried on the next sweep, not silently marked done."""
+    sessions = FakeSessions([session(1, channel_id=42)])
+    announcer = FakeAnnouncer(fail_channel_ids={42})
+    await announce_ready_sessions(sessions, announcer, T0)  # must not raise
+    assert announcer.posted == []
+    assert sessions.announced == []
+
+
+async def test_announce_ready_sessions_survives_one_sessions_failure() -> None:
+    """One channel being unreachable must not stop every other session's
+    announcement in the same sweep.
+    """
+    sessions = FakeSessions(
+        [session(1, channel_id=42), session(2, channel_id=43)],
+    )
+    announcer = FakeAnnouncer(fail_channel_ids={42})
+    await announce_ready_sessions(sessions, announcer, T0)  # must not raise
+    assert [channel_id for channel_id, _ in announcer.posted] == [43]
+    assert sessions.announced == [2]

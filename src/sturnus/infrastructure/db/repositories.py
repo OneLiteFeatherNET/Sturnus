@@ -14,6 +14,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.assembly import deserialize_transcript
+from sturnus.application.publishing import DOCUMENTED_STATUS
 from sturnus.application.transcription import TranscriptionResult
 from sturnus.domain.consent import ConsentRecord
 from sturnus.infrastructure.db.models import (
@@ -253,6 +254,65 @@ class SessionRepository:
             raise ValueError(f"session {session_id} is still open")
         return started_at, ended_at
 
+    async def candidates_for_announcement(self) -> list[dict[str, object]]:
+        """Every `documented` session, shaped for
+        `sturnus.application.publishing.sessions_to_announce`.
+
+        Filters only by `status`; `announced_at`/`document_url` are left
+        for that pure function to check, so there is exactly one
+        definition of the selection rule.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(
+                    Session.id,
+                    Session.channel_id,
+                    Session.status,
+                    Session.document_url,
+                    Session.announced_at,
+                ).where(Session.status == DOCUMENTED_STATUS)
+            )
+            return [
+                {
+                    "id": row.id,
+                    "channel_id": row.channel_id,
+                    "status": row.status,
+                    "document_url": row.document_url,
+                    "announced_at": row.announced_at,
+                }
+                for row in rows
+            ]
+
+    async def mark_announced(self, session_id: int, now: datetime) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                update(Session).where(Session.id == session_id).values(announced_at=now)
+            )
+            await session.commit()
+
+    async def closed_undocumented_sessions(self) -> list[int]:
+        """Closed sessions whose jobs are all terminal but which never got documented.
+
+        Used by `sturnus.application.worker.retry_pending_documents` to
+        retry document creation independently of any one job -- see that
+        function's docstring for why a session can end up here at all. A
+        session with no jobs at all (nobody ever spoke) is excluded: there
+        is nothing to assemble.
+        """
+        async with self._session_factory() as session:
+            has_jobs = select(TranscriptionJob.session_id).distinct()
+            unfinished = select(TranscriptionJob.session_id).where(
+                TranscriptionJob.status.not_in(("done", "dead"))
+            )
+            rows = await session.execute(
+                select(Session.id).where(
+                    Session.status == "closed",
+                    Session.id.in_(has_jobs),
+                    Session.id.not_in(unfinished),
+                )
+            )
+            return [row[0] for row in rows]
+
 
 class JobRepository:
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -284,6 +344,42 @@ class JobRepository:
             session.add(job)
             await session.commit()
             return job.id
+
+    async def candidates_for_retention(self) -> list[dict[str, object]]:
+        """Every job not yet marked `audio_deleted_at`, shaped for
+        `sturnus.application.retention.expired_jobs`.
+
+        Filters only by `audio_deleted_at`; the `retention_until` boundary
+        is left for that pure function to check, so there is exactly one
+        definition of it.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(
+                    TranscriptionJob.id,
+                    TranscriptionJob.s3_key,
+                    TranscriptionJob.retention_until,
+                    TranscriptionJob.audio_deleted_at,
+                ).where(TranscriptionJob.audio_deleted_at.is_(None))
+            )
+            return [
+                {
+                    "id": row.id,
+                    "s3_key": row.s3_key,
+                    "retention_until": row.retention_until,
+                    "audio_deleted_at": row.audio_deleted_at,
+                }
+                for row in rows
+            ]
+
+    async def mark_audio_deleted(self, job_id: int, now: datetime) -> None:
+        async with self._session_factory() as session:
+            await session.execute(
+                update(TranscriptionJob)
+                .where(TranscriptionJob.id == job_id)
+                .values(audio_deleted_at=now)
+            )
+            await session.commit()
 
     async def transcripts_for(self, session_id: int) -> dict[int, TranscriptionResult]:
         """Each speaker's stored transcript for a session, keyed by `discord_user_id`.

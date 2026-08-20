@@ -65,7 +65,7 @@ import importlib.resources
 import logging
 import os
 import signal
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from alembic import command
@@ -76,10 +76,11 @@ from sqlalchemy import select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from sturnus.application.worker import process_one
+from sturnus.application.retention import sweep_expired_audio
+from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file
 from sturnus.infrastructure.db.models import Session, SessionParticipant
-from sturnus.infrastructure.db.queue import JobQueue
+from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, JobQueue
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
     JobRepository,
@@ -96,6 +97,17 @@ log = logging.getLogger(__name__)
 #: that a freshly enqueued job is picked up quickly, long enough that an
 #: idle worker does not spin.
 _POLL_SECONDS = 5.0
+
+#: How often the retention sweep (Spec 12.2, Defect 3) checks for expired
+#: audio. Retention is measured in days (`audio_retention_days`), so an
+#: hourly check is easily frequent enough -- unlike `_POLL_SECONDS`, there
+#: is no user-visible latency being traded off here.
+_RETENTION_SWEEP_INTERVAL_SECONDS = 3600.0
+
+#: How often the document-retry sweep (Defect 4) re-checks for closed
+#: sessions that never got documented. Short enough that a transient
+#: Outline error self-heals within minutes, not hours.
+_DOCUMENT_RETRY_INTERVAL_SECONDS = 300.0
 
 #: faster-whisper on CPU (Spec 7 sizes the deployment for CPU, not GPU --
 #: see `charts/sturnus/values.yaml`'s `worker.resources`): int8 is the
@@ -155,6 +167,10 @@ class WorkerSettings(BaseSettings):
     model_cache_dir: Path | None = None
     work_dir: Path = Path("/tmp")
     max_job_attempts: int = 3
+    # How long a claimed job may stay `running` before `JobQueue.claim`
+    # reclaims it (Defect 4) -- see `sturnus.infrastructure.db.queue`'s
+    # `DEFAULT_LEASE_SECONDS` for why this default is as generous as it is.
+    job_lease_seconds: float = DEFAULT_LEASE_SECONDS
     health_port: int = 8080
 
 
@@ -230,6 +246,9 @@ class _WorkerSessionStore:
     async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]:
         return await self._sessions.session_bounds(session_id)
 
+    async def closed_undocumented_sessions(self) -> list[int]:
+        return await self._sessions.closed_undocumented_sessions()
+
     async def detected_language(self, session_id: int, user_id: int) -> str | None:
         async with self._session_factory() as session:
             return await session.scalar(
@@ -300,6 +319,51 @@ def _run_migrations(database_url: str) -> None:
     command.upgrade(cfg, "head")
 
 
+async def _retention_sweep_loop(
+    jobs: JobRepository, store: _DownloadableAudioStore, stop: asyncio.Event
+) -> None:
+    """Periodically deletes expired audio and stamps `audio_deleted_at`
+    (Spec 12.2, Defect 3): `sturnus.application.retention.expired_jobs`
+    exists but nothing outside its own tests calls it -- this is that
+    call, on `_RETENTION_SWEEP_INTERVAL_SECONDS`.
+
+    `sweep_expired_audio` already survives one job's own failure and
+    continues past it; the `try`/`except` here is one layer up, for a
+    failure reading candidates in the first place (a database hiccup) --
+    without it, that would kill this loop outright instead of simply
+    trying again on the next interval.
+    """
+    while not stop.is_set():
+        try:
+            await sweep_expired_audio(jobs, store, datetime.now(UTC))
+        except Exception as exc:
+            log.warning("Retention sweep failed; will retry next interval: %s", exc)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=_RETENTION_SWEEP_INTERVAL_SECONDS)
+
+
+async def _document_retry_loop(
+    documents: OutlineSink,
+    sessions: _WorkerSessionStore,
+    jobs: JobRepository,
+    links: AccountLinkRepository,
+    template_source: str,
+    stop: asyncio.Event,
+) -> None:
+    """Periodically retries document creation for closed, undocumented
+    sessions (Defect 4) on `_DOCUMENT_RETRY_INTERVAL_SECONDS`. See
+    `sturnus.application.worker.retry_pending_documents`'s docstring for
+    why a session can need this at all.
+    """
+    while not stop.is_set():
+        try:
+            await retry_pending_documents(documents, sessions, jobs, links, template_source)
+        except Exception as exc:
+            log.warning("Document retry sweep failed; will retry next interval: %s", exc)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=_DOCUMENT_RETRY_INTERVAL_SECONDS)
+
+
 async def _run() -> None:
     logging.basicConfig(level=logging.INFO)
     settings = WorkerSettings()
@@ -318,7 +382,7 @@ async def _run() -> None:
     engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
-    queue = JobQueue(session_factory)
+    queue = JobQueue(session_factory, lease_seconds=settings.job_lease_seconds)
     transcription_engine = WhisperEngine(
         settings.whisper_model,
         "cpu",
@@ -364,6 +428,15 @@ async def _run() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
+    # Two background sweeps, independent of the main claim/transcribe loop
+    # below and of each other -- each survives its own errors (see their
+    # own docstrings) so a failure in one never stops the other or the
+    # main loop.
+    retention_task = asyncio.create_task(_retention_sweep_loop(jobs, store, stop))
+    document_retry_task = asyncio.create_task(
+        _document_retry_loop(documents, sessions, jobs, links, template_source, stop)
+    )
+
     log.info("Worker started; polling the transcription queue")
     try:
         while not stop.is_set():
@@ -390,6 +463,11 @@ async def _run() -> None:
                     await asyncio.wait_for(stop.wait(), timeout=_POLL_SECONDS)
     finally:
         log.info("Shutdown requested: worker stopping after its current job")
+        for task in (retention_task, document_retry_task):
+            task.cancel()
+        for task in (retention_task, document_retry_task):
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
         await health_runner.cleanup()
         await engine.dispose()
 

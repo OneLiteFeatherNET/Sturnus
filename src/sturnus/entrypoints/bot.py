@@ -12,15 +12,18 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import logging
 import signal
 from datetime import UTC, datetime
 
+import discord
 from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from sturnus.application.ports import Clock
+from sturnus.application.publishing import announce_ready_sessions
 from sturnus.application.recovery import recover_orphans
 from sturnus.config import get_settings
 from sturnus.domain import settings as domain_settings
@@ -45,12 +48,68 @@ log = logging.getLogger(__name__)
 _SCHEMA_WAIT_TIMEOUT_SECONDS = 60.0
 _SCHEMA_WAIT_INTERVAL_SECONDS = 2.0
 
+# `publish_poll_seconds` (Spec 8.5) is stored per guild, but the sweep below
+# posts across every guild's ready sessions in one pass; a single process-
+# wide interval, taken from the setting's own default, is a deliberate
+# simplification rather than per-guild scheduling for what the spec itself
+# calls "only a handful of sessions per day".
+_PUBLISH_POLL_SECONDS = float(domain_settings.DEFAULTS[domain_settings.PUBLISH_POLL_SECONDS])
+
 
 class SystemClock:
     """Satisfies the `Clock` port with the wall clock, always timezone-aware."""
 
     def now(self) -> datetime:
         return datetime.now(UTC)
+
+
+class _DiscordAnnouncer:
+    """Satisfies `sturnus.application.publishing.Announcer` over the gateway.
+
+    Posts into the session's own `channel_id` -- the recording channel
+    (Spec 8.5) -- which discord.py's `VoiceChannel` supports directly via
+    `.send()`, the same way `sturnus.infrastructure.discord.voice.
+    VoiceReceiveAdapter` already resolves that same id with `get_channel`.
+    """
+
+    def __init__(self, client: discord.Client) -> None:
+        self._client = client
+
+    async def post(self, channel_id: int, text: str) -> None:
+        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
+            channel_id
+        )
+        if not isinstance(channel, discord.abc.Messageable):
+            raise ValueError(f"channel {channel_id} cannot receive messages")
+        await channel.send(text)
+
+
+async def _publish_loop(
+    client: discord.Client,
+    sessions: SessionRepository,
+    stop: asyncio.Event,
+    poll_seconds: float = _PUBLISH_POLL_SECONDS,
+) -> None:
+    """Periodically posts each finished session's document link (Spec 8.5,
+    Defect 3): `sturnus.application.publishing.sessions_to_announce` exists
+    but nothing outside its own tests calls it -- this is that call.
+
+    Waits for the gateway connection before its first sweep -- `get_channel`
+    needs the client's channel cache populated, which only happens once
+    `on_ready` has run. `announce_ready_sessions` already survives one
+    session's own failure and continues past it; the `try`/`except` here is
+    one layer up, for a failure reading candidates in the first place (a
+    database hiccup), so it does not kill this loop outright.
+    """
+    await client.wait_until_ready()
+    announcer = _DiscordAnnouncer(client)
+    while not stop.is_set():
+        try:
+            await announce_ready_sessions(sessions, announcer, datetime.now(UTC))
+        except Exception as exc:
+            log.warning("Publish sweep failed; will retry next interval: %s", exc)
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
 
 
 async def _wait_for_schema(
@@ -182,10 +241,14 @@ async def _run() -> None:
         loop.add_signal_handler(sig, stop.set)
 
     client_task = asyncio.create_task(client.start(settings.discord_token.get_secret_value()))
+    publish_task = asyncio.create_task(_publish_loop(client, session_repo, stop))
     try:
         await stop.wait()
     finally:
         log.info("Shutdown requested: closing every active session before disconnecting")
+        publish_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await publish_task
         await client.graceful_shutdown()
         await client.close()
         await client_task

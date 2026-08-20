@@ -1,11 +1,14 @@
 """The transcription job queue.
 
-The correctness of this module lives in one rule: `complete` marks a job
-done and counts the session's jobs that are neither `done` nor `dead` —
-that count is what decides whether this was the session's last job.
+The correctness of this module lives in two rules.
+
+**`complete` marks a job done and reports whether it was the session's
+last job.** "Last" requires two things together: every job of the session
+is now `done` or `dead` (its own remaining-jobs count), *and* the session
+itself is `closed`. The count alone is not enough -- see Defect 5 below.
 
 Doing both inside one transaction is *not*, on its own, enough to make
-this safe. Under PostgreSQL's default READ COMMITTED isolation, a
+the count safe. Under PostgreSQL's default READ COMMITTED isolation, a
 transaction does not see another transaction's UPDATE until that other
 transaction commits — "it's all one transaction" only protects each
 `complete()` call's own view of the world, it says nothing about what two
@@ -19,16 +22,54 @@ calls concurrently on the two jobs of one session, 49 of 50 runs returned
 recomputing the count, forcing the second caller to wait for the first to
 commit and then recompute against the already-applied update. See
 `complete`'s docstring for the details.
+
+**Defect 5: the remaining-jobs count alone can go to zero too early.**
+`sturnus.application.recording.RecordingService.close` uploads and
+enqueues one speaker at a time, and each `enqueue` commits on its own —
+so a worker can claim and complete a session's *first* speaker's job
+before a second speaker has even been enqueued yet, let alone before the
+session itself closes. At that instant the remaining-jobs count is
+genuinely zero (only one job exists), so without the session-closed check
+`complete` would report the session done from one speaker alone — the
+same failure the assembly fix (`sturnus.application.assembly.assemble`)
+was meant to end, one level up. Requiring `session.status == "closed"` as
+well closes that window: `close_session` only ever runs after every
+speaker has already been uploaded and enqueued, so this can never fire
+before that has actually happened. It is a strict extra condition, never
+a substitute for the remaining-jobs count — a `closed` session can still
+have jobs pending. The residual case this cannot catch — every job
+happens to complete a moment *before* `close_session` commits, so no
+`complete()` call ever runs again afterwards to notice the session is now
+closed — is what `sturnus.application.worker.retry_pending_documents`
+exists to sweep up after the fact.
+
+**Defect 4: `claim` reclaims a `running` job whose lease has expired.** A worker
+killed mid-job (SIGKILL, an evicted pod) leaves its claimed job `running`
+forever otherwise: `claim` only ever selected `pending` jobs, and nothing
+else ever moves a job out of `running`, so it is never in a terminal
+state and `complete`'s remaining-jobs count never reaches zero for that
+session either. `claim` therefore also selects a `running` job whose
+`claimed_at` is older than `lease_seconds`, exactly as if it were
+`pending` — see `claim`'s docstring.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from sturnus.infrastructure.db.models import TranscriptionJob
+from sturnus.infrastructure.db.models import Session, TranscriptionJob
+
+#: How long a claimed job may stay `running` before `claim` treats it as
+#: abandoned and reclaims it. Generous on purpose: a large-v3 Whisper model
+#: transcribing a long recording on CPU (Spec 7 sizes the deployment for
+#: CPU, not GPU) can legitimately run for many minutes, and reclaiming a
+#: job that is still genuinely being worked on would have two workers
+#: processing the same recording at once.
+DEFAULT_LEASE_SECONDS = 1800.0
 
 
 @dataclass(frozen=True)
@@ -42,26 +83,49 @@ class ClaimedJob:
 
 
 class JobQueue:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    ) -> None:
         self._session_factory = session_factory
+        self._lease_seconds = lease_seconds
 
-    async def claim(self) -> ClaimedJob | None:
-        """Claims one pending job for a worker.
+    async def claim(self, now: datetime | None = None) -> ClaimedJob | None:
+        """Claims one pending (or lease-expired running) job for a worker.
 
-        Selection, status update, and commit happen in one transaction with
-        `FOR UPDATE SKIP LOCKED`, so concurrent workers never claim the same
-        job.
+        `now` defaults to the wall clock; a test passes it explicitly to
+        make lease expiry deterministic. Selection, status update, and
+        commit happen in one transaction with `FOR UPDATE SKIP LOCKED`, so
+        concurrent workers never claim the same job.
+
+        A `running` job whose `claimed_at` is older than `lease_seconds`
+        is selected exactly as if it were `pending` -- see the module
+        docstring's "Defect 4" note on why this exists. `claimed_at` is
+        then stamped with `now` regardless of which branch matched, so a
+        reclaim starts a fresh lease rather than an immediately-expired one.
         """
+        now = now if now is not None else datetime.now(UTC)
+        lease_cutoff = now - timedelta(seconds=self._lease_seconds)
         async with self._session_factory() as session:
             job = await session.scalar(
                 select(TranscriptionJob)
-                .where(TranscriptionJob.status == "pending")
+                .where(
+                    or_(
+                        TranscriptionJob.status == "pending",
+                        and_(
+                            TranscriptionJob.status == "running",
+                            TranscriptionJob.claimed_at < lease_cutoff,
+                        ),
+                    )
+                )
                 .with_for_update(skip_locked=True)
                 .limit(1)
             )
             if job is None:
                 return None
             job.status = "running"
+            job.claimed_at = now
             await session.commit()
             return ClaimedJob(
                 id=job.id,
@@ -92,6 +156,17 @@ class JobQueue:
         BY id` keeps lock-acquisition order identical across transactions
         so that concurrent completions of *different* sessions can never
         deadlock against each other.
+
+        The remaining-jobs count reaching zero is still not sufficient on
+        its own: the session must also be `closed` (see the module
+        docstring's "Defect 5" note), or a worker completing a session's
+        first speaker before a second speaker has even been enqueued yet
+        would see zero remaining jobs -- because no sibling exists yet --
+        and wrongly report the session done from one speaker's job alone.
+        This last read needs no extra lock: under READ COMMITTED it can
+        only ever see `status == "closed"` once `close_session`'s own
+        transaction has actually committed, so a stale read here is always
+        the safe direction (a false "not yet last", never a false "last").
         """
         async with self._session_factory() as session:
             job = await session.get(TranscriptionJob, job_id)
@@ -121,8 +196,11 @@ class JobQueue:
                     TranscriptionJob.status.not_in(("done", "dead")),
                 )
             )
+            session_status = await session.scalar(
+                select(Session.status).where(Session.id == session_id)
+            )
             await session.commit()
-            return remaining == 0
+            return remaining == 0 and session_status == "closed"
 
     async def fail(self, job_id: int, error: str, max_attempts: int) -> None:
         """Records the error and either returns the job to `pending` or, once

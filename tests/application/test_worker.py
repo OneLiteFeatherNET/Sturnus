@@ -17,7 +17,7 @@ from typing import Any
 
 from sturnus.application.documents import CreatedDocument
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
-from sturnus.application.worker import process_one
+from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.infrastructure.db.queue import ClaimedJob
 from sturnus.infrastructure.documents.outline import PermanentDocumentError
 
@@ -105,6 +105,9 @@ class FakeSessions:
         self.names: dict[int, str] = {100: "speaker-100"}
         self.epochs: dict[int, datetime] = {100: T0}
         self.bounds: tuple[datetime, datetime] = (T0, T0 + timedelta(hours=1))
+        #: What `closed_undocumented_sessions` reports -- empty by default,
+        #: since most tests never exercise `retry_pending_documents`.
+        self.pending_retry: list[int] = []
 
     async def detected_language(self, _session_id: int, user_id: int) -> str | None:
         return self.languages.get(user_id)
@@ -123,6 +126,9 @@ class FakeSessions:
 
     async def session_bounds(self, _session_id: int) -> tuple[datetime, datetime]:
         return self.bounds
+
+    async def closed_undocumented_sessions(self) -> list[int]:
+        return self.pending_retry
 
 
 class FakeJobs:
@@ -352,3 +358,94 @@ async def test_the_audio_object_is_not_deleted_after_transcription(tmp_path: Pat
     store = FakeStore()
     await process_one(**run(tmp_path, store=store))
     assert store.deleted == []
+
+
+class FailingStore:
+    """Stands in for a failed S3 download -- neither `get` nor `delete` ever succeeds."""
+
+    async def get(self, _key: str, _target: Path) -> None:
+        raise RuntimeError("S3 is unreachable")
+
+    async def delete(self, _key: str) -> None:
+        raise AssertionError("never called by process_one")
+
+
+class FailingDocuments:
+    """A document sink that always raises something other than `PermanentDocumentError`."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def create(self, _title: str, _body: str) -> CreatedDocument:
+        self.calls += 1
+        raise RuntimeError("Outline is briefly returning 502")
+
+
+async def test_a_download_failure_fails_the_job_instead_of_crashing_the_worker(
+    tmp_path: Path,
+) -> None:
+    """Defect 4: before this fix, anything but a transcription error (a
+    failed S3 download, a decrypt error, ...) propagated straight out of
+    `process_one` with nothing to catch it, killing the worker process and
+    leaving the job stuck `running` forever.
+    """
+    queue = FakeQueue([job()])
+    done = await process_one(**run(tmp_path, queue=queue, store=FailingStore()))
+    assert done is True
+    assert queue.completed == []
+    assert len(queue.failed) == 1
+    assert "S3 is unreachable" in queue.failed[0][1]
+
+
+async def test_a_transient_document_error_does_not_crash_the_worker(tmp_path: Path) -> None:
+    """Defect 4: a transient Outline error (anything other than
+    `PermanentDocumentError`) must not propagate out of `process_one` and
+    kill the worker. The transcription job itself already succeeded, so it
+    must not be requeued either -- `retry_pending_documents`, not
+    `queue.fail`, is what retries the document.
+    """
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    documents = FailingDocuments()
+    done = await process_one(**run(tmp_path, queue=queue, documents=documents))
+    assert done is True
+    assert len(queue.completed) == 1  # the transcription job is still done
+    assert queue.failed == []  # not requeued -- there is nothing wrong with it
+    assert documents.calls == 1
+
+
+async def test_retry_pending_documents_retries_closed_undocumented_sessions() -> None:
+    sessions = FakeSessions()
+    sessions.pending_retry = [1]
+    documents = FakeDocuments()
+    jobs = FakeJobs(
+        {
+            100: TranscriptionResult(
+                segments=(TranscribedSegment(0.0, 1.0, "hello again"),), language="de"
+            )
+        }
+    )
+    await retry_pending_documents(documents, sessions, jobs, FakeLinks())
+    assert len(documents.created) == 1
+    assert "hello again" in documents.created[0][1]
+    assert sessions.documented == [(1, "https://outline.example/doc/1")]
+
+
+async def test_retry_pending_documents_survives_one_sessions_failure() -> None:
+    """One session still failing (Outline still down) must not stop the
+    sweep from trying every other session in the same pass.
+    """
+    sessions = FakeSessions()
+    sessions.pending_retry = [1, 2]
+    documents = FailingDocuments()
+    jobs = FakeJobs(
+        {100: TranscriptionResult(segments=(TranscribedSegment(0.0, 1.0, "hi"),), language="de")}
+    )
+    await retry_pending_documents(documents, sessions, jobs, FakeLinks())  # must not raise
+    assert documents.calls == 2  # both sessions were attempted despite failing
+
+
+async def test_retry_pending_documents_does_nothing_when_nothing_is_pending() -> None:
+    documents = FakeDocuments()
+    await retry_pending_documents(documents, FakeSessions(), FakeJobs(), FakeLinks())
+    assert documents.created == []

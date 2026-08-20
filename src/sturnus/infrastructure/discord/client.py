@@ -191,7 +191,9 @@ class SturnusClient(commands.Bot):
             encryptor=self._encryptor,
             retention_days=int(retention),
         )
-        voice = VoiceReceiveAdapter(self, service, self._config_store, self._clock)
+        voice = VoiceReceiveAdapter(
+            self, service, self._config_store, self._clock, self._consent_repo
+        )
         self._guilds[guild.id] = _GuildRecording(
             channel_id=int(voice_channel_id),
             role_id=int(consent_role_id),

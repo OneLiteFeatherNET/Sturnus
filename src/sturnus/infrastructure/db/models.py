@@ -119,6 +119,14 @@ class TranscriptionJob(Base):
     retention_until: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     audio_deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(Text, nullable=False)
+    # Set every time `claim` hands this job to a worker (including a
+    # reclaim). `claim` reads this back to decide whether a `running` job's
+    # lease has expired -- a worker killed mid-job (SIGKILL, an evicted pod)
+    # would otherwise strand it `running` forever, since `claim` only ever
+    # selects `pending` jobs and nothing else ever moves it out of
+    # `running`. Nullable because a job that has never been claimed yet
+    # (still `pending`) has no lease to speak of.
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text)
     transcript: Mapped[str | None] = mapped_column(Text)

@@ -156,3 +156,112 @@ async def test_the_stored_error_is_readable(
     assert job is not None
     await queue.fail(job.id, "decryption failed", max_attempts=3)
     assert "decryption failed" in (await queue.last_error(job.id) or "")
+
+
+async def test_completing_a_job_is_not_last_while_the_session_is_still_open(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Reproduces Defect 5 deterministically at the queue level.
+
+    `sturnus.application.recording.RecordingService.close` uploads and
+    enqueues speaker by speaker, so a worker can claim and complete the
+    first speaker's job before a second speaker has even been enqueued
+    yet, let alone before the session itself closes. Without gating on
+    `session.status`, `complete` would report the session done from this
+    one job alone -- exactly the failure the assembly fix was meant to
+    end, one level up. This enqueues only one speaker and never closes
+    the session, so a second speaker could still show up later.
+
+    Against the pre-fix `complete` (remaining-jobs count only), this
+    returns `True` -- confirmed by running it against that code directly.
+    """
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    await sessions.add_participant(session_id, ANNA, "anna", T0)
+    await jobs.enqueue(
+        session_id=session_id,
+        discord_user_id=ANNA,
+        s3_key=f"sessions/{session_id}/speakers/{ANNA}.enc",
+        encryption_key_id="k1",
+        wrapped_data_key=b"wrapped",
+        retention_until=T0 + timedelta(days=30),
+    )
+    # Deliberately never closed.
+
+    queue = JobQueue(factory)
+    job = await queue.claim()
+    assert job is not None
+    assert await queue.complete(job.id, "anna's words") is False
+
+
+async def test_completing_the_final_job_is_last_once_the_session_closes(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The counterpart to the test above: once every speaker is enqueued
+    and the session is actually closed, the same job now correctly
+    reports last.
+    """
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, T0)
+    await sessions.add_participant(session_id, ANNA, "anna", T0)
+    await jobs.enqueue(
+        session_id=session_id,
+        discord_user_id=ANNA,
+        s3_key=f"sessions/{session_id}/speakers/{ANNA}.enc",
+        encryption_key_id="k1",
+        wrapped_data_key=b"wrapped",
+        retention_until=T0 + timedelta(days=30),
+    )
+    await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
+
+    queue = JobQueue(factory)
+    job = await queue.claim()
+    assert job is not None
+    assert await queue.complete(job.id, "anna's words") is True
+
+
+async def test_a_running_jobs_lease_protects_it_from_a_second_claim(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory, lease_seconds=60)
+    first = await queue.claim(T0)
+    assert first is not None
+    # Still well within the lease: must not be handed to a second worker.
+    assert await queue.claim(T0 + timedelta(seconds=30)) is None
+
+
+async def test_a_running_jobs_expired_lease_is_reclaimed(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A worker killed mid-job (SIGKILL, an evicted pod) leaves its job
+    `running` forever without this -- `claim` only ever selected `pending`
+    jobs, so nothing would ever reclaim it (Defect 4).
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory, lease_seconds=60)
+    first = await queue.claim(T0)
+    assert first is not None
+
+    reclaimed = await queue.claim(T0 + timedelta(seconds=61))
+    assert reclaimed is not None
+    assert reclaimed.id == first.id
+
+
+async def test_a_reclaimed_job_gets_a_fresh_lease(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The reclaiming worker must get the full lease again, not an
+    already-expired one -- otherwise a third worker could reclaim it out
+    from under the second before it has had any real time to work.
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory, lease_seconds=60)
+    first = await queue.claim(T0)
+    assert first is not None
+    reclaimed = await queue.claim(T0 + timedelta(seconds=61))
+    assert reclaimed is not None
+
+    assert await queue.claim(T0 + timedelta(seconds=90)) is None

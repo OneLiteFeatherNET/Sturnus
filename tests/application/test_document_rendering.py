@@ -13,7 +13,12 @@ TEMPLATE = (
     / "src/sturnus/infrastructure/documents/outline_template.md.j2"
 ).read_text(encoding="utf-8")
 
-LINKED = SpeakerIdentity(1234, "maxm", external_user_id="9c8b", external_display_name="Max Example")
+LINKED = SpeakerIdentity(
+    1234,
+    "maxm",
+    external_user_id="c9a1b2e3-4f5a-4b3c-8d2e-1a2b3c4d5e6f",
+    external_display_name="Max Example",
+)
 GUEST = SpeakerIdentity(9876, "guestuser")
 
 
@@ -39,8 +44,16 @@ def render(*blocks: TranscriptBlock) -> str:
 
 
 def test_a_linked_speaker_is_rendered_as_a_mention() -> None:
+    """The id is a real Outline UUID (it has dashes), not the old dash-free
+    test fixture that let a broken template pass unnoticed: `escape_markdown`
+    backslash-escapes `-`, so an id that comes from Outline's own API --
+    not attacker-controlled, unlike the display name beside it -- must
+    reach the mention verbatim, or Outline treats it as malformed and never
+    resolves it to a notification.
+    """
     out = render(block(LINKED, 0, "hello"))
-    assert "@[Max Example](mention://user/9c8b)" in out
+    assert "@[Max Example](mention://user/c9a1b2e3-4f5a-4b3c-8d2e-1a2b3c4d5e6f)" in out
+    assert "\\" not in out.split("mention://user/", 1)[1].split(")", 1)[0]
 
 
 def test_a_linked_speaker_also_carries_the_discord_link() -> None:

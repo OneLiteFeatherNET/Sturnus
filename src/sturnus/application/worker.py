@@ -141,6 +141,15 @@ class SessionStore(Protocol):
 
     async def session_bounds(self, session_id: int) -> tuple[datetime, datetime]: ...
 
+    async def closed_undocumented_sessions(self) -> list[int]:
+        """Closed sessions whose jobs are all terminal but which never got documented.
+
+        Used by `retry_pending_documents`, not by `process_one` itself --
+        see that function's docstring for why a session can end up here at
+        all despite `process_one` already trying once.
+        """
+        ...
+
 
 class _ClaimedJobShape(Protocol):
     """The attributes `process_one` reads off whatever `Queue.claim` returns.
@@ -234,6 +243,25 @@ async def process_one(
     as parameters up front (rather than constructed lazily) so every
     collaborator `process_one` needs is visible in its signature, matching
     `sessions`/`documents`/`queue` and the rest.
+
+    **Error handling (Defect 4).** Steps 2-5 are wrapped in a `try`/`except`
+    that routes *any* failure -- a failed S3 download, a decrypt error, a
+    database error storing the transcript, anything at all other than the
+    transcription failure already handled by its own narrower `except`
+    below -- through `queue.fail`, exactly like a transcription failure is.
+    Without this, such a failure propagated straight out of `process_one`;
+    the entrypoint has no handler either, so the whole worker process died,
+    and the job it was holding stayed `running` forever (`claim` only ever
+    selects `pending` jobs -- see `sturnus.infrastructure.db.queue.JobQueue`
+    for the lease that also reclaims a job stranded this way).
+
+    Step 6 (document creation) is deliberately handled by a *separate*
+    `try`/`except`, outside the one above: by the time it runs, `queue.
+    complete` has already succeeded and the job is `done` -- calling
+    `queue.fail` on it would incorrectly return an already-transcribed job
+    to the queue for no reason. A transient document-sink failure here is
+    instead only logged; `retry_pending_documents` is what actually retries
+    document creation, on its own schedule, independent of any one job.
     """
     claimed = await queue.claim()
     if claimed is None:
@@ -245,40 +273,101 @@ async def process_one(
     encrypted_path = job_dir / "audio.enc"
     wav_path = job_dir / "audio.wav"
 
+    is_last = False
     try:
-        await store.get(job.s3_key, encrypted_path)
-        await asyncio.to_thread(
-            crypto.decrypt_to,
-            encrypted_path,
-            wav_path,
-            job.wrapped_data_key,
-            job.encryption_key_id,
-        )
-
-        pinned_language = await sessions.detected_language(job.session_id, job.discord_user_id)
         try:
-            result = await engine.transcribe(wav_path, pinned_language)
+            await store.get(job.s3_key, encrypted_path)
+            await asyncio.to_thread(
+                crypto.decrypt_to,
+                encrypted_path,
+                wav_path,
+                job.wrapped_data_key,
+                job.encryption_key_id,
+            )
+
+            pinned_language = await sessions.detected_language(job.session_id, job.discord_user_id)
+            try:
+                result = await engine.transcribe(wav_path, pinned_language)
+            except Exception as exc:
+                log.warning("Transcription failed for job %d", job.id)
+                await queue.fail(job.id, str(exc), max_attempts)
+                return True
+
+            if pinned_language is None:
+                await sessions.set_detected_language(
+                    job.session_id, job.discord_user_id, result.language
+                )
+
+            is_last = await queue.complete(job.id, serialize_transcript(result))
         except Exception as exc:
-            log.warning("Transcription failed for job %d", job.id)
+            # Everything other than the transcription failure already
+            # handled above: a failed download, a decrypt error, a
+            # database error. See this function's docstring's "Error
+            # handling (Defect 4)" note -- without this, the exception
+            # propagated out of `process_one` and killed the worker
+            # process, stranding this job `running` forever.
+            log.warning("Job %d failed outside transcription: %s", job.id, exc)
             await queue.fail(job.id, str(exc), max_attempts)
             return True
-
-        if pinned_language is None:
-            await sessions.set_detected_language(
-                job.session_id, job.discord_user_id, result.language
-            )
-
-        is_last = await queue.complete(job.id, serialize_transcript(result))
-
-        if is_last:
-            await _create_session_document(
-                documents, sessions, jobs, links, job.session_id, template_source
-            )
-
-        return True
     finally:
         # Runs whether processing succeeded, the transcription failed, or
         # something above raised outright: decrypted speech (and the
         # encrypted copy fetched to build it) must never survive this
         # function, regardless of how it exits.
         shutil.rmtree(job_dir, ignore_errors=True)
+
+    if is_last:
+        try:
+            await _create_session_document(
+                documents, sessions, jobs, links, job.session_id, template_source
+            )
+        except Exception as exc:
+            # The job itself already completed successfully -- see this
+            # function's docstring for why this is a separate, narrower
+            # handler that never calls `queue.fail`. Left for
+            # `retry_pending_documents` to pick up: the session stays
+            # `closed` and never becomes `documented`, which is exactly
+            # what that sweep looks for.
+            log.warning(
+                "Document creation failed for session %d; will retry: %s",
+                job.session_id,
+                exc,
+            )
+
+    return True
+
+
+async def retry_pending_documents(
+    documents: DocumentSink,
+    sessions: SessionStore,
+    jobs: JobReader,
+    links: LinkReader,
+    template_source: str = _FALLBACK_TEMPLATE,
+) -> None:
+    """Retries document creation for closed sessions that never got documented.
+
+    `_create_session_document` (called from `process_one`, above) only
+    ever fires once, off the one job that happens to complete a session
+    last -- and by the time it runs that job is already `done`, so nothing
+    else naturally re-triggers it if the attempt fails (Defect 4). This
+    re-derives the same "every job of this session is terminal" condition
+    independently and after the fact, from `sessions.
+    closed_undocumented_sessions`, and tries again. It also serves as the
+    safety net for the residual timing gap `sturnus.infrastructure.db.
+    queue.JobQueue.complete`'s own docstring describes under "Defect 5":
+    a session whose last job happens to complete a moment *before*
+    `close_session` commits reports "not last" at that moment, and nothing
+    else would ever revisit it without this sweep.
+
+    Survives its own errors per session, same as `process_one` does for
+    document creation: one session still failing (Outline still down, or
+    a rejection that never becomes `PermanentDocumentError`) must not stop
+    every other session in the same sweep from being tried.
+    """
+    for session_id in await sessions.closed_undocumented_sessions():
+        try:
+            await _create_session_document(
+                documents, sessions, jobs, links, session_id, template_source
+            )
+        except Exception as exc:
+            log.warning("Retrying document creation failed for session %d: %s", session_id, exc)
