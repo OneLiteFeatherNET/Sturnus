@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.4.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.3.1...v0.4.0) (2026-08-20)
+
+
+### Features
+
+* name the channel, the date and the local time in the protocol ([#34](https://github.com/OneLiteFeatherNET/Sturnus/issues/34)) ([0c6baa8](https://github.com/OneLiteFeatherNET/Sturnus/commit/0c6baa846fb0d2975f0fdc57883bd8bb2a04b32f))
+* **observability:** report errors to Sentry without shipping content ([#36](https://github.com/OneLiteFeatherNET/Sturnus/issues/36)) ([f58aea8](https://github.com/OneLiteFeatherNET/Sturnus/commit/f58aea8d9206409936b666aa4377333c0c381245))
+
+
+### Bug Fixes
+
+* **bot:** apply configuration changes without restarting the process ([#35](https://github.com/OneLiteFeatherNET/Sturnus/issues/35)) ([a943f87](https://github.com/OneLiteFeatherNET/Sturnus/commit/a943f87da4372262361db95472cf65fe5e29960b))
+* serve link's health port before waiting for the schema ([#33](https://github.com/OneLiteFeatherNET/Sturnus/issues/33)) ([dfd509c](https://github.com/OneLiteFeatherNET/Sturnus/commit/dfd509c93cff190347a4af1a152871f0af256a9e))
+* **voice:** decode Opus ourselves so one bad frame cannot end a recording ([#37](https://github.com/OneLiteFeatherNET/Sturnus/issues/37)) ([757828d](https://github.com/OneLiteFeatherNET/Sturnus/commit/757828d2f87ee09c74ee9ecec5fe81082538f077))
+
 ## [0.3.1](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.3.0...v0.3.1) (2026-08-20)
 
 
