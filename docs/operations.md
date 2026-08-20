@@ -496,14 +496,49 @@ stored is actually what is running.
 
 ## 5. Troubleshooting
 
+**`/queue`, the admin command for most of what follows.** `QueueCog`
+(`src/sturnus/infrastructure/discord/queue_cog.py`) adds three subcommands,
+all admin-gated the same way `/setup` and `/config` are (`require_admin`,
+section 3.1) and all replying `ephemeral=True`:
+
+- **`/queue status`** — a guild-wide, counts-only overview: jobs by status
+  (`pending` / `running` / `done` / `dead`), how many `running` jobs are
+  past the default lease, the age of the oldest `pending` job, and how many
+  `closed` sessions have every job finished but no document yet. Read-only.
+- **`/queue session <session_id>`** — one session in detail: its status,
+  end time and reason, its document URL and announcement time, and one
+  line per speaker giving job status, attempts, whether the audio is still
+  present, the last error, and the *length* of the stored transcript —
+  never its text; a slash command is deliberately not a way to read
+  meeting content. Read-only.
+- **`/queue requeue <session_id>`** — the only one that writes. It resets
+  the session's finished jobs back to `pending` so the worker transcribes
+  them again from the still-stored audio, discarding whatever was there
+  before. Nothing is written until an explicit Confirm press on a message
+  that names, in full, what cannot be undone: the discarded transcripts, a
+  second Outline document (the old one is left in place, not deleted or
+  updated — `DocumentSink` has no update path), and a second announcement
+  posted to the recording channel. It refuses outright if any job of the
+  session is still `pending` or `running` (there is nothing to redo yet,
+  and resetting a job a worker is about to finish would just let that
+  worker overwrite the reset), and it skips — rather than resets — any
+  speaker whose audio has already been erased, carrying their existing
+  transcript into the new document unchanged.
+
+Every `/queue` query is scoped to the guild the command was run in; a
+session id from another guild gets the same reply as one that does not
+exist, so it cannot be used to probe another guild's sessions.
+
 **A job is `dead`.** `transcription_job.status` becomes `dead` once
 `attempts` reaches the worker's configured retry limit
 (`JobQueue.fail`). A dead job is deliberately excluded from the
 remaining-jobs count that decides whether a session is finished
 (`JobQueue.complete`) — so one unreadable recording does not block the
 rest of that session's document from being produced; it just means that
-one speaker's portion is permanently missing from it. There is no admin
-command yet to list dead jobs; query them directly:
+one speaker's portion is permanently missing from it. `/queue status`
+gives the guild-wide count and `/queue session <id>` names which speaker
+and shows the last error for one session; for anything that cuts across
+sessions or guilds, or that needs the raw row, query directly:
 ```sql
 SELECT id, session_id, discord_user_id, attempts, error
 FROM transcription_job WHERE status = 'dead';
@@ -530,6 +565,62 @@ These happen at different granularities and leave different traces:
   collection), retrying will not help until the underlying Outline-side
   problem is fixed; anything else raised there is a transient failure
   worth retrying.
+
+**A third kind, distinct from both of the above: a job that is `done`,
+raised no error, and is still wrong.** Every session transcribed by a
+worker running Silero VAD (`vad_filter=True`, before this fix landed —
+`sturnus.infrastructure.whisper.WhisperEngine._transcribe`, commit
+`12d4299`) produced an empty or hallucinated transcript while reporting
+complete success: `status` is `done`, `transcript` is non-`NULL`, nothing
+is logged, and `/queue status` shows nothing wrong, because nothing failed
+from the code's point of view. The mechanism (full reasoning in
+`sturnus.infrastructure.speech_gate`'s module docstring) was Silero's
+recurrent state collapsing on the bit-exact digital-zero padding
+`SpeakerWriter` writes into every gap between packets — on a real
+100-minute recording it reported about one second of speech in two
+minutes, and the transcript for that speaker came back
+`" Copyright WDR 2021"`, a stock Whisper hallucination on near-silence
+that has nothing to do with anything anyone said. `"Thank you."` is
+another shape of the same failure: a short, generic, plausible-sounding
+sentence standing in for a much longer real recording.
+
+*How to recognise it, without reading a transcript's content at all.*
+`/queue session <session_id>` reports `transcript: N characters` per
+speaker. A session that ran for an hour with a transcript of a few dozen
+characters is the tell — the test fixture for this exact failure
+(`tests/infrastructure/discord/test_queue_cog.py`) uses the real observed
+hallucination `" Copyright WDR 2021"`, all of 19 characters, precisely
+because a number that small against a long session is unambiguous at a
+glance, and the command deliberately never echoes the transcript text
+itself (only its length), so this check does not require reading meeting
+content to make the call.
+
+*This affects only sessions transcribed before the fix.* A session
+transcribed by a worker running the amplitude gate does not exhibit this —
+the gate carries no state across frames, so there is no history for
+padding to corrupt (again, see the module docstring for why). Do not chase
+this section for a session transcribed after the fix shipped; a short
+transcript there has some other cause.
+
+*What to do.* Check `/queue session <session_id>` for `audio: present` vs.
+`audio: erased` per speaker — erased audio cannot be re-transcribed, only
+carried forward unchanged (section 6 covers when audio is erased) — and
+then run `/queue requeue <session_id>`. Read what its confirmation says
+before pressing Confirm: it names the old (bad) document and states that
+it stays and is not deleted or updated, and it says a new link will be
+posted publicly in the recording channel once the redo finishes. The
+worker's ordinary pipeline carries the redo the rest of the way on its own
+— nothing else needs to be run by hand.
+
+One more thing worth expecting rather than being surprised by: a redone
+job actually transcribes the speech instead of ~1% of the file, so it
+takes far longer than the original (garbage) run did — the design that
+shipped this fix estimated roughly 20-25x, turning a couple of minutes
+into tens of minutes for a long session. If `/queue status` starts
+reporting `running` jobs past the default lease after a batch of
+re-queues, that is very plausibly this, not a stuck worker — check whether
+`STURNUS_JOB_LEASE_SECONDS` (section 1.2) has been raised to match before
+assuming something is broken.
 
 **The bot is sitting out of the channel while people are in it.** A
 session that ended with `capture_failure` or `decode_failure` means the bot
