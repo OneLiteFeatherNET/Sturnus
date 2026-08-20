@@ -4,8 +4,8 @@ description: Discord voice transcription with Outline document output -- bot, li
 type: application
 # Both markers are rewritten by release-please, so the chart version and the
 # image it deploys always come from the same release (see pyproject.toml).
-version: "0.1.0" # x-release-please-version
-appVersion: "0.1.0" # x-release-please-version
+version: "0.3.0" # x-release-please-version
+appVersion: "0.3.0" # x-release-please-version
 home: https://github.com/OneLiteFeatherNET/Sturnus
 sources:
   - https://github.com/OneLiteFeatherNET/Sturnus
