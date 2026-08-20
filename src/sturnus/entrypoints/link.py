@@ -25,10 +25,10 @@ from datetime import UTC, datetime
 
 from aiohttp import web
 from pydantic import SecretStr
-from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
+from sturnus.config import StrictSettings
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.models import AccountLink, OAuthState
 from sturnus.infrastructure.db.repositories import AccountLinkRepository
@@ -43,15 +43,13 @@ _SCHEMA_WAIT_INTERVAL_SECONDS = 2.0
 _REQUIRED_TABLES = {OAuthState.__tablename__, AccountLink.__tablename__}
 
 
-class LinkSettings(BaseSettings):
+class LinkSettings(StrictSettings):
     """Everything this process needs, and nothing it does not.
 
     No `discord_token`, no `s3_*` credentials, no `master_key`: unlike
     `sturnus.config.Settings`, every field here is something this specific
     process actually uses.
     """
-
-    model_config = SettingsConfigDict(env_prefix="STURNUS_", frozen=True)
 
     database_url: str
     outline_base_url: str
