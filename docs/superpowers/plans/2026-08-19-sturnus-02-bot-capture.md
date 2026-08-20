@@ -1869,3 +1869,147 @@ Nothing reads those jobs yet. Plan 3 adds the worker: transcription, the transcr
 - **The spike in Task 10 may invalidate Spec 6.2.** If the extension does not expose RTP timestamps, silence reconstruction has no basis and the design needs revisiting before the worker is built on top of it.
 - **CPU under real load is unmeasured.** Resampling several concurrent streams on one core is plausible but untested; the first real session is also the first measurement.
 - **`audio_started_at` accuracy depends on the SSRC-to-user mapping being available at the first packet.** If it arrives later, the first packets of a speaker cannot be attributed, and the epoch shifts by however long that takes. The spike must answer this.
+
+---
+
+### Task 12: Guided setup and two constants moved into configuration
+
+Implements Spec 10.1 and the two configuration keys added alongside it.
+
+**Files:**
+- Create: `src/sturnus/infrastructure/discord/setup_cog.py`
+- Create: `src/sturnus/application/setup_plan.py`
+- Modify: `src/sturnus/domain/settings.py`, `src/sturnus/infrastructure/discord/permissions.py`, `src/sturnus/application/documents.py`
+- Test: `tests/application/test_setup_plan.py`
+
+**Interfaces:**
+- Produces:
+  - `settings.ADMIN_ROLE_ID`, `settings.MERGE_GAP_SECONDS` and their defaults
+  - `PermissionChange(target: str, allow_speak: bool | None)`, `SetupPlan(writes: dict[str, str], permission_changes: list[PermissionChange], role_to_create: str | None, missing: list[str])`
+  - `plan_setup(current: dict[str, str | None], channel_id: int, role_id: int | None, policy_url: str, policy_version: str, everyone_may_speak: bool, role_may_speak: bool) -> SetupPlan`
+  - `SetupCog`
+
+- [ ] **Step 1: Write the failing test for the planning function**
+
+The command's decisions live in a pure function so they can be tested without a guild. Discord objects never reach it — only the ids and permission facts read off them.
+
+```python
+# tests/application/test_setup_plan.py
+from sturnus.application.setup_plan import PermissionChange, plan_setup
+from sturnus.domain import settings
+
+CHANNEL, ROLE = 111, 222
+POLICY_URL = "https://example.org/privacy"
+POLICY_VERSION = "2026-08-01"
+
+
+def plan(current: dict[str, str | None] | None = None, **kw: object) -> object:
+    defaults: dict[str, object] = {
+        "current": current or {},
+        "channel_id": CHANNEL,
+        "role_id": ROLE,
+        "policy_url": POLICY_URL,
+        "policy_version": POLICY_VERSION,
+        "everyone_may_speak": True,
+        "role_may_speak": False,
+    }
+    defaults.update(kw)
+    return plan_setup(**defaults)  # type: ignore[arg-type]
+
+
+def test_a_fresh_guild_writes_every_required_key() -> None:
+    result = plan(None)
+    assert result.writes[settings.VOICE_CHANNEL_ID] == str(CHANNEL)
+    assert result.writes[settings.CONSENT_ROLE_ID] == str(ROLE)
+    assert result.writes[settings.POLICY_URL] == POLICY_URL
+
+
+def test_nothing_required_remains_missing_after_a_full_setup() -> None:
+    assert plan(None).missing == []
+
+
+def test_a_missing_document_target_is_reported_not_invented() -> None:
+    """The Outline collection cannot be guessed from Discord."""
+    result = plan({settings.DOCUMENT_TARGET: None})
+    assert settings.DOCUMENT_TARGET in result.missing
+
+
+def test_everyone_speaking_is_denied() -> None:
+    """The primary layer of the consent protection (Spec 3.1)."""
+    result = plan(everyone_may_speak=True)
+    assert PermissionChange("everyone", allow_speak=False) in result.permission_changes
+
+
+def test_the_consent_role_is_allowed_to_speak() -> None:
+    result = plan(role_may_speak=False)
+    assert PermissionChange("consent_role", allow_speak=True) in result.permission_changes
+
+
+def test_correct_permissions_produce_no_changes() -> None:
+    """Re-running against a configured guild must be a no-op, not a rewrite."""
+    result = plan(everyone_may_speak=False, role_may_speak=True)
+    assert result.permission_changes == []
+
+
+def test_a_missing_role_is_requested_for_creation() -> None:
+    result = plan(role_id=None)
+    assert result.role_to_create is not None
+    assert settings.CONSENT_ROLE_ID not in result.writes
+
+
+def test_an_unchanged_value_is_not_rewritten() -> None:
+    result = plan({settings.VOICE_CHANNEL_ID: str(CHANNEL)})
+    assert settings.VOICE_CHANNEL_ID not in result.writes
+
+
+def test_a_changed_channel_is_rewritten() -> None:
+    result = plan({settings.VOICE_CHANNEL_ID: "999"})
+    assert result.writes[settings.VOICE_CHANNEL_ID] == str(CHANNEL)
+```
+
+- [ ] **Step 2: Run it, confirm it fails, then implement `plan_setup`**
+
+It compares the desired state against what is already configured and returns only the differences. Re-running against a correctly configured guild yields an empty plan — that is what makes the command safe to run twice.
+
+`document_target` cannot be derived from Discord, so it is reported as missing rather than guessed.
+
+- [ ] **Step 3: Add the two configuration keys**
+
+In `domain/settings.py`: `ADMIN_ROLE_ID = "admin_role_id"` (required, no default) and `MERGE_GAP_SECONDS = "merge_gap_seconds"` with default `"15"`. Add the latter to the integer keys that `ConfigStore.set` validates, and `ADMIN_ROLE_ID` to `REQUIRED_KEYS`.
+
+Then remove the two constants they replace:
+- `permissions.py`'s hardcoded role name — `require_admin()` reads `admin_role_id` from the config store instead. Discord's own administrator permission still passes unconditionally, so a guild that has not configured the key yet is not locked out of `/config` and `/setup`.
+- `documents.py`'s merge gap default — `render_transcript` already takes the gap from its caller; make the worker read it from configuration in plan 3.
+
+- [ ] **Step 4: Write the cog**
+
+`/setup` with typed parameters so Discord renders native pickers:
+
+```python
+@app_commands.command()
+@require_admin()
+async def setup(
+    self,
+    interaction: discord.Interaction,
+    channel: discord.VoiceChannel,
+    policy_url: str,
+    policy_version: str,
+    consent_role: discord.Role | None = None,
+) -> None: ...
+```
+
+The cog reads the current configuration and the channel's existing overwrites, calls `plan_setup`, applies the result, and reports what it changed, what it left alone, and what is still missing. Ephemeral, like every other reply.
+
+Requirements a reviewer checks by reading:
+
+- **Permission failures are reported, never swallowed.** If the bot may not edit the channel or create the role, it says exactly what a human must do instead. A half-applied setup that claims success is worse than one that admits it stopped.
+- **It applies the configuration writes even when the permission changes fail**, and says so — the two are independent, and refusing to store anything because a permission edit failed would leave the guild worse off than before.
+- **It never prints a token or a secret**, and its summary names keys, not values, for anything that could be sensitive later.
+
+- [ ] **Step 5: Verify and commit**
+
+```bash
+uv run ruff check . && uv run ruff format --check . && uv run mypy && uv run pytest
+git add -A
+git commit -m "feat: add guided setup and move two constants into configuration"
+```
