@@ -10,10 +10,17 @@ on:
     paths:
       - 'charts/**'
       - '.github/workflows/chart.yml'
+      # The chart's per-component credential lists are compared against these
+      # below, so a settings class changing has to re-run this job.
+      - 'src/sturnus/config.py'
+      - 'src/sturnus/entrypoints/**'
+      - 'scripts/component_credentials.py'
   push:
     branches: [main]
     paths:
       - 'charts/**'
+      - 'src/sturnus/config.py'
+      - 'src/sturnus/entrypoints/**'
 
 permissions:
   contents: read
@@ -28,6 +35,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: azure/setup-helm@v4
+      # The per-component credential lists asserted below are derived from the
+      # settings classes rather than restated here, so this job needs the
+      # package importable.
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-groups --locked
 
       - name: helm lint
         run: helm lint charts/sturnus
@@ -122,6 +136,62 @@ jobs:
                   for env in container.get('env') or []:
                       check('value' not in env or 'TOKEN' not in env['name'].upper(),
                             f"{name} sets {env['name']} as a literal env value")
+
+          # Every component gets exactly the secret keys its own settings
+          # class declares, and no others. This is the assertion that fails
+          # if a component regains a credential it does not read -- the
+          # regression being guarded is `link`, the only component reachable
+          # from outside the cluster (the OAuth callback, published through
+          # the Cloudflare Tunnel), being handed STURNUS_MASTER_KEY, the key
+          # that wraps every recording's data key. `envFrom` over the whole
+          # Secret did exactly that, silently, because the pod still ran.
+          import json, subprocess
+          expected_secret_keys = {
+              k: set(v)
+              for k, v in json.loads(
+                  subprocess.run(
+                      ['uv', 'run', 'python', 'scripts/component_credentials.py'],
+                      capture_output=True, text=True, check=True,
+                  ).stdout
+              ).items()
+          }
+
+          check(set(deployments) == set(expected_secret_keys),
+                f'expected Deployments {sorted(expected_secret_keys)}, '
+                f'rendered {sorted(deployments)}')
+          for name, expected in expected_secret_keys.items():
+              dep = deployments.get(name)
+              if dep is None:
+                  continue
+              for container in dep['spec']['template']['spec']['containers']:
+                  # envFrom takes the whole Secret in one go, which is what
+                  # this per-key wiring replaced; there is no way to assert a
+                  # key set against it, so it must not come back.
+                  check(not container.get('envFrom'),
+                        f'{name}/{container["name"]} uses envFrom, which hands it '
+                        f'every key in the Secret regardless of what it reads')
+                  got = set()
+                  for env in container.get('env') or []:
+                      ref = (env.get('valueFrom') or {}).get('secretKeyRef')
+                      if not ref:
+                          continue
+                      got.add(env['name'])
+                      check(ref.get('name') == 'sturnus-secrets',
+                            f'{name} reads {env["name"]} from Secret '
+                            f'{ref.get("name")!r}, not from existingSecret')
+                      check(ref.get('key') == env['name'],
+                            f'{name} maps Secret key {ref.get("key")!r} onto env '
+                            f'{env["name"]} -- the two must match')
+                      # Deliberately not optional: a key missing from the
+                      # Secret must stop the pod, not inject an empty string
+                      # that pydantic accepts for a required SecretStr.
+                      check(not ref.get('optional'),
+                            f'{name} marks {env["name"]} optional, so a missing key '
+                            f'silently becomes an empty value')
+                  check(got == expected,
+                        f'{name} receives secret keys {sorted(got)}, expected '
+                        f'{sorted(expected)}; extra={sorted(got - expected)} '
+                        f'missing={sorted(expected - got)}')
 
           if failures:
               print('\n'.join(f'::error::{f}' for f in failures))

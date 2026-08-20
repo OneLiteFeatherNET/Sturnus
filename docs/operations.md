@@ -195,10 +195,16 @@ the other six credentials listed in section 1.4 — is not set directly in
 the chart. It goes into a SOPS-encrypted secret file in the cluster's
 GitOps repository, which decrypts into the Kubernetes `Secret` the chart
 expects to already exist (`existingSecret: sturnus-secrets` in
-`values.yaml`). The chart only ever references that secret by name, and
-hands each component just the keys its own settings class reads — it never
-places a secret value into `values.yaml` or a template, and this
-repository holds none of the cluster's actual key material.
+`values.yaml`). The chart only ever references that secret by name, and it
+does so one key at a time through `valueFrom.secretKeyRef`: each of the
+three components is handed only the keys its own settings class declares,
+so `link` — the only component reachable from outside the cluster, via the
+Cloudflare Tunnel serving the OAuth callback — never receives
+`STURNUS_MASTER_KEY` or the Discord token at all. The per-component key
+lists live in the `sturnus.secretEnv` helper in
+`charts/sturnus/templates/_helpers.tpl`. The chart never places a secret
+value into `values.yaml` or a template, never creates the `Secret` itself,
+and this repository holds none of the cluster's actual key material.
 
 **What `encryption_key_id` is for.** Every wrapped data key is stored next
 to the id of the master key that wrapped it (`STURNUS_MASTER_KEY_ID` at

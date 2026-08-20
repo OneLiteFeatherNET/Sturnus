@@ -40,10 +40,14 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             {{- toYaml .Values.link.command | nindent 12 }}
-          envFrom:
-            - secretRef:
-                name: {{ .Values.existingSecret }}
+          # Exactly the secret keys LinkSettings declares -- the database URL
+          # and the OAuth client secret -- one `secretKeyRef` each, rather
+          # than `envFrom` over the whole Secret. This is the component the
+          # Cloudflare Tunnel publishes, so it is the one that must not be
+          # holding the master key or the Discord token it never reads; see
+          # `sturnus.secretEnv` in _helpers.tpl.
           env:
+            {{- include "sturnus.secretEnv" (dict "root" . "component" "link") | nindent 12 }}
             {{- range $k, $v := .Values.commonEnv }}
             - name: {{ $k }}
               value: {{ $v | quote }}
