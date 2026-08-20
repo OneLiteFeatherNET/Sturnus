@@ -27,9 +27,8 @@ podLabels: {}
 
 # Name of a Kubernetes Secret that already exists in the namespace (managed
 # outside this chart, via SOPS -- Spec 13.5). It must hold exactly these
-# seven keys; each component reads the subset its own settings class
-# declares, and a missing one fails that pod at startup with a pydantic
-# ValidationError naming the field:
+# seven keys, and each component is given only the subset its own settings
+# class declares -- not the whole Secret:
 #
 #   STURNUS_DISCORD_TOKEN         bot
 #   STURNUS_DATABASE_URL          bot, worker, link
@@ -39,12 +38,20 @@ podLabels: {}
 #   STURNUS_OUTLINE_SERVICE_KEY   worker
 #   STURNUS_OUTLINE_CLIENT_SECRET link
 #
+# That distribution is not configurable from here on purpose; it is encoded
+# once in the `sturnus.secretEnv` helper in templates/_helpers.tpl, which
+# also explains why it is a helper and not a value. A key missing from the
+# Secret stops the affected pod at CreateContainerConfigError before its
+# container starts, rather than injecting an empty string -- see the same
+# helper for why that trade was made deliberately.
+#
 # The non-secret Outline settings (base URL, OAuth client id, redirect URI)
 # are NOT here -- they belong in `commonEnv` below. docs/operations.md
 # section 1 carries the full per-component table.
 #
-# This chart only ever references the Secret by name via `envFrom.secretRef`;
-# it never places a secret value into values.yaml or a template.
+# This chart only ever references the Secret by name, through a per-key
+# `valueFrom.secretKeyRef`; it never places a secret value into values.yaml
+# or a template, and it never creates or templates the Secret itself.
 existingSecret: sturnus-secrets
 
 serviceAccount:

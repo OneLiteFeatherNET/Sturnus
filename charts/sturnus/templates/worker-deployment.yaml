@@ -47,10 +47,12 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           command:
             {{- toYaml .Values.worker.command | nindent 12 }}
-          envFrom:
-            - secretRef:
-                name: {{ .Values.existingSecret }}
+          # Exactly the secret keys WorkerSettings declares, one
+          # `secretKeyRef` each, rather than `envFrom` over the whole Secret:
+          # the map of who gets what, and what that split buys, is on
+          # `sturnus.secretEnv` in _helpers.tpl.
           env:
+            {{- include "sturnus.secretEnv" (dict "root" . "component" "worker") | nindent 12 }}
             {{- range $k, $v := .Values.commonEnv }}
             - name: {{ $k }}
               value: {{ $v | quote }}
