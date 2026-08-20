@@ -6,6 +6,14 @@ metadata:
     {{- include "sturnus.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
 spec:
   replicas: {{ .Values.worker.replicaCount }}
+  # Recreate, not RollingUpdate: the work directory below is a
+  # ReadWriteOnce volume, and a rolling update starts the new pod before
+  # the old one releases it. On a ReadWriteOnce claim the new pod then
+  # stays Pending on a multi-attach error while the old one waits to be
+  # replaced -- a deadlock that blocks every future image update. The bot
+  # sets the same strategy for a different reason (see bot-deployment.yaml).
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       {{- include "sturnus.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
@@ -13,6 +21,9 @@ spec:
     metadata:
       labels:
         {{- include "sturnus.componentLabels" (dict "root" . "component" "worker") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
