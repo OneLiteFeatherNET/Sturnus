@@ -48,19 +48,7 @@ jobs:
       # filter expressions at all, so a release-please upgrade can break it
       # without a changelog entry. Do not "correct" that path.
       - name: uv.lock must pin the same version as pyproject.toml
-        run: |
-          set -euo pipefail
-          proj=$(awk -F'"' '/^version = "/{print $2; exit}' pyproject.toml)
-          lock=$(awk -F'"' '/^name = "sturnus"$/{getline; if ($1 == "version = ") print $2; exit}' uv.lock)
-          echo "pyproject.toml=$proj uv.lock=$lock"
-          if [ -z "$proj" ] || [ -z "$lock" ]; then
-            echo "::error::Could not read a version from pyproject.toml ($proj) or uv.lock ($lock). The file layout changed and this check needs updating."
-            exit 1
-          fi
-          if [ "$proj" != "$lock" ]; then
-            echo "::error::uv.lock pins sturnus at $lock but pyproject.toml says $proj. On a release PR this means release-please did not rewrite uv.lock -- check the uv.lock extra-files entry in release-please-config.json. Otherwise, run 'uv lock' and commit the result."
-            exit 1
-          fi
+        run: python3 scripts/check_lock_version.py
       - run: uv sync --all-groups --locked
       - run: uv run ruff check .
       - run: uv run ruff format --check .

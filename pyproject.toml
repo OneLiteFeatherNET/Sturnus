@@ -59,7 +59,9 @@ select = ["E", "F", "I", "UP", "B", "SIM", "ARG"]
 [tool.mypy]
 python_version = "3.12"
 strict = true
-files = ["src", "tests"]
+# scripts/ is included because check_lock_version.py runs in CI: a script
+# the pipeline depends on deserves the same checking as the package.
+files = ["src", "tests", "scripts"]
 # pydantic-settings populates its fields from the environment, so a
 # zero-argument Settings() is correct. Without this plugin mypy reads it as a
 # call missing every required argument.
