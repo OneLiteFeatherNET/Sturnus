@@ -84,3 +84,27 @@ def test_main_starts_no_sentry_client_without_a_dsn(
     module.main()
 
     assert sentry_sdk.is_initialized() is False
+
+
+@pytest.mark.parametrize("module_name,component", MODULES)
+def test_main_survives_a_malformed_sentry_dsn(
+    module_name: str, component: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A typo in optional telemetry must not stop the process from starting.
+
+    `init_sentry` runs before the event loop in every `main()`, so a `BadDsn`
+    escaping it does not degrade error reporting — it crash-loops bot, worker
+    and link, and the bot stops recording because the thing meant to observe
+    the failure could not start. Reporting is disabled instead, loudly, and
+    `main()` goes on to `asyncio.run`.
+    """
+    del component
+    module = importlib.import_module(module_name)
+    monkeypatch.setenv("STURNUS_SENTRY_DSN", "not-a-dsn")
+    order: list[str] = []
+    _stub_asyncio_run(module, monkeypatch, order)
+
+    module.main()
+
+    assert order == ["run"]
+    assert sentry_sdk.is_initialized() is False

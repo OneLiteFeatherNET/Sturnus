@@ -12,17 +12,17 @@ code. Any of them appearing in the serialised event is the failure.
 
 from __future__ import annotations
 
+import asyncio
+import errno
 import json
 import logging
+import os
 from collections.abc import Iterator
 from typing import Any, cast
 
 import pytest
 import sentry_sdk
 from sentry_sdk.envelope import Envelope
-from sentry_sdk.integrations.argv import ArgvIntegration
-from sentry_sdk.integrations.logging import LoggingIntegration
-from sentry_sdk.integrations.stdlib import StdlibIntegration
 from sentry_sdk.transport import Transport
 
 from sturnus.config import SentrySettings
@@ -30,6 +30,7 @@ from sturnus.domain.errors import DiagnosticSafeError
 from sturnus.infrastructure.observability import (
     REDACTED,
     SAFE_EVENT_KEYS,
+    SAFE_EXCEPTION_VALUE_KEYS,
     drop_breadcrumb,
     drop_transaction,
     init_sentry,
@@ -42,7 +43,13 @@ TRANSCRIPT = "SENTINEL-so-then-I-told-the-whole-channel-about-my-divorce"
 SPEAKER = "SENTINEL-display-name-Alice"
 MASTER_KEY = "SENTINEL-master-key-material"
 OAUTH_CODE = "SENTINEL-outline-authorization-code"
-ALL_SENTINELS = (TRANSCRIPT, SPEAKER, MASTER_KEY, OAUTH_CODE)
+# Not a sentinel string but a real one: `OSError.__str__` renders whatever
+# path the OS handed back, and `RecordingFileStore` names its files
+# `<recording_dir>/session-<session_id>/<discord_user_id>.wav`. The Discord
+# user id and the session id together say who was recorded and when, so the
+# literal shape is what has to be searched for.
+RECORDING_PATH = "/data/recordings/session-8f3c/198273645102938471.wav"
+ALL_SENTINELS = (TRANSCRIPT, SPEAKER, MASTER_KEY, OAUTH_CODE, RECORDING_PATH)
 
 
 def _rendered(event: object) -> str:
@@ -154,13 +161,69 @@ def test_exception_message_is_redacted_by_default() -> None:
     _assert_clean(out)
 
 
-def test_os_error_message_is_kept() -> None:
+def test_os_error_errno_and_strerror_are_kept() -> None:
     """The messages that matter for a process talking to four networks, and
-    which the OS composes rather than we do."""
-    out = scrub_event(*cast(Any, _capture(ConnectionRefusedError("[Errno 111] refused"))))
+    which the C library composes from a fixed table rather than we do."""
+    out = scrub_event(*cast(Any, _capture(ConnectionRefusedError(111, "Connection refused"))))
 
     assert out is not None
-    assert out["exception"]["values"][0]["value"] == "[Errno 111] refused"
+    assert out["exception"]["values"][0]["value"] == "[Errno 111] Connection refused"
+
+
+def test_os_error_does_not_ship_the_filename() -> None:
+    """`OSError` is vouched for because the OS writes its errno table, not
+    because it writes the filename.
+
+    `str(FileNotFoundError(2, "...", path))` appends `: '<path>'`, and the
+    path an `OSError` here is most likely to name identifies a Discord user
+    and a session. The errno survives -- it is the diagnostic value -- and
+    the trailing `: <redacted>` keeps the operator informed that a path was
+    involved, to be read with `kubectl logs`.
+    """
+    out = scrub_event(
+        *cast(
+            Any,
+            _capture(FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), RECORDING_PATH)),
+        )
+    )
+
+    assert out is not None
+    assert out["exception"]["values"][0]["value"] == (
+        f"[Errno {errno.ENOENT}] {os.strerror(errno.ENOENT)}: {REDACTED}"
+    )
+    _assert_clean(out)
+
+
+def test_os_error_does_not_ship_either_filename_of_a_two_path_call() -> None:
+    """`filename2` is the second path of an `os.rename`/`os.link` failure.
+
+    Both halves name a recording, so redacting only `filename` would ship the
+    other one.
+    """
+    exc = OSError(
+        errno.EXDEV, os.strerror(errno.EXDEV), RECORDING_PATH, None, f"{RECORDING_PATH}.enc"
+    )
+
+    out = scrub_event(*cast(Any, _capture(exc)))
+
+    assert out is not None
+    assert out["exception"]["values"][0]["value"].endswith(f": {REDACTED} -> {REDACTED}")
+    _assert_clean(out)
+
+
+def test_a_free_form_os_error_message_is_redacted() -> None:
+    """The single-argument form carries no errno table entry at all.
+
+    `OSError("cannot open <path>")` is a string a library wrote, structurally
+    indistinguishable from `RuntimeError("failed on <transcript>")`, so the
+    `OSError` opt-out does not reach it. Type and stack trace still travel.
+    """
+    out = scrub_event(*cast(Any, _capture(OSError(f"cannot open {RECORDING_PATH}"))))
+
+    assert out is not None
+    assert out["exception"]["values"][0]["value"] == REDACTED
+    assert out["exception"]["values"][0]["type"] == "OSError"
+    _assert_clean(out)
 
 
 def test_diagnostic_safe_error_message_is_kept() -> None:
@@ -229,22 +292,102 @@ def test_an_unpairable_chain_redacts_everything() -> None:
     _assert_clean(out)
 
 
-def test_logentry_keeps_only_the_format_string() -> None:
-    """`log.error("job %s failed", transcript)` renders the transcript into
-    `formatted` and puts it verbatim into `params`; only the uninterpolated
-    template, which ruff's `G` ruleset keeps a source literal, survives."""
+def test_exception_values_are_rebuilt_from_an_allowlist() -> None:
+    """The one nesting level that used to be copied wholesale.
+
+    `exception.values` entries were `dict(value)` with `value` overwritten,
+    so a field a later sentry-sdk starts attaching -- a `raw_stacktrace`, a
+    `data` blob on the mechanism -- would have been forwarded, which is the
+    exact failure mode `SAFE_EVENT_KEYS` exists to prevent one level up.
+    """
     event = {
-        "logentry": {
-            "message": "job %s failed",
-            "formatted": f"job {TRANSCRIPT} failed",
-            "params": [TRANSCRIPT],
+        "exception": {
+            "values": [
+                {
+                    "type": "ValueError",
+                    "module": "sturnus.application.assembly",
+                    "value": "boom",
+                    "mechanism": {
+                        "type": "logging",
+                        "handled": True,
+                        "data": {"speaker": SPEAKER},
+                    },
+                    "raw_stacktrace": {"frames": [{"vars": {"text": TRANSCRIPT}}]},
+                    "some_future_sdk_field": OAUTH_CODE,
+                }
+            ]
         }
     }
 
     out = scrub_event(cast(Any, event), {})
 
     assert out is not None
+    value = out["exception"]["values"][0]
+    assert set(value) <= SAFE_EXCEPTION_VALUE_KEYS
+    assert value["module"] == "sturnus.application.assembly"
+    assert value["mechanism"] == {"type": "logging", "handled": True}
+    _assert_clean(out)
+
+
+def test_logentry_keeps_only_the_format_string() -> None:
+    """`log.error("job %s failed", transcript)` renders the transcript into
+    `formatted` and puts it verbatim into `params`; only the uninterpolated
+    template, which ruff's `G` ruleset keeps a source literal, survives."""
+    event = {
+        "logger": "sturnus.application.worker",
+        "logentry": {
+            "message": "job %s failed",
+            "formatted": f"job {TRANSCRIPT} failed",
+            "params": [TRANSCRIPT],
+        },
+    }
+
+    out = scrub_event(cast(Any, event), {})
+
+    assert out is not None
     assert out["logentry"] == {"message": "job %s failed"}
+    _assert_clean(out)
+
+
+@pytest.mark.parametrize(
+    "logger_name",
+    ["asyncio", "discord.player", "aiohttp.server", "root", "sturnusx.thing", ""],
+)
+def test_logentry_from_a_foreign_logger_is_dropped(logger_name: str) -> None:
+    """`logentry.message` is only a template because ruff says so, and ruff
+    only says so about this repository.
+
+    `record.msg` is a reviewable source literal for the log calls written
+    here; for every other producer it is whatever that producer composed.
+    `asyncio`'s default exception handler is the concrete one -- it builds
+    its `msg` out of `repr(future)`, which embeds the raised exception's
+    message -- and `sturnusx` is the reason the prefix test is dotted.
+    """
+    event = {
+        "logger": logger_name,
+        "logentry": {
+            "message": f"Task exception was never retrieved\nfuture: <Task finished "
+            f"coro=<transcribe()> exception=RuntimeError('whisper failed on "
+            f"{TRANSCRIPT}')>",
+            "params": (),
+        },
+    }
+
+    out = scrub_event(cast(Any, event), {})
+
+    assert out is not None
+    assert "logentry" not in out
+    _assert_clean(out)
+
+
+def test_logentry_without_a_logger_is_dropped() -> None:
+    """Fail closed: an event with no `logger` names no producer to vouch for."""
+    event = {"logentry": {"message": f"failed on {TRANSCRIPT}"}}
+
+    out = scrub_event(cast(Any, event), {})
+
+    assert out is not None
+    assert "logentry" not in out
     _assert_clean(out)
 
 
@@ -340,6 +483,48 @@ def test_init_sentry_initialises_with_a_dsn(monkeypatch: pytest.MonkeyPatch) -> 
     assert tags == [("component", "link")]
 
 
+def test_a_malformed_dsn_disables_sentry_instead_of_crashing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo in optional telemetry must not stop the bot recording.
+
+    `sentry_sdk.init` raises `BadDsn` on an unparseable DSN, and `init_sentry`
+    is the first statement of all three `main()`s -- so unhandled it takes
+    down bot, worker and link before their event loops start, and Kubernetes
+    turns that into a CrashLoopBackOff of the whole system because a value
+    that only controls error reporting was mistyped.
+    """
+    caplog.set_level(logging.INFO, logger="sturnus.infrastructure.observability")
+
+    assert init_sentry("worker", SentrySettings(sentry_dsn="not-a-dsn")) is False
+
+    # Nothing half-built is left behind: no `callHandlers` patch, no
+    # `excepthook`, no atexit flush -- the same state as having no DSN.
+    assert sentry_sdk.is_initialized() is False
+    assert "DISABLED" in caplog.text, "an operator must be able to see Sentry is off, and why"
+    assert "STURNUS_SENTRY_DSN" in caplog.text
+    assert "not-a-dsn" not in caplog.text
+
+
+def test_a_rejected_dsn_does_not_put_its_key_in_the_logs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The "why" must not become its own leak.
+
+    A DSN embeds a public key, but it is still a credential-shaped value that
+    ends up in `kubectl logs` and in whatever ships those logs onward, so the
+    failure is reported by the SDK's own message -- which names the scheme,
+    the hostname or the project path -- and never by echoing the input.
+    """
+    caplog.set_level(logging.ERROR, logger="sturnus.infrastructure.observability")
+
+    settings = SentrySettings(sentry_dsn=f"https://{MASTER_KEY}@sentry.invalid/not-a-project")
+    assert init_sentry("bot", settings) is False
+
+    assert sentry_sdk.is_initialized() is False
+    _assert_clean(caplog.text)
+
+
 class _CapturingTransport(Transport):
     """Collects envelopes instead of sending them.
 
@@ -366,8 +551,16 @@ class _CapturingTransport(Transport):
 
 
 @pytest.fixture
-def sentry_transport() -> Iterator[list[dict[str, Any]]]:
-    """A real, fully configured client whose events land in a list.
+def sentry_transport(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict[str, Any]]]:
+    """A client built by `init_sentry` itself, whose events land in a list.
+
+    The option set is not restated here. It used to be, and that made the
+    end-to-end tests below assert against a copy of the configuration rather
+    than against the configuration the three processes run: an option removed
+    from `init_sentry` -- `before_send`, say -- would have left every test
+    here green. The only thing injected is the transport, by wrapping
+    `sentry_sdk.init` for the duration of the test; everything else, up to
+    and including the `component` tag, comes from the shipped code path.
 
     `sentry_sdk.init` patches `logging.Logger.callHandlers` process-wide and
     the patch is not undone by a later `init`, so the teardown detaches the
@@ -375,29 +568,15 @@ def sentry_transport() -> Iterator[list[dict[str, Any]]]:
     non-recording client and no other test starts emitting breadcrumbs.
     """
     captured: list[dict[str, Any]] = []
-    sentry_sdk.init(
-        dsn="https://sentinelkey@sentry.invalid/1",
-        transport=_CapturingTransport(captured),
-        send_default_pii=False,
-        include_local_variables=False,
-        include_source_context=True,
-        max_request_body_size="never",
-        max_value_length=1024,
-        attach_stacktrace=False,
-        auto_enabling_integrations=False,
-        integrations=[
-            LoggingIntegration(level=None, event_level=logging.ERROR, sentry_logs_level=None)
-        ],
-        disabled_integrations=[StdlibIntegration(), ArgvIntegration()],
-        before_send=scrub_event,
-        before_breadcrumb=drop_breadcrumb,
-        before_send_transaction=drop_transaction,
-        traces_sample_rate=0.0,
-        profiles_sample_rate=0.0,
-        enable_logs=False,
-        enable_metrics=False,
-    )
-    sentry_sdk.set_tag("component", "worker")
+    real_init = sentry_sdk.init
+
+    def init_with_capturing_transport(**kwargs: Any) -> Any:
+        return real_init(transport=_CapturingTransport(captured), **kwargs)
+
+    monkeypatch.setattr(sentry_sdk, "init", init_with_capturing_transport)
+    settings = SentrySettings(sentry_dsn="https://sentinelkey@sentry.invalid/1")
+    assert init_sentry("worker", settings) is True
+
     try:
         yield captured
     finally:
@@ -406,13 +585,13 @@ def sentry_transport() -> Iterator[list[dict[str, Any]]]:
 
 
 def test_a_real_capture_carries_no_content(sentry_transport: list[dict[str, Any]]) -> None:
-    """End-to-end against the option set `init_sentry` actually uses.
+    """End-to-end through `init_sentry` itself.
 
     The unit tests above feed hand-built events, which proves the hook but
     not that the hook is reached with these options; this drives a real
-    `log.exception` through a real client and asserts on what the transport
-    receives. It is the test that would catch an option name that silently
-    does nothing.
+    `log.exception` through a client `init_sentry` built and asserts on what
+    the transport receives. It is the test that would catch an option name
+    that silently does nothing.
     """
     log = logging.getLogger("sturnus.test.observability")
     try:
@@ -428,4 +607,82 @@ def test_a_real_capture_carries_no_content(sentry_transport: list[dict[str, Any]
     assert event["logentry"] == {"message": "job %s failed"}
     assert event["exception"]["values"][0]["value"] == REDACTED
     assert set(event) <= SAFE_EVENT_KEYS
+    _assert_clean(event)
+
+
+def test_an_asyncio_handler_message_carries_no_content(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """The leak route that went around `exception.values` entirely.
+
+    `asyncio`'s default exception handler does not log a `%s` template. It
+    composes `msg` itself, one line per context key, each rendered with
+    `repr` -- and `repr` of a finished `Task` embeds the exception it holds.
+    A coroutine that raised `RuntimeError(f"whisper failed on {segment}")`
+    and was never awaited therefore produced an event whose
+    `exception.values[0].value` was correctly `<redacted>` while
+    `logentry.message` carried the segment verbatim.
+
+    Asserted on what the transport receives, because the scrubber called
+    directly was never the thing that was wrong.
+    """
+
+    async def transcribe() -> None:
+        raise RuntimeError(f"whisper failed on {TRANSCRIPT}")
+
+    loop = asyncio.new_event_loop()
+    try:
+        task = loop.create_task(transcribe())
+        loop.run_until_complete(asyncio.wait([task]))
+        # Exactly the call `Task.__del__` makes for a task nobody retrieved
+        # the exception from, with the context asyncio itself builds.
+        loop.call_exception_handler(
+            {
+                "message": "Task exception was never retrieved",
+                "exception": task.exception(),
+                "future": task,
+            }
+        )
+    finally:
+        loop.close()
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    event = sentry_transport[0]
+    assert event["logger"] == "asyncio"
+    assert "logentry" not in event, (
+        "a message this repository did not compose cannot be vouched for by "
+        "ruff's G ruleset, which only covers this repository's own log calls"
+    )
+    assert event["exception"]["values"][0]["value"] == REDACTED
+    assert event["exception"]["values"][0]["type"] == "RuntimeError"
+    assert set(event) <= SAFE_EVENT_KEYS
+    _assert_clean(event)
+
+
+def test_a_real_os_error_does_not_ship_the_recording_path(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """`OSError` is on the safe side of the default, and its `__str__` is not.
+
+    The path a `FileNotFoundError` names in this codebase is
+    `<recording_dir>/session-<session_id>/<discord_user_id>.wav`: a Discord
+    user id and a session id, i.e. who was recorded and when. What survives
+    is the errno, which is what an operator actually diagnoses with.
+    """
+    log = logging.getLogger("sturnus.test.observability")
+    try:
+        raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), RECORDING_PATH)
+    except FileNotFoundError:
+        log.exception("opening the recording for session %s failed", "8f3c")
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    event = sentry_transport[0]
+    assert event["exception"]["values"][0]["type"] == "FileNotFoundError"
+    assert event["exception"]["values"][0]["value"] == (
+        f"[Errno {errno.ENOENT}] {os.strerror(errno.ENOENT)}: {REDACTED}"
+    )
     _assert_clean(event)

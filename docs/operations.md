@@ -396,17 +396,35 @@ individual jobs.
 `STURNUS_SENTRY_DSN` is set, an issue carries: the exception type, the
 module, a stack trace with five lines of surrounding *source* per frame, the
 `component` tag (`bot`/`worker`/`link`), the release
-(`sturnus@<version>`), the pod name, and — for errors raised from a log call
-— the log message's uninterpolated format string, e.g. `job %s failed`.
+(`sturnus@<version>`), the pod name, and — for errors raised from one of
+*Sturnus's own* log calls — that log message's uninterpolated format string,
+e.g. `job %s failed`.
 
 It does not carry local variables, breadcrumbs, request data, or the
-interpolated log line and its arguments. **Exception messages are redacted
-to `<redacted>` unless the exception is an `OSError`** (so
-`ConnectionRefusedError: [Errno 111] refused` survives, as do the DNS, TLS
-and timeout failures that matter for a process talking to Discord, S3,
-Postgres and Outline) **or subclasses
-`sturnus.domain.errors.DiagnosticSafeError`**, the explicit opt-in whose
-docstring carries the contract.
+interpolated log line and its arguments. Two things are narrower than they
+look, and both are deliberate:
+
+- **The log format string survives only for the `sturnus` logger
+  namespace.** That guarantee rests on ruff's `G` ruleset, which only
+  governs the log calls written in this repository. Records the SDK captures
+  from anywhere else are dropped whole — most importantly asyncio's "Task
+  exception was never retrieved", whose message asyncio composes itself out
+  of `repr(task)` and which therefore embeds the raised exception's own
+  message. An issue from a third-party logger has no message line; read the
+  pod log.
+- **`OSError` messages are rebuilt from `errno` and `strerror`.** So
+  `ConnectionRefusedError: [Errno 111] Connection refused` survives, as do
+  the DNS, TLS and timeout failures that matter for a process talking to
+  Discord, S3, Postgres and Outline — but the filename `OSError.__str__`
+  normally appends becomes `<redacted>`, because the file an `OSError` here
+  is most likely to name is
+  `<recording_dir>/session-<session_id>/<discord_user_id>.wav`, which says
+  who was recorded and when. An `OSError` carrying no errno at all (the
+  free-form `OSError("cannot open ...")` form) is redacted entirely.
+
+Otherwise **exception messages are redacted to `<redacted>` unless the
+exception subclasses `sturnus.domain.errors.DiagnosticSafeError`**, the
+explicit opt-in whose docstring carries the contract.
 
 That is a deliberate trade, not an oversight, and it should not be undone
 during an incident. Sturnus records people talking; Spec 3 makes consent a
@@ -420,6 +438,24 @@ the information has moved, not vanished. The enforcement lives in
 SDK version adds is dropped by default) and in ruff's `G` ruleset, which
 forbids f-string logging so that the format string Sentry does see stays a
 literal written in reviewable source.
+
+**A DSN Sentry rejects turns reporting off, not the process.** `init_sentry`
+runs before the event loop in all three `main()`s, so an unparseable
+`STURNUS_SENTRY_DSN` used to raise `BadDsn` out of `main()` and
+CrashLoopBackOff bot, worker and link — an outage of the recording caused by
+a typo in optional telemetry. It is now caught, and the process runs on
+without reporting. The log line to grep for is
+
+```
+sentry error reporting is DISABLED for component <bot|worker|link>: the SDK
+rejected the configured DSN (...)
+```
+
+at `ERROR`, from `sturnus.infrastructure.observability`. The DSN itself is
+never echoed, only the SDK's own reason (unsupported scheme, missing
+hostname, missing public key, invalid project). Its counterpart on success is
+`sentry error reporting enabled for component <...>` at `INFO`; if neither
+line appears, no DSN was configured.
 
 One consequence worth knowing: `sentry_sdk` calls the scrubbing hook inside
 its own exception guard, so a bug there makes Sentry go *quiet* rather than

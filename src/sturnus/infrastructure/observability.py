@@ -8,10 +8,10 @@ second system holding a copy of whatever it is sent, so the question is not
 it".
 
 The answer here is: exception type, module, a source-context stack trace, the
-`%s`-shaped log template, and the three tags that say which process and which
-release produced it. Nothing else. A Sentry issue is therefore strictly less
-than the corresponding pod log, and the operator reads the message with
-`kubectl logs`.
+`%s`-shaped log template of *this repository's own* log calls, and the tags
+that say which process and which release produced it. Nothing else. A Sentry
+issue is therefore strictly less than the corresponding pod log, and the
+operator reads the message with `kubectl logs`.
 
 Two design choices carry that, and both are deliberate inversions of how the
 SDK is normally configured.
@@ -35,6 +35,34 @@ an Outline authorization code. `StdlibIntegration` records outbound
 Neither is worth its risk, and neither comes back by accident when someone
 adds a library.
 
+**Nothing is vouched for because of where it usually comes from.** Two of
+the allowlists below were first written around an assumption about the
+*producer* of a string rather than about the string, and an assumption about
+a producer is only as good as the set of producers you thought of:
+
+- `logentry.message` is `LogRecord.msg`, which is a reviewable source
+  literal only for log calls written here, because only they are covered by
+  ruff's `G` ruleset. Records the SDK captures from code this repository did
+  not write are not: `asyncio`'s default exception handler composes its
+  `msg` from `repr(task)`, and a task that raised
+  `RuntimeError(f"whisper failed on {segment}")` puts that segment straight
+  into it -- past a redaction that correctly handled `exception.values`.
+  `logentry` therefore survives only for the `sturnus` logger namespace and
+  is dropped for every other producer.
+- `OSError.__str__` appends whatever filename the OS reported, and the file
+  an `OSError` here is most likely to name is
+  `<recording_dir>/session-<session_id>/<discord_user_id>.wav` -- who was
+  recorded, and in which session. The errno is the diagnostic value, the
+  path is the leak, so the message is rebuilt from `errno` and `strerror`
+  and never taken from `str(exc)`.
+
+**Optional telemetry never stops the recording.** A malformed DSN makes
+`sentry_sdk.init` raise `BadDsn`, and `init_sentry` is the first statement of
+every `main()`: unhandled, one typo in an optional environment variable
+CrashLoopBackOffs all three deployments and the bot stops recording. It is
+caught, logged at `ERROR` as "disabled", and the process runs on without
+reporting -- the state an operator without a DSN is already in.
+
 Failure mode: `sentry_sdk` calls `before_send` inside
 `capture_internal_exceptions()` with the result pre-initialised to `None`
 (`sentry_sdk/client.py`), so a bug in `scrub_event` drops the event rather
@@ -55,6 +83,7 @@ import sentry_sdk
 from sentry_sdk.integrations.argv import ArgvIntegration
 from sentry_sdk.integrations.logging import LoggingIntegration
 from sentry_sdk.integrations.stdlib import StdlibIntegration
+from sentry_sdk.utils import BadDsn
 
 from sturnus import __version__
 from sturnus.config import SentrySettings
@@ -95,7 +124,7 @@ SAFE_EVENT_KEYS = frozenset(
         "modules",  # installed package versions, from ModulesIntegration
         "transaction",
         "exception",
-        "logentry",  # sub-filtered below: only the uninterpolated template
+        "logentry",  # sub-filtered below: our own loggers' template, or nothing
         "contexts",  # sub-filtered below
         "tags",  # sub-filtered below
     }
@@ -133,18 +162,88 @@ SAFE_TAG_KEYS = frozenset({"component"})
 # reviewed, so it does not travel.
 SAFE_CONTEXT_KEYS = frozenset({"runtime", "os", "trace"})
 
-# Exception types whose `value` -- the message -- may be sent unredacted.
+# The fields of one entry in `exception.values`. `values` was the one
+# nesting level not rebuilt from an allowlist, which contradicted the
+# principle the rest of this module is built on: a future SDK version that
+# starts attaching, say, a rendered `raw_stacktrace` or a `data` blob would
+# have been forwarded without a test noticing.
 #
-# `OSError` covers `ConnectionError`, `TimeoutError`, `ssl.SSLError` and
-# `socket.gaierror`: the failures that actually matter for a process talking
-# to Discord, S3, Postgres and Outline, with messages composed by the OS and
-# the standard library rather than by us.
-#
-# `DiagnosticSafeError` is the explicit opt-in; its docstring carries the
-# contract and the reasons two obvious candidates are not on it.
-SAFE_VALUE_TYPES: tuple[type[BaseException], ...] = (OSError, DiagnosticSafeError)
+# `type` and `module` are identifiers from the source; `value` is judged
+# below; `stacktrace` and `mechanism` are themselves sub-filtered.
+SAFE_EXCEPTION_VALUE_KEYS = frozenset({"type", "module", "value", "stacktrace", "mechanism"})
+
+# `mechanism.data` is free-form and integration-supplied (the logging
+# integration and aiohttp both put request-shaped material there), so only
+# the three scalars that say how the exception was caught survive.
+SAFE_MECHANISM_KEYS = frozenset({"type", "handled", "synthetic"})
+
+# The logger namespace whose `LogRecord.msg` is a literal written in this
+# repository and therefore covered by ruff's `G` ruleset. Every module here
+# uses `logging.getLogger(__name__)`, so this is exactly "our own log calls";
+# `asyncio`, `discord`, `aiohttp`, `sqlalchemy` and `botocore` are not in it
+# and their pre-composed messages are dropped rather than forwarded.
+TRUSTED_LOGGER_ROOT = "sturnus"
 
 log = logging.getLogger(__name__)
+
+
+def _is_trusted_logger(name: object) -> bool:
+    """Whether a record's logger is one whose format strings we review.
+
+    See `TRUSTED_LOGGER_ROOT`. The dotted-prefix test is deliberate: a
+    hypothetical third-party `sturnusx` logger must not match.
+    """
+    return isinstance(name, str) and (
+        name == TRUSTED_LOGGER_ROOT or name.startswith(f"{TRUSTED_LOGGER_ROOT}.")
+    )
+
+
+def _os_error_value(exc: OSError) -> str:
+    """An `OSError` message rebuilt from `errno` and `strerror` alone.
+
+    `OSError` is on the safe side of the default because the failures that
+    matter for a process talking to Discord, S3, Postgres and Outline --
+    `ConnectionError`, `TimeoutError`, `ssl.SSLError`, `socket.gaierror` --
+    are `OSError`s whose text the C library composes from a fixed table. That
+    reasoning covers `errno` and `strerror`. It does not cover the rest of
+    what `OSError.__str__` renders:
+
+    - `filename`/`filename2`, which for this codebase is a recording path
+      naming a Discord user id and a session id, and
+    - the free-form single-argument form, `OSError("cannot open /data/...")`,
+      which any library may raise and which no table constrains.
+
+    So the value is composed here rather than read off the exception, and an
+    `OSError` carrying neither `errno` nor `strerror` yields `<redacted>` --
+    the type, module and stack trace still travel, which is what actually
+    identifies the failure.
+    """
+    prefix = f"[Errno {exc.errno}] " if exc.errno is not None else ""
+    strerror = exc.strerror if isinstance(exc.strerror, str) else None
+    if not prefix and strerror is None:
+        return REDACTED
+    value = f"{prefix}{strerror}" if strerror is not None else prefix.strip()
+    # Keep the shape of `str(OSError)` so an operator can see that a path was
+    # involved -- and read it with `kubectl logs`, where it never left.
+    if exc.filename is not None:
+        value += f": {REDACTED}"
+    if exc.filename2 is not None:
+        value += f" -> {REDACTED}"
+    return value
+
+
+def _exception_value(exc: BaseException | None) -> str | None:
+    """The message that may be sent for `exc`, or `None` to redact it.
+
+    `DiagnosticSafeError` is checked first: it is an explicit, reviewed
+    opt-in for the whole message, and it wins over the structural rebuild
+    `OSError` gets even for a class that happens to be both.
+    """
+    if isinstance(exc, DiagnosticSafeError):
+        return str(exc)
+    if isinstance(exc, OSError):
+        return _os_error_value(exc)
+    return None
 
 
 def _exception_chain(hint: Hint) -> list[BaseException] | None:
@@ -182,9 +281,10 @@ def _scrub_exception(event: dict[str, Any], hint: Hint) -> dict[str, Any]:
 
     No structural rule separates `ConnectionRefusedError: [Errno 111]` from
     `RuntimeError: failed on <transcript>` -- both are just a string in
-    `value` -- so the default is redaction and the exceptions are named in
-    `SAFE_VALUE_TYPES`. Frames are rebuilt from `SAFE_FRAME_KEYS` at the same
-    time.
+    `value` -- so the default is redaction and the exceptions that opt out
+    are named in `_exception_value`. Each entry is rebuilt from
+    `SAFE_EXCEPTION_VALUE_KEYS`, its frames from `SAFE_FRAME_KEYS` and its
+    mechanism from `SAFE_MECHANISM_KEYS`, at the same time.
 
     When the chain from `hint` cannot be paired one-for-one with the values
     the SDK produced, every message is redacted: a mismatch means the pairing
@@ -206,19 +306,30 @@ def _scrub_exception(event: dict[str, Any], hint: Hint) -> dict[str, Any]:
     for index, value in enumerate(values):
         if not isinstance(value, dict):
             continue
-        new_value = dict(value)
+        new_value = {k: v for k, v in value.items() if k in SAFE_EXCEPTION_VALUE_KEYS}
         exc = paired[index] if paired is not None else None
-        if not isinstance(exc, SAFE_VALUE_TYPES):
-            new_value["value"] = REDACTED
-        stacktrace = new_value.get("stacktrace")
-        if isinstance(stacktrace, dict) and isinstance(stacktrace.get("frames"), list):
-            new_value["stacktrace"] = dict(stacktrace) | {
-                "frames": [
-                    {k: v for k, v in frame.items() if k in SAFE_FRAME_KEYS}
-                    for frame in stacktrace["frames"]
-                    if isinstance(frame, dict)
-                ]
+        vouched = _exception_value(exc)
+        new_value["value"] = vouched if vouched is not None else REDACTED
+
+        mechanism = new_value.get("mechanism")
+        if isinstance(mechanism, dict):
+            new_value["mechanism"] = {
+                k: v for k, v in mechanism.items() if k in SAFE_MECHANISM_KEYS
             }
+
+        stacktrace = new_value.get("stacktrace")
+        if isinstance(stacktrace, dict):
+            frames = stacktrace.get("frames")
+            if isinstance(frames, list):
+                new_value["stacktrace"] = {
+                    "frames": [
+                        {k: v for k, v in frame.items() if k in SAFE_FRAME_KEYS}
+                        for frame in frames
+                        if isinstance(frame, dict)
+                    ]
+                }
+            else:
+                del new_value["stacktrace"]
         scrubbed_values.append(new_value)
 
     event["exception"] = dict(exception) | {"values": scrubbed_values}
@@ -243,15 +354,24 @@ def scrub_event(event: Event, hint: Hint) -> Event | None:
     if isinstance(contexts, dict):
         out["contexts"] = {k: v for k, v in contexts.items() if k in SAFE_CONTEXT_KEYS}
 
+    # `logentry` is opt-in per producer, so it is removed first and only
+    # added back for a record this repository wrote.
+    #
+    # `message` is `LogRecord.msg`. `formatted` is the rendered line and
+    # `params` is `record.args` verbatim -- `log.error("job %s failed",
+    # transcript)` puts the transcript in both, so those two never travel.
+    # The template only survives when ruff's `G` ruleset (see pyproject.toml)
+    # actually applies to the call site, i.e. when the record came from the
+    # `sturnus` logger namespace. `asyncio`'s "Task exception was never
+    # retrieved" is composed from `repr(task)` -- which embeds the raised
+    # exception's message, transcript and all -- and is a `msg` no format
+    # discipline of ours constrains, so it is dropped whole.
+    out.pop("logentry", None)
     logentry = event.get("logentry")
-    if isinstance(logentry, dict):
-        # `message` is `LogRecord.msg`, the format string as written in the
-        # source. `formatted` is the rendered line and `params` is
-        # `record.args` verbatim -- `log.error("job %s failed", transcript)`
-        # puts the transcript in both. Only the template survives, and ruff's
-        # `G` ruleset (see pyproject.toml) is what keeps the template a
-        # literal rather than an f-string someone interpolated data into.
-        out["logentry"] = {"message": logentry.get("message", "")}
+    if isinstance(logentry, dict) and _is_trusted_logger(event.get("logger")):
+        message = logentry.get("message")
+        if isinstance(message, str):
+            out["logentry"] = {"message": message}
 
     out = _scrub_exception(out, hint)
     return cast("Event", out)
@@ -287,30 +407,15 @@ def drop_transaction(event: Event, hint: Hint) -> Event | None:
     return None
 
 
-def init_sentry(component: str, settings: SentrySettings | None = None) -> bool:
-    """Initialises Sentry for one process. Returns whether it did.
+def _init_client(dsn: str, environment: str) -> None:
+    """The `sentry_sdk.init` call itself, split out so it can be guarded.
 
-    Call this as the first statement of `main()`, before the process's own
-    settings class is constructed: `SentrySettings` has no required fields,
-    so it always builds, which is what makes a settings `ValidationError`
-    itself reportable. (Pydantic's message can embed the offending input --
-    safe here precisely because exception messages are redacted by default.)
-
-    Sentry is optional. With no DSN -- unset, empty, or whitespace, see
-    `SentrySettings` -- `sentry_sdk.init()` is *never reached*: no
-    `logging.Logger.callHandlers` patch, no `sys.excepthook`, no `atexit`
-    hook, no threading patch. The three processes then behave exactly as they
-    do without this module. `sentry_sdk.init(dsn=None)` would not achieve
-    that -- it installs all of it and merely sends nothing -- which is why
-    the test here is the DSN and not `sentry_sdk.is_active()`.
+    Every option here is a decision about what leaves the cluster; see the
+    module docstring before changing one.
     """
-    settings = settings or SentrySettings()
-    if settings.sentry_dsn is None:
-        return False
-
     sentry_sdk.init(
-        dsn=settings.sentry_dsn.get_secret_value(),
-        environment=settings.sentry_environment,
+        dsn=dsn,
+        environment=environment,
         # `sturnus.__version__` reads the installed distribution's version,
         # which release-please keeps in lockstep with the chart's appVersion,
         # so a Sentry release matches a deployed tag without extra wiring.
@@ -334,9 +439,11 @@ def init_sentry(component: str, settings: SentrySettings | None = None) -> bool:
                 # No breadcrumbs from log records at all.
                 level=None,
                 # `log.exception(...)` and asyncio's "Task exception was
-                # never retrieved" should become issues. Safe only because
-                # `scrub_event` keeps `logentry.message` alone and ruff `G`
-                # keeps that a literal.
+                # never retrieved" should become issues. Both arrive with
+                # `record.msg` attached, so `scrub_event` keeps that string
+                # only for the `sturnus` logger namespace, where ruff `G`
+                # guarantees it is a literal; asyncio's is composed from
+                # `repr(task)` and is dropped.
                 event_level=logging.ERROR,
                 # Sentry Logs is a separate pipeline with its own
                 # `before_send_log`; it would bypass every allowlist here.
@@ -360,6 +467,59 @@ def init_sentry(component: str, settings: SentrySettings | None = None) -> bool:
         # `socket.gethostname()`, which in Kubernetes is the pod name --
         # more useful than anything we could pass, and not PII here.
     )
+
+
+def init_sentry(component: str, settings: SentrySettings | None = None) -> bool:
+    """Initialises Sentry for one process. Returns whether it did.
+
+    Call this as the first statement of `main()`, before the process's own
+    settings class is constructed: `SentrySettings` has no required fields,
+    so it always builds, which is what makes a settings `ValidationError`
+    itself reportable. (Pydantic's message can embed the offending input --
+    safe here precisely because exception messages are redacted by default.)
+
+    Sentry is optional. With no DSN -- unset, empty, or whitespace, see
+    `SentrySettings` -- `sentry_sdk.init()` is *never reached*: no
+    `logging.Logger.callHandlers` patch, no `sys.excepthook`, no `atexit`
+    hook, no threading patch. The three processes then behave exactly as they
+    do without this module. `sentry_sdk.init(dsn=None)` would not achieve
+    that -- it installs all of it and merely sends nothing -- which is why
+    the test here is the DSN and not `sentry_sdk.is_active()`.
+
+    It is optional in the other direction too: a DSN that the SDK refuses is
+    reported and then treated as no DSN. This function runs before the event
+    loop starts in all three `main()`s, so letting `BadDsn` out of it turns a
+    typo in an optional telemetry variable into a CrashLoopBackOff of the bot
+    that is supposed to be recording -- an availability failure caused
+    entirely by the thing that was meant to observe it.
+    """
+    settings = settings or SentrySettings()
+    dsn = settings.sentry_dsn
+    if dsn is None:
+        return False
+
+    try:
+        _init_client(dsn.get_secret_value(), settings.sentry_environment)
+    except Exception as exc:
+        # `sentry_sdk.init` builds the `Client` and only then attaches it to
+        # the global scope, and the DSN is parsed while the transport is
+        # built -- so a raise here leaves nothing initialised and nothing
+        # patched, exactly the no-DSN state.
+        #
+        # Only `BadDsn`'s own text is echoed. Its messages name the scheme,
+        # the missing hostname, the missing public key or the project path,
+        # none of which is key material; an unreviewed message from anywhere
+        # else might quote the DSN, so those are reported by class alone.
+        detail = str(exc) if isinstance(exc, BadDsn) else type(exc).__name__
+        log.error(
+            "sentry error reporting is DISABLED for component %s: the SDK rejected "
+            "the configured DSN (%s). Check STURNUS_SENTRY_DSN; this process "
+            "continues to run without error reporting.",
+            component,
+            detail,
+        )
+        return False
+
     # Three deployments run from one image; this is what tells them apart in
     # the issue list, and it keeps grouping separate per process.
     sentry_sdk.set_tag("component", component)
