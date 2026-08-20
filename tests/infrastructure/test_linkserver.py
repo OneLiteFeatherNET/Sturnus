@@ -83,7 +83,13 @@ class FakeLinks:
 @pytest.fixture
 async def client(aiohttp_client: AiohttpClientFactory) -> TestClient[web.Request, web.Application]:
     return await aiohttp_client(
-        build_app(oauth=FakeOAuth(), states=FakeStates(), links=FakeLinks(), now=lambda: T0)
+        build_app(
+            oauth=FakeOAuth(),
+            states=FakeStates(),
+            links=FakeLinks(),
+            now=lambda: T0,
+            schema_ready=lambda: True,
+        )
     )
 
 
@@ -94,7 +100,13 @@ async def test_healthz_is_served(client: TestClient[web.Request, web.Application
 async def test_a_valid_callback_stores_the_link(aiohttp_client: AiohttpClientFactory) -> None:
     links = FakeLinks()
     c = await aiohttp_client(
-        build_app(oauth=FakeOAuth(), states=FakeStates(), links=links, now=lambda: T0)
+        build_app(
+            oauth=FakeOAuth(),
+            states=FakeStates(),
+            links=links,
+            now=lambda: T0,
+            schema_ready=lambda: True,
+        )
     )
     response = await c.get("/oauth/callback", params={"code": "c", "state": "good-state"})
     assert response.status == 200
@@ -107,7 +119,13 @@ async def test_an_unknown_state_is_refused_and_stores_nothing(
     """A forged callback must not link anything."""
     links = FakeLinks()
     c = await aiohttp_client(
-        build_app(oauth=FakeOAuth(), states=FakeStates(), links=links, now=lambda: T0)
+        build_app(
+            oauth=FakeOAuth(),
+            states=FakeStates(),
+            links=links,
+            now=lambda: T0,
+            schema_ready=lambda: True,
+        )
     )
     response = await c.get("/oauth/callback", params={"code": "c", "state": "forged"})
     assert response.status == 400
@@ -117,7 +135,13 @@ async def test_an_unknown_state_is_refused_and_stores_nothing(
 async def test_a_replayed_state_is_refused(aiohttp_client: AiohttpClientFactory) -> None:
     links = FakeLinks()
     c = await aiohttp_client(
-        build_app(oauth=FakeOAuth(), states=FakeStates(), links=links, now=lambda: T0)
+        build_app(
+            oauth=FakeOAuth(),
+            states=FakeStates(),
+            links=links,
+            now=lambda: T0,
+            schema_ready=lambda: True,
+        )
     )
     params = {"code": "c", "state": "good-state"}
     assert (await c.get("/oauth/callback", params=params)).status == 200
@@ -137,7 +161,13 @@ async def test_a_failed_exchange_reports_an_error_and_stores_nothing(
 ) -> None:
     links = FakeLinks()
     c = await aiohttp_client(
-        build_app(oauth=FakeOAuth(fail=True), states=FakeStates(), links=links, now=lambda: T0)
+        build_app(
+            oauth=FakeOAuth(fail=True),
+            states=FakeStates(),
+            links=links,
+            now=lambda: T0,
+            schema_ready=lambda: True,
+        )
     )
     response = await c.get("/oauth/callback", params={"code": "c", "state": "good-state"})
     assert response.status >= 400
@@ -147,10 +177,59 @@ async def test_a_failed_exchange_reports_an_error_and_stores_nothing(
 async def test_the_error_page_does_not_echo_the_input(aiohttp_client: AiohttpClientFactory) -> None:
     """Reflecting user input into HTML is how a callback becomes an XSS sink."""
     c = await aiohttp_client(
-        build_app(oauth=FakeOAuth(), states=FakeStates(), links=FakeLinks(), now=lambda: T0)
+        build_app(
+            oauth=FakeOAuth(),
+            states=FakeStates(),
+            links=FakeLinks(),
+            now=lambda: T0,
+            schema_ready=lambda: True,
+        )
     )
     response = await c.get(
         "/oauth/callback", params={"code": "c", "state": "<script>alert(1)</script>"}
     )
     body = await response.text()
     assert "<script>" not in body
+
+
+async def test_healthz_answers_before_the_schema_exists(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Liveness must not depend on the database.
+
+    The link deployment starts this server and only then waits for the
+    worker's migrations, which can take up to a minute on a fresh cluster.
+    If `/healthz` were unavailable during that wait, the liveness probe
+    would kill the pod for doing exactly what it should -- which is what
+    happened on the first real deployment.
+    """
+    client = await aiohttp_client(
+        build_app(
+            oauth=FakeOAuth(),
+            states=FakeStates(),
+            links=FakeLinks(),
+            now=lambda: T0,
+            schema_ready=lambda: False,
+        )
+    )
+    assert (await client.get("/healthz")).status == 200
+
+
+async def test_readyz_holds_traffic_back_until_the_schema_is_there(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Readiness must depend on it, so no request arrives before the tables do."""
+    ready = False
+    client = await aiohttp_client(
+        build_app(
+            oauth=FakeOAuth(),
+            states=FakeStates(),
+            links=FakeLinks(),
+            now=lambda: T0,
+            schema_ready=lambda: ready,
+        )
+    )
+    assert (await client.get("/readyz")).status == 503
+
+    ready = True
+    assert (await client.get("/readyz")).status == 200
