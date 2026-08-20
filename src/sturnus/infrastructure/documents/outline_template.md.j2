@@ -1,17 +1,45 @@
+{#
+  A speaker's name, rendered once and used in both places that need it.
+
+  It is a macro rather than the same conditional written out twice for a
+  reason beyond duplication: the environment runs with `trim_blocks=True`
+  (see `sturnus.application.documents._build_environment`), which eats the
+  newline that follows a block tag. A line ending in `{% endif %}` therefore
+  loses its own line break, so a blank line written after it survives as a
+  single newline -- and a single newline in Markdown is a *soft* break, which
+  renders on the same line. That is how the speaker's name used to run
+  straight into the words they said.
+
+  Ending the line with `}}` instead of a block tag puts the whitespace back
+  under the template author's control, so a blank line below means a blank
+  line in the output.
+-#}
+{% macro speaker(s) -%}
+{% if s.external_user_id -%}
+@[{{ s.external_display_name | md }}](mention://user/{{ s.external_user_id }}) ([{{ s.discord_display_name | md }}](https://discord.com/users/{{ s.discord_user_id }}))
+{%- else -%}
+[{{ s.discord_display_name | md }}](https://discord.com/users/{{ s.discord_user_id }})
+{%- endif %}
+{%- endmacro %}
 {% if channel %}**Channel:** [{{ channel.label | md }}]({{ channel.url }})
+
 {% endif %}**Date:** @[{{ date_label }}](mention://date/{{ date_iso }}) · {{ started }}, {{ duration_minutes }} min · {{ participants | length }} participant{{ '' if participants | length == 1 else 's' }}
 
 ## Participants
 
-{% for speaker in participants %}
-- {% if speaker.external_user_id %}@[{{ speaker.external_display_name | md }}](mention://user/{{ speaker.external_user_id }}) ([{{ speaker.discord_display_name | md }}](https://discord.com/users/{{ speaker.discord_user_id }})){% else %}[{{ speaker.discord_display_name | md }}](https://discord.com/users/{{ speaker.discord_user_id }}){% endif %}
-
+{# One list item per line, with no blank line between them: a blank line
+   would make this a "loose" list, which Markdown renders with a paragraph
+   around every item and a gap between them. The transcript below wants the
+   opposite -- there the blank line is what separates the attribution from
+   the words. #}
+{% for s in participants %}
+- {{ speaker(s) }}
 {% endfor %}
 
 ## Transcript
 
 {% for block in blocks %}
-**{{ block.time }}** · {% if block.speaker.external_user_id %}@[{{ block.speaker.external_display_name | md }}](mention://user/{{ block.speaker.external_user_id }}) ([{{ block.speaker.discord_display_name | md }}](https://discord.com/users/{{ block.speaker.discord_user_id }})){% else %}[{{ block.speaker.discord_display_name | md }}](https://discord.com/users/{{ block.speaker.discord_user_id }}){% endif %}
+**{{ block.time }}** · {{ speaker(block.speaker) }}
 
 {{ block.text | md }}
 
