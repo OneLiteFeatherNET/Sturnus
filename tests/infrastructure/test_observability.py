@@ -5,9 +5,10 @@ the value of `sturnus.infrastructure.observability` is not that it runs, it
 is that specific content does not leave the cluster. A test that only checked
 `sentry_sdk.init` had been called would pass with the scrubbing deleted.
 
-The sentinels below are the four things that must not travel -- a line of
+The sentinels below are the things that must not travel -- a line of
 transcript, a Discord display name, a master key, an OAuth authorization
-code. Any of them appearing in the serialised event is the failure.
+code, a recording path, a presigned S3 URL. Any of them appearing in the
+serialised event is the failure.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import os
 from collections.abc import Iterator
 from typing import Any, cast
 
+import aiohttp
 import pytest
 import sentry_sdk
 from sentry_sdk.envelope import Envelope
@@ -29,7 +31,9 @@ from sturnus.config import SentrySettings
 from sturnus.domain.errors import DiagnosticSafeError
 from sturnus.infrastructure.observability import (
     REDACTED,
+    SAFE_CONTEXT_FIELDS,
     SAFE_EVENT_KEYS,
+    SAFE_EXCEPTION_KEYS,
     SAFE_EXCEPTION_VALUE_KEYS,
     drop_breadcrumb,
     drop_transaction,
@@ -49,7 +53,16 @@ OAUTH_CODE = "SENTINEL-outline-authorization-code"
 # user id and the session id together say who was recorded and when, so the
 # literal shape is what has to be searched for.
 RECORDING_PATH = "/data/recordings/session-8f3c/198273645102938471.wav"
-ALL_SENTINELS = (TRANSCRIPT, SPEAKER, MASTER_KEY, OAUTH_CODE, RECORDING_PATH)
+# Also a real shape rather than an invented one: `aiohttp` raises an
+# `OSError` whose `strerror` is `f"Can not write request body for {url}"`,
+# and the bodies this process writes go to presigned S3 URLs -- which carry
+# both the object key (session id and Discord user id again) and
+# `X-Amz-Signature`.
+PRESIGNED_URL = (
+    "https://s3.invalid/sturnus/session-8f3c/198273645102938471.wav"
+    "?X-Amz-Signature=SENTINEL-presigned-request-signature"
+)
+ALL_SENTINELS = (TRANSCRIPT, SPEAKER, MASTER_KEY, OAUTH_CODE, RECORDING_PATH, PRESIGNED_URL)
 
 
 def _rendered(event: object) -> str:
@@ -161,13 +174,25 @@ def test_exception_message_is_redacted_by_default() -> None:
     _assert_clean(out)
 
 
-def test_os_error_errno_and_strerror_are_kept() -> None:
-    """The messages that matter for a process talking to four networks, and
-    which the C library composes from a fixed table rather than we do."""
-    out = scrub_event(*cast(Any, _capture(ConnectionRefusedError(111, "Connection refused"))))
+def test_os_error_errno_is_looked_up_rather_than_read_off_the_exception() -> None:
+    """The message that matters for a process talking to four networks --
+    and it comes from the table, not from the exception.
+
+    `strerror` is only *conventionally* the errno description: it is
+    whatever the raiser passed as `OSError`'s second argument. So the
+    exception here is built the way a library that composes its own is,
+    and the assertion is that the description is `os.strerror(111)`
+    regardless -- the errno number is the input, nothing else.
+    """
+    exc = ConnectionRefusedError(errno.ECONNREFUSED, f"refused while fetching {PRESIGNED_URL}")
+
+    out = scrub_event(*cast(Any, _capture(exc)))
 
     assert out is not None
-    assert out["exception"]["values"][0]["value"] == "[Errno 111] Connection refused"
+    assert out["exception"]["values"][0]["value"] == (
+        f"[Errno {errno.ECONNREFUSED}] {os.strerror(errno.ECONNREFUSED)}"
+    )
+    _assert_clean(out)
 
 
 def test_os_error_does_not_ship_the_filename() -> None:
@@ -685,4 +710,243 @@ def test_a_real_os_error_does_not_ship_the_recording_path(
     assert event["exception"]["values"][0]["value"] == (
         f"[Errno {errno.ENOENT}] {os.strerror(errno.ENOENT)}: {REDACTED}"
     )
+    _assert_clean(event)
+
+
+def test_a_real_aiohttp_error_does_not_ship_the_url_in_its_strerror(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """The second `OSError` attribute that turned out to be free-form text.
+
+    The previous round vouched for `errno` *and* `strerror`, on the reasoning
+    that the C library composes both from a fixed table. That is true of the
+    number and only of the number: `strerror` is whatever the raiser passed
+    as `OSError`'s second argument, and `aiohttp` -- which every one of this
+    process's four network conversations goes through -- passes
+    `f"Can not write request body for {url}"` (`client_reqrep.py`). The
+    bodies this process writes go to presigned S3 URLs, so that string is the
+    object key plus `X-Amz-Signature`, arriving through the one exception
+    class the scrubber positively vouches for.
+
+    Asserted end to end, because that is the route the leak took: the
+    exception is raised for real, logged for real, and what the transport
+    receives is what is checked.
+    """
+    log = logging.getLogger("sturnus.test.observability")
+    try:
+        raise aiohttp.ClientOSError(errno.EPIPE, f"Can not write request body for {PRESIGNED_URL}")
+    except OSError:
+        log.exception("uploading the recording for session %s failed", "8f3c")
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    event = sentry_transport[0]
+    value = event["exception"]["values"][0]
+    assert value["type"] == "ClientOSError"
+    # The number, looked up in the table. Nothing the exception was carrying.
+    assert value["value"] == f"[Errno {errno.EPIPE}] {os.strerror(errno.EPIPE)}"
+    _assert_clean(event)
+
+
+def test_an_os_error_without_an_errno_is_redacted_whatever_its_strerror_says(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """No number, no table lookup, no message.
+
+    `OSError(None, text)` is the shape `aiohttp` falls back to when the
+    underlying failure was a timeout rather than a system call, and it is
+    also what any two-argument `OSError` looks like when the first argument
+    is not an errno. Without a number there is nothing to vouch for, so the
+    whole message goes -- the type and the stack trace still identify it.
+    """
+    log = logging.getLogger("sturnus.test.observability")
+    try:
+        raise OSError(None, f"Can not write request body for {PRESIGNED_URL}")
+    except OSError:
+        log.exception("uploading the recording for session %s failed", "8f3c")
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    event = sentry_transport[0]
+    assert event["exception"]["values"][0]["value"] == REDACTED
+    assert event["exception"]["values"][0]["type"] == "OSError"
+    _assert_clean(event)
+
+
+def test_an_errno_outside_the_platform_table_is_redacted(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """`errno` is only trustworthy because a table constrains it.
+
+    An integer the platform cannot look up is an integer with no table entry
+    behind it, so it earns no message either -- the fallback is the same
+    `<redacted>`, never the string the exception happened to carry.
+    """
+    log = logging.getLogger("sturnus.test.observability")
+    try:
+        raise OSError(2**70, f"Can not write request body for {PRESIGNED_URL}")
+    except OSError:
+        log.exception("uploading the recording for session %s failed", "8f3c")
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    event = sentry_transport[0]
+    assert event["exception"]["values"][0]["value"] == REDACTED
+    _assert_clean(event)
+
+
+def test_a_malformed_exception_container_is_dropped_not_forwarded(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """Fail closed one level up, like everything else here.
+
+    `exception["values"]` that is not a list is a payload no allowlist in the
+    module has looked at, and the module's whole design is that such a
+    payload does not leave the cluster. It used to be returned verbatim.
+
+    Driven through the live client with `capture_event`, which is the route
+    an integration or a `capture_event` call elsewhere in the codebase would
+    take -- the scrubber is reached with the options the three processes
+    actually run under, and the assertion is on what the transport got.
+    """
+    sentry_sdk.capture_event(
+        cast(
+            Any,
+            {
+                "level": "error",
+                "exception": {"values": {"0": {"type": "RuntimeError", "value": TRANSCRIPT}}},
+            },
+        )
+    )
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    event = sentry_transport[0]
+    assert "exception" not in event
+    _assert_clean(event)
+
+
+def test_an_exception_that_is_not_a_container_is_dropped_not_forwarded() -> None:
+    """The same rule for the other malformed shape, at the hook.
+
+    This one cannot be driven end to end: an `exception` that is not a dict
+    makes the SDK's own `handle_in_app` raise (`utils.py`, `for exception in
+    event["exception"].get("values")`), and `Client._prepare_event` is not
+    wrapped in `capture_internal_exceptions`, so the event dies inside the
+    SDK before `before_send` is ever called. The branch exists because that
+    guard is sentry-sdk's rather than ours and a later version may soften
+    it; the rule it enforces is the module's own.
+    """
+    event = {"level": "error", "exception": f"RuntimeError: {TRANSCRIPT}"}
+
+    out = scrub_event(cast(Any, event), {})
+
+    assert out is not None
+    assert "exception" not in out
+    _assert_clean(out)
+
+
+def test_the_exception_container_itself_is_rebuilt_from_an_allowlist(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """The nesting level between the two that were already closed.
+
+    `exception.values` entries are rebuilt and the event's top level is
+    rebuilt, but the `exception` container between them was
+    `dict(exception) | {"values": ...}` -- so a sibling key a later
+    sentry-sdk starts attaching next to `values` rode along, which is the
+    exact failure mode the allowlists exist to prevent.
+    """
+    sentry_sdk.capture_event(
+        cast(
+            Any,
+            {
+                "level": "error",
+                "exception": {
+                    "values": [{"type": "RuntimeError", "value": "boom"}],
+                    "some_future_sdk_field": {"speaker": SPEAKER},
+                },
+            },
+        )
+    )
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    event = sentry_transport[0]
+    assert set(event["exception"]) <= SAFE_EXCEPTION_KEYS
+    assert event["exception"]["values"][0]["value"] == REDACTED
+    _assert_clean(event)
+
+
+def test_context_objects_are_rebuilt_field_by_field(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """Allowing a context is a statement about its ids, not about its blobs.
+
+    `contexts` was filtered at the top key only, so naming `trace` as allowed
+    forwarded the whole object -- including `Span.get_trace_context`'s
+    `description`, which is SQL statement text for a database span and the
+    full outbound URL for an HTTP one, and its free-form `data` dict. Those
+    are precisely what `drop_transaction` keeps out of transactions, reaching
+    *error* events by the side door whenever a span is active.
+    """
+    sentry_sdk.capture_event(
+        cast(
+            Any,
+            {
+                "level": "error",
+                "contexts": {
+                    "trace": {
+                        "trace_id": "a" * 32,
+                        "span_id": "b" * 16,
+                        "op": "db",
+                        "description": f"INSERT INTO transcript VALUES ('{TRANSCRIPT}')",
+                        "data": {"speaker": SPEAKER},
+                    },
+                    "runtime": {"name": "CPython", "some_future_sdk_field": MASTER_KEY},
+                    "os": {"name": "Linux", "raw_description": f"host {SPEAKER}"},
+                    "session": {"text": TRANSCRIPT},
+                },
+            },
+        )
+    )
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    contexts = sentry_transport[0]["contexts"]
+    assert set(contexts) == {"trace", "runtime", "os"}
+    assert contexts["trace"] == {"trace_id": "a" * 32, "span_id": "b" * 16, "op": "db"}
+    assert contexts["runtime"] == {"name": "CPython"}
+    assert contexts["os"] == {"name": "Linux"}
+    _assert_clean(sentry_transport[0])
+
+
+def test_the_sdks_own_trace_context_stays_within_the_allowlist(
+    sentry_transport: list[dict[str, Any]],
+) -> None:
+    """The client attaches a `trace` context to every event by itself.
+
+    Nothing in this codebase asks for it, which is why it has to be checked
+    against the allowlist rather than assumed to be ids: it is the container
+    the SDK will keep adding fields to across the versions Renovate bumps.
+    """
+    log = logging.getLogger("sturnus.test.observability")
+    try:
+        raise RuntimeError(f"assembling failed for {TRANSCRIPT}")
+    except RuntimeError:
+        log.exception("job %s failed", "41")
+
+    sentry_sdk.flush()
+
+    assert len(sentry_transport) == 1
+    event = sentry_transport[0]
+    assert set(event["contexts"]) <= set(SAFE_CONTEXT_FIELDS)
+    for name, context in event["contexts"].items():
+        assert set(context) <= SAFE_CONTEXT_FIELDS[name]
     _assert_clean(event)

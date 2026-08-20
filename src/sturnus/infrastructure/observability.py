@@ -52,9 +52,14 @@ a producer is only as good as the set of producers you thought of:
 - `OSError.__str__` appends whatever filename the OS reported, and the file
   an `OSError` here is most likely to name is
   `<recording_dir>/session-<session_id>/<discord_user_id>.wav` -- who was
-  recorded, and in which session. The errno is the diagnostic value, the
-  path is the leak, so the message is rebuilt from `errno` and `strerror`
-  and never taken from `str(exc)`.
+  recorded, and in which session. `strerror` is no better: it is only
+  *conventionally* the errno description -- nothing enforces that, it is
+  simply `OSError`'s second constructor argument, and `aiohttp` raises
+  `ClientOSError(errno, f"Can not write request body for {url}")`, which
+  makes it a presigned S3 URL. The errno *number* is the diagnostic value
+  and the only part of an `OSError` a fixed table constrains, so the message
+  is composed from `os.strerror(exc.errno)` and no string the exception
+  carries is read at all.
 
 **Optional telemetry never stops the recording.** A malformed DSN makes
 `sentry_sdk.init` raise `BadDsn`, and `init_sentry` is the first statement of
@@ -77,6 +82,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import sentry_sdk
@@ -159,8 +165,31 @@ SAFE_TAG_KEYS = frozenset({"component"})
 
 # `runtime` and `os` are interpreter and kernel versions; `trace` is ids.
 # Everything else a context can hold (`threadpool`, custom contexts) is not
-# reviewed, so it does not travel.
-SAFE_CONTEXT_KEYS = frozenset({"runtime", "os", "trace"})
+# reviewed, so it does not travel -- and neither does an unreviewed *field*
+# of one that does, which is why this maps each allowed context to its own
+# allowlist rather than naming the container alone.
+#
+# `trace` is the one that makes the difference concrete. `Span.get_trace_context`
+# emits `description` -- the span description, i.e. SQL statement text for a
+# database span and the full outbound URL for an HTTP one -- alongside the
+# ids, plus a free-form `data` dict that any integration may write into. Both
+# are exactly what `drop_transaction` exists to keep out of transactions, and
+# they arrive on *error* events through this container whenever a span is
+# active. `origin`, `status` and `op` are SDK-side enum-shaped strings.
+#
+# `os.raw_description` is absent for the same reason one level down: it is
+# the unparsed `uname` line, which includes the node name.
+SAFE_CONTEXT_FIELDS: dict[str, frozenset[str]] = {
+    "runtime": frozenset({"type", "name", "version", "build"}),
+    "os": frozenset({"type", "name", "version", "kernel_version"}),
+    "trace": frozenset({"type", "trace_id", "span_id", "parent_span_id", "op", "origin", "status"}),
+}
+
+# The `exception` container itself. `values` is the only key Sentry defines
+# for it, and it is rebuilt entry by entry below; naming the set is what
+# stops a future SDK version's sibling key riding along one level *above*
+# the nesting level that was already closed.
+SAFE_EXCEPTION_KEYS = frozenset({"values"})
 
 # The fields of one entry in `exception.values`. `values` was the one
 # nesting level not rebuilt from an allowlist, which contradicted the
@@ -199,30 +228,49 @@ def _is_trusted_logger(name: object) -> bool:
 
 
 def _os_error_value(exc: OSError) -> str:
-    """An `OSError` message rebuilt from `errno` and `strerror` alone.
+    """An `OSError` message rebuilt from `errno` alone.
 
     `OSError` is on the safe side of the default because the failures that
     matter for a process talking to Discord, S3, Postgres and Outline --
     `ConnectionError`, `TimeoutError`, `ssl.SSLError`, `socket.gaierror` --
-    are `OSError`s whose text the C library composes from a fixed table. That
-    reasoning covers `errno` and `strerror`. It does not cover the rest of
-    what `OSError.__str__` renders:
+    carry an `errno`, which is a small integer indexing a fixed table. That
+    reasoning covers the number and the table lookup, and *only* those. It
+    does not cover any of the strings the exception happens to be holding:
 
     - `filename`/`filename2`, which for this codebase is a recording path
-      naming a Discord user id and a session id, and
+      naming a Discord user id and a session id;
     - the free-form single-argument form, `OSError("cannot open /data/...")`,
-      which any library may raise and which no table constrains.
+      which any library may raise and which no table constrains; and
+    - `strerror` itself, which is only *conventionally* the errno
+      description. Nothing enforces that: the attribute is just whatever the
+      raiser passed as `OSError`'s second argument, and a library that
+      composes it is not misusing the type. aiohttp does exactly that --
+      `client_reqrep.py` raises
+      `ClientOSError(errno, f"Can not write request body for {self.url!s}")`
+      -- so `strerror` is a full request URL, and every URL this process
+      writes a body to is either a presigned S3 URL carrying
+      `X-Amz-Signature` or an Outline API call. That is the same hazard
+      `filename` was, reached through a different attribute, so the fix has
+      to be the one that does not depend on guessing which attribute the
+      next library picks: read nothing free-form off the exception at all.
 
-    So the value is composed here rather than read off the exception, and an
-    `OSError` carrying neither `errno` nor `strerror` yields `<redacted>` --
-    the type, module and stack trace still travel, which is what actually
-    identifies the failure.
+    So the description is looked up from the number with `os.strerror`
+    rather than read off the exception, and an `OSError` without a usable
+    integer `errno` yields `<redacted>` -- the type, module and stack trace
+    still travel, which is what actually identifies the failure.
     """
-    prefix = f"[Errno {exc.errno}] " if exc.errno is not None else ""
-    strerror = exc.strerror if isinstance(exc.strerror, str) else None
-    if not prefix and strerror is None:
+    number = exc.errno
+    if not isinstance(number, int) or isinstance(number, bool):
         return REDACTED
-    value = f"{prefix}{strerror}" if strerror is not None else prefix.strip()
+    try:
+        # The fixed table, keyed by the integer -- not the string the
+        # exception is carrying, whoever composed that.
+        description = os.strerror(number)
+    except (ValueError, OverflowError):
+        # An errno outside the platform's table. The number is still a
+        # number, but there is nothing to say about it.
+        return REDACTED
+    value = f"[Errno {number}] {description}"
     # Keep the shape of `str(OSError)` so an operator can see that a path was
     # involved -- and read it with `kubectl logs`, where it never left.
     if exc.filename is not None:
@@ -290,13 +338,24 @@ def _scrub_exception(event: dict[str, Any], hint: Hint) -> dict[str, Any]:
     the SDK produced, every message is redacted: a mismatch means the pairing
     is a guess, and a guess is not a basis for sending someone's words to a
     third system.
+
+    A container that is not the shape this function knows how to rebuild is
+    dropped, not forwarded. There is no version of "unrecognised, so send it
+    unread" that is compatible with the rest of this module: an `exception`
+    that is not a dict, or an `exception["values"]` that is not a list, is a
+    payload no allowlist here has looked at, and the whole design is that
+    such a payload does not leave the cluster. The cost of being wrong is a
+    Sentry issue with no exception section; the cost of the other choice is
+    the content of whatever that field turned out to hold.
     """
     exception = event.get("exception")
     if not isinstance(exception, dict):
+        event.pop("exception", None)
         return event
 
     values = exception.get("values")
     if not isinstance(values, list):
+        event.pop("exception", None)
         return event
 
     chain = _exception_chain(hint)
@@ -311,13 +370,16 @@ def _scrub_exception(event: dict[str, Any], hint: Hint) -> dict[str, Any]:
         vouched = _exception_value(exc)
         new_value["value"] = vouched if vouched is not None else REDACTED
 
-        mechanism = new_value.get("mechanism")
+        # Same rule as the container above at both of these nesting levels:
+        # a `mechanism` or a `stacktrace` that is not the shape rebuilt here
+        # is dropped rather than passed through unread.
+        mechanism = new_value.pop("mechanism", None)
         if isinstance(mechanism, dict):
             new_value["mechanism"] = {
                 k: v for k, v in mechanism.items() if k in SAFE_MECHANISM_KEYS
             }
 
-        stacktrace = new_value.get("stacktrace")
+        stacktrace = new_value.pop("stacktrace", None)
         if isinstance(stacktrace, dict):
             frames = stacktrace.get("frames")
             if isinstance(frames, list):
@@ -328,11 +390,11 @@ def _scrub_exception(event: dict[str, Any], hint: Hint) -> dict[str, Any]:
                         if isinstance(frame, dict)
                     ]
                 }
-            else:
-                del new_value["stacktrace"]
         scrubbed_values.append(new_value)
 
-    event["exception"] = dict(exception) | {"values": scrubbed_values}
+    new_exception = {k: v for k, v in exception.items() if k in SAFE_EXCEPTION_KEYS}
+    new_exception["values"] = scrubbed_values
+    event["exception"] = new_exception
     return event
 
 
@@ -346,13 +408,25 @@ def scrub_event(event: Event, hint: Hint) -> Event | None:
     """
     out: dict[str, Any] = {k: v for k, v in event.items() if k in SAFE_EVENT_KEYS}
 
+    # Popped first, so that the one shape this rebuilds is the only one that
+    # can survive: Sentry's protocol also accepts `tags` as a list of
+    # `[key, value]` pairs, which the copy above would have forwarded intact.
+    out.pop("tags", None)
     tags = event.get("tags")
     if isinstance(tags, dict):
         out["tags"] = {k: v for k, v in tags.items() if k in SAFE_TAG_KEYS}
 
+    # Both levels, for the reason in `SAFE_CONTEXT_FIELDS`: naming `trace` as
+    # an allowed context is a statement about ids, not about the span
+    # `description` and `data` the SDK packs in beside them.
+    out.pop("contexts", None)
     contexts = event.get("contexts")
     if isinstance(contexts, dict):
-        out["contexts"] = {k: v for k, v in contexts.items() if k in SAFE_CONTEXT_KEYS}
+        out["contexts"] = {
+            name: {k: v for k, v in context.items() if k in SAFE_CONTEXT_FIELDS[name]}
+            for name, context in contexts.items()
+            if name in SAFE_CONTEXT_FIELDS and isinstance(context, dict)
+        }
 
     # `logentry` is opt-in per producer, so it is removed first and only
     # added back for a record this repository wrote.
