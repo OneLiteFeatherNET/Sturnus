@@ -7,18 +7,26 @@ compares that list against, so the two cannot drift apart silently: add a
 `SecretStr` field to a settings class without giving the component the key,
 and the chart job fails naming it.
 
-A credential is a `SecretStr` field, plus `database_url` -- typed `str`
-because SQLAlchemy takes a string, but it embeds the database password, so
-it is stored and handled like the rest.
+A credential is a `SecretStr` field -- including an optional one, typed
+`SecretStr | None` -- plus `database_url`, typed `str` because SQLAlchemy
+takes a string, but it embeds the database password, so it is stored and
+handled like the rest.
+
+`SentrySettings` is folded into every component. It is a class of its own
+because all three read it (see its docstring), so unlike the other three it
+is not "one component's settings"; but the DSN still has to reach each
+container through the Secret, and this list is what the chart is checked
+against.
 """
 
 import json
 import sys
+from typing import get_args
 
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings
 
-from sturnus.config import Settings
+from sturnus.config import SentrySettings, Settings
 from sturnus.entrypoints.link import LinkSettings
 from sturnus.entrypoints.worker import WorkerSettings
 
@@ -35,15 +43,36 @@ COMPONENTS: dict[str, type[BaseSettings]] = {
 ALSO_SECRET = {"database_url"}
 
 
+def _is_credential(name: str, annotation: object) -> bool:
+    """Whether one settings field holds a credential.
+
+    `SecretStr | None` is a `SecretStr` for this purpose. Testing the
+    annotation with `is` alone missed it, which is how the Sentry DSN sat
+    outside the chart's credential inventory: an optional secret is still a
+    secret, and a check that only recognises the required spelling silently
+    exempts every optional one added after it.
+    """
+    if name in ALSO_SECRET:
+        return True
+    return SecretStr in get_args(annotation) or annotation is SecretStr
+
+
 def credentials() -> dict[str, list[str]]:
+    #: Read by all three components, so it contributes to each list rather
+    #: than forming one of its own.
+    shared = [
+        f"STURNUS_{name.upper()}"
+        for name, field in SentrySettings.model_fields.items()
+        if _is_credential(name, field.annotation)
+    ]
     out = {}
     for deployment, cls in COMPONENTS.items():
         names = [
             f"STURNUS_{name.upper()}"
             for name, field in cls.model_fields.items()
-            if field.annotation is SecretStr or name in ALSO_SECRET
+            if _is_credential(name, field.annotation)
         ]
-        out[deployment] = sorted(names)
+        out[deployment] = sorted(names + shared)
     return out
 
 

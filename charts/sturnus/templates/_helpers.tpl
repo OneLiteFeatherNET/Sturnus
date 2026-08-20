@@ -127,10 +127,25 @@ to be read back. Refusing to start is the loud version of the same event, and
 `kubectl describe pod` names the missing key.
 */}}
 {{- define "sturnus.secretEnv" -}}
+{{- /*
+  STURNUS_SENTRY_DSN is on all three lists, and it is the one key here that
+  is not a secret in the usual sense: it carries Sentry's *public* key,
+  write-only to one project and granting no read access. It is routed
+  through the Secret anyway, because the GitOps repository that supplies
+  these values is public, and a DSN published there can be used by anyone
+  who finds it to fill the project with events. Being unable to read
+  anything is not the same as being harmless to publish.
+
+  It is also the one key that may legitimately be empty: blank is the off
+  switch (`SentrySettings._blank_dsn_is_absent`). It is still required to be
+  *present*, like every other key here -- see the `optional` note below --
+  so a cluster that does not report errors sets it to the empty string
+  rather than omitting it.
+*/ -}}
 {{- $lists := dict
-      "bot" (list "STURNUS_DISCORD_TOKEN" "STURNUS_DATABASE_URL" "STURNUS_S3_ACCESS_KEY" "STURNUS_S3_SECRET_KEY" "STURNUS_MASTER_KEY")
-      "worker" (list "STURNUS_DATABASE_URL" "STURNUS_S3_ACCESS_KEY" "STURNUS_S3_SECRET_KEY" "STURNUS_MASTER_KEY" "STURNUS_OUTLINE_SERVICE_KEY")
-      "link" (list "STURNUS_DATABASE_URL" "STURNUS_OUTLINE_CLIENT_SECRET")
+      "bot" (list "STURNUS_DISCORD_TOKEN" "STURNUS_DATABASE_URL" "STURNUS_S3_ACCESS_KEY" "STURNUS_S3_SECRET_KEY" "STURNUS_MASTER_KEY" "STURNUS_SENTRY_DSN")
+      "worker" (list "STURNUS_DATABASE_URL" "STURNUS_S3_ACCESS_KEY" "STURNUS_S3_SECRET_KEY" "STURNUS_MASTER_KEY" "STURNUS_OUTLINE_SERVICE_KEY" "STURNUS_SENTRY_DSN")
+      "link" (list "STURNUS_DATABASE_URL" "STURNUS_OUTLINE_CLIENT_SECRET" "STURNUS_SENTRY_DSN")
 -}}
 {{- if not (hasKey $lists .component) -}}
 {{- fail (printf "sturnus.secretEnv: no secret key list defined for component %q" .component) -}}

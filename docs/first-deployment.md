@@ -77,9 +77,10 @@ There is no Sturnus bot application yet. At
 positioned above its own. Drag the bot's role above the consent role in
 **Server Settings → Roles**, or `/setup` fails with a permissions error.
 
-## 3. Collect the seven secret values
+## 3. Collect the eight secret values
 
-Six you create or generate; one pair you read out of the cluster.
+Six you create or generate, one pair you read out of the cluster, and one
+that may be left blank.
 
 | Value | Where it comes from |
 |---|---|
@@ -90,6 +91,7 @@ Six you create or generate; one pair you read out of the cluster.
 | `STURNUS_MASTER_KEY` | `openssl rand -base64 32` |
 | `STURNUS_OUTLINE_SERVICE_KEY` | Outline API key, step 4. |
 | `STURNUS_OUTLINE_CLIENT_SECRET` | Outline OAuth app, step 4. |
+| `STURNUS_SENTRY_DSN` | Sentry project, or **blank to switch error reporting off**. The line has to be there either way. |
 
 **The S3 pair.** Rook generated these in step 1. Read them:
 
