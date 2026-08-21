@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.application.assembly import serialize_transcript
@@ -567,6 +567,57 @@ async def test_mark_announced_stamps_the_session(
 
     candidates = await repo.candidates_for_announcement()
     assert candidates[0]["announced_at"] == T0 + timedelta(minutes=5)
+
+
+async def test_mark_announced_does_not_stamp_a_session_that_was_requeued_meanwhile(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The stamp has to land on the session the post was actually about.
+
+    `announce_ready_sessions` selects a `documented`, unannounced session,
+    awaits `announcer.post` -- a Discord HTTP call that takes seconds
+    under rate limiting -- and only then calls `mark_announced`. A
+    `/queue requeue` can land inside that window: it puts the session back
+    to `closed` and clears `announced_at` precisely so the redo's fresh
+    link gets posted. An unconditional stamp arriving afterwards would put
+    a timestamp back on a session that has *not* been announced since, and
+    `sessions_to_announce` would then never select it again: the corrected
+    transcript would be documented and silently never posted, which is the
+    exact failure clearing the column exists to prevent.
+
+    A duplicate post of the superseded link is the accepted cost here, and
+    the one `announce_ready_sessions` already documents itself as erring
+    towards -- losing an announcement is the worse half of that trade.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await _mark_documented(factory, session_id)
+    # The re-queue, exactly as `queue_cog._apply_requeue` writes it, while
+    # the sweep is somewhere inside `announcer.post`.
+    await _requeue(factory, session_id)
+
+    await repo.mark_announced(session_id, T0 + timedelta(minutes=5))
+
+    async with factory() as session:
+        row = await session.get(Session, session_id)
+        assert row is not None
+        assert row.announced_at is None, "the late stamp belongs to a run that is superseded"
+    # And the consequence that matters: once the redo is documented, the
+    # session is a candidate again and the new link does get posted.
+    await _mark_documented(factory, session_id)
+    assert [c["id"] for c in await repo.candidates_for_announcement()] == [session_id]
+
+
+async def _requeue(factory: async_sessionmaker[AsyncSession], session_id: int) -> None:
+    """The session-row half of a `/queue requeue`, without the cog."""
+    async with factory() as session:
+        await session.execute(
+            update(Session)
+            .where(Session.id == session_id)
+            .values(status="closed", announced_at=None)
+        )
+        await session.commit()
 
 
 async def test_closed_undocumented_sessions_finds_a_session_whose_jobs_are_all_terminal(

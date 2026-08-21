@@ -66,6 +66,7 @@ from sturnus.infrastructure.discord.audio_cog import AudioCog
 from sturnus.infrastructure.discord.config_cog import ConfigCog
 from sturnus.infrastructure.discord.consent_cog import ConsentCog
 from sturnus.infrastructure.discord.link_cog import LinkCog
+from sturnus.infrastructure.discord.queue_cog import QueueCog
 from sturnus.infrastructure.discord.setup_cog import SetupCog
 from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
@@ -228,6 +229,13 @@ class SturnusClient(commands.Bot):
         await self.add_cog(ConfigCog(self._config_store, self.reconcile_guild, self.running_state))
         await self.add_cog(SetupCog(self._config_store, self._clock, self.reconcile_guild))
         await self.add_cog(AudioCog(self._session_factory, self._audio_store, self._clock))
+        # Reads and re-queues transcription jobs. It takes the session
+        # factory rather than `JobQueue`/`SessionRepository` on purpose:
+        # its selections are specific to these three admin commands and
+        # used nowhere else, so neither of those grows a method only a
+        # slash command calls -- the same shape `AudioCog` above already
+        # has, and for the same reason.
+        await self.add_cog(QueueCog(self._session_factory, self._clock))
         await self.add_cog(
             LinkCog(self._outline_oauth, self._link_states, self._account_links, self._clock)
         )
