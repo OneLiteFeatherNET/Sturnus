@@ -7,6 +7,7 @@ implementation behind a real database test is ceremony.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 
 from sqlalchemy import CursorResult, delete, select, update
@@ -24,6 +25,8 @@ from sturnus.infrastructure.db.models import (
     SessionParticipant,
     TranscriptionJob,
 )
+
+log = logging.getLogger(__name__)
 
 
 class ConsentRepository:
@@ -301,11 +304,59 @@ class SessionRepository:
             ]
 
     async def mark_announced(self, session_id: int, now: datetime) -> None:
+        """Stamps `announced_at`, but only on the session that was announced.
+
+        A compare-and-set, not a plain write, and the condition is the
+        whole point. `sturnus.application.publishing.
+        announce_ready_sessions` selects a `documented` session whose
+        `announced_at` is null, awaits `announcer.post` -- a Discord HTTP
+        call that takes seconds under rate limiting -- and calls this only
+        afterwards. `/queue requeue` can land inside that window: it puts
+        the session back to `closed` and clears `announced_at` precisely
+        so the redo's new link will be posted. An unconditional stamp
+        arriving late would put a timestamp back on a session that has not
+        been announced since, and `sessions_to_announce` selects only
+        sessions whose `announced_at` is null -- so the corrected
+        transcript would be documented and then never posted, with nothing
+        logged and nothing raised. That is the exact failure clearing the
+        column exists to prevent, reintroduced by the sweep that was
+        racing it.
+
+        Restricting the UPDATE to the state the selection was made on --
+        still `documented`, still unannounced -- makes the stamp land only
+        if the session is still the one the post was about. When it is
+        not, no row matches, the re-queued session keeps its null
+        `announced_at`, and the sweep after the redo announces the new
+        link. The cost is one duplicate post of the superseded link, which
+        is the side `announce_ready_sessions` already documents itself as
+        erring towards: losing an announcement entirely is the worse half
+        of that trade.
+        """
         async with self._session_factory() as session:
-            await session.execute(
-                update(Session).where(Session.id == session_id).values(announced_at=now)
+            result = await session.execute(
+                update(Session)
+                .where(
+                    Session.id == session_id,
+                    Session.status == DOCUMENTED_STATUS,
+                    Session.announced_at.is_(None),
+                )
+                .values(announced_at=now)
             )
             await session.commit()
+        # Same narrowing `AccountLinkRepository.delete` uses: `execute` on
+        # a Core UPDATE always yields a `CursorResult` at runtime, and the
+        # assertion makes `.rowcount` available without an unchecked cast.
+        assert isinstance(result, CursorResult)
+        if result.rowcount == 0:
+            # Not an error: the announcement went out, and the session it
+            # went out for no longer exists in that form. Worth a line
+            # anyway -- it is the only trace connecting a link posted in a
+            # channel to a session row that does not say it was announced.
+            log.info(
+                "Session %d changed while its announcement was being posted; "
+                "announced_at left unset so the next sweep can announce it again",
+                session_id,
+            )
 
     async def closed_undocumented_sessions(self) -> list[int]:
         """Closed sessions whose jobs are all terminal but which never got documented.

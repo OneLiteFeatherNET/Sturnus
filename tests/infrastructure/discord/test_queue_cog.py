@@ -5,8 +5,18 @@ way `test_config_commands` and `test_link_cog` do: that is the coroutine
 the cog defines, so calling it exercises the decision without a gateway.
 The hand-rolled `_Response`/`_Followup`/`_Interaction` fakes are the same
 shape as `test_config_commands`'s, and enforce the same contract Discord
-really does -- an interaction is answered once, and a deferred one must
-answer through `followup`.
+really does -- an interaction is answered once, a deferred one must answer
+through `followup`, and a followup is refused outright until the
+interaction has been acknowledged, which is what makes the `defer` calls
+in this cog impossible to delete unnoticed.
+
+*Buttons*, unlike commands, are not invoked directly: `_press` goes
+through `discord.ui.View._scheduled_task`, the coroutine the gateway
+actually schedules, because that is where `interaction_check` runs. A test
+calling `Button.callback` itself never passes through the confirm view's
+author check at all, so its allow branch would be untested and could be
+broken -- locking every administrator out of their own Confirm -- with
+this file still green.
 
 The writes run against a real ephemeral PostgreSQL through the
 `clean_database` fixture, because everything worth pinning about a
@@ -39,12 +49,16 @@ from sturnus.infrastructure.db.models import Base, Session, TranscriptionJob
 from sturnus.infrastructure.db.repositories import JobRepository, SessionRepository
 from sturnus.infrastructure.discord.permissions import _has_admin_access
 from sturnus.infrastructure.discord.queue_cog import (
+    DISCORD_MESSAGE_LIMIT,
     NO_SUCH_SESSION,
+    JobLine,
     QueueCog,
     RequeueConfirmView,
     SessionSummary,
     _apply_requeue,
     render_requeue_confirmation,
+    render_requeue_refusal,
+    render_session,
 )
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
@@ -106,13 +120,30 @@ class _Response:
 
 
 class _Followup:
-    def __init__(self) -> None:
+    """Discord's followup webhook, which only exists once the interaction is acknowledged.
+
+    The acknowledgement check is the contract, not decoration: a followup
+    sent for an interaction that was never deferred and never answered is
+    a 404 (`Unknown Webhook`) from Discord, so the administrator sees "The
+    application did not respond" and then nothing -- on a command that may
+    already have written. Without this assertion the `await
+    interaction.response.defer(...)` in `RequeueConfirmView.confirm` can
+    be deleted with the whole suite still green, which is exactly what a
+    fake claiming to enforce Discord's contract must not allow.
+    """
+
+    def __init__(self, response: _Response) -> None:
+        self._response = response
         self.messages: list[tuple[str, bool]] = []
         self.views: list[discord.ui.View | None] = []
 
     async def send(
         self, content: str, ephemeral: bool = False, view: discord.ui.View | None = None
     ) -> None:
+        assert self._response.deferred or self._response.messages, (
+            "followup on an interaction Discord has not been told about yet; "
+            "defer or send_message first"
+        )
         self.messages.append((content, ephemeral))
         self.views.append(view)
 
@@ -129,8 +160,13 @@ class _Interaction:
         self.guild_id = guild_id
         self.user = _User(user_id)
         self.response = _Response()
-        self.followup = _Followup()
+        self.followup = _Followup(self.response)
         self.message = _Message()
+        #: `discord.ui.View._scheduled_task` hands this to
+        #: `Item._refresh_state` before any check runs, so `_press` cannot
+        #: dispatch the way Discord does without it. Empty is faithful:
+        #: a button's component data carries nothing the callback reads.
+        self.data: dict[str, Any] = {}
 
     async def original_response(self) -> _Message:
         return self.message
@@ -173,12 +209,49 @@ async def _invoke(cog: QueueCog, command: str, interaction: _Interaction, *args:
 
 
 async def _press(view: discord.ui.View, label: str, interaction: _Interaction) -> None:
-    """Presses one of the view's buttons the way Discord dispatches it."""
+    """Presses one of the view's buttons through Discord's own dispatch path.
+
+    Not `item.callback(...)`: discord.py never dispatches a component that
+    way. `View._scheduled_task` runs
+    `await item._run_checks(interaction) and await
+    self.interaction_check(interaction)` first and returns *without*
+    calling the callback if either is falsy -- so calling the callback
+    directly walks straight past `RequeueConfirmView.interaction_check`.
+    The deny direction can still be asserted by calling that method
+    itself, but the allow direction then never runs anywhere in this file:
+    `interaction_check` could be made to return `False` unconditionally,
+    locking every administrator out of their own Confirm button, and every
+    test here would keep passing. Going through `_scheduled_task` is what
+    makes the gate load-bearing in this suite.
+
+    `_scheduled_task` also funnels any exception into `View.on_error`,
+    whose default logs it and returns. That would swallow every assertion
+    the fakes above make -- `_Followup.send`'s acknowledgement check most
+    of all -- and turn a broken button into a passing test, so the handler
+    is replaced for the duration of the press by one that re-raises.
+    """
     for item in view.children:
         if isinstance(item, discord.ui.Button) and item.label == label:
-            await item.callback(_as_interaction(interaction))
+            await _dispatch(view, item, interaction)
             return
     raise AssertionError(f"no button labelled {label!r} in {view.children}")
+
+
+async def _dispatch(
+    view: discord.ui.View, item: discord.ui.Item[Any], interaction: _Interaction
+) -> None:
+    """Runs `View._scheduled_task`, surfacing what `on_error` would hide."""
+    failures: list[BaseException] = []
+
+    async def _capture(
+        _interaction: discord.Interaction, error: Exception, _item: discord.ui.Item[Any]
+    ) -> None:
+        failures.append(error)
+
+    view.on_error = _capture  # type: ignore[method-assign]
+    await view._scheduled_task(item, _as_interaction(interaction))
+    if failures:
+        raise failures[0]
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +495,10 @@ async def test_session_reports_the_transcript_length_and_never_its_text(
     assert "anna" in interaction.reply
     assert "19 characters" in interaction.reply
     assert "Copyright WDR" not in interaction.reply, "the transcript text must never be echoed"
+    # Ephemerality is a contract this cog states in its own docstring: the
+    # reply names who was recorded and how much they said, which is not a
+    # fact for the channel to see.
+    assert interaction.ephemeral is True
 
 
 async def test_session_reports_whether_the_audio_still_exists(
@@ -434,6 +511,30 @@ async def test_session_reports_whether_the_audio_still_exists(
 
     assert "audio: present" in interaction.reply
     assert "audio: erased" in interaction.reply
+
+
+async def test_the_session_reply_an_admin_receives_is_short_enough_to_send(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The bound has to hold for the values that really come out of the database.
+
+    `transcription_job.error` is whatever `str(exc)` produced when the job
+    last failed, stored unbounded and never truncated on the way in. The
+    reply carrying it goes out through `followup.send` after a
+    `thinking=True` defer, and a body over Discord's limit is an
+    `HTTPException` there -- so an unbounded error would turn the one
+    command that can explain a broken queue into no answer whatsoever.
+    """
+    session_id = await seed(
+        factory, [Speaker(ANNA, error="x" * 5_000), Speaker(BEN), Speaker(CLARA)]
+    )
+    interaction = _Interaction()
+
+    await _invoke(cog(factory), "session", interaction, session_id)
+
+    assert len(interaction.reply) <= DISCORD_MESSAGE_LIMIT
+    reply = interaction.reply
+    assert "anna" in reply and "ben" in reply and "clara" in reply
 
 
 async def test_session_from_another_guild_reads_as_not_existing(
@@ -499,6 +600,72 @@ async def test_requeue_refuses_a_session_with_a_running_job(
     assert interaction.view is None, "a refusal must not offer a Confirm button"
     jobs = await read_jobs(factory, session_id)
     assert jobs[ANNA].status == "done", "nothing may change on a refusal"
+
+
+async def test_requeue_refuses_a_session_that_is_still_open(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The window `JobQueue.complete`'s Defect 5 guard exists to close.
+
+    `RecordingService.close` uploads and enqueues one speaker at a time,
+    each `enqueue` committing on its own, and only calls `close_session`
+    after the last upload -- so for a long multi-speaker session there is
+    a wide window in which the session is still `open` while an early
+    speaker's job is already `done` and later speakers have not been
+    enqueued at all. A re-queue writes `status="closed"` unconditionally,
+    which is precisely the state Defect 5's guard refuses to accept from
+    anyone else: the next `complete()` would see no outstanding jobs and a
+    `closed` session, call it the session's last job, and build the
+    document out of one speaker. An impatient administrator re-queueing
+    "the session that just ended" lands in exactly this window.
+    """
+    session_id = await seed(
+        factory,
+        [Speaker(ANNA)],
+        session_status="open",
+        document_url=None,
+        announced_at=None,
+    )
+    interaction = _Interaction()
+
+    await _invoke(cog(factory), "requeue", interaction, session_id)
+
+    assert "Refused" in interaction.reply
+    assert "still open" in interaction.reply, "the reply has to say why, not just refuse"
+    assert interaction.view is None, "a refusal must not offer a Confirm button"
+    assert (await read_jobs(factory, session_id))[ANNA].status == "done"
+    assert (await read_session(factory, session_id)).status == "open", "nothing may change"
+
+
+async def test_requeue_refuses_a_closed_session_that_has_no_document_yet(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`retry_pending_documents` still owns a `closed` session; racing it strands.
+
+    That sweep documents any closed session whose jobs are all terminal,
+    and it can be between its `closed_undocumented_sessions` read and its
+    `mark_documented` write right now. A re-queue landing in between hands
+    it a session whose transcripts have just been cleared: it publishes
+    that empty document and flips the session to `documented`, after which
+    `complete`'s last-job rule (`status == "closed"`) never fires again
+    and the sweep never looks at it again either. The redo would finish
+    into a database nobody ever reads a document out of.
+    """
+    session_id = await seed(
+        factory,
+        [Speaker(ANNA)],
+        session_status="closed",
+        document_url=None,
+        announced_at=None,
+    )
+    interaction = _Interaction()
+
+    await _invoke(cog(factory), "requeue", interaction, session_id)
+
+    assert "Refused" in interaction.reply
+    assert "no document yet" in interaction.reply
+    assert interaction.view is None
+    assert (await read_jobs(factory, session_id))[ANNA].transcript == "old hallucinated text"
 
 
 async def test_requeue_refuses_when_every_speakers_audio_is_erased(
@@ -602,6 +769,37 @@ async def test_only_the_invoker_may_press_confirm(
 
     assert allowed is False
     assert "Only" in intruder.reply
+    assert intruder.ephemeral is True
+
+
+async def test_a_press_by_someone_else_never_reaches_the_write(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The gate has to hold on the path Discord really dispatches through.
+
+    The test above calls `interaction_check` itself, which proves only
+    what that method returns; this presses the button the way the gateway
+    does (`View._scheduled_task` -- see `_press`), and then asserts on the
+    database rather than on the reply, because "somebody else's press
+    changed nothing" is the property the check exists for. Between the two
+    of them both directions of the gate are load-bearing: a check that
+    always allowed would fail here, and a check that always denied would
+    fail every `test_confirming_*` above.
+    """
+    session_id = await seed(factory, [Speaker(ANNA)])
+    interaction = _Interaction()
+    await _invoke(cog(factory), "requeue", interaction, session_id)
+    view = interaction.view
+    assert isinstance(view, RequeueConfirmView)
+
+    intruder = _Interaction(user_id=ADMIN + 1)
+    await _press(view, "Confirm", intruder)
+
+    assert "Only" in intruder.reply
+    jobs = await read_jobs(factory, session_id)
+    assert jobs[ANNA].status == "done", "a press that failed the check must not write"
+    assert jobs[ANNA].transcript == "old hallucinated text"
+    assert (await read_session(factory, session_id)).status == "documented"
 
 
 async def test_a_timeout_disables_the_buttons(
@@ -635,6 +833,7 @@ async def test_cancelling_changes_nothing(
     await _press(view, "Cancel", pressed)
 
     assert "Cancelled" in pressed.reply
+    assert pressed.ephemeral is True, "the reply names the session an admin was looking at"
     jobs = await read_jobs(factory, session_id)
     assert jobs[ANNA].status == "done"
     assert jobs[ANNA].transcript == "old hallucinated text"
@@ -797,6 +996,7 @@ async def test_confirming_reports_how_many_of_how_many_speakers_were_requeued(
     await _press(view, "Confirm", pressed)
 
     assert "2 of 3" in pressed.reply
+    assert pressed.ephemeral is True, "the result names every speaker whose audio was erased"
 
 
 async def test_confirming_touches_no_other_session(
@@ -907,6 +1107,30 @@ async def test_the_write_refuses_another_guilds_session_on_its_own(
     assert (await read_jobs(factory, session_id))[ANNA].status == "done"
 
 
+async def test_the_write_refuses_a_session_that_is_not_documented_on_its_own(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The status check has to be inside the lock, not only in front of the prompt.
+
+    `/queue requeue` refuses an `open` or `closed` session before a
+    Confirm button ever exists, so no test that goes through the cog can
+    reach this one -- dropping it from the write would look safe. It is
+    not: the prompt holds nothing but ids for as long as an administrator
+    reads it, and in that time the session can move (a second
+    administrator's re-queue of the same session leaves it `closed`; a
+    session that has just closed can be documented). The write must decide
+    on the row it locked, not on the row the prompt was rendered from.
+    """
+    session_id = await seed(factory, [Speaker(ANNA)], session_status="open")
+
+    view = await _apply_requeue(factory, GUILD, session_id)
+
+    assert view is not None
+    assert view.is_refused is True
+    assert (await read_jobs(factory, session_id))[ANNA].status == "done"
+    assert (await read_session(factory, session_id)).status == "open"
+
+
 async def test_the_write_waits_for_a_worker_holding_the_sessions_jobs(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -978,6 +1202,96 @@ def _summary(**overrides: Any) -> SessionSummary:
         "announced_at": T1,
     }
     return SessionSummary(**{**defaults, **overrides})
+
+
+def _job_line(user_id: int, error: str | None = None) -> JobLine:
+    return JobLine(
+        discord_user_id=user_id,
+        status="dead",
+        attempts=3,
+        audio_present=True,
+        error=error,
+        transcript_length=None,
+    )
+
+
+def test_a_session_readout_of_many_speakers_stays_inside_discords_limit() -> None:
+    """The reply that has to survive is the one from a session full of failures.
+
+    `followup.send` raises `HTTPException` on a body over
+    `DISCORD_MESSAGE_LIMIT`, and by then the interaction has been deferred
+    with `thinking=True`, so the administrator gets no answer at all --
+    the diagnostic command going silent exactly when the queue is in the
+    state it exists to diagnose. Every speaker line is worth ~85
+    characters, so a 40-person voice channel passes the limit on speaker
+    count alone, with no long error involved.
+    """
+    jobs = [
+        _job_line(user_id, error="boto3 timed out talking to the object store")
+        for user_id in range(40)
+    ]
+
+    text = render_session(_summary(), jobs, {})
+
+    assert len(text) <= DISCORD_MESSAGE_LIMIT
+    assert "**Session 4**" in text, "the header is what identifies the session being read"
+    assert "user 0" in text, "as many speakers as fit, from the first"
+    assert "more speakers not shown" in text, "silently dropping speakers would be worse"
+
+
+def test_one_enormous_error_cannot_push_the_other_speakers_out_of_the_reply() -> None:
+    """`job.error` is `str(exc)` -- arbitrary text of arbitrary length.
+
+    A single unbounded exception string (a boto3 error carrying a whole
+    request context, say) would otherwise consume the entire budget and
+    leave the readout to be truncated after one speaker, which is the
+    least useful place to cut a list of speakers. Bounding each error
+    first keeps the shape of the answer -- one line per speaker -- intact,
+    and the length of a transcript, which is the reason this command
+    exists, is on those lines rather than in the error text.
+    """
+    jobs = [_job_line(ANNA), _job_line(BEN, error="x" * 5_000), _job_line(CLARA)]
+
+    text = render_session(_summary(), jobs, NAMES)
+
+    assert len(text) <= DISCORD_MESSAGE_LIMIT
+    assert "anna" in text and "ben" in text and "clara" in text
+    assert "more speakers not shown" not in text, "three speakers must all fit"
+
+
+def test_an_error_full_of_newlines_still_renders_as_one_line_per_speaker() -> None:
+    """A multi-line exception string would otherwise break the list apart.
+
+    The readout is one line per speaker and is read as such; an error
+    carrying newlines (a wrapped traceback, an XML error body) would turn
+    one speaker into a dozen lines that look like speakers of their own.
+    """
+    jobs = [_job_line(ANNA, error="failed:\n  line two\n  line three"), _job_line(BEN)]
+
+    text = render_session(_summary(), jobs, NAMES)
+
+    assert text.count("\n- ") == 2, "exactly one bullet per speaker"
+    assert "failed: line two line three" in text
+
+
+def test_a_refusal_naming_a_whole_channel_of_erased_speakers_is_still_sendable() -> None:
+    """The same limit applies to every reply, not only to `/queue session`.
+
+    A refusal lists names, and a Discord display name is up to 32
+    characters: a large enough session pushes even this text past the
+    limit, and a refusal that cannot be sent reads to the administrator
+    exactly like a command that did nothing.
+    """
+    erased = tuple(range(80))
+    names = {user_id: f"a-rather-long-display-name-{user_id}" for user_id in erased}
+
+    text = render_requeue_refusal(
+        _summary(),
+        RequeuePlan(resettable_job_ids=(), erased_user_ids=erased, active_user_ids=()),
+        names,
+    )
+
+    assert len(text) <= DISCORD_MESSAGE_LIMIT
 
 
 def test_a_confirmation_for_a_session_that_was_never_documented_says_so() -> None:

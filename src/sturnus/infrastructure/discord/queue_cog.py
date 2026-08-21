@@ -15,8 +15,13 @@ and before documentation, so that `claim`, `complete`,
 second time on their own. Nothing here orchestrates the redo. Which jobs
 may be reset is decided by `sturnus.application.requeue.plan_requeue`, a
 pure function tested without a database; read its module docstring first,
-because the two rules that keep this command from being destructive live
-there rather than here.
+because two of the three rules that keep this command from being
+destructive live there rather than here. The third is `SessionView.
+is_settled`: only a `documented` session may be re-queued at all, because
+that is the one status in which nothing else in the pipeline is still
+working on the session -- a rule about the session row rather than about
+its jobs, which is why it lives here beside the write and not in that
+pure function over job rows.
 
 **Why the SQL is inline instead of in a repository.** This selection is
 specific to these three commands and used nowhere else, so
@@ -65,6 +70,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.ports import Clock
+from sturnus.application.publishing import DOCUMENTED_STATUS
 from sturnus.application.requeue import TERMINAL_STATUSES, RequeuePlan, plan_requeue
 from sturnus.infrastructure.db.models import Session, SessionParticipant, TranscriptionJob
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS
@@ -84,6 +90,23 @@ NO_SUCH_SESSION = "No session with that id in this server."
 #: (`_apply_requeue`), so a stale press is refused rather than obeyed --
 #: this timeout only keeps a forgotten prompt from lingering.
 CONFIRM_TIMEOUT_SECONDS = 60.0
+
+#: The longest message body Discord accepts. Not advisory: `followup.send`
+#: raises `HTTPException` on anything longer, and every reply this cog
+#: sends goes out *after* a `thinking=True` defer -- so an over-long reply
+#: is not a truncated answer, it is no answer at all, on commands whose
+#: whole job is to explain a queue that has gone wrong. Every render
+#: function here therefore ends inside `_capped`.
+DISCORD_MESSAGE_LIMIT = 2000
+
+#: How much of one job's stored `error` a `/queue session` line may carry.
+#: `transcription_job.error` is `str(exc)` -- arbitrary text of arbitrary
+#: length, never truncated on the way in -- and one such string is easily
+#: longer than the whole message budget. Enough to recognise a failure
+#: ("An error occurred (AccessDenied) when calling the GetObject
+#: operation..."), and `docs/operations.md` section 5 says where to read
+#: the untruncated row.
+MAX_ERROR_CHARS = 160
 
 #: Job statuses reported by `/queue status`, in lifecycle order rather than
 #: alphabetically: an administrator reads this line to see where work is
@@ -124,6 +147,55 @@ class SessionView:
     plan: RequeuePlan
     #: `discord_user_id` -> display name, from `session_participant`.
     names: dict[int, str]
+
+    @property
+    def is_settled(self) -> bool:
+        """Whether the pipeline has finished with this session and let go of it.
+
+        `documented` is the only status from which a re-queue is safe, and
+        each of the other two is unsafe for its own reason.
+
+        An `open` session is the window `JobQueue.complete`'s "Defect 5"
+        guard exists to refuse. `RecordingService.close` uploads and
+        enqueues one speaker at a time, every `enqueue` committing on its
+        own, and calls `close_session` only after the last upload -- so a
+        long multi-speaker session spends a long time `open` with early
+        speakers already enqueued (and possibly already `done`) while
+        later ones do not exist as rows yet. `_apply_requeue` writes
+        `status="closed"` unconditionally, so re-queueing in that window
+        hands `complete` exactly the state its guard is there to prevent:
+        no outstanding jobs plus a `closed` session, therefore "this was
+        the session's last job", therefore a document assembled from the
+        speakers that happened to exist at that moment. That is this
+        command causing the failure it exists to repair.
+
+        A `closed` session is still owned by
+        `sturnus.application.worker.retry_pending_documents`, which
+        documents any closed session whose jobs are all terminal and may
+        be between its read and its `mark_documented` write right now.
+        Re-queueing into that sweep gives it a session whose transcripts
+        this command has just cleared: it publishes that near-empty
+        document and flips the session to `documented`, after which
+        `complete`'s last-job rule (which requires `closed`) never fires
+        again and the sweep never selects it again either -- the redo runs
+        to completion and no document is ever made from it.
+
+        Waiting costs nothing: a session that is genuinely finished
+        reaches `documented` on its own, and `/queue session` shows when.
+        """
+        return self.summary.status == DOCUMENTED_STATUS
+
+    @property
+    def is_refused(self) -> bool:
+        """Whether this session must be refused instead of re-queued.
+
+        The three reasons in the order `render_requeue_refusal` reports
+        them, which is the order of what an administrator can do about it:
+        a blocked session only needs the queue to go idle, an unsettled
+        one needs the pipeline to finish, and an empty one will never
+        change.
+        """
+        return self.plan.is_blocked or not self.is_settled or self.plan.is_empty
 
 
 @dataclass(frozen=True)
@@ -351,10 +423,18 @@ async def _apply_requeue(
     that was actually applied, or the one that caused a refusal. `None`
     means the session does not belong to this guild (or does not exist),
     which the caller renders as `NO_SUCH_SESSION`. Whether the write
-    happened is derivable: it did exactly when the returned plan is neither
-    blocked nor empty.
+    happened is derivable: it did exactly when the returned view is not
+    `is_refused`.
 
-    Two properties matter and neither is incidental.
+    Three properties matter and none is incidental.
+
+    **The session's own status is checked here too, not only in front of
+    the prompt.** `SessionView.is_settled` spells out why only a
+    `documented` session may be reset; what matters at *this* point is
+    that the check is made against the row this transaction locked. The
+    prompt holds nothing but ids while an administrator reads it, and the
+    session can move in that time -- so a status read before the lock
+    would be exactly the stale snapshot the lock exists to rule out.
 
     **The lock comes first.** `SELECT TranscriptionJob.id WHERE session_id
     = ... ORDER BY id FOR UPDATE` is the same statement, with the same
@@ -395,7 +475,7 @@ async def _apply_requeue(
             plan=plan_requeue(await _job_dicts(db, session_id)),
             names=await _participant_names(db, session_id),
         )
-        if view.plan.is_blocked or view.plan.is_empty:
+        if view.is_refused:
             return view
 
         await db.execute(
@@ -446,6 +526,15 @@ async def _apply_requeue(
                 # Clearing it is the deliberate choice to post again,
                 # exactly once, the same not-null guard preventing any
                 # further repeats.
+                #
+                # Clearing the column is not by itself enough to make that
+                # second post happen: an announcement sweep can already be
+                # inside `announcer.post` for this session right now, and
+                # its `mark_announced` afterwards would stamp the column
+                # we have just cleared. `SessionRepository.mark_announced`
+                # is a compare-and-set on `status = 'documented' AND
+                # announced_at IS NULL` for that reason -- the `closed`
+                # written above is what makes the late stamp miss.
                 announced_at=None,
                 # `document_provider`/`document_id`/`document_url` are
                 # deliberately untouched: the next `mark_documented`
@@ -501,6 +590,45 @@ def _speakers(count: int) -> str:
     return "1 speaker" if count == 1 else f"{count} speakers"
 
 
+def _one_line(text: str) -> str:
+    """Collapses every run of whitespace, so one value stays one line.
+
+    `job.error` can carry newlines -- a wrapped traceback, an XML error
+    body -- and the `/queue session` readout is a bullet per speaker,
+    read as such. Left alone, one error would break its speaker into a
+    dozen lines that look like speakers of their own, and each of those
+    newlines would also spend budget that belongs to a speaker who then
+    does not get shown.
+    """
+    return " ".join(text.split())
+
+
+def _shortened(text: str, limit: int) -> str:
+    """`text` cut to `limit` characters, ending in an ellipsis when it was cut."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1].rstrip() + "…"
+
+
+def _capped(text: str) -> str:
+    """The last line of defence: never hand Discord a body it will reject.
+
+    The render functions bound themselves where the length actually comes
+    from -- errors, speaker lists -- and that structured bound is what
+    keeps a truncated reply *readable*. This is the crude backstop under
+    it, for the lengths nobody budgeted: a session document URL a
+    self-hosted Outline made 900 characters long, a display name that is
+    all combining marks. A reply cut off mid-sentence is a poor answer;
+    an `HTTPException` behind a `thinking=True` defer is no answer at all,
+    and this cog is what an administrator reaches for when they already
+    cannot see what is happening.
+    """
+    if len(text) <= DISCORD_MESSAGE_LIMIT:
+        return text
+    marker = f"\n… (cut off at Discord's {DISCORD_MESSAGE_LIMIT}-character limit)"
+    return text[: DISCORD_MESSAGE_LIMIT - len(marker)] + marker
+
+
 def _running_jobs(count: int) -> str:
     return "1 running job" if count == 1 else f"{count} running jobs"
 
@@ -537,11 +665,65 @@ def render_status(status: QueueStatus, now: datetime, lease_seconds: float) -> s
             f"{_closed_sessions(status.closed_undocumented)} with every job finished but "
             "no document yet; the worker retries those on its own sweep."
         )
-    return "\n".join(lines)
+    return _capped("\n".join(lines))
+
+
+def _speaker_line(job: JobLine, names: dict[int, str]) -> str:
+    """One speaker's bullet, bounded so no single job can eat the reply."""
+    name = names.get(job.discord_user_id, f"user {job.discord_user_id}")
+    length = (
+        "transcript: none stored"
+        if job.transcript_length is None
+        else f"transcript: {job.transcript_length} characters"
+    )
+    audio = "audio: present" if job.audio_present else "audio: erased"
+    line = f"- {name} — status: `{job.status}`, attempts: {job.attempts}, {audio}, {length}"
+    if job.error:
+        line += f", last error: {_shortened(_one_line(job.error), MAX_ERROR_CHARS)}"
+    return line
+
+
+def _omitted(count: int) -> str:
+    noun = "speaker" if count == 1 else "speakers"
+    return (
+        f"…and {count} more {noun} not shown — the full readout is longer than the "
+        f"{DISCORD_MESSAGE_LIMIT} characters Discord allows in one message. Query "
+        "`transcription_job` directly for the rest (docs/operations.md, section 5)."
+    )
+
+
+def _fitted(header: list[str], speakers: list[str]) -> list[str]:
+    """`header` plus as many speaker lines as fit, then a line saying how many did not.
+
+    Truncation rather than an attached file, and the choice is about what
+    a truncated answer is *for*. This readout is scanned for one thing --
+    a speaker whose transcript length is absurd for the length of the
+    session -- and the first speakers are as good a sample of that as any;
+    an attachment would answer completely but reaches the administrator as
+    a download to open, on a command whose value is that the answer is on
+    screen in a second. Nothing is lost silently either way: the omitted
+    count is stated, and section 5 of `docs/operations.md` already
+    documents the SQL for the rows behind this command.
+
+    Dropping the *tail* rather than the middle keeps the list in job-id
+    order, which is the order every other `/queue` reply and the document
+    itself use.
+    """
+    kept: list[str] = []
+    # `+ 1` per line for the newline `join` will add. One more than it
+    # really needs, which is the safe direction to be wrong in.
+    used = sum(len(line) + 1 for line in header)
+    for index, line in enumerate(speakers):
+        omitted = _omitted(len(speakers) - index)
+        if used + len(line) + 1 + len(omitted) + 1 > DISCORD_MESSAGE_LIMIT:
+            return [*header, *kept, omitted]
+        used += len(line) + 1
+        kept.append(line)
+    return [*header, *kept]
 
 
 def render_session(summary: SessionSummary, jobs: list[JobLine], names: dict[int, str]) -> str:
-    lines = [
+    header = [
         f"**Session {summary.id}** in <#{summary.channel_id}>",
         f"Status: `{summary.status}` — ended {_stamp(summary.ended_at)}"
         f" ({summary.end_reason or 'no reason recorded'})",
@@ -549,22 +731,11 @@ def render_session(summary: SessionSummary, jobs: list[JobLine], names: dict[int
         f"Announced: {_stamp(summary.announced_at)}",
     ]
     if not jobs:
-        lines.append("No transcription jobs — nobody spoke in this session.")
-        return "\n".join(lines)
-    lines.append(f"{_speakers(len(jobs))}:")
-    for job in jobs:
-        name = names.get(job.discord_user_id, f"user {job.discord_user_id}")
-        length = (
-            "transcript: none stored"
-            if job.transcript_length is None
-            else f"transcript: {job.transcript_length} characters"
-        )
-        audio = "audio: present" if job.audio_present else "audio: erased"
-        line = f"- {name} — status: `{job.status}`, attempts: {job.attempts}, {audio}, {length}"
-        if job.error:
-            line += f", last error: {job.error}"
-        lines.append(line)
-    return "\n".join(lines)
+        header.append("No transcription jobs — nobody spoke in this session.")
+        return _capped("\n".join(header))
+    header.append(f"{_speakers(len(jobs))}:")
+    speakers = [_speaker_line(job, names) for job in jobs]
+    return _capped("\n".join(_fitted(header, speakers)))
 
 
 def _document_line(summary: SessionSummary, *, future: bool) -> str:
@@ -614,7 +785,7 @@ def render_requeue_confirmation(
         f"- A new link is posted in <#{summary.channel_id}> once it is ready. Everyone "
         "who can see that channel sees the post, not only administrators."
     )
-    return "\n".join(lines)
+    return _capped("\n".join(lines))
 
 
 def render_requeue_applied(
@@ -634,7 +805,46 @@ def render_requeue_applied(
         )
     lines.append(_document_line(summary, future=False))
     lines.append(f"- A new link is posted in <#{summary.channel_id}> when it is ready.")
-    return "\n".join(lines)
+    return _capped("\n".join(lines))
+
+
+def _unsettled_refusal(summary: SessionSummary) -> str:
+    """Why a session that is not `documented` cannot be re-queued yet.
+
+    One sentence per status about what is still holding the session, then
+    the same instruction in both cases: wait for `documented`. The
+    reasoning behind each is on `SessionView.is_settled`; what an
+    administrator needs from the reply is that the pipeline is not
+    finished with this session and that waiting is the whole remedy --
+    said plainly enough that the obvious next move is not to try again
+    immediately.
+    """
+    if summary.status == "open":
+        return (
+            f"Refused: session {summary.id} is still open — the recording has not "
+            "finished, or the bot is still uploading the speakers it recorded. A "
+            "re-queue would close the session while speakers are still being added to "
+            "it, and the first job to finish afterwards would be taken for the "
+            "session's last: the document would then be built from part of the "
+            "meeting. Stop the recording and wait until `/queue session "
+            f"{summary.id}` reports `documented`."
+        )
+    if summary.status == "closed":
+        return (
+            f"Refused: session {summary.id} has finished transcribing but has no "
+            "document yet. The worker's own retry sweep still owns it and creates "
+            "that document on its next pass; a re-queue landing in the middle of the "
+            "sweep can leave the session documented from the transcripts this command "
+            "has just discarded, and nothing revisits it afterwards. Wait until "
+            f"`/queue session {summary.id}` reports `documented` and re-queue then — "
+            "if it never gets there, that is a different fault, and `/queue status` "
+            "counts the sessions stuck in it."
+        )
+    return (
+        f"Refused: session {summary.id} is `{summary.status}`, and only a "
+        "`documented` session can be re-queued — that is the one state in which "
+        "nothing else in the pipeline is still working on it."
+    )
 
 
 def render_requeue_refusal(
@@ -645,29 +855,40 @@ def render_requeue_refusal(
     Split from the other two because a refusal is not a smaller success:
     `config_cog` names four honest outcomes rather than one cheerful
     confirmation, and this follows that.
+
+    The branches are checked in `SessionView.is_refused`'s order and must
+    stay in step with it, or the reply would explain a reason other than
+    the one the write actually refused on.
     """
     prefix = (
         "The session changed while the confirmation was on screen, so nothing was written. "
         if rechecked
         else ""
     )
+    return _capped(f"{prefix}{_refusal(summary, plan, names)}")
+
+
+def _refusal(summary: SessionSummary, plan: RequeuePlan, names: dict[int, str]) -> str:
+    """The reason itself, in `SessionView.is_refused`'s order of checks."""
     if plan.is_blocked:
         return (
-            f"{prefix}Refused: {_speakers(len(plan.active_user_ids))} in session "
+            f"Refused: {_speakers(len(plan.active_user_ids))} in session "
             f"{summary.id} still have a job pending or running "
             f"({_named(plan.active_user_ids, names)}). Those recordings are already "
             "going to be transcribed, and resetting a job a worker is holding would be "
             "undone the moment that worker finishes. Try again once the queue is idle."
         )
+    if summary.status != DOCUMENTED_STATUS:
+        return _unsettled_refusal(summary)
     if plan.erased_user_ids:
         return (
-            f"{prefix}Nothing to do: every speaker in session {summary.id} has had "
+            f"Nothing to do: every speaker in session {summary.id} has had "
             f"their audio erased ({_named(plan.erased_user_ids, names)}). Re-queueing "
             "would only hand a worker a key it cannot download. Their existing "
             "transcripts are untouched."
         )
     return (
-        f"{prefix}Nothing to do: session {summary.id} has no transcription jobs at all "
+        f"Nothing to do: session {summary.id} has no transcription jobs at all "
         "— nobody spoke, so there is nothing to transcribe again."
     )
 
@@ -756,7 +977,7 @@ class RequeueConfirmView(discord.ui.View):
         if view is None:
             await interaction.followup.send(NO_SUCH_SESSION, ephemeral=True)
             return
-        if view.plan.is_blocked or view.plan.is_empty:
+        if view.is_refused:
             await interaction.followup.send(
                 render_requeue_refusal(view.summary, view.plan, view.names, rechecked=True),
                 ephemeral=True,
@@ -872,7 +1093,7 @@ class QueueCog(
         if view is None:
             await interaction.followup.send(NO_SUCH_SESSION, ephemeral=True)
             return
-        if view.plan.is_blocked or view.plan.is_empty:
+        if view.is_refused:
             # No buttons at all: there is nothing to confirm, and offering
             # a Confirm that would only be refused invites the
             # administrator to press it and learn nothing new.
