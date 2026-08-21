@@ -94,6 +94,7 @@ from sentry_sdk.utils import BadDsn
 from sturnus import __version__
 from sturnus.config import SentrySettings
 from sturnus.domain.errors import DiagnosticSafeError
+from sturnus.observability.redaction import SAFE_MESSAGE_TYPES
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from sentry_sdk._types import Breadcrumb, BreadcrumbHint, Event, Hint
@@ -213,6 +214,22 @@ SAFE_MECHANISM_KEYS = frozenset({"type", "handled", "synthetic"})
 # and their pre-composed messages are dropped rather than forwarded.
 TRUSTED_LOGGER_ROOT = "sturnus"
 
+# Exception types allowed to say anything at all about themselves.
+#
+# Aliased to `sturnus.observability.redaction.SAFE_MESSAGE_TYPES` rather than
+# restated, so that Sentry, Tempo and Loki answer "may this exception's
+# message leave the pod" from one list. Two subtly different answers in two
+# files is worse than either alone -- the gap between them is where a message
+# gets out, and the gap opens on the day someone *removes* a type from one
+# list because it turned out to leak. The name stays for the call sites here.
+#
+# The alias is the gate, not the whole rule: what a vouched-for type is then
+# allowed to *say* is still decided per type in `_exception_value`, and for
+# `OSError` that is stricter here than `redaction.safe_exception_message` --
+# see `_os_error_value`. Narrower than the shared list is always allowed;
+# wider is not, and the `isinstance` gate is what makes wider impossible.
+SAFE_VALUE_TYPES: tuple[type[BaseException], ...] = SAFE_MESSAGE_TYPES
+
 log = logging.getLogger(__name__)
 
 
@@ -283,14 +300,26 @@ def _os_error_value(exc: OSError) -> str:
 def _exception_value(exc: BaseException | None) -> str | None:
     """The message that may be sent for `exc`, or `None` to redact it.
 
+    `SAFE_VALUE_TYPES` is the gate: a type the shared list does not vouch
+    for says nothing here, whatever the branches below would have done with
+    it. That is what keeps this function from drifting wider than
+    `redaction.safe_exception_message` when the shared list shrinks.
+
     `DiagnosticSafeError` is checked first: it is an explicit, reviewed
     opt-in for the whole message, and it wins over the structural rebuild
     `OSError` gets even for a class that happens to be both.
     """
+    if not isinstance(exc, SAFE_VALUE_TYPES):
+        return None
     if isinstance(exc, DiagnosticSafeError):
         return str(exc)
     if isinstance(exc, OSError):
         return _os_error_value(exc)
+    # Vouched for by the shared list but with no rebuild rule of its own
+    # here. Sentry is the transport with the least operator context around
+    # it, so an unrecognised addition to the list is redacted rather than
+    # forwarded: adding a type has to be a deliberate edit in both places,
+    # removing one takes effect in both at once.
     return None
 
 

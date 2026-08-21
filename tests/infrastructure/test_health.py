@@ -46,7 +46,20 @@ async def test_version_reports_the_installed_package_version() -> None:
         assert "version" in body
 
 
-async def test_metrics_is_reachable() -> None:
+async def test_metrics_answers_501_because_metrics_are_pushed() -> None:
+    """The route exists and truthfully says there is nothing to scrape.
+
+    It used to return `200` with an empty body, on the reasoning that an
+    empty exposition is still valid Prometheus. That reasoning inverts the
+    signal: a scrape of an empty `200` is indistinguishable from "every
+    counter is legitimately zero", so an uninstrumented process would look
+    perfectly healthy to a ServiceMonitor. A `501` marks the target down,
+    which is the true statement, and the route still exists so Spec 4.1's
+    endpoint list stays satisfied.
+    """
     async with TestClient(TestServer(health_app(ReadinessState()))) as client:
         response = await client.get("/metrics")
-        assert response.status == 200
+        assert response.status == 501
+        # Names the variable that turns metrics on, so the 501 is
+        # self-documenting to whoever pointed a scraper here.
+        assert "STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT" in await response.text()

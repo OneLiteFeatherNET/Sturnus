@@ -44,6 +44,14 @@ from sturnus.infrastructure.health import ReadinessState, start_health_server
 from sturnus.infrastructure.objectstore import S3AudioStore
 from sturnus.infrastructure.observability import init_sentry
 from sturnus.infrastructure.recording_adapters import CryptoEncryptor, FileAudioWriterFactory
+from sturnus.infrastructure.telemetry import init_telemetry, shutdown_telemetry
+from sturnus.infrastructure.traced import TracedAudioStore, TracedEncryptor, TracedJobQueue
+from sturnus.observability.events import Event, log_event, log_exception
+from sturnus.observability.setup import (
+    asyncio_exception_handler,
+    configure_logging,
+    install_excepthooks,
+)
 
 log = logging.getLogger(__name__)
 
@@ -101,11 +109,25 @@ async def _publish_loop(
         try:
             await announce_ready_sessions(sessions, announcer, now)
         except Exception as exc:
-            log.warning("Publish sweep failed; will retry next interval: %s", exc)
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SWEEP_FAILED,
+                "Publish sweep failed; will retry next interval",
+                exc,
+                reason="publish",
+            )
         try:
             await link_states.purge_expired(now)
         except Exception as exc:
-            log.warning("Expired link-state purge failed; will retry next interval: %s", exc)
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SWEEP_FAILED,
+                "Expired link-state purge failed; will retry next interval",
+                exc,
+                reason="link_state_purge",
+            )
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
 
@@ -139,7 +161,13 @@ async def _wait_for_schema(
                 f"Database schema is missing required table(s): {sorted(missing)}. "
                 "The worker owns migrations and must run them before the bot can start."
             )
-        log.warning("Waiting for the database schema; missing table(s): %s", sorted(missing))
+        log_event(
+            log,
+            logging.WARNING,
+            Event.SCHEMA_WAITING,
+            "Waiting for the worker to migrate the database schema",
+            missing=sorted(missing),
+        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -184,6 +212,21 @@ async def _run() -> None:
     writer_factory = FileAudioWriterFactory(settings.recording_dir)
     clock: Clock = SystemClock()
 
+    # Tracing is applied here, on the way into `SturnusClient` and therefore
+    # into `RecordingService`. Each wrapper satisfies the same port the plain
+    # adapter does, so `sturnus.application.recording` gains a span per
+    # encrypt/upload/enqueue without importing OpenTelemetry -- which it may
+    # not do (`tests/test_architecture.py`). See
+    # `sturnus.infrastructure.traced`.
+    #
+    # `audio_store` and `encryptor` are wrapped *after* `recover_orphans`
+    # has used the plain ones below: recovery runs once at startup, outside
+    # any session, and its spans would be orphaned roots carrying nothing
+    # a log line does not already say.
+    traced_audio_store = TracedAudioStore(audio_store)
+    traced_encryptor = TracedEncryptor(encryptor)
+    traced_job_repo = TracedJobQueue(job_repo)
+
     # Recovery has no guild to read a per-guild retention override from --
     # only a session id parsed off the filesystem -- so it falls back to
     # the global default rather than guessing at any one guild's setting.
@@ -198,9 +241,12 @@ async def _run() -> None:
         clock.now(),
     )
     if recovered:
-        log.warning(
-            "Recovered %d orphaned recording(s) left behind by a previous process",
-            len(recovered),
+        log_event(
+            log,
+            logging.WARNING,
+            Event.SESSION_RECOVERED,
+            "Recovered orphaned recordings left behind by a previous process",
+            count=len(recovered),
         )
 
     readiness = ReadinessState()
@@ -220,10 +266,10 @@ async def _run() -> None:
         config_store=config_store,
         consent_repo=consent_repo,
         session_repo=session_repo,
-        job_repo=job_repo,
-        audio_store=audio_store,
+        job_repo=traced_job_repo,
+        audio_store=traced_audio_store,
         writer_factory=writer_factory,
-        encryptor=encryptor,
+        encryptor=traced_encryptor,
         readiness=readiness,
         database_ping=database_ping,
         session_factory=session_factory,
@@ -234,6 +280,7 @@ async def _run() -> None:
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+    loop.set_exception_handler(asyncio_exception_handler)
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
@@ -242,7 +289,12 @@ async def _run() -> None:
     try:
         await stop.wait()
     finally:
-        log.info("Shutdown requested: closing every active session before disconnecting")
+        log_event(
+            log,
+            logging.INFO,
+            Event.SHUTDOWN_BEGIN,
+            "Shutdown requested: closing every active session before disconnecting",
+        )
         publish_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await publish_task
@@ -251,16 +303,28 @@ async def _run() -> None:
         await client_task
         await health_runner.cleanup()
         await engine.dispose()
+        # Last: flushes the spans describing this very shutdown, which is
+        # exactly the batch someone will be looking for after a deploy that
+        # lost a session.
+        shutdown_telemetry()
+        log_event(log, logging.INFO, Event.SHUTDOWN_COMPLETE, "Bot stopped")
 
 
 def main() -> None:
-    # Both run before `_run`, and so before `get_settings()` reads the
+    # All four run before `_run`, and so before `get_settings()` reads the
     # environment: with a DSN configured, a settings `ValidationError` is
     # then itself reported instead of being the one failure Sentry can never
     # see. Without a DSN, `init_sentry` returns having touched nothing at all
     # -- see `sturnus.infrastructure.observability`.
-    logging.basicConfig(level=logging.INFO)
+    # `configure_logging` first of all: it installs the handler that formats
+    # and redacts everything the other three might have to report, and
+    # `install_excepthooks` is what stops a settings `ValidationError` --
+    # whose pydantic message embeds the raw environment dict, token prefix
+    # and all -- reaching stderr unredacted.
+    configure_logging("bot")
+    install_excepthooks()
     init_sentry("bot")
+    init_telemetry("bot")
     asyncio.run(_run())
 
 

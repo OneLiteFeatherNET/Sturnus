@@ -32,6 +32,8 @@ from typing import Protocol, cast
 
 from jinja2.sandbox import SandboxedEnvironment
 
+from sturnus.observability.events import Event, log_event, log_exception
+
 log = logging.getLogger(__name__)
 
 #: The session `status` value the worker writes once a session's protocol
@@ -175,5 +177,21 @@ async def announce_ready_sessions(
         try:
             await announcer.post(channel_id, render_announcement(document_url, template_source))
             await sessions.mark_announced(session_id, now)
+            log_event(
+                log,
+                logging.INFO,
+                Event.ANNOUNCE_POSTED,
+                "Posted the session document link to the channel",
+                session_id=session_id,
+                channel_id=channel_id,
+            )
         except Exception as exc:
-            log.warning("Failed to announce session %d; will retry: %s", session_id, exc)
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.ANNOUNCE_FAILED,
+                "Failed to announce the session document; will retry next sweep",
+                exc,
+                session_id=session_id,
+                channel_id=channel_id,
+            )

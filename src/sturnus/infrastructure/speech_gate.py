@@ -50,6 +50,16 @@ fixed there, and the comments there say how.
 This module lives in `infrastructure` and not in `domain` because it needs
 numpy, and `tests/test_architecture.py` enforces that `sturnus.domain` imports
 nothing but the standard library and itself.
+
+**It has no logger, no span and no metric of its own, deliberately.** It is a
+pure function over an array — called once per job, from
+`WhisperEngine._transcribe`, which has its result in hand the moment it
+returns. Its verdict is reported from there instead, as `clips` and
+`speech_seconds` on `transcription.decoded` and `transcription.skipped` and as
+span attributes on `job.transcribe`, so a hot numpy routine stays free of I/O
+and the numbers still get out. `speech_seconds` against `audio_seconds` is the
+signature that would have named Silero as the culprit on the first read: one
+second of speech in two minutes of recording is not a plausible meeting.
 """
 
 from __future__ import annotations

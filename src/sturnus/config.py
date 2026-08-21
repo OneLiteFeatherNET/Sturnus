@@ -10,7 +10,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import SecretStr, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -91,6 +91,63 @@ class SentrySettings(StrictSettings):
     def _blank_dsn_is_absent(cls, value: SecretStr | None) -> SecretStr | None:
         if value is None or not value.get_secret_value().strip():
             return None
+        return value
+
+
+class OtelSettings(StrictSettings):
+    """Whether, and where, to send traces and metrics.
+
+    Its own class, and constructed before the process's real settings, for
+    exactly the two reasons `SentrySettings` gives: nothing here is
+    required, so it always builds; and observability has no business
+    widening the per-process credential asymmetry Spec 13.2 establishes.
+
+    **The blank-to-`None` normalisation is the same load-bearing trick, for
+    the same verified reason.** An unconfigured cluster's chart default is
+    `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT: ""`, not an absent variable, and
+    `StrictSettings._reject_blank_required_values` does not apply to an
+    optional field. So blank must become `None` here, and `None` must mean
+    *no provider is ever constructed* -- not "a provider pointed at
+    nothing", which would retry a dead endpoint forever and log an ERROR
+    each time. With no provider the OpenTelemetry API degrades to
+    `NonRecordingSpan` and `_ProxyCounter`, measured at 0.10 us per
+    `counter.add`, so every instrumentation call in the codebase becomes a
+    no-op without a single conditional at a call site.
+
+    **One switch, deliberately.** The bare `OTEL_EXPORTER_OTLP_ENDPOINT` and
+    `OTEL_SDK_DISABLED` that the SDK reads natively are *not* honoured. Two
+    switches for one behaviour is how a deployment ends up silently wrong in
+    a way no test catches; the endpoint below is passed explicitly to both
+    exporters instead.
+
+    `environment` deliberately reads `STURNUS_SENTRY_ENVIRONMENT` -- the
+    variable the Sentry work already landed, documented and defaulted in the
+    chart -- rather than introducing a second name. One environment string
+    for both back ends, so `deployment.environment.name` in Tempo can never
+    disagree with the environment filter in Sentry. If the two ever need to
+    differ, that is a rename of one shared variable, not a second one added
+    quietly alongside it.
+    """
+
+    otel_exporter_otlp_endpoint: str | None = None
+    otel_traces_sample_ratio: float = 1.0
+    otel_metric_export_interval_seconds: float = 60.0
+    environment: str = Field(default="production", validation_alias="STURNUS_SENTRY_ENVIRONMENT")
+
+    @field_validator("otel_exporter_otlp_endpoint", mode="after")
+    @classmethod
+    def _blank_endpoint_is_absent(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        return value.strip()
+
+    @field_validator("otel_traces_sample_ratio", mode="after")
+    @classmethod
+    def _ratio_in_range(cls, value: float) -> float:
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                "STURNUS_OTEL_TRACES_SAMPLE_RATIO must be between 0.0 and 1.0 inclusive"
+            )
         return value
 
 

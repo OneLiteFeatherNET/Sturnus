@@ -56,10 +56,25 @@ def health_app(state: ReadinessState) -> web.Application:
         )
 
     async def metrics(_request: web.Request) -> web.Response:
-        # No metrics backend is wired up yet; an empty exposition is still
-        # a valid Prometheus response, so the endpoint doesn't 404 while
-        # nothing has been instrumented.
-        return web.Response(text="", content_type="text/plain")
+        # Metrics are **pushed** over OTLP to the endpoint named below (see
+        # `sturnus.infrastructure.telemetry`), not scraped from here.
+        #
+        # This used to return 200 with an empty body, on the reasoning that
+        # an empty exposition is still valid Prometheus. That is worse than
+        # a 501: a scrape of an empty 200 is indistinguishable from "every
+        # counter is legitimately zero", so the day someone points a
+        # ServiceMonitor at this route, a completely uninstrumented process
+        # looks perfectly healthy. A 501 marks the target down, which is the
+        # truthful signal, and the route still exists so Spec 4.1's endpoint
+        # list stays literally satisfied.
+        return web.Response(
+            status=501,
+            text=(
+                "Sturnus pushes metrics over OTLP; there is nothing to scrape here. "
+                "Set STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT and read them from Grafana.\n"
+            ),
+            content_type="text/plain",
+        )
 
     async def version(_request: web.Request) -> web.Response:
         return web.json_response({"version": __version__})

@@ -27,6 +27,9 @@ from sturnus.application.publishing import Announcer, render_silent_audio_warnin
 from sturnus.domain.session import EndReason, SessionMachine, SessionState, SessionTimeouts
 from sturnus.domain.silence import SILENCE_EVIDENCE_SECONDS, SilentAudioWatch
 from sturnus.domain.timeline import SpeakerClock
+from sturnus.observability.events import Event, log_event, log_exception
+
+log = logging.getLogger(__name__)
 
 log = logging.getLogger(__name__)
 
@@ -184,6 +187,16 @@ class RecordingService:
         self._data_key: SessionKey | None = None
         self._writers: dict[int, AudioWriter] = {}
         self._closed = False
+        #: Packet and byte counters for `session.closed`'s verdict. They
+        #: live here, in a class with thorough unit tests, rather than in
+        #: `sturnus.infrastructure.discord.voice` -- whose sink callback
+        #: runs on the extension's packet-router thread and has no unit
+        #: tests at all, by explicit design. Putting the count in the
+        #: untested file would make the replacement signal less trustworthy
+        #: than the flood it replaces.
+        self._packets = 0
+        self._bytes = 0
+        self._seen_participants = False
 
     @property
     def is_recording(self) -> bool:
@@ -206,6 +219,15 @@ class RecordingService:
     @property
     def session_id(self) -> int | None:
         return self._session_id
+
+    @property
+    def guild_id(self) -> int:
+        """The guild this service records for.
+
+        Read-only, and public so telemetry in `infrastructure` can label a
+        session span without reaching into a private attribute.
+        """
+        return self._guild_id
 
     @property
     def channel_id(self) -> int:
@@ -263,6 +285,8 @@ class RecordingService:
     async def participants_changed(self, consented_count: int, now: datetime) -> None:
         """Forwards to the machine; opens a session row on the IDLE -> RECORDING edge."""
         was_idle = self._machine.state is SessionState.IDLE
+        if consented_count > 0:
+            self._seen_participants = True
         self._machine.participants_changed(consented_count, now)
         if was_idle and self._machine.state is SessionState.RECORDING:
             self._session_id = await self._sessions.open_session(
@@ -276,6 +300,22 @@ class RecordingService:
             # key stranded only in this process's memory.
             await self._sessions.record_session_key(
                 self._session_id, self._encryptor.key_id, self._data_key.wrapped
+            )
+            # The anchor line of the whole story: every later event, in this
+            # process and in the worker, joins to it on `session_id`.
+            # `key_id` says which master key must still exist for this
+            # session ever to be decrypted -- the one fact that makes a
+            # rotation mistake recoverable rather than merely visible.
+            log_event(
+                log,
+                logging.INFO,
+                Event.SESSION_OPENED,
+                "Opened a recording session",
+                session_id=self._session_id,
+                guild_id=self._guild_id,
+                channel_id=self._channel_id,
+                consented_present=consented_count,
+                key_id=self._encryptor.key_id,
             )
 
     async def voice_packet(
@@ -302,8 +342,28 @@ class RecordingService:
                 self._session_id, discord_user_id, display_name, now
             )
             await self._sessions.set_audio_epoch(self._session_id, discord_user_id, at)
+            # One line per speaker, never per packet. This is what separates
+            # "nobody consented" from "consented but silent" from "capture
+            # is broken" -- three very different incidents that look
+            # identical from outside without it.
+            #
+            # `display_name` is deliberately absent: it is directly
+            # identifying and tells an operator nothing the user id does
+            # not. It is in `fields.DENIED_NAMES` so the build fails if
+            # anyone adds it here later.
+            log_event(
+                log,
+                logging.INFO,
+                Event.SESSION_SPEAKER_FIRST_PACKET,
+                "First audio packet from a speaker",
+                session_id=self._session_id,
+                discord_user_id=discord_user_id,
+                ssrc=ssrc,
+            )
 
         writer.write(at, pcm)
+        self._packets += 1
+        self._bytes += len(pcm)
         self._machine.audio_received(now)
 
         # Last, and only after the audio itself is safely written: this is
@@ -312,11 +372,9 @@ class RecordingService:
         # logged or passed on -- and answers `True` exactly once per
         # speaker per session, on the packet that completes the case.
         if self._silence.observe(discord_user_id, pcm):
-            await self._report_silent_audio(discord_user_id, display_name, at)
+            await self._report_silent_audio(discord_user_id, at)
 
-    async def _report_silent_audio(
-        self, discord_user_id: int, display_name: str, at: datetime
-    ) -> None:
+    async def _report_silent_audio(self, discord_user_id: int, at: datetime) -> None:
         """Says, three ways, that this speaker's audio is arriving empty.
 
         Three, because each survives something the others do not. The log
@@ -336,35 +394,52 @@ class RecordingService:
         warning.
         """
         assert self._session_id is not None
-        log.warning(
-            "Audio from %s (id %d) in session %d has been arriving for %ds with no "
-            "audible level: packets are being received and decoded, and every sample in "
-            "them is at the noise floor. This is what a microphone muted at system level "
-            "produces, and it transcribes to nothing. Recording continues.",
-            display_name,
-            discord_user_id,
-            self._session_id,
-            SILENCE_EVIDENCE_SECONDS,
+        # `display_name` is deliberately not here, and this is the one line
+        # in the three where leaving it out costs something: it is what the
+        # room would recognise. It is directly identifying, it is in
+        # `fields.DENIED_NAMES`, and the id answers the operator's question
+        # -- "whose microphone" is a question for the channel message, which
+        # renders the mention and is read by people who are in the meeting.
+        log_event(
+            log,
+            logging.WARNING,
+            Event.SPEAKER_AUDIO_SILENT,
+            "Audio from this speaker has been arriving with no audible level: packets are "
+            "being received and decoded, and every sample in them is at the noise floor. "
+            "This is what a microphone muted at system level produces, and it transcribes "
+            "to nothing. Recording continues.",
+            session_id=self._session_id,
+            discord_user_id=discord_user_id,
+            duration_seconds=SILENCE_EVIDENCE_SECONDS,
         )
         try:
             await self._announcer.post(
                 self._channel_id, render_silent_audio_warning(discord_user_id)
             )
         except Exception as exc:
-            log.warning(
-                "Could not post the silent-audio warning for id %d into channel %d: %s",
-                discord_user_id,
-                self._channel_id,
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SPEAKER_SILENT_WARNING_FAILED,
+                "Could not post the silent-audio warning into the channel; the durable "
+                "record below is what is left of it",
                 exc,
+                session_id=self._session_id,
+                discord_user_id=discord_user_id,
+                channel_id=self._channel_id,
             )
         try:
             await self._sessions.record_silent_audio(self._session_id, discord_user_id, at)
         except Exception as exc:
-            log.warning(
-                "Could not record silent audio for id %d on session %d: %s",
-                discord_user_id,
-                self._session_id,
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SPEAKER_SILENT_RECORD_FAILED,
+                "Could not record this speaker's silent audio on the session row; the "
+                "finding survives only as this line",
                 exc,
+                session_id=self._session_id,
+                discord_user_id=discord_user_id,
             )
 
     def request_close(self, reason: EndReason) -> None:
@@ -454,7 +529,17 @@ class RecordingService:
         assert self._data_key is not None
         session_id = self._session_id
         retention_until = now + timedelta(days=self._retention_days)
+        log_event(
+            log,
+            logging.INFO,
+            Event.SESSION_CLOSING,
+            "Closing the session: encrypting, uploading and enqueuing",
+            session_id=session_id,
+            reason=reason.value,
+            speakers=len(self._writers),
+        )
 
+        jobs_enqueued = 0
         enc_paths: list[Path] = []
         session_dir: Path | None = None
         for discord_user_id, writer in self._writers.items():
@@ -475,9 +560,45 @@ class RecordingService:
                 wrapped_data_key=self._data_key.wrapped,
                 retention_until=retention_until,
             )
+            jobs_enqueued += 1
             enc_paths.append(enc_path)
+            # The object key is not logged: it is
+            # `sessions/{session_id}/speakers/{discord_user_id}.enc`, so
+            # both halves are on this line already and the key itself would
+            # be duplication with a wider blast radius. `audio_key()`
+            # reconstructs it.
+            log_event(
+                log,
+                logging.INFO,
+                Event.SESSION_SPEAKER_FINALIZED,
+                "Encrypted, uploaded and enqueued one speaker's recording",
+                session_id=session_id,
+                discord_user_id=discord_user_id,
+                bytes=enc_path.stat().st_size if enc_path.exists() else 0,
+            )
 
         await self._sessions.close_session(session_id, now, reason.value)
+
+        # The verdict, and the reason this line exists at all: a session
+        # that had consenting participants and enqueued nothing recorded
+        # nothing. Today that outcome is expressed as complete silence --
+        # no document, no announcement, and not one log line saying so.
+        # Here it is a single ERROR an alert can fire on.
+        recorded_nothing = jobs_enqueued == 0 and self._seen_participants
+        log_event(
+            log,
+            logging.ERROR if recorded_nothing else logging.INFO,
+            Event.SESSION_CLOSED,
+            "Session closed having recorded nothing despite participants being present"
+            if recorded_nothing
+            else "Session closed",
+            session_id=session_id,
+            reason=reason.value,
+            speakers=len(self._writers),
+            jobs_enqueued=jobs_enqueued,
+            packets=self._packets,
+            bytes=self._bytes,
+        )
 
         for enc_path in enc_paths:
             enc_path.unlink(missing_ok=True)
@@ -499,6 +620,10 @@ class RecordingService:
         the voice adapter that dispatches packets into it) can be reused
         for a second, third, ... session without ever being reconstructed.
 
+        Also zeroes the packet/byte counters and the "we saw participants"
+        flag, so the next session's `session.closed` verdict is about that
+        session rather than a running total across the process's lifetime.
+
         Without this, `_closed` stays `True` and `_machine` stays stuck in
         `SessionState.CLOSING` forever: `is_recording` never becomes
         `True` again, `voice_packet` keeps returning early, and
@@ -513,3 +638,6 @@ class RecordingService:
         self._data_key = None
         self._writers = {}
         self._closed = False
+        self._packets = 0
+        self._bytes = 0
+        self._seen_participants = False

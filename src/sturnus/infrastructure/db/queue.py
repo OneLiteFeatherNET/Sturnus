@@ -55,6 +55,7 @@ session either. `claim` therefore also selects a `running` job whose
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
@@ -62,6 +63,10 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.infrastructure.db.models import Session, TranscriptionJob
+from sturnus.infrastructure.telemetry import JOB_OUTCOME, record
+from sturnus.observability.events import Event, log_event
+
+log = logging.getLogger(__name__)
 
 #: How long a claimed job may stay `running` before `claim` treats it as
 #: abandoned and reclaims it. Generous on purpose: a large-v3 Whisper model
@@ -200,14 +205,35 @@ class JobQueue:
                 select(Session.status).where(Session.id == session_id)
             )
             await session.commit()
-            return remaining == 0 and session_status == "closed"
 
-    async def fail(self, job_id: int, error: str, max_attempts: int) -> None:
+        # **Where `sturnus.job.outcome` is counted, and the reason it is
+        # counted here.** The worker loop used to derive the label from
+        # `process_one`'s return value, which is `True` after `queue.fail`
+        # just as it is after `queue.complete` -- it means "work was
+        # attempted", not "work succeeded" -- so every failed job was
+        # published as `outcome="done"`. A metric that reports failures as
+        # successes is worse than no metric, because it is believed.
+        #
+        # This method and `fail` below are the two transitions that decide
+        # a job's terminal state, so they are the two places that can say
+        # what happened without inferring it. Recorded after the commit:
+        # the counter must not claim a `done` that a failed transaction
+        # rolled back.
+        record(JOB_OUTCOME, 1, outcome="done")
+        return remaining == 0 and session_status == "closed"
+
+    async def fail(self, job_id: int, error: str, max_attempts: int) -> bool:
         """Records the error and either returns the job to `pending` or, once
-        `attempts` reaches `max_attempts`, marks it `dead`.
+        `attempts` reaches `max_attempts`, marks it `dead`. Returns whether
+        it is now dead.
 
         A `dead` job is excluded from `complete`'s remaining-jobs count, so
         one unreadable recording never blocks its session's completion.
+
+        The return value exists because the caller otherwise cannot tell
+        permanent loss from a retry -- `process_one` returns `True` for both
+        -- and the distinction is the whole point of the outcome metric and
+        of the `job.process` span's `outcome` attribute.
         """
         async with self._session_factory() as session:
             job = await session.get(TranscriptionJob, job_id)
@@ -215,7 +241,52 @@ class JobQueue:
             job.attempts += 1
             job.error = error
             job.status = "dead" if job.attempts >= max_attempts else "pending"
+            session_id = job.session_id
+            attempts = job.attempts
+            dead = job.status == "dead"
             await session.commit()
+
+        if dead:
+            # A speaker's audio will never be transcribed. This method has
+            # set `status="dead"` since it was written and said nothing at
+            # all about it -- permanent loss, expressed as silence.
+            #
+            # `error` is **not** logged: it is `str(exc)` from
+            # `process_one`, which is fine in the database column an
+            # operator queries deliberately and is exactly what must not go
+            # into a retained, indexed store. The column still has it.
+            log_event(
+                log,
+                logging.ERROR,
+                Event.JOB_DEAD,
+                "Job exhausted its attempts and is now dead; this recording will never "
+                "be transcribed",
+                job_id=job_id,
+                session_id=session_id,
+                attempts=attempts,
+                max_attempts=max_attempts,
+            )
+            record(JOB_OUTCOME, 1, outcome="dead")
+        else:
+            log_event(
+                log,
+                logging.WARNING,
+                Event.JOB_FAILED,
+                "Job returned to the queue for another attempt",
+                job_id=job_id,
+                session_id=session_id,
+                attempt=attempts,
+                max_attempts=max_attempts,
+            )
+            # The measurement that was missing entirely. `dead` was counted
+            # from the moment this metric existed; a retryable failure was
+            # not counted at all, and the worker loop then counted the same
+            # job as `done`. So the two labels an operator most needs --
+            # "is this job pipeline failing" and "is it failing
+            # permanently" -- were one lie and one silence.
+            record(JOB_OUTCOME, 1, outcome="failed")
+
+        return dead
 
     async def last_error(self, job_id: int) -> str | None:
         async with self._session_factory() as session:

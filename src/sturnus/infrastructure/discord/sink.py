@@ -56,6 +56,7 @@ import discord
 from discord.ext import voice_recv
 
 from sturnus.application.ports import Clock
+from sturnus.infrastructure.telemetry import VOICE_PACKETS, record
 
 log = logging.getLogger(__name__)
 
@@ -144,10 +145,19 @@ class RecordingSink(voice_recv.AudioSink):
         decoder: OpusDecoderPool,
         clock: Clock,
         emit: Callable[[CaptureMessage], None],
+        guild_id: int | None = None,
     ) -> None:
         # No destination: this sink is an endpoint, not a link in a
         # transformer chain, so it registers no child.
         super().__init__()
+        # Metric label only, and optional so the sink stays constructible
+        # from a list of packets with no guild anywhere in sight -- which
+        # is the property `tests/infrastructure/discord/test_sink.py`
+        # exists to keep. `guild_id` is the one non-literal in
+        # `METRIC_LABEL_FIELDS` (see `sturnus.observability.fields`), and
+        # it is what makes "which server stopped being recorded" a query
+        # rather than a log search.
+        self._guild_id = guild_id
         self._consent_role_id = consent_role_id
         self._decoder = decoder
         self._clock = clock
@@ -240,6 +250,7 @@ class RecordingSink(voice_recv.AudioSink):
             # the mapping with its speaking event) or the user is not a
             # guild member at all. Nothing is decoded and nothing is
             # written -- but it is not silent either.
+            record(VOICE_PACKETS, 1, outcome="unknown_user", guild_id=self._guild_id)
             self._note_unattributed(ssrc)
             return
 
@@ -250,6 +261,12 @@ class RecordingSink(voice_recv.AudioSink):
             # immediately. Deliberately *before* the decoder: audio nobody
             # consented to is never even turned into PCM, and no decoder
             # object is ever created for that speaker.
+            #
+            # Counted, because "nobody consented" and "capture is broken"
+            # produce the same silence in the recording and the same empty
+            # session row. The counter is what separates them without
+            # anything per-frame reaching Loki.
+            record(VOICE_PACKETS, 1, outcome="no_role", guild_id=self._guild_id)
             return
 
         # `data.opus` is `packet.decrypted_data`, already stripped of RTP
@@ -265,6 +282,12 @@ class RecordingSink(voice_recv.AudioSink):
             # RTP-derived absolute time, so this becomes exactly one
             # frame of real silence in the WAV and nothing after it
             # shifts.
+            #
+            # The rate of this label against `recorded` is the early
+            # warning `.decoding`'s threshold deliberately does not give:
+            # that fires once, after five consecutive seconds of nothing,
+            # and this is visible from the first frame.
+            record(VOICE_PACKETS, 1, outcome="undecodable", guild_id=self._guild_id)
             return
 
         self._emit(

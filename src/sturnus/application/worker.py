@@ -90,6 +90,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
 import uuid
 from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
@@ -107,6 +108,7 @@ from sturnus.application.documents import (
 from sturnus.application.transcription import TranscriptionEngine
 from sturnus.domain import settings as domain_settings
 from sturnus.domain.transcript import DEFAULT_MERGE_GAP
+from sturnus.observability.events import Event, log_event, log_exception
 
 log = logging.getLogger(__name__)
 
@@ -138,7 +140,12 @@ class Queue(Protocol):
 
     async def complete(self, job_id: int, transcript: str) -> bool: ...
 
-    async def fail(self, job_id: int, error: str, max_attempts: int) -> None: ...
+    #: Returns whether the job is now **dead** -- out of attempts, so this
+    #: recording will never be transcribed -- rather than queued for another
+    #: try. Only the queue can answer that, because only the queue counts
+    #: the attempts, and without the answer a caller cannot tell permanent
+    #: loss from an ordinary retry: `process_one` returns `True` for both.
+    async def fail(self, job_id: int, error: str, max_attempts: int) -> bool: ...
 
 
 class AudioDownloader(Protocol):
@@ -404,9 +411,32 @@ async def _create_session_document(
         # which this module must never import (see the module docstring).
         if type(exc).__name__ != "PermanentDocumentError":
             raise
-        log.warning("Document sink permanently rejected creation for session %d", session_id)
+        # ERROR, not WARNING: a permanent rejection is the end of the road
+        # for this session's document. No sweep will fix it, so it needs a
+        # human -- unlike every other document failure here, which
+        # `retry_pending_documents` picks up on its own schedule.
+        log_event(
+            log,
+            logging.ERROR,
+            Event.SESSION_DOCUMENT_REJECTED,
+            "Document sink permanently rejected creation; no retry will succeed",
+            session_id=session_id,
+        )
         return
     await sessions.mark_documented(session_id, created.id, created.url, provider)
+    log_event(
+        log,
+        logging.INFO,
+        Event.SESSION_DOCUMENT_CREATED,
+        "Created the session protocol document",
+        session_id=session_id,
+        document_id=created.id,
+        provider=provider,
+        collection_id=target,
+        participants=len(transcript.participants),
+        blocks=len(transcript.blocks),
+        body_bytes=len(body.encode("utf-8")),
+    )
 
 
 async def process_one(
@@ -472,6 +502,16 @@ async def process_one(
     if claimed is None:
         return False
     job = cast(_ClaimedJobShape, claimed)
+    log_event(
+        log,
+        logging.INFO,
+        Event.JOB_CLAIMED,
+        "Claimed a transcription job",
+        job_id=job.id,
+        session_id=job.session_id,
+        discord_user_id=job.discord_user_id,
+        key_id=job.encryption_key_id,
+    )
 
     job_dir = work_dir / f"job-{job.id}-{uuid.uuid4().hex}"
     job_dir.mkdir(parents=True, exist_ok=True)
@@ -508,12 +548,49 @@ async def process_one(
                 if named_language is not None
                 else await sessions.detected_language(job.session_id, job.discord_user_id)
             )
+
+            # Started here rather than before the two config reads above, so
+            # `realtime_factor` stays a measurement of the model and not of
+            # a database round-trip. Spec 15 wants that number compared
+            # against real material, and a number that quietly includes
+            # whatever the config store was doing is not comparable.
+            started = time.monotonic()
             try:
                 result = await engine.transcribe(wav_path, pinned_language, prompt)
             except Exception as exc:
-                log.warning("Transcription failed for job %d", job.id)
+                log_exception(
+                    log,
+                    logging.WARNING,
+                    Event.JOB_FAILED,
+                    "Transcription failed",
+                    exc,
+                    job_id=job.id,
+                    session_id=job.session_id,
+                    stage="transcribe",
+                    max_attempts=max_attempts,
+                )
                 await queue.fail(job.id, str(exc), max_attempts)
                 return True
+
+            wall_seconds = time.monotonic() - started
+            audio_seconds = max((segment.end for segment in result.segments), default=0.0)
+            # Counts and durations, never text. `realtime_factor` is the
+            # number Spec 15 says must be measured against real material
+            # before rollout rather than estimated -- this is that
+            # measurement, on every job, forever.
+            log_event(
+                log,
+                logging.INFO,
+                Event.JOB_TRANSCRIBED,
+                "Transcribed a recording",
+                job_id=job.id,
+                session_id=job.session_id,
+                segments=len(result.segments),
+                audio_seconds=round(audio_seconds, 3),
+                wall_seconds=round(wall_seconds, 3),
+                realtime_factor=round(wall_seconds / audio_seconds, 3) if audio_seconds else None,
+                language=result.language,
+            )
 
             # Reached only when the guild asked for detection *and* this is
             # the first job for this speaker: a named language is never
@@ -534,7 +611,21 @@ async def process_one(
             # handling (Defect 4)" note -- without this, the exception
             # propagated out of `process_one` and killed the worker
             # process, stranding this job `running` forever.
-            log.warning("Job %d failed outside transcription: %s", job.id, exc)
+            # `stage` is what this line was missing: it covered download,
+            # decrypt *and* the transcript write with one message and no
+            # timing for any of them. The stage now says which, and the
+            # matching `job.process` trace times all three.
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.JOB_FAILED,
+                "Job failed outside transcription",
+                exc,
+                job_id=job.id,
+                session_id=job.session_id,
+                stage="pipeline",
+                max_attempts=max_attempts,
+            )
             await queue.fail(job.id, str(exc), max_attempts)
             return True
     finally:
@@ -556,10 +647,18 @@ async def process_one(
             # `retry_pending_documents` to pick up: the session stays
             # `closed` and never becomes `documented`, which is exactly
             # what that sweep looks for.
-            log.warning(
-                "Document creation failed for session %d; will retry: %s",
-                job.session_id,
+            # Never `%s` on `exc`: `_create_session_document` renders the
+            # assembled transcript through Jinja and posts it through httpx,
+            # so a `jinja2.UndefinedError` or an `httpx.HTTPStatusError`
+            # raised in that path can carry template context or request
+            # content -- and `%s` would print it verbatim.
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SESSION_DOCUMENT_RETRY_FAILED,
+                "Document creation failed; the retry sweep will try again",
                 exc,
+                session_id=job.session_id,
             )
 
     return True
@@ -599,4 +698,11 @@ async def retry_pending_documents(
                 documents, sessions, jobs, links, config, session_id, template_source
             )
         except Exception as exc:
-            log.warning("Retrying document creation failed for session %d: %s", session_id, exc)
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SESSION_DOCUMENT_RETRY_FAILED,
+                "Retrying document creation failed; will try again next sweep",
+                exc,
+                session_id=session_id,
+            )

@@ -45,8 +45,12 @@ class FakeQueue:
         self.completed.append((job_id, transcript))
         return self.last_is_final
 
-    async def fail(self, job_id: int, error: str, _max_attempts: int) -> None:
+    async def fail(self, job_id: int, error: str, _max_attempts: int) -> bool:
         self.failed.append((job_id, error))
+        # Never dead: this fake counts no attempts, and the real
+        # `JobQueue.fail` is where "out of attempts" is decided and tested
+        # (`tests/infrastructure/test_queue.py`).
+        return False
 
 
 class FakeEngine:

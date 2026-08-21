@@ -37,6 +37,8 @@ from aiohttp import web
 
 from sturnus.application.linking import PendingLink
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
+from sturnus.infrastructure.telemetry import OAUTH_CALLBACK, record
+from sturnus.observability.events import Event, log_event
 
 log = logging.getLogger(__name__)
 
@@ -137,7 +139,19 @@ def build_app(
         code = request.query.get("code")
         state = request.query.get("state")
         if not code or not state:
-            log.warning("Rejected an OAuth callback missing a required parameter")
+            # Never logs `code` or `state` themselves: `code` is an
+            # authorization code and `state` is a single-use CSRF token.
+            # `reason` is what makes these two lines countable, which is the
+            # whole diagnostic value -- a spike of `bad_state` is a replay
+            # attempt, a spike of `missing_param` is a broken redirect URI.
+            record(OAUTH_CALLBACK, 1, outcome="missing_param")
+            log_event(
+                log,
+                logging.WARNING,
+                Event.LINK_CALLBACK_REJECTED,
+                "Rejected an OAuth callback missing a required parameter",
+                reason="missing_param",
+            )
             return web.Response(text=_ERROR_PAGE, content_type="text/html", status=400)
 
         pending = await states.consume(state, now())
@@ -145,15 +159,27 @@ def build_app(
             # Covers both a forged state and a replayed one -- see
             # `LinkStateStore.consume`, which deliberately makes the two
             # indistinguishable to the caller.
-            log.warning("Rejected an OAuth callback with an unknown, expired or reused state")
+            record(OAUTH_CALLBACK, 1, outcome="bad_state")
+            log_event(
+                log,
+                logging.WARNING,
+                Event.LINK_CALLBACK_REJECTED,
+                "Rejected an OAuth callback with an unknown, expired or reused state",
+                reason="bad_state",
+            )
             return web.Response(text=_ERROR_PAGE, content_type="text/html", status=400)
 
         try:
             identity = await oauth.identity_from_code(code)
         except LinkExchangeError:
-            log.warning(
-                "Outline refused the account link attempt for discord_user_id=%s",
-                pending.discord_user_id,
+            record(OAUTH_CALLBACK, 1, outcome="exchange_failed")
+            log_event(
+                log,
+                logging.WARNING,
+                Event.LINK_EXCHANGE_FAILED,
+                "Outline refused the account link attempt",
+                discord_user_id=pending.discord_user_id,
+                provider=pending.provider,
             )
             return web.Response(text=_ERROR_PAGE, content_type="text/html", status=502)
 
@@ -163,11 +189,18 @@ def build_app(
             identity.external_user_id,
             identity.display_name,
         )
-        log.info(
-            "Linked discord_user_id=%s to %s account external_user_id=%s",
-            pending.discord_user_id,
-            pending.provider,
-            identity.external_user_id,
+        record(OAUTH_CALLBACK, 1, outcome="established")
+        # `display_name` came back from Outline alongside these and is
+        # deliberately not logged: the ids answer every operational
+        # question, and the name is the part that identifies a person.
+        log_event(
+            log,
+            logging.INFO,
+            Event.LINK_ESTABLISHED,
+            "Linked a Discord account to an external identity",
+            discord_user_id=pending.discord_user_id,
+            provider=pending.provider,
+            external_user_id=identity.external_user_id,
         )
         return web.Response(text=_CONFIRMATION_PAGE, content_type="text/html", status=200)
 

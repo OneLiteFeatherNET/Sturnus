@@ -50,6 +50,8 @@ from urllib.parse import urlencode
 
 import httpx
 
+from sturnus.observability.events import Event, log_event
+
 log = logging.getLogger(__name__)
 
 #: Assumed authorization endpoint (Outline's built-in OAuth 2.0 provider,
@@ -172,7 +174,16 @@ class OutlineOAuth:
         both as "this link attempt failed", not distinguish them.
         """
         async with httpx.AsyncClient(transport=self._transport) as http:
-            log.debug("Exchanging Outline authorization code for an access token")
+            # No `code`, no `client_secret`, no request body: an
+            # authorization code is a bearer credential for one exchange and
+            # the secret is one for every exchange.
+            log_event(
+                log,
+                logging.DEBUG,
+                Event.LINK_CALLBACK_REJECTED,
+                "Exchanging an Outline authorization code for an access token",
+                reason="exchange_started",
+            )
             token_response = await http.post(
                 f"{self._base_url}{_TOKEN_PATH}",
                 data={
@@ -184,9 +195,17 @@ class OutlineOAuth:
                 },
             )
             if token_response.status_code != httpx.codes.OK:
-                log.warning(
-                    "Outline rejected the authorization code exchange (status=%d)",
-                    token_response.status_code,
+                # The status code, never the response body: Outline's error
+                # bodies are not documented here and have not been read, so
+                # they are exactly the class of content that needs reading
+                # before it is waved through.
+                log_event(
+                    log,
+                    logging.WARNING,
+                    Event.LINK_EXCHANGE_FAILED,
+                    "Outline rejected the authorization code exchange",
+                    http_status=token_response.status_code,
+                    reason="code_exchange",
                 )
                 raise LinkExchangeError(
                     "the authorization code was refused", status_code=token_response.status_code
@@ -194,7 +213,13 @@ class OutlineOAuth:
 
             access_token = token_response.json()["access_token"]
 
-            log.debug("Fetching the linked identity from Outline")
+            log_event(
+                log,
+                logging.DEBUG,
+                Event.LINK_ESTABLISHED,
+                "Fetching the linked identity from Outline",
+                reason="identity_lookup_started",
+            )
             identity_response = await http.post(
                 f"{self._base_url}{_IDENTITY_PATH}",
                 headers={"Authorization": f"Bearer {access_token}"},
@@ -202,14 +227,27 @@ class OutlineOAuth:
             )
 
         if identity_response.status_code != httpx.codes.OK:
-            log.warning(
-                "Outline rejected the identity lookup (status=%d)",
-                identity_response.status_code,
+            log_event(
+                log,
+                logging.WARNING,
+                Event.LINK_EXCHANGE_FAILED,
+                "Outline rejected the identity lookup",
+                http_status=identity_response.status_code,
+                reason="identity_lookup",
             )
             raise LinkExchangeError(
                 "the identity lookup was refused", status_code=identity_response.status_code
             )
 
         identity = _extract_identity(identity_response.json())
-        log.info("Resolved Outline identity %s", identity.external_user_id)
+        # `identity.display_name` came back on the same response and is
+        # deliberately not logged -- see `fields.DENIED_NAMES`.
+        log_event(
+            log,
+            logging.INFO,
+            Event.LINK_ESTABLISHED,
+            "Resolved the external identity",
+            external_user_id=identity.external_user_id,
+            provider="outline",
+        )
         return identity

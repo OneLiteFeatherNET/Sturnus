@@ -7,25 +7,52 @@ from sqlalchemy import engine_from_config, pool
 # access to the values within the .ini file in use.
 config = context.config
 
-# Interpret the config file for Python logging.
-#
-# `disable_existing_loggers=False` is load-bearing, not a preference.
-# `fileConfig` defaults it to True, which sets `disabled = True` on every
-# logger that already exists and is not named in `alembic.ini` -- and
-# `logging.Logger.handle` returns immediately for a disabled logger. This
-# module is not only imported by the `alembic` CLI: the worker runs
-# migrations in-process at startup (`_run_migrations` in
-# `sturnus.entrypoints.worker`), by which point every `sturnus.*` logger
-# already exists. With the default, the worker would fall silent for the
-# rest of its life the moment it finished migrating -- and Sentry with it,
-# because `LoggingIntegration` hooks `Logger.callHandlers`, which a disabled
-# logger never reaches. See `tests/infrastructure/test_migrations.py`.
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name, disable_existing_loggers=False)
-
 import os  # noqa: E402
 
 from sturnus.infrastructure.db.models import Base  # noqa: E402
+from sturnus.observability.setup import logging_is_configured  # noqa: E402
+
+# Interpret the config file for Python logging -- but only when nothing else
+# owns logging yet.
+#
+# `fileConfig` is not additive. It *replaces* `root.handlers` with
+# alembic.ini's bare stderr `StreamHandler` and, with its default
+# `disable_existing_loggers=True`, sets `disabled = True` on every logger the
+# ini does not name -- which is all of `sturnus.*`.
+#
+# `sturnus.entrypoints.worker` calls `configure_logging("worker")` in
+# `main()` and then `_run_migrations` a few lines into `_run()`. Without this
+# guard, the worker's single filtered JSON handler is torn out seconds after
+# startup and every later line goes to stderr unstructured and, more
+# importantly, unfiltered by `SturnusFilter` -- or is dropped entirely
+# because its logger was disabled. That is the "one handler, one exit"
+# guarantee in `sturnus.observability.setup` silently undone by a call in
+# another file.
+#
+# Running Alembic standalone (`alembic upgrade head` from a shell) still gets
+# the ini's logging, because nothing has configured logging in that process --
+# and that is the case `disable_existing_loggers=False` is for. The guard and
+# the argument fix two different halves of the same regression and neither
+# replaces the other:
+#
+# - The guard stops `root.handlers` being *replaced*, which the argument does
+#   nothing about. That is the half that matters once `configure_logging()`
+#   has installed the single filtered JSON handler.
+# - `disable_existing_loggers` defaults to True, which sets `disabled = True`
+#   on every logger not named in `alembic.ini` -- and `Logger.handle` returns
+#   immediately for a disabled logger, so even Sentry stops seeing them
+#   (`LoggingIntegration` hooks `Logger.callHandlers`, which is downstream).
+#   That is the half that still bites on the standalone path the guard lets
+#   through: `alembic upgrade head` imports `sturnus.*` for `Base.metadata`
+#   above, so those loggers already exist by the time this line runs.
+#
+# Drop either one and a process goes quiet: without the guard the worker
+# loses its filter seconds after startup, without the argument standalone
+# Alembic disables every logger it did not name. See
+# `tests/infrastructure/test_migrations.py` and
+# `tests/test_logging_discipline.py`.
+if config.config_file_name is not None and not logging_is_configured():
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 
