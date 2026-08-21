@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.6.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.5.1...v0.6.0) (2026-08-21)
+
+
+### Features
+
+* **bot:** say so, during the meeting, when a speaker's audio has no level ([#43](https://github.com/OneLiteFeatherNET/Sturnus/issues/43)) ([0ceb496](https://github.com/OneLiteFeatherNET/Sturnus/commit/0ceb4969f4174237e04d0589bc180511eccd68f9))
+* **discord:** add /queue and let an admin re-run a finished session ([#49](https://github.com/OneLiteFeatherNET/Sturnus/issues/49)) ([e2e8c93](https://github.com/OneLiteFeatherNET/Sturnus/commit/e2e8c9334e9becb389d766b2394023e42f277c86))
+* **observability:** trace, measure and log Sturnus without shipping content ([#50](https://github.com/OneLiteFeatherNET/Sturnus/issues/50)) ([1ff8a9d](https://github.com/OneLiteFeatherNET/Sturnus/commit/1ff8a9df415ff203ccb3c9ae1470bea1eeb70aea))
+
+
+### Bug Fixes
+
+* **worker:** transcribe the speech, not the padded track ([#48](https://github.com/OneLiteFeatherNET/Sturnus/issues/48)) ([d3e773a](https://github.com/OneLiteFeatherNET/Sturnus/commit/d3e773a79b16cf0c3f2bad695d822cd0461a1553))
+
 ## [0.5.1](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.5.0...v0.5.1) (2026-08-21)
 
 
