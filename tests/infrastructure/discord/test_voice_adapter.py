@@ -83,6 +83,9 @@ class FakeSessions:
     async def set_audio_epoch(self, _sid: int, _user: int, _at: datetime) -> None:
         return None
 
+    async def record_silent_audio(self, _sid: int, _user: int, _at: datetime) -> None:
+        return None
+
     async def close_session(self, session_id: int, _ended_at: datetime, reason: str) -> None:
         self.closed.append((session_id, reason))
 
@@ -113,6 +116,7 @@ def recording_service(sessions: FakeSessions) -> RecordingService:
         store=AsyncMock(),
         writers=MagicMock(),
         encryptor=FakeEncryptor(),
+        announcer=AsyncMock(),
         retention_days=30,
     )
 

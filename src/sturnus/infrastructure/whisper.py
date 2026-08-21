@@ -25,14 +25,45 @@ reported about one second of speech in two minutes of a real recording and
 every transcript this project produced came back empty or hallucinated.
 `sturnus.infrastructure.speech_gate` does the same job with a stateless
 amplitude test; its module docstring carries the full reasoning.
+
+What the gate finds is then concatenated here and handed to the model as one
+short array, with `clip_timestamps` re-expressed on that timeline and the
+segment times mapped back onto the recording's afterwards. Handing over the
+padded file and only marking the speech with `clip_timestamps` — which is what
+this did until now — makes faster-whisper run its log-mel extraction over the
+padding as well, because the array is shrunk only in the `vad_filter` branch
+that setting clips skips: 4.94 GB of frames for a 100-minute track against
+1.99 GB for the 41 minutes of speech in it, and the worker's memory limit had
+to be raised from 6Gi to 12Gi in production because of it. The clip boundaries
+stay, on the new timeline, because they are what keeps an encoder window from
+spanning two utterances spoken minutes apart; `_on_the_original_timeline`
+below carries the rest of that reasoning.
+
+This adapter is not a pure consumer of documented API and should not be read
+as one. `clip_timestamps` is a documented argument, but what it is used *for*
+here — and how a returned segment is put back on the recording's timeline —
+rests on three internals of `generate_segments`: that `segment_size =
+min(nb_max_frames, content_frames - seek, seek_clip_end - seek)` keeps an
+encoder window inside one clip, that `Segment.seek` is that window's first
+log-mel frame, and that clip boundaries reach the seek loop as `round(ts *
+frames_per_second)`. None of the three is documented, the loop around them
+carries faster-whisper's own note that it should be rewritten as a nested
+loop, and `pyproject.toml` pins `faster-whisper>=1.1` with no upper bound
+while Renovate merges on a green build.
+`tests/infrastructure/test_whisper.py::test_a_window_never_spans_two_clips`
+drives the real `generate_segments` — no weights, no download — and fails if
+any of the three stops holding. It is the only upper bound there is.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from bisect import bisect_right
+from itertools import accumulate
 from pathlib import Path
 
+import numpy as np
 from faster_whisper import WhisperModel  # type: ignore[import-untyped]
 from faster_whisper.audio import decode_audio  # type: ignore[import-untyped]
 
@@ -45,6 +76,87 @@ from sturnus.infrastructure.speech_gate import speech_clips
 _SAMPLE_RATE = 16_000
 
 log = logging.getLogger(__name__)
+
+
+def _on_the_frame_grid(times: list[float], frames_per_second: int) -> list[int]:
+    """Seconds, as the log-mel frame numbers faster-whisper's seek loop counts in.
+
+    `generate_segments` converts `clip_timestamps` with `seek_points =
+    [round(ts * self.frames_per_second) for ts in options.clip_timestamps]`
+    and every seek position it reports afterwards is a number on that grid.
+    Attributing a segment to a clip is therefore a comparison of frames, and
+    this is the one place the conversion is written down. Doing it in seconds
+    instead would put a window that begins exactly on a boundary that rounded
+    *up* into the clip before it, and being one clip out is being one removed
+    silence out — minutes, not milliseconds.
+    """
+    return [round(time * frames_per_second) for time in times]
+
+
+def _on_the_original_timeline(
+    start: float,
+    end: float,
+    seek: int,
+    bounds: list[tuple[int, int]],
+    clip_starts_in_frames: list[int],
+    offsets: list[float],
+) -> tuple[float, float]:
+    """One segment's times, moved from the concatenated speech back to the file.
+
+    The clip is decided by **where the segment was decoded from, not by the
+    times it reports**, and that is the whole of the difference between a
+    working restore and the one faster-whisper ships. `seek` is the segment's
+    own `Segment.seek`: the first log-mel frame of the encoder window it came
+    out of (`yield Segment(seek=previous_seek, ...)`, with `previous_seek`
+    set to the window's start immediately before decoding). The seek loop
+    enters a clip at `seek = seek_clips[clip_idx][0]` and leaves it the
+    moment `seek >= seek_clip_end`, so that frame names one clip and only
+    one, whatever the decoder then says about the audio in it.
+
+    Reading it from the times cannot be made safe. A decoded `end` is
+    `time_offset + end_timestamp_position * time_precision` and
+    `_split_segments_by_timestamps` caps neither it nor the seek positions it
+    derives at the window's content, so a tail segment routinely claims a few
+    tenths of a second the window never held. Resolve the clip from that
+    `end` — or from a midpoint, when the overrun is more than half the
+    segment's own length — and the *next* clip's offset is added, moving the
+    text across the entire removed silence. Measured on the real engine with
+    this branch's own pre-fix code, on the shape the recording that started
+    this has — 100 minutes, 187 clips, 41.2 minutes of speech: 57 of 462
+    segments reported an `end` past their clip, and for 5 of them the overrun
+    was more than half the segment, so a midpoint landed in the next clip.
+    Those 5 came back 20 to 31 seconds from where they were spoken, one of
+    them carrying 14 seconds of text. 20 to 31 seconds because that is the
+    silence removed between two clips *on this shape*; the error is always
+    exactly one gap, so on a session with three utterances forty minutes
+    apart it is forty minutes. That is the same silently wrong timestamp
+    `restore_speech_timestamps` produces, which is the reason this project
+    does the restore itself — and moving the arithmetic into our own file is
+    not what made it wrong there.
+
+    The guarantee this now gives: **a restored segment always lies inside the
+    file-timeline extent of the clip whose encoder window produced it.**
+    `seek` is what picks the clip; the clamp is what holds the times to it
+    whatever the decoder claimed, at a cost of an overrun's worth off a
+    segment that only ever feeds a global sort, a 15-second merge window and
+    an %H:%M:%S render. It rests on three properties of `generate_segments`,
+    none of them documented and all of them observed on the real library by
+    `tests/infrastructure/test_whisper.py::test_a_window_never_spans_two_clips`:
+    that `Segment.seek` is the window's first frame, that the loop never
+    decodes a window from outside the clip it is walking, and that clip
+    boundaries reach it as `round(ts * frames_per_second)`.
+    """
+    # `bisect_right` on the clip *starts*: the clips are adjacent on the
+    # concatenated timeline, so the starts partition it and the window's
+    # frame falls in exactly one of them. `max(..., 0)` is for a `seek` below
+    # the first boundary, which the loop cannot produce and which would
+    # otherwise index the list from the wrong end.
+    index = max(bisect_right(clip_starts_in_frames, seek) - 1, 0)
+    first, last = bounds[index]
+    low, high = first / _SAMPLE_RATE, last / _SAMPLE_RATE
+    restored_start = min(max(start + offsets[index], low), high)
+    restored_end = min(max(end + offsets[index], restored_start), high)
+    return restored_start, restored_end
 
 
 class WhisperEngine:
@@ -84,10 +196,84 @@ class WhisperEngine:
             # entire recording of nothing but padding through the decoder —
             # slow, and the single most reliable way to make Whisper invent
             # text. A silent participant must produce no segments at all.
+            #
+            # It guards a second thing since the speech is concatenated here:
+            # `np.concatenate([])` raises `ValueError`, and a zero-length
+            # array is an input `FeatureExtractor` has never been exercised
+            # against. This one line is what stands between an all-padding
+            # track and both failures.
             return TranscriptionResult(segments=(), language=self._default_language)
 
+        # Seconds are what `speech_clips` speaks in and samples are the only
+        # unit in which the arithmetic below is exact, so the conversion
+        # happens once, here.
+        bounds = [(round(start * _SAMPLE_RATE), round(end * _SAMPLE_RATE)) for start, end in clips]
+        # `speech_clips` promises clips inside the array it was handed,
+        # ascending, non-overlapping, and none shorter than about 0.37 s
+        # (`_MIN_RUN_FRAMES` plus a quarter-second hangover at each end).
+        # Every line below is built on those promises and none of the
+        # failures would be visible in a transcript: a clip past the end of
+        # the array slices short, so every offset after it is wrong by the
+        # difference; out-of-order clips make `offsets` decrease, so a
+        # speaker's lines come back shuffled and the protocol interleaves two
+        # speakers wrongly; and a clip that does not end strictly after it
+        # starts contributes a length of zero or less to the cumulative sum
+        # below, which is what the concatenated timeline *is* — the
+        # boundaries stop increasing, so `clip_timestamps` describes a clip
+        # the seek loop can never enter and `clip_starts_in_frames` stops
+        # being sorted, at which point the `bisect_right` that attributes a
+        # segment to a clip answers by accident. Asserted rather than
+        # repaired, and asserted here rather than
+        # trusted, because the constants the promises rest on live in another
+        # module and this is where breaking them would surface.
+        assert bounds[0][0] >= 0 and bounds[-1][1] <= audio.shape[0], (
+            "speech_clips returned a clip outside the audio it was given"
+        )
+        assert all(first < last for first, last in bounds), (
+            "speech_clips returned a clip that does not end after it starts"
+        )
+        assert all(
+            before[1] <= after[0] for before, after in zip(bounds, bounds[1:], strict=False)
+        ), "speech_clips returned overlapping or out-of-order clips"
+
+        # One allocation for the whole of the speech. Deliberately not
+        # `faster_whisper.vad.collect_chunks`, which concatenates inside its
+        # own loop and is therefore quadratic in the clip count: 1.71 s
+        # against 0.01 s for a bit-identical array on the 100-minute
+        # recording, and worse again on a four-hour session.
+        speech = np.concatenate([audio[first:last] for first, last in bounds])
+        # The padded array is dead the moment those slices are copied, and
+        # dropping it *here* rather than letting the frame hold it is worth
+        # 271 MB of peak: `WhisperModel.transcribe` allocates the log-mel
+        # features while this frame is still alive, so anything still
+        # referenced adds to the peak instead of overlapping with it.
+        del audio
+
+        # Where each clip lands once the silence between them is gone.
+        # `concat_ends` doubles as the boundary list `clip_timestamps` wants:
+        # the clips are adjacent on this timeline, so the flat
+        # [start, end, start, end, ...] form is just the cumulative
+        # boundaries repeated.
+        lengths = [last - first for first, last in bounds]
+        counted = list(accumulate(lengths))
+        concat_ends = [count / _SAMPLE_RATE for count in counted]
+        concat_starts = [0.0, *concat_ends[:-1]]
+        # Silence removed before each clip, in seconds — a difference of two
+        # integer sample counts, so it is exact, and adding it to a segment
+        # decoded from that clip is the whole of the restore.
+        offsets = [
+            first / _SAMPLE_RATE - concat_start
+            for (first, _), concat_start in zip(bounds, concat_starts, strict=True)
+        ]
+        # Which clip a returned segment belongs to is read off the seek
+        # position it reports, so the seek loop's own frame grid has to be
+        # reproduced here (`_on_the_frame_grid`). Asked for before the call
+        # rather than while collecting: a library that stopped publishing
+        # `frames_per_second` should fail now, not after a 100-minute decode.
+        clip_starts_in_frames = _on_the_frame_grid(concat_starts, self._model.frames_per_second)
+
         segments, info = self._model.transcribe(
-            audio,
+            speech,
             language=language,
             # Biases the decoder towards the vocabulary and the style of
             # this text. It is the only lever Sturnus has on proper nouns,
@@ -102,7 +288,19 @@ class WhisperEngine:
             # A flat list of seconds — [start0, end0, start1, end1, ...] — not
             # a list of pairs and not the dict form, which belongs to
             # `BatchedInferencePipeline.transcribe`, a different API.
-            clip_timestamps=[value for clip in clips for value in clip],
+            #
+            # Still passed, now that the array is already only speech, for
+            # the one thing it does that concatenating cannot: `segment_size
+            # = min(nb_max_frames, content_frames - seek, seek_clip_end -
+            # seek)` caps an encoder window at the clip it began in, so the
+            # decoder is never shown two utterances at once and cannot emit a
+            # segment spanning the join between them. Dropping it — plain
+            # concatenation, which is what the library's own `vad_filter`
+            # path does — was measured emitting a single 258-second segment
+            # covering four utterances spoken minutes apart.
+            clip_timestamps=[
+                value for pair in zip(concat_starts, concat_ends, strict=True) for value in pair
+            ],
             # Redundant on paper: faster-whisper's guard is
             # `if vad_filter and clip_timestamps == "0"`, so setting the clips
             # already keeps Silero from ever being loaded. Stated anyway, so
@@ -191,12 +389,16 @@ class WhisperEngine:
             # One hallucinated segment then becomes the context every
             # following segment is decoded against, and the cascade the
             # two thresholds above exist to catch is exactly what that
-            # produces. `vad_filter` makes the default worse here rather
-            # than better: it cuts one speaker's track into fragments with
-            # every silence removed, so the "previous text" is routinely
-            # from minutes earlier and about something else entirely --
+            # produces. Cutting the silence out makes the default worse
+            # here rather than better, whichever way it is cut: one
+            # speaker's track becomes fragments minutes apart, so the
+            # "previous text" is routinely about something else entirely --
             # per-speaker recordings of a conversation are the case this
-            # default is least suited to.
+            # default is least suited to. (faster-whisper also resets the
+            # prompt at every window boundary of its own accord, so under
+            # the clip boundaries above this is belt and braces rather than
+            # the load-bearing part. It stays because it is a decision, and
+            # because the boundaries are not what it depends on.)
             condition_on_previous_text=False,
             # Above the library's default of 5. Beam search cost is
             # roughly linear in the width and this deployment transcribes
@@ -206,17 +408,31 @@ class WhisperEngine:
             # document people read instead of having been in the room.
             beam_size=8,
         )
-        # No offset arithmetic here, deliberately. Unlike the `vad_filter`
-        # path, which concatenates the kept audio and repairs the timestamps
-        # afterwards, the `clip_timestamps` path runs the feature extractor
-        # over the whole array and makes the seek loop jump between clips, so
-        # `time_offset = seek * time_per_frame` is already on the original
-        # timeline. These offsets stay file-relative in exactly the sense
-        # `sturnus.application.transcription.to_absolute` assumes.
-
-        collected = tuple(
-            TranscribedSegment(start=s.start, end=s.end, text=s.text) for s in segments
-        )
+        # The model was handed concatenated speech, so every time it
+        # reports is a position in *that* array: an utterance spoken at 02:30
+        # comes back at about five seconds. `sturnus.application.
+        # transcription.to_absolute` adds the speaker's epoch to whatever is
+        # here and `domain.transcript` sorts all speakers' segments together
+        # on the result, so leaving these alone would not make a
+        # slightly-wrong document — it would stack the whole meeting into its
+        # first seconds and interleave two speakers into nonsense. The
+        # restored times are file-relative in exactly the sense `to_absolute`
+        # assumes, to within the 10 ms of frame-grid rounding
+        # `_on_the_original_timeline` describes.
+        collected = []
+        for segment in segments:
+            start, end = _on_the_original_timeline(
+                segment.start,
+                segment.end,
+                segment.seek,
+                bounds,
+                clip_starts_in_frames,
+                offsets,
+            )
+            collected.append(TranscribedSegment(start=start, end=end, text=segment.text))
+        # The model never sees the padding at all now, so a speaker whose
+        # file opens with twenty minutes of it no longer has their language
+        # guessed from silence.
 
         # Count what the guard cost, every time, because from in here a track
         # of room tone correctly rejected and a track of quiet speech wrongly
@@ -254,8 +470,5 @@ class WhisperEngine:
                 gated_seconds,
             )
 
-        # With `clip_timestamps` set, detection starts at the first clip
-        # instead of at second 0, so a speaker whose file opens with twenty
-        # minutes of padding no longer has their language guessed from it.
         detected = getattr(info, "language", None) or self._default_language
-        return TranscriptionResult(segments=collected, language=detected)
+        return TranscriptionResult(segments=tuple(collected), language=detected)

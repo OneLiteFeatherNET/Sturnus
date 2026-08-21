@@ -36,6 +36,7 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
 from sturnus.infrastructure.discord.client import SturnusClient
 from sturnus.infrastructure.discord.link_cog import PROVIDER as OUTLINE_PROVIDER
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
@@ -62,27 +63,6 @@ class SystemClock:
 
     def now(self) -> datetime:
         return datetime.now(UTC)
-
-
-class _DiscordAnnouncer:
-    """Satisfies `sturnus.application.publishing.Announcer` over the gateway.
-
-    Posts into the session's own `channel_id` -- the recording channel
-    (Spec 8.5) -- which discord.py's `VoiceChannel` supports directly via
-    `.send()`, the same way `sturnus.infrastructure.discord.voice.
-    VoiceReceiveAdapter` already resolves that same id with `get_channel`.
-    """
-
-    def __init__(self, client: discord.Client) -> None:
-        self._client = client
-
-    async def post(self, channel_id: int, text: str) -> None:
-        channel = self._client.get_channel(channel_id) or await self._client.fetch_channel(
-            channel_id
-        )
-        if not isinstance(channel, discord.abc.Messageable):
-            raise ValueError(f"channel {channel_id} cannot receive messages")
-        await channel.send(text)
 
 
 async def _publish_loop(
@@ -115,7 +95,7 @@ async def _publish_loop(
     not stop the other, or kill this loop outright.
     """
     await client.wait_until_ready()
-    announcer = _DiscordAnnouncer(client)
+    announcer = DiscordAnnouncer(client)
     while not stop.is_set():
         now = datetime.now(UTC)
         try:

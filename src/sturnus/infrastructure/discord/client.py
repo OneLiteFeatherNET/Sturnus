@@ -61,6 +61,7 @@ from sturnus.infrastructure.db.repositories import (
     SessionRepository,
 )
 from sturnus.infrastructure.discord.about_cog import AboutCog
+from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
 from sturnus.infrastructure.discord.audio_cog import AudioCog
 from sturnus.infrastructure.discord.config_cog import ConfigCog
 from sturnus.infrastructure.discord.consent_cog import ConsentCog
@@ -555,6 +556,11 @@ class SturnusClient(commands.Bot):
             store=self._audio_store,
             writers=self._writer_factory,
             encryptor=self._encryptor,
+            # The real adapter, not a seam: unlike `_make_voice` below,
+            # nothing here needs a gateway connection to *construct*, so a
+            # test can drive this build path and still see what the
+            # pipeline said by standing in for the channel it resolves.
+            announcer=DiscordAnnouncer(self),
             retention_days=desired.retention_days,
         )
         self._guilds[guild_id] = _GuildRecording(

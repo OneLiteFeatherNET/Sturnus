@@ -106,6 +106,16 @@ class SessionParticipant(Base):
     detected_language: Mapped[str | None] = mapped_column(Text)
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     audio_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    #: When this speaker's audio was first seen to be arriving with no
+    #: audible level in it -- packets received and decoded, every sample at
+    #: the noise floor (`sturnus.domain.silence`). The bot writes it during
+    #: the session, at the same moment it says so in the channel, because
+    #: the message is gone by the next meeting and this is what an operator
+    #: can still read afterwards: it is what separates "we could not hear
+    #: them" from "they said nothing", which two empty transcripts left
+    #: unanswerable. Nullable, and null for nearly everybody: being quiet
+    #: is normal, so a value here means something on its own.
+    silent_audio_detected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (
         UniqueConstraint("session_id", "discord_user_id", name="uq_participant_per_session"),
