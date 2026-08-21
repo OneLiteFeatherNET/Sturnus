@@ -27,6 +27,7 @@ regardless of how many times the poll runs afterwards.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol, cast
 
@@ -68,7 +69,18 @@ def sessions_to_announce(sessions: list[dict[str, object]]) -> list[dict[str, ob
 #: announcement and the completion message with the document link alike --
 #: rather than a hardcoded f-string, so the wording can be adjusted later
 #: without a code change once a per-guild template exists.
-DEFAULT_ANNOUNCEMENT_TEMPLATE = "The transcript for this session is ready: {{ document_url }}"
+#:
+#: The mentions come first, on their own line: a protocol is written for
+#: the people who were in the room, and a link posted into a busy channel
+#: without addressing anyone scrolls past unread -- the same reasoning
+#: `SILENT_AUDIO_WARNING_TEMPLATE` below already applies to naming one
+#: speaker. `{% if %}` rather than an unconditional `{{ mentions }}`, so a
+#: session whose participants are somehow unknown posts the link by itself
+#: instead of a stray blank first line.
+DEFAULT_ANNOUNCEMENT_TEMPLATE = (
+    "{% if mentions %}{{ mentions }}\n{% endif %}"
+    "The transcript for this session is ready: {{ document_url }}"
+)
 
 
 def _build_environment() -> SandboxedEnvironment:
@@ -81,12 +93,37 @@ def _build_environment() -> SandboxedEnvironment:
     return SandboxedEnvironment(autoescape=False, trim_blocks=True, lstrip_blocks=True)
 
 
+def format_mentions(discord_user_ids: Sequence[int]) -> str:
+    """Renders Discord's `<@id>` mention syntax for a session's participants.
+
+    Each id is passed through `int()` first. The ids come from a
+    `BigInteger` column and are already integers, so this converts
+    nothing in practice -- it exists because this environment does not
+    autoescape and the result is posted verbatim into a channel: an id
+    that somehow arrived as a string would otherwise be able to carry
+    `@everyone` into the message. `int()` makes that unrepresentable
+    rather than merely unlikely.
+    """
+    return " ".join(f"<@{int(discord_user_id)}>" for discord_user_id in discord_user_ids)
+
+
 def render_announcement(
-    document_url: str, template_source: str = DEFAULT_ANNOUNCEMENT_TEMPLATE
+    document_url: str,
+    participant_ids: Sequence[int] = (),
+    template_source: str = DEFAULT_ANNOUNCEMENT_TEMPLATE,
 ) -> str:
-    """Renders the Discord announcement text for one finished session's link."""
+    """Renders the Discord announcement text for one finished session's link.
+
+    `participant_ids` defaults to empty so a caller that has no
+    participant list still renders a valid announcement -- the link is
+    the message; the mentions only decide who is told about it.
+    """
     template = _build_environment().from_string(template_source)
-    return template.render(document_url=document_url)
+    return template.render(
+        document_url=document_url,
+        participant_ids=tuple(participant_ids),
+        mentions=format_mentions(participant_ids),
+    )
 
 
 #: Wording for the in-meeting warning that a speaker's audio is arriving
@@ -134,6 +171,12 @@ class SessionReader(Protocol):
         Deliberately unfiltered by `announced_at`/`document_url`: those
         checks are `sessions_to_announce`'s job alone, so there is exactly
         one definition of the selection rule anywhere in the codebase.
+
+        Each row carries a `participant_ids` key -- the Discord ids of
+        everyone recorded in that session, so the announcement can
+        mention them. An implementation that omits the key still works:
+        `announce_ready_sessions` falls back to no mentions rather than
+        failing to post the link.
         """
         ...
 
@@ -174,8 +217,14 @@ async def announce_ready_sessions(
         session_id = cast(int, session["id"])
         channel_id = cast(int, session["channel_id"])
         document_url = cast(str, session["document_url"])
+        # `.get`, not `[...]`: a reader that does not supply participants
+        # loses the mentions, not the announcement itself.
+        participant_ids = cast("Sequence[int]", session.get("participant_ids", ()))
         try:
-            await announcer.post(channel_id, render_announcement(document_url, template_source))
+            await announcer.post(
+                channel_id,
+                render_announcement(document_url, participant_ids, template_source),
+            )
             await sessions.mark_announced(session_id, now)
             log_event(
                 log,

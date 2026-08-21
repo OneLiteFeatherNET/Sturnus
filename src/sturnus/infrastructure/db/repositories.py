@@ -311,17 +311,42 @@ class SessionRepository:
         Filters only by `status`; `announced_at`/`document_url` are left
         for that pure function to check, so there is exactly one
         definition of the selection rule.
+
+        Each row also carries `participant_ids`, the Discord ids the
+        announcement mentions. Read in a second statement over exactly
+        the candidate sessions rather than as a join: a join would
+        multiply each session row by its participant count and leave this
+        method regrouping them anyway, and a session with no participants
+        would need an outer join to survive at all.
         """
         async with self._session_factory() as session:
-            rows = await session.execute(
-                select(
-                    Session.id,
-                    Session.channel_id,
-                    Session.status,
-                    Session.document_url,
-                    Session.announced_at,
-                ).where(Session.status == DOCUMENTED_STATUS)
-            )
+            rows = (
+                await session.execute(
+                    select(
+                        Session.id,
+                        Session.channel_id,
+                        Session.status,
+                        Session.document_url,
+                        Session.announced_at,
+                    ).where(Session.status == DOCUMENTED_STATUS)
+                )
+            ).all()
+            participants: dict[int, list[int]] = {row.id: [] for row in rows}
+            if participants:
+                participant_rows = await session.execute(
+                    select(
+                        SessionParticipant.session_id,
+                        SessionParticipant.discord_user_id,
+                    )
+                    .where(SessionParticipant.session_id.in_(participants))
+                    # Ordered by the row's own id, so the mentions appear
+                    # in the order the speakers first spoke -- stable
+                    # across sweeps, which matters for the retry path:
+                    # a re-posted announcement reads identically.
+                    .order_by(SessionParticipant.id)
+                )
+                for session_id, discord_user_id in participant_rows:
+                    participants[session_id].append(discord_user_id)
             return [
                 {
                     "id": row.id,
@@ -329,6 +354,7 @@ class SessionRepository:
                     "status": row.status,
                     "document_url": row.document_url,
                     "announced_at": row.announced_at,
+                    "participant_ids": tuple(participants[row.id]),
                 }
                 for row in rows
             ]

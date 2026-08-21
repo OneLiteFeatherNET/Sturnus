@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import discord
 import pytest
 
-from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
+from sturnus.infrastructure.discord.announcer import _ALLOWED_MENTIONS, DiscordAnnouncer
 
 CHANNEL_ID = 4242
 
@@ -36,7 +36,7 @@ async def test_it_sends_into_the_channel_it_was_given() -> None:
     await DiscordAnnouncer(client).post(CHANNEL_ID, "hello")
 
     client.get_channel.assert_called_once_with(CHANNEL_ID)
-    channel.send.assert_awaited_once_with("hello")
+    channel.send.assert_awaited_once_with("hello", allowed_mentions=_ALLOWED_MENTIONS)
 
 
 async def test_a_channel_missing_from_the_cache_is_fetched() -> None:
@@ -56,7 +56,7 @@ async def test_a_channel_missing_from_the_cache_is_fetched() -> None:
     await DiscordAnnouncer(client).post(CHANNEL_ID, "hello")
 
     client.fetch_channel.assert_awaited_once_with(CHANNEL_ID)
-    channel.send.assert_awaited_once_with("hello")
+    channel.send.assert_awaited_once_with("hello", allowed_mentions=_ALLOWED_MENTIONS)
 
 
 async def test_a_channel_that_cannot_receive_messages_is_refused_loudly() -> None:
@@ -73,3 +73,25 @@ async def test_a_channel_that_cannot_receive_messages_is_refused_loudly() -> Non
 
     with pytest.raises(ValueError, match=str(CHANNEL_ID)):
         await DiscordAnnouncer(client).post(CHANNEL_ID, "hello")
+
+
+async def test_the_people_a_message_names_are_actually_notified() -> None:
+    """Both messages posted through here mention people on purpose.
+
+    Discord only turns a `<@id>` into a notification when `allowed_mentions`
+    permits it, and discord.py otherwise falls back to a process-wide client
+    setting. Without `users=True` the mentions would still render as chips
+    -- looking entirely correct in the channel -- while notifying nobody,
+    which is the whole reason either message names anyone.
+    """
+    assert _ALLOWED_MENTIONS.users is True
+
+
+async def test_a_posted_message_can_never_notify_a_role_or_the_channel() -> None:
+    """Neither template renders `@everyone` or a role mention, so permitting
+    them could only ever grant reach to something that got into the text by
+    accident. This is the layer that makes that harmless rather than merely
+    improbable.
+    """
+    assert _ALLOWED_MENTIONS.everyone is False
+    assert _ALLOWED_MENTIONS.roles is False
