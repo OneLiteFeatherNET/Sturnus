@@ -527,6 +527,22 @@ stored is actually what is running.
 
 ## 5. Troubleshooting
 
+**A pod is SIGKILLed at 137 shortly after starting, with `connection
+refused` on its probes.** The process is not crashing; its liveness probe
+is killing it while it is still importing. Look at the gap between the
+container's `startedAt` and its first "listening" log line: on 0.6.0 a
+`link` pod took 55 seconds on 200m of CPU, against a liveness budget of
+`initialDelaySeconds + periodSeconds x failureThreshold` = 65 seconds.
+
+Every component has a `startupProbe` for exactly this, and liveness and
+readiness are not evaluated at all until it succeeds. If you see this
+again, the startup budget has been outgrown rather than the process broken
+-- raise `<component>.startupProbe.failureThreshold`, or give the component
+more CPU so it imports faster. `.github/workflows/chart.yml` asserts that
+every component's startup budget exceeds its liveness budget, so the two
+cannot drift apart silently.
+
+
 **`/queue`, the admin command for most of what follows.** `QueueCog`
 (`src/sturnus/infrastructure/discord/queue_cog.py`) adds three subcommands,
 all admin-gated the same way `/setup` and `/config` are (`require_admin`,

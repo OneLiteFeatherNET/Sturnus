@@ -111,6 +111,30 @@ jobs:
                         f'{name} mounts a ReadWriteOnce claim {sorted(claims & rwo_claims)} '
                         f'but its strategy is {strategy!r}, not Recreate')
 
+          # Every component gets a startupProbe, and its budget must exceed
+          # its liveness budget. Without one, liveness starts counting from
+          # `initialDelaySeconds` while the process is still importing, and
+          # a slow start is indistinguishable from a hung one. That is not
+          # hypothetical: 0.6.0 added the OpenTelemetry import graph, `link`
+          # took 55 seconds to reach "listening" on 200m of CPU, and its own
+          # liveness probe SIGKILLed it at 137 -- with the process healthy
+          # and about to serve.
+          for name, dep in deployments.items():
+              container = dep['spec']['template']['spec']['containers'][0]
+              startup = container.get('startupProbe')
+              check(startup is not None,
+                    f'{name} has no startupProbe, so liveness judges it while it is '
+                    f'still starting')
+              if startup is None:
+                  continue
+              startup_budget = startup.get('periodSeconds', 10) * startup.get('failureThreshold', 3)
+              live = container.get('livenessProbe') or {}
+              live_budget = (live.get('initialDelaySeconds', 0)
+                             + live.get('periodSeconds', 10) * live.get('failureThreshold', 3))
+              check(startup_budget > live_budget,
+                    f'{name} allows {startup_budget}s to start but liveness would have '
+                    f'killed it after {live_budget}s; the startupProbe buys nothing')
+
           # podLabels must reach every pod, and must never reach a selector:
           # selectors are immutable on a live Deployment.
           for name, dep in deployments.items():

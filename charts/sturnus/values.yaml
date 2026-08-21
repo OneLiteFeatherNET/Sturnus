@@ -232,6 +232,29 @@ bot:
   # documented `max_session_hours` ceiling plus upload time with margin; size
   # this to the deployed `max_session_hours` if that default ever changes.
   terminationGracePeriodSeconds: 21600
+  # Startup is slower than it looks, and on 0.6.0 it outgrew the liveness
+  # budget: a `link` pod took 55 seconds from container start to "Link
+  # service listening" and was SIGKILLed at 137 by its own liveness probe,
+  # which allows 5 + 3x20 seconds and then gives up.
+  #
+  # The time is import time, not work: the OpenTelemetry SDK and its
+  # exporters are a large import graph, and `bot` has 1 CPU of CPU to do
+  # it with. A startupProbe is exactly the instrument for that -- liveness
+  # and readiness are not evaluated at all until it succeeds, so a slow
+  # start cannot be mistaken for a hung process, and once it succeeds the
+  # normal cadence takes over. `worker` has had one since the model
+  # download made the same point more loudly.
+  #
+  # 5 minutes of budget, which is far more than the 55 seconds observed:
+  # the cost of being generous is that a process genuinely wedged at
+  # startup is noticed later, and the cost of being tight is a crash loop
+  # on a cold node. Only one of those is a working deployment.
+  startupProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    periodSeconds: 10
+    failureThreshold: 30
   livenessProbe:
     httpGet:
       path: /healthz
@@ -277,6 +300,29 @@ link:
     limits:
       cpu: 200m
       memory: 128Mi
+  # Startup is slower than it looks, and on 0.6.0 it outgrew the liveness
+  # budget: a `link` pod took 55 seconds from container start to "Link
+  # service listening" and was SIGKILLed at 137 by its own liveness probe,
+  # which allows 5 + 3x20 seconds and then gives up.
+  #
+  # The time is import time, not work: the OpenTelemetry SDK and its
+  # exporters are a large import graph, and `link` has 200m of CPU to do
+  # it with. A startupProbe is exactly the instrument for that -- liveness
+  # and readiness are not evaluated at all until it succeeds, so a slow
+  # start cannot be mistaken for a hung process, and once it succeeds the
+  # normal cadence takes over. `worker` has had one since the model
+  # download made the same point more loudly.
+  #
+  # 5 minutes of budget, which is far more than the 55 seconds observed:
+  # the cost of being generous is that a process genuinely wedged at
+  # startup is noticed later, and the cost of being tight is a crash loop
+  # on a cold node. Only one of those is a working deployment.
+  startupProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    periodSeconds: 10
+    failureThreshold: 30
   livenessProbe:
     httpGet:
       path: /healthz
