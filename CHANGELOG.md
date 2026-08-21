@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.5.0...v0.5.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* **worker:** close the veto that switched off Whisper's own silence check ([#46](https://github.com/OneLiteFeatherNET/Sturnus/issues/46)) ([455b200](https://github.com/OneLiteFeatherNET/Sturnus/commit/455b2008baf452713a1278448580bdffdfb35cd2))
+
 ## [0.5.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.4.0...v0.5.0) (2026-08-20)
 
 
