@@ -1,3 +1,4 @@
+import logging
 import wave
 from pathlib import Path
 from typing import Any
@@ -61,19 +62,23 @@ async def test_silence_yields_no_segments(engine: WhisperEngine, tmp_path: Path)
 
 
 class _FakeSegment:
-    """The four attributes `_transcribe` reads off a faster-whisper segment.
+    """The three attributes `_transcribe` reads off a faster-whisper segment.
 
-    `no_speech_prob` defaults to 0.0 -- the model saying "this window was
-    certainly speech" -- so every test written before the filter existed keeps
-    meaning exactly what it meant: the segment it hands back is one the filter
-    has no reason to touch.
+    Deliberately still three. An earlier attempt at the hallucination guard
+    filtered on a fourth, `no_speech_prob`, and this fake grew a field for it.
+    That filter is gone: `no_speech_prob` is one value per decoded 30-second
+    window, copied onto every `Segment` cut out of that window
+    (`faster_whisper/transcribe.py:1364`), so reading it here as if it were a
+    per-segment verdict made the adapter claim a precision the number does not
+    have. The judgement is now made by the library, at the window, via
+    `log_prob_threshold=None` -- see
+    `test_the_veto_on_the_no_speech_skip_is_closed_explicitly`.
     """
 
-    def __init__(self, start: float, end: float, text: str, no_speech_prob: float = 0.0) -> None:
+    def __init__(self, start: float, end: float, text: str) -> None:
         self.start = start
         self.end = end
         self.text = text
-        self.no_speech_prob = no_speech_prob
 
 
 class _FakeInfo:
@@ -224,16 +229,14 @@ async def test_the_decoder_side_hallucination_guards_stay_set(tmp_path: Path) ->
 
     An amplitude test admits hum, keyboard clatter and cross-talk that Silero
     would have excluded. That is decode time wasted rather than a correctness
-    bug only because the decoder's own output is filtered afterwards (Spec 7).
+    bug only because the decoder keeps filtering its own output (Spec 7).
 
-    These two thresholds are the part of that filtering the library does. They
-    are necessary and they are not sufficient: a short subtitle credit invented
-    on room tone is fluent and unrepetitive, so `compression_ratio_threshold`
-    cannot see it, and `no_speech_threshold` is vetoed on this path by
-    `log_prob_threshold`. `no_speech_prob` is therefore checked again on our
-    side of the call -- see
-    `test_a_segment_the_model_thinks_was_silence_is_dropped`. Both stay set:
-    each still does its own job, and dropping a partial guard because a hole
+    `compression_ratio_threshold` catches the long repetition cascades and
+    cannot in principle catch a short subtitle credit, which compresses like
+    any other four-word phrase. `no_speech_threshold` is the one that catches
+    the credit -- but only once its veto is removed, which is what
+    `test_the_veto_on_the_no_speech_skip_is_closed_explicitly` pins. Both stay
+    set: each does its own job, and dropping a partial guard because a hole
     was found in one of its paths leaves no guard at all.
     """
     recording = tmp_path / "speech.wav"
@@ -266,104 +269,125 @@ async def test_offsets_are_returned_unchanged(tmp_path: Path) -> None:
     assert [(s.start, s.end, s.text) for s in result.segments] == [(5.25, 6.75, " hallo")]
 
 
-async def test_a_segment_the_model_thinks_was_silence_is_dropped(tmp_path: Path) -> None:
-    """The guard against invented subtitle credits, which nothing else catches.
+async def test_the_veto_on_the_no_speech_skip_is_closed_explicitly(tmp_path: Path) -> None:
+    """`log_prob_threshold=None`, which is what actually catches the credits.
 
-    Fed a short fragment of room tone, Whisper writes the text that follows the
-    last line of dialogue in the subtitle files it was trained on -- in
-    production, `" Untertitelung des ZDF, 2020"`, and before the language was
-    pinned, `" Thank you."` and `" Copyright WDR 2021"`. A four-word credit is
-    fluent and unrepetitive, so it sails past `compression_ratio_threshold`,
-    and its `avg_logprob` is *better* than real speech's because a credit is a
-    high-probability token sequence -- which is precisely why the model reaches
-    for one when it has nothing to transcribe. `no_speech_prob` was the only
-    quantity measured that separated the two classes at all.
+    Everything else in this adapter is set to a number. This one is set to
+    `None`, and that is the whole point, so it needs its own test: an argument
+    whose value is the absence of a value is exactly the kind that gets tidied
+    away by someone who reads it as a leftover.
 
-    Both probabilities are literals taken from that measurement -- 0.906 was an
-    observed hallucination, 0.453 the hardest real case (an isolated 0.4 s word
-    decoded alone in its window) -- and deliberately *not* derived from
-    `_NO_SPEECH_LIMIT`. A test that probes with a value computed from the
-    constant it claims to pin passes for every value of that constant,
-    including the ones that throw away every real word or keep every credit.
+    What it does. In the sequential path faster-whisper decides silence like
+    this (`transcribe.py:1215-1233`)::
 
-    Both segments arrive from the same call, because the filter has to be a
-    per-segment judgement: a track where the speaker says one sentence and then
-    leaves the room must keep the sentence and drop what follows it.
+        should_skip = result.no_speech_prob > options.no_speech_threshold
+        if (options.log_prob_threshold is not None
+                and avg_logprob > options.log_prob_threshold):
+            should_skip = False
+
+    `log_prob_threshold` is not a floor that rejects low-confidence output --
+    on this path it is a *veto on the no-speech skip*. Its -1.0 default, which
+    Sturnus used to inherit, therefore switches `no_speech_threshold` off for
+    any decode fluent enough to clear -1.0. A subtitle credit is a
+    high-probability token sequence -- that is why the model reaches for one
+    when it has nothing to transcribe -- so `" Untertitelung des ZDF, 2020"`
+    at an `avg_logprob` of about -0.88 disabled the very guard aimed at it.
+    Measured through this call path: with the veto in place, 11 of 111
+    non-speech inputs came back carrying invented text; with
+    `log_prob_threshold=None`, 0 of 111 did.
+
+    That also explains a dead end worth not repeating: lowering
+    `no_speech_threshold` to 0.4 was measured to change nothing at all,
+    because the veto fires whatever the threshold is.
     """
     recording = tmp_path / "speech.wav"
     _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
-    model = _RecordingModel(
-        segments=(
-            _FakeSegment(0.0, 1.5, " Guten Morgen.", no_speech_prob=0.453),
-            _FakeSegment(1.5, 2.0, " Untertitelung des ZDF, 2020", no_speech_prob=0.906),
-        )
-    )
-    engine = _engine_with(model)
+    engine = _engine_with(model := _RecordingModel())
 
-    result = await engine.transcribe(recording, language="de", initial_prompt=None)
+    await engine.transcribe(recording, language="de", initial_prompt=None)
 
-    assert [s.text for s in result.segments] == [" Guten Morgen."]
+    assert model.calls[0]["log_prob_threshold"] is None
 
 
-async def test_a_track_of_nothing_but_hallucination_yields_no_segments(
-    tmp_path: Path,
+async def test_a_track_the_decoder_emptied_says_so_in_the_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The production case: a track on which nobody spoke, and only credits came back.
+    """A guard whose cost never shows up anywhere is one nobody can audit.
 
-    Two short recordings failed this way on the same day, one of them yielding
-    the same invented credit twice. The gate is an amplitude test and admits
-    room tone, so the model does get called and does return something. What
-    must not survive is the something.
-    An empty protocol is obviously empty and sends its reader to ask a person;
-    a protocol carrying `" Untertitelung des ZDF, 2020"` under a named
-    participant's name, timestamped and set in the same typeface as everything
-    real, looks like a result and is unfalsifiable by anyone who was not in the
-    room.
+    This is the shape of the guard firing: the gate found audio above the
+    silence floor, the model was called on it, and every decoded window came
+    back judged as silence, so the speaker contributes nothing to the
+    document. That is the intended outcome for a track of room tone and the
+    failure mode for a track of quiet speech, and the two are indistinguishable
+    from inside this adapter -- which is precisely why it has to be visible
+    from outside it.
 
-    The detected language deliberately survives the filter. It is only ever
-    stored (`worker.py`, `assembly.py`) and never used to select or reject
-    content, so resetting it here would be a branch pinning nothing.
+    The line carries the gated duration rather than only a count, because that
+    is the number that separates the two readings: 0.9 s of room tone dropped
+    is the guard working, 40 minutes dropped is an incident.
     """
     recording = tmp_path / "roomtone.wav"
     _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
-    model = _RecordingModel(
-        segments=(
-            _FakeSegment(1.4, 3.1, " Untertitelung des ZDF, 2020", no_speech_prob=0.711),
-            _FakeSegment(15.8, 17.0, " Untertitelung des ZDF, 2020", no_speech_prob=0.906),
-        )
-    )
-    engine = _engine_with(model)
+    engine = _engine_with(_RecordingModel(segments=()))
 
-    result = await engine.transcribe(recording, language="de", initial_prompt=None)
+    with caplog.at_level(logging.WARNING, logger="sturnus.infrastructure.whisper"):
+        result = await engine.transcribe(recording, language="de", initial_prompt=None)
 
     assert result.segments == ()
-    assert result.language == "de"
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "roomtone.wav" in message
+    # 2.3 s, and none of the other three numbers this file offers. The
+    # recording is 3.0 s long and holds a 2.0 s tone; the gate widens that
+    # tone by `_HANGOVER_SECONDS` at the end and clamps it at the start,
+    # yielding the 2.25 s it actually handed the decoder. So this also fails
+    # if the message reports the file length, the tone length, or a count of
+    # clips dressed up as seconds.
+    assert "2.3 s" in message, message
 
 
-async def test_a_missing_no_speech_probability_is_an_error_and_not_a_pass(
-    tmp_path: Path,
+async def test_a_track_that_produced_text_is_not_reported_as_a_loss(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """Read the attribute directly; never `getattr(segment, ..., 0.0)`.
+    """The counterpart, and the reason the level is WARNING and not INFO.
 
-    A default would turn a renamed library field into a guard that silently
-    stops guarding, which is how this defect reached production the first time:
-    the parameters meant to catch it were set and did nothing. `info.language`
-    next to it *is* read with `getattr`, because a missing language has a sane
-    fallback and a missing no-speech probability does not.
+    Most jobs transcribe fine. If the ordinary case warned too, the warning
+    would carry no information and would be filtered out by the first person
+    who reads the worker's logs -- taking the case that matters with it.
     """
-
-    class _SegmentWithoutTheField:
-        def __init__(self) -> None:
-            self.start = 0.0
-            self.end = 1.0
-            self.text = " hallo"
-
     recording = tmp_path / "speech.wav"
     _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
-    engine = _engine_with(_RecordingModel(segments=(_SegmentWithoutTheField(),)))  # type: ignore[arg-type]
+    engine = _engine_with(_RecordingModel(segments=(_FakeSegment(0.0, 1.5, " Guten Morgen."),)))
 
-    with pytest.raises(AttributeError):
+    with caplog.at_level(logging.WARNING, logger="sturnus.infrastructure.whisper"):
+        result = await engine.transcribe(recording, language="de", initial_prompt=None)
+
+    assert [s.text for s in result.segments] == [" Guten Morgen."]
+    assert caplog.records == []
+
+
+async def test_the_transcribed_text_is_never_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """What a participant said is the one thing this adapter must not emit.
+
+    The worker's logs are not the protocol and are not access-controlled like
+    it: the document goes to a named Outline collection, the logs go wherever
+    the cluster ships them. The counting added for auditability must count,
+    not quote -- the same rule `infrastructure/documents/outline.py` follows
+    when it logs a request without its body.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    secret = " Wir kuendigen den Vertrag mit Beispiel GmbH."
+    engine = _engine_with(_RecordingModel(segments=(_FakeSegment(0.0, 1.5, secret),)))
+
+    with caplog.at_level(logging.DEBUG, logger="sturnus.infrastructure.whisper"):
         await engine.transcribe(recording, language="de", initial_prompt=None)
+
+    assert caplog.records, "the debug trace exists at all, so this is not vacuous"
+    assert "Vertrag" not in caplog.text
+    assert "Beispiel" not in caplog.text
 
 
 async def test_an_undetected_language_falls_back_to_the_default(tmp_path: Path) -> None:
@@ -495,9 +519,16 @@ async def test_the_hallucination_guards_are_still_in_place(spy: _ModelSpy) -> No
     padding `SpeakerWriter` writes between packets, and it reported about
     one second of speech in two minutes of a real recording. The silence is
     now cut by `sturnus.infrastructure.speech_gate` before the decoder sees
-    it, so the guard is the clip list plus the two thresholds below, and
+    it, so the guard is the clip list plus the three arguments below, and
     turning Silero back on would restore the defect rather than a
     safeguard.
+
+    The third of those is `log_prob_threshold`, and it is asserted here as
+    well as in `test_the_veto_on_the_no_speech_skip_is_closed_explicitly`
+    on purpose. This is the roll-up a reader consults to learn what the
+    guards *are*; a list that named only the two thresholds would teach them
+    that `no_speech_threshold` works on its own, which is the belief this
+    defect was shipped under. The focused test carries the mechanism.
     """
     await _engine().transcribe(FIXTURE, "de", None)
     assert spy.transcription["vad_filter"] is False
@@ -511,6 +542,7 @@ async def test_the_hallucination_guards_are_still_in_place(spy: _ModelSpy) -> No
     assert clips and len(clips) % 2 == 0
     assert spy.transcription["compression_ratio_threshold"] == 2.4
     assert spy.transcription["no_speech_threshold"] == 0.6
+    assert spy.transcription["log_prob_threshold"] is None
 
 
 async def test_the_pinned_language_reaches_the_library(spy: _ModelSpy) -> None:

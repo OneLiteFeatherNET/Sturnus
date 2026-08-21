@@ -24,7 +24,6 @@ from sturnus.infrastructure.speech_gate import (
     _BLOCK_FRAMES,
     _FRAME_SAMPLES,
     _HANGOVER_SECONDS,
-    _MERGE_GAP_SECONDS,
     _frame_peaks,
     speech_clips,
 )
@@ -272,11 +271,21 @@ def test_clips_are_ascending_and_do_not_overlap() -> None:
     Its seek loop advances monotonically and skips any clip whose end it has
     already passed, so an out-of-order or overlapping pair would silently
     drop audio instead of failing loudly.
+
+    The 6.0 s separator is a literal, and the same literal
+    `test_bursts_separated_by_a_long_gap_stay_separate` uses, for the same
+    reason: written as `_MERGE_GAP_SECONDS * 2.0` it stayed twice the constant
+    for every value of it, so `assert len(clips) == 6` held whatever the merge
+    gap was and the test pinned nothing. 6.0 s leaves 5.5 s of real separation
+    after `_HANGOVER_SECONDS` widens each burst by 0.25 s at both ends, which
+    must come back as six clips and not fewer. Verified by mutation:
+    `_MERGE_GAP_SECONDS = 6.5` merges all six into one and fails this; under
+    the old form it passed.
     """
     pieces = [_zeros(1.0)]
     for _ in range(6):
         pieces.append(_tone(0.5))
-        pieces.append(_zeros(_MERGE_GAP_SECONDS * 2.0))
+        pieces.append(_zeros(6.0))
     audio = np.concatenate(pieces)
 
     clips = speech_clips(audio)

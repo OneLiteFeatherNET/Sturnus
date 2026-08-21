@@ -8,7 +8,11 @@ hands the flattened list to `build_transcript` from Plan 1, which owns the
 ordering and block-merging rules. `assemble` itself makes exactly one
 substantive decision: a speaker with no audio epoch never actually spoke,
 so they contribute no segments rather than being placed, wrongly, at the
-session's start.
+session's start -- and, for the same reason, is not counted as an attendee.
+Everyone who *does* have an epoch is passed to `build_transcript` as the
+recorded roster, separately from their segments, because a recorded speaker
+can produce no text at all (see `sturnus.infrastructure.whisper`) and the
+attendee list must not read that as absence.
 
 `sessions`, `jobs` and `links` are typed as local `Protocol`s rather than
 the concrete repositories, for the same reason `sturnus.application.
@@ -128,6 +132,7 @@ async def assemble(
     transcripts = await jobs.transcripts_for(session_id)
 
     segments: list[Segment] = []
+    recorded: list[SpeakerIdentity] = []
     for discord_user_id, result in transcripts.items():
         epoch = await sessions.audio_epoch(session_id, discord_user_id)
         if epoch is None:
@@ -143,6 +148,23 @@ async def assemble(
             external_user_id=external[0] if external is not None else None,
             external_display_name=external[1] if external is not None else None,
         )
+        # Collected whether or not the transcription produced anything, and
+        # handed to `build_transcript` separately from the segments. A speaker
+        # can reach this point with an empty transcript because
+        # faster-whisper judged every one of their decoded windows to be
+        # silence (`sturnus.infrastructure.whisper`), and deriving the
+        # attendee list from the segments alone would then let the protocol
+        # report that they were not at the meeting. The audio epoch just
+        # checked above is the evidence they were: it is written when their
+        # first packet arrives, so having one means audio of them exists,
+        # which is a different question from whether any of it became text.
+        recorded.append(speaker)
         segments.extend(to_absolute(result, epoch.astimezone(tz), speaker))
 
-    return build_transcript(segments, started_at.astimezone(tz), ended_at.astimezone(tz), merge_gap)
+    return build_transcript(
+        segments,
+        started_at.astimezone(tz),
+        ended_at.astimezone(tz),
+        merge_gap,
+        recorded=recorded,
+    )
