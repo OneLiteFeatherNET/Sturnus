@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.6.0...v0.7.0) (2026-08-21)
+
+
+### Features
+
+* **publishing:** mention every recorded speaker when the link is posted ([#53](https://github.com/OneLiteFeatherNET/Sturnus/issues/53)) ([ee4019f](https://github.com/OneLiteFeatherNET/Sturnus/commit/ee4019f619b07ef9e3f49d6d584e032aa3aac1e8))
+
+
+### Bug Fixes
+
+* **chart:** let every component finish starting before liveness judges it ([#52](https://github.com/OneLiteFeatherNET/Sturnus/issues/52)) ([f8776c5](https://github.com/OneLiteFeatherNET/Sturnus/commit/f8776c5da9a9ab880904722986efee1990d88918))
+
 ## [0.6.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.5.1...v0.6.0) (2026-08-21)
 
 
