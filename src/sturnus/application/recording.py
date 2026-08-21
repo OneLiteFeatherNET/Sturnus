@@ -11,6 +11,7 @@ with fakes.
 from __future__ import annotations
 
 import contextlib
+import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
@@ -22,8 +23,12 @@ from sturnus.application.ports import (
     Encryptor,
     SessionKey,
 )
+from sturnus.application.publishing import Announcer, render_silent_audio_warning
 from sturnus.domain.session import EndReason, SessionMachine, SessionState, SessionTimeouts
+from sturnus.domain.silence import SILENCE_EVIDENCE_SECONDS, SilentAudioWatch
 from sturnus.domain.timeline import SpeakerClock
+
+log = logging.getLogger(__name__)
 
 
 def audio_key(session_id: int, discord_user_id: int) -> str:
@@ -52,6 +57,19 @@ class SessionRecorder(Protocol):
     async def set_audio_epoch(
         self, session_id: int, discord_user_id: int, at: datetime
     ) -> None: ...
+
+    async def record_silent_audio(
+        self, session_id: int, discord_user_id: int, at: datetime
+    ) -> None:
+        """Records that this speaker's audio arrived carrying no audible level.
+
+        Written once, at the moment the case is established, so that an
+        operator reading the session afterwards can tell a broken capture
+        path from a room in which nobody said anything -- the question two
+        empty transcripts left unanswerable. The warning posted into the
+        channel is gone by the next meeting; this is what survives it.
+        """
+        ...
 
     async def close_session(self, session_id: int, ended_at: datetime, reason: str) -> None: ...
 
@@ -113,9 +131,14 @@ class RecordingService:
     packets on an absolute timeline, and one `AudioWriter` per speaker who
     has actually spoken. Every collaborator that reaches outward -- the
     session and job repositories, the object store, the audio writers, the
-    encryptor -- is reached through a port or a narrow protocol, so this
-    class never touches Discord, SQL, S3, the filesystem's audio format, or
-    a crypto library directly.
+    encryptor, the announcer -- is reached through a port or a narrow
+    protocol, so this class never touches Discord, SQL, S3, the
+    filesystem's audio format, or a crypto library directly.
+
+    It speaks into the channel exactly once, and only about a fault it can
+    see and the room cannot: audio arriving from a speaker with no audible
+    level in it (`_report_silent_audio`). Everything else it has to say
+    about a session it says by writing it down.
     """
 
     def __init__(
@@ -128,6 +151,7 @@ class RecordingService:
         store: AudioStore,
         writers: AudioWriterFactory,
         encryptor: Encryptor,
+        announcer: Announcer,
         retention_days: int,
         channel_name: str | None = None,
     ) -> None:
@@ -144,8 +168,18 @@ class RecordingService:
         self._store = store
         self._writer_factory = writers
         self._encryptor = encryptor
+        #: The only way this service says anything to the people it is
+        #: recording. Reached through the same `Announcer` port the link
+        #: publisher already posts through, rather than a second route out
+        #: to Discord, so this layer still has no idea Discord exists.
+        self._announcer = announcer
         self._retention_days = retention_days
 
+        #: Watches each speaker's amplitude for audio that arrives and
+        #: decodes but carries nothing (`sturnus.domain.silence`). Rebuilt
+        #: per session in `reset()`, like `_clock`, so "once per speaker"
+        #: means once per session.
+        self._silence = SilentAudioWatch()
         self._session_id: int | None = None
         self._data_key: SessionKey | None = None
         self._writers: dict[int, AudioWriter] = {}
@@ -271,6 +305,67 @@ class RecordingService:
 
         writer.write(at, pcm)
         self._machine.audio_received(now)
+
+        # Last, and only after the audio itself is safely written: this is
+        # a report about the recording, never a step in making it. The
+        # watch reads amplitude and nothing else -- no sample is kept,
+        # logged or passed on -- and answers `True` exactly once per
+        # speaker per session, on the packet that completes the case.
+        if self._silence.observe(discord_user_id, pcm):
+            await self._report_silent_audio(discord_user_id, display_name, at)
+
+    async def _report_silent_audio(
+        self, discord_user_id: int, display_name: str, at: datetime
+    ) -> None:
+        """Says, three ways, that this speaker's audio is arriving empty.
+
+        Three, because each survives something the others do not. The log
+        line reaches the operator watching the pod and is the one thing
+        that cannot itself fail. The channel message reaches the meeting
+        while it can still act -- at the end it would be worthless, since
+        the recording is already lost. The participant row outlives both
+        and is what turns "the transcript is empty" into an answerable
+        question weeks later.
+
+        Each of the two that can fail is guarded on its own rather than
+        together: a Discord rate limit must not swallow the durable
+        record, and a database hiccup must not swallow the message that
+        could still get somebody's microphone fixed. Neither may reach the
+        caller at all -- `voice_packet` is the capture path, and a warning
+        that took the recording down with it would be worse than no
+        warning.
+        """
+        assert self._session_id is not None
+        log.warning(
+            "Audio from %s (id %d) in session %d has been arriving for %ds with no "
+            "audible level: packets are being received and decoded, and every sample in "
+            "them is at the noise floor. This is what a microphone muted at system level "
+            "produces, and it transcribes to nothing. Recording continues.",
+            display_name,
+            discord_user_id,
+            self._session_id,
+            SILENCE_EVIDENCE_SECONDS,
+        )
+        try:
+            await self._announcer.post(
+                self._channel_id, render_silent_audio_warning(discord_user_id)
+            )
+        except Exception as exc:
+            log.warning(
+                "Could not post the silent-audio warning for id %d into channel %d: %s",
+                discord_user_id,
+                self._channel_id,
+                exc,
+            )
+        try:
+            await self._sessions.record_silent_audio(self._session_id, discord_user_id, at)
+        except Exception as exc:
+            log.warning(
+                "Could not record silent audio for id %d on session %d: %s",
+                discord_user_id,
+                self._session_id,
+                exc,
+            )
 
     def request_close(self, reason: EndReason) -> None:
         """Arms an out-of-band close that the next `tick()` acts on.
@@ -413,6 +508,7 @@ class RecordingService:
         assert self._closed, "reset() must only follow close()"
         self._machine.reset()
         self._clock = SpeakerClock()
+        self._silence = SilentAudioWatch()
         self._session_id = None
         self._data_key = None
         self._writers = {}

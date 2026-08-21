@@ -87,6 +87,42 @@ def render_announcement(
     return template.render(document_url=document_url)
 
 
+#: Wording for the in-meeting warning that a speaker's audio is arriving
+#: with nothing audible in it (`sturnus.domain.silence`). Posted publicly
+#: into the recording channel and naming the person, which is a deliberate
+#: choice over a direct message: whoever is muted at system level is
+#: usually the last to notice, and somebody else in the room can help.
+#:
+#: Every word of it is load-bearing. It states what was observed rather
+#: than what somebody did wrong, it names the one cause that explains
+#: audio arriving at zero level, and it says the recording continues --
+#: without that last sentence the message reads as "you are not being
+#: recorded", which is false and would send people out of the meeting to
+#: fix something that is not broken.
+#:
+#: Rendered through the same sandboxed engine as the announcement above,
+#: for the same reason (Spec 8.2: one engine for every Discord message
+#: this system posts), so the wording can move to a per-guild template
+#: later without a code change.
+SILENT_AUDIO_WARNING_TEMPLATE = (
+    "Audio is arriving from <@{{ discord_user_id }}> but at no audible level. "
+    "The microphone is most likely muted at system level. Recording continues."
+)
+
+
+def render_silent_audio_warning(
+    discord_user_id: int, template_source: str = SILENT_AUDIO_WARNING_TEMPLATE
+) -> str:
+    """Renders the public warning for one speaker whose audio carries no level.
+
+    `<@id>` is Discord's mention syntax; the id is an integer taken from
+    the voice packet itself, so nothing user-controlled reaches the
+    template even though this environment does not autoescape.
+    """
+    template = _build_environment().from_string(template_source)
+    return template.render(discord_user_id=discord_user_id)
+
+
 class SessionReader(Protocol):
     """Where announcement candidates are read from and `announced_at` is stamped."""
 

@@ -496,6 +496,51 @@ stored is actually what is running.
 
 ## 5. Troubleshooting
 
+**A speaker's audio arrives with no level.** During a meeting the bot may
+post, into the recording channel and naming the person:
+
+> Audio is arriving from @Name but at no audible level. The microphone is
+> most likely muted at system level. Recording continues.
+
+That message means something narrower than "it is quiet", and the
+distinction is the whole point. Three states exist and only the third is
+reported:
+
+| What is happening | Reported? |
+|---|---|
+| No packets at all from that speaker | No — they are not speaking, which is normal |
+| Packets arrive but will not decode | No — that is `EndReason.DECODE_FAILURE`, section 5 below |
+| Packets arrive, decode, and every sample stays at the noise floor | **Yes** |
+
+It fires after 30 seconds of *received* audio at the noise floor
+(`SILENCE_EVIDENCE_SECONDS` in `sturnus/domain/silence.py`), counted in
+bytes of PCM rather than wall-clock — somebody who transmits nothing for
+half an hour has produced no evidence about their microphone and is never
+warned. Any audible packet discards that speaker's evidence and starts
+over. Once per speaker per session, never repeated.
+
+The usual cause is a microphone muted below Discord: in the operating
+system's mixer, on the device itself, or a hardware mute switch. Discord's
+own mute sends no packets at all and therefore never triggers this.
+
+It is also recorded, so it can be seen after the fact:
+
+```sql
+SELECT discord_display_name, silent_audio_detected_at
+FROM session_participant WHERE session_id = <id>;
+```
+
+A row with `silent_audio_detected_at` set will have contributed an empty
+or near-empty transcript. That is the signal to look at before concluding
+that Whisper failed: a transcript of one short hallucinated phrase over a
+long recording is what silence looks like after transcription, not what a
+broken model looks like.
+
+Only amplitude is ever measured. No sample is buffered, logged or sent
+anywhere, which is why this applies equally to people who have not
+consented — a peak is a number about loudness, not about content.
+
+
 **A job is `dead`.** `transcription_job.status` becomes `dead` once
 `attempts` reaches the worker's configured retry limit
 (`JobQueue.fail`). A dead job is deliberately excluded from the
