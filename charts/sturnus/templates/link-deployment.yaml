@@ -60,6 +60,10 @@ spec:
             - name: health
               containerPort: {{ .Values.healthPort }}
               protocol: TCP
+          {{- with .Values.link.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           {{- with .Values.link.livenessProbe }}
           livenessProbe:
             {{- toYaml . | nindent 12 }}
