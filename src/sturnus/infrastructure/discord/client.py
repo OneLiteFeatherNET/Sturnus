@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -49,7 +50,7 @@ from sturnus.application.reconfigure import (
     RunningState,
     plan_reconfigure,
 )
-from sturnus.application.recording import RecordingService
+from sturnus.application.recording import JobQueue, RecordingService
 from sturnus.domain import settings
 from sturnus.domain.session import EndReason, SessionTimeouts
 from sturnus.infrastructure.db.config_store import ConfigStore
@@ -57,7 +58,6 @@ from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
     ConsentRepository,
-    JobRepository,
     SessionRepository,
 )
 from sturnus.infrastructure.discord.about_cog import AboutCog
@@ -68,9 +68,18 @@ from sturnus.infrastructure.discord.consent_cog import ConsentCog
 from sturnus.infrastructure.discord.link_cog import LinkCog
 from sturnus.infrastructure.discord.queue_cog import QueueCog
 from sturnus.infrastructure.discord.setup_cog import SetupCog
-from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter
+from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter, voice_close_code
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState
+from sturnus.infrastructure.telemetry import (
+    SESSION_ACTIVE,
+    SESSION_CLOSE_DURATION,
+    SESSION_DURATION,
+    fail_span,
+    record,
+    span,
+)
+from sturnus.observability.events import Event, log_event, log_exception
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +134,19 @@ class _GuildRecording:
     #: loop once it has passed -- a guard that only an operator can clear
     #: turns a transient fault into an outage.
     blocked_until: datetime | None = None
+    #: Monotonic timestamp of the moment this guild's session started
+    #: recording, or `None` when it is idle. Kept here rather than on
+    #: `RecordingService` because it exists purely to feed
+    #: `sturnus.session.duration` and `sturnus.session.active`, and
+    #: `RecordingService` is `application` code that may not know
+    #: OpenTelemetry exists.
+    #:
+    #: It is also the idempotence key for `_record_session_close`: a
+    #: session can now reach its close through the sweep, through
+    #: `/config apply force:true` and through `graceful_shutdown`, and
+    #: `sturnus.session.active` must be decremented exactly once whichever
+    #: of them gets there.
+    started_monotonic: float | None = None
 
     @property
     def channel_id(self) -> int:
@@ -145,7 +167,13 @@ class SturnusClient(commands.Bot):
         config_store: ConfigStore,
         consent_repo: ConsentRepository,
         session_repo: SessionRepository,
-        job_repo: JobRepository,
+        # Typed against the narrow `JobQueue` port rather than the concrete
+        # `JobRepository`: the only thing this class does with it is hand it
+        # to `RecordingService`, and `sturnus.entrypoints.bot` passes a
+        # `TracedJobQueue` wrapper around the real repository. Widening it
+        # here is what lets the tracing decorator be applied at the
+        # composition root instead of reaching into this class.
+        job_repo: JobQueue,
         audio_store: AudioStore,
         writer_factory: AudioWriterFactory,
         encryptor: Encryptor,
@@ -261,7 +289,13 @@ class SturnusClient(commands.Bot):
         for guild in self.guilds:
             await self.reconcile_guild(guild.id)
         self._readiness.discord_connected = True
-        log.info("Connected to Discord; configured for %d guild(s)", len(self._guilds))
+        log_event(
+            log,
+            logging.INFO,
+            Event.BOT_CONNECTED,
+            "Connected to Discord",
+            count=len(self._guilds),
+        )
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
         """Configures a guild that invited the bot while the process was running.
@@ -295,12 +329,35 @@ class SturnusClient(commands.Bot):
         channel = snapshot.get(settings.VOICE_CHANNEL_ID)
         role = snapshot.get(settings.CONSENT_ROLE_ID)
         if channel is None or role is None:
-            self._notice(
+            # `missing` is the addition that matters: the prose line says a
+            # guild is unconfigured without saying which key is absent, so
+            # the operator's next step was always "run /config show and read
+            # it yourself". Emitted behind `_notice`'s return value rather
+            # than beside it, so the structured line inherits the same
+            # per-guild deduplication -- a guild nobody has configured is
+            # reconciled every ten seconds forever.
+            if self._notice(
                 guild_id,
                 "Guild %d is missing voice_channel_id and/or consent_role_id; "
                 "an administrator must run /config show to see what's missing.",
                 guild_id,
-            )
+            ):
+                log_event(
+                    log,
+                    logging.WARNING,
+                    Event.GUILD_UNCONFIGURED,
+                    "Guild cannot record: required configuration is missing. "
+                    "An administrator must run /config show.",
+                    guild_id=guild_id,
+                    missing=[
+                        key
+                        for key, value in (
+                            (settings.VOICE_CHANNEL_ID, channel),
+                            (settings.CONSENT_ROLE_ID, role),
+                        )
+                        if value is None
+                    ],
+                )
             return None
         try:
             desired = GuildRuntimeConfig(
@@ -326,18 +383,28 @@ class SturnusClient(commands.Bot):
         self._clear_notice(guild_id)
         return desired
 
-    def _notice(self, guild_id: int, message: str, *args: object) -> None:
+    def _notice(self, guild_id: int, message: str, *args: object) -> bool:
         """Logs a per-guild configuration complaint once, not once per tick.
 
         Deduplicated on the *rendered* text, not the template, so a value
         that changes from one bad state to another is reported again while
         the same complaint repeating every ten seconds is not.
+
+        Returns whether this call was the one that logged, so a caller with
+        a structured `log_event` to emit alongside the prose can hang it off
+        the same deduplication instead of building a second one that drifts.
+
+        The rendered text goes through `%s` rather than being the format
+        string: `LogRecord.msg` stays a literal, which is the one thing
+        `sturnus.infrastructure.observability.scrub_event` forwards to
+        Sentry.
         """
         rendered = message % args
         if self._config_notices.get(guild_id) == rendered:
-            return
+            return False
         self._config_notices[guild_id] = rendered
         log.warning("%s", rendered)
+        return True
 
     def _clear_notice(self, guild_id: int) -> None:
         """Forgets a guild's last complaint, so a fixed value is reported again."""
@@ -566,10 +633,13 @@ class SturnusClient(commands.Bot):
         self._guilds[guild_id] = _GuildRecording(
             config=desired, service=service, voice=self._make_voice(service)
         )
-        log.info(
-            "Guild %d is now configured; watching voice channel %d.",
-            guild_id,
-            desired.channel_id,
+        log_event(
+            log,
+            logging.INFO,
+            Event.GUILD_CONFIGURED,
+            "Guild is armed to record; watching its voice channel",
+            guild_id=guild_id,
+            channel_id=desired.channel_id,
         )
         await self._sync_participants(self.get_guild(guild_id), self._guilds[guild_id])
 
@@ -685,6 +755,19 @@ class SturnusClient(commands.Bot):
         was_recording = recording.service.is_recording
         await recording.service.participants_changed(consented_count, self._clock.now())
         if recording.service.is_recording and not was_recording:
+            # The session's bookkeeping opens here, not inside
+            # `_start_capture`. The session row exists from this moment
+            # whether or not `join()` then works, and `_start_capture`
+            # deliberately swallows a failed join into
+            # `EndReason.CAPTURE_FAILURE` -- so the close path decrements
+            # `sturnus.session.active` for a capture failure too. Pairing
+            # the increment with the *session* rather than with the join is
+            # what keeps that counter from drifting negative.
+            recording.started_monotonic = time.monotonic()
+            # An up/down counter, so "is anything recording right now" and
+            # "did a session leak" are both one query. A gauge would need a
+            # callback on the reader's own thread, which has no event loop.
+            record(SESSION_ACTIVE, 1, guild_id=recording.service.guild_id)
             await self._start_capture(recording)
 
     async def _start_capture(self, recording: _GuildRecording) -> None:
@@ -697,16 +780,44 @@ class SturnusClient(commands.Bot):
         it, leaves the channel and resets, and the row says we could not
         hear rather than that there was nothing to hear.
         """
-        try:
-            await recording.voice.join(recording.channel_id)
-        except Exception:
-            log.exception(
-                "Could not start voice capture in channel %d; ending the session as %s "
-                "instead of leaving it open with nothing arriving.",
-                recording.channel_id,
-                EndReason.CAPTURE_FAILURE.value,
-            )
-            recording.service.request_close(EndReason.CAPTURE_FAILURE)
+        # `join()` is a gateway round trip, a libopus probe and a
+        # `listen()` call, and it is the only step between "a session row
+        # exists" and "audio is arriving". A span over exactly it is what
+        # separates a slow join from a slow meeting in a trace.
+        with span(
+            "session.open",
+            guild_id=recording.service.guild_id,
+            channel_id=recording.channel_id,
+            session_id=recording.service.session_id,
+        ) as active:
+            try:
+                await recording.voice.join(recording.channel_id)
+            except Exception as exc:
+                # The exception is swallowed here on purpose (see the
+                # docstring), so the span has to be marked by hand: `span`
+                # only marks the ones that propagate out of it.
+                fail_span(active, exc)
+                log_exception(
+                    log,
+                    logging.ERROR,
+                    Event.VOICE_JOIN_FAILED,
+                    "Could not start voice capture; ending the session rather than "
+                    "leaving it open with nothing arriving.",
+                    exc,
+                    guild_id=recording.service.guild_id,
+                    channel_id=recording.channel_id,
+                    session_id=recording.service.session_id,
+                    end_reason=EndReason.CAPTURE_FAILURE.value,
+                    # The one join failure whose type name says nothing
+                    # useful: `discord.ConnectionClosed` is what Discord
+                    # raises for "session no longer valid", "you were
+                    # moved", "rate limited" and "voice server crashed"
+                    # alike, and its message is withheld by
+                    # `redaction.SAFE_MESSAGE_TYPES`. The code separates
+                    # them; see `voice.voice_close_code`.
+                    close_code=voice_close_code(exc),
+                )
+                recording.service.request_close(EndReason.CAPTURE_FAILURE)
 
     async def _return_to_idle(self, guild_id: int, recording: _GuildRecording) -> None:
         """Leaves the channel and puts the machine back where a session can start.
@@ -735,11 +846,17 @@ class SturnusClient(commands.Bot):
             return
         try:
             await recording.voice.leave()
-        except Exception:
-            log.exception(
-                "Guild %d: leaving the voice channel failed; continuing anyway so the "
-                "guild is able to record again.",
-                guild_id,
+        except Exception as exc:
+            log_exception(
+                log,
+                logging.ERROR,
+                Event.VOICE_LEFT_FAILED,
+                "Leaving the voice channel failed; continuing anyway so the guild is "
+                "able to record again.",
+                exc,
+                guild_id=guild_id,
+                channel_id=recording.channel_id,
+                session_id=recording.service.session_id,
             )
         recording.service.reset()
 
@@ -769,9 +886,15 @@ class SturnusClient(commands.Bot):
         """
         if not recording.service.is_recording:
             return
+        session_id = recording.service.session_id
         try:
             await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
         finally:
+            # In the `finally` for the same reason `_return_to_idle` is: a
+            # close that raised mid-upload still ended the session, and a
+            # `sturnus.session.active` that only comes down on the happy
+            # path is a counter that climbs forever.
+            self._record_session_close(recording, SHUTDOWN_END_REASON, session_id)
             await self._return_to_idle(guild_id, recording)
 
     async def _teardown(self, guild_id: int, recording: _GuildRecording) -> None:
@@ -953,8 +1076,15 @@ class SturnusClient(commands.Bot):
         for guild_id in sorted(guild_ids):
             try:
                 await self._tick_guild(guild_id, now)
-            except Exception:
-                log.exception("Tick failed for guild %d; other guilds are unaffected.", guild_id)
+            except Exception as exc:
+                log_exception(
+                    log,
+                    logging.ERROR,
+                    Event.GUILD_TICK_FAILED,
+                    "The periodic tick failed for this guild; every other guild is unaffected.",
+                    exc,
+                    guild_id=guild_id,
+                )
 
     async def _tick_guild(self, guild_id: int, now: datetime) -> None:
         """Closes a due session, lands anything deferred, then reconciles.
@@ -1030,30 +1160,49 @@ class SturnusClient(commands.Bot):
         """
         reason: EndReason | None = None
         closed = False
+        # Read before `tick()`, because a successful close is followed by
+        # `reset()` and the id is gone by the time there is anything to say
+        # about it.
+        session_id = recording.service.session_id
         try:
             reason = await recording.service.tick(now)
             closed = reason is not None
-        except Exception:
+        except Exception as exc:
             # Not necessarily a failed close: `tick()` could equally have
             # raised before deciding anything, in which case nothing ever
             # moved to CLOSING and there is nothing to recover from.
             closed = recording.service.needs_reset
             if closed:
-                log.exception(
-                    "Guild %d: closing the due session failed; its audio may not have "
-                    "been uploaded (recover_orphans picks that up on the next start). "
+                log_exception(
+                    log,
+                    logging.ERROR,
+                    Event.SESSION_CLOSE_FAILED,
+                    "Closing the due session failed; its audio may not have been "
+                    "uploaded (recover_orphans picks that up on the next start). "
                     "Returning the guild to a recordable state so it does not stop "
                     "recording silently.",
-                    guild_id,
+                    exc,
+                    guild_id=guild_id,
+                    channel_id=recording.channel_id,
+                    session_id=session_id,
+                    reason="timeout_sweep",
                 )
             else:
-                log.exception(
-                    "Guild %d: the timeout sweep failed before closing anything; the "
-                    "session in progress is untouched.",
-                    guild_id,
+                log_exception(
+                    log,
+                    logging.ERROR,
+                    Event.GUILD_TICK_FAILED,
+                    "The timeout sweep failed before closing anything; the session in "
+                    "progress is untouched.",
+                    exc,
+                    guild_id=guild_id,
+                    session_id=session_id,
                 )
         if not closed:
             return
+        # Before `_return_to_idle`, which resets the service: after it,
+        # there is no session left to attribute the measurement to.
+        self._record_session_close(recording, reason, session_id)
         await self._return_to_idle(guild_id, recording)
         if reason is not None and reason in CAPTURE_FAILURE_REASONS:
             self._begin_capture_cooldown(recording, reason, now)
@@ -1072,12 +1221,21 @@ class SturnusClient(commands.Bot):
         announcing to the channel that it is being recorded.
         """
         recording.blocked_until = now + REJOIN_COOLDOWN
-        log.error(
-            "The session in channel %d ended with %s; not recording there again before %s. "
-            "Investigate before then: a rejoin would meet the same fault.",
-            recording.channel_id,
-            reason.value,
-            recording.blocked_until.isoformat(),
+        # `duration_seconds` rather than the absolute `blocked_until`: the
+        # line carries its own `ts`, so the two together give the moment
+        # the guard lifts, and the registry has no field for a timestamp
+        # precisely because every line already has one.
+        log_event(
+            log,
+            logging.ERROR,
+            Event.VOICE_REJOIN_BLOCKED,
+            "The session in this channel ended because we could not hear it; not "
+            "recording there again until the cooldown passes. Investigate before then: "
+            "a rejoin would meet the same fault.",
+            guild_id=recording.service.guild_id,
+            channel_id=recording.channel_id,
+            end_reason=reason.value,
+            duration_seconds=REJOIN_COOLDOWN.total_seconds(),
         )
 
     async def _end_capture_cooldown(self, guild_id: int, recording: _GuildRecording) -> None:
@@ -1115,15 +1273,106 @@ class SturnusClient(commands.Bot):
             # Each guild is isolated: SIGTERM gives us one pass at this,
             # and one guild whose upload fails must not cost every guild
             # after it in the dict the session it is still holding open.
+            was_recording = recording.service.is_recording
+            session_id = recording.service.session_id
+            started = time.monotonic()
+            outcome = "ok"
             try:
                 # No `reset()` afterwards, deliberately: the process is
                 # going away, and a machine left in CLOSING cannot offer a
                 # session that would never be recorded.
-                await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
+                #
+                # The highest-consequence span in the system, and the reason
+                # `sturnus.session.close.duration` exists. `end_now()`
+                # encrypts, uploads and enqueues **serially, per speaker**,
+                # and it runs during SIGTERM. If six speakers take longer
+                # than `terminationGracePeriodSeconds`, Kubernetes kills the
+                # pod mid-loop and Spec 15's "the entire session is lost,
+                # not just a portion" is what happens. Per-guild isolation
+                # changes the blast radius of that, not the question:
+                # comparing this histogram's p99 to the grace period is what
+                # turns "we lost an evening during a deploy" into a number
+                # somebody can act on beforehand.
+                with span(
+                    "session.close",
+                    guild_id=guild_id,
+                    session_id=session_id,
+                    end_reason=SHUTDOWN_END_REASON.value,
+                ):
+                    await recording.service.end_now(SHUTDOWN_END_REASON, self._clock.now())
                 await recording.voice.leave()
-            except Exception:
-                log.exception(
-                    "Guild %d: closing its session during shutdown failed; its audio "
-                    "may be left for recover_orphans. Other guilds are unaffected.",
-                    guild_id,
+            except Exception as exc:
+                # `outcome` is the label main's rewrite made worth having:
+                # shutdown is per-guild now, so "the close ran" and "the
+                # close ran and worked" are genuinely different questions
+                # and the histogram can answer both.
+                outcome = "error"
+                log_exception(
+                    log,
+                    logging.ERROR,
+                    Event.SESSION_CLOSE_FAILED,
+                    "Closing this guild's session during shutdown failed; its audio may "
+                    "be left for recover_orphans. Every other guild is unaffected.",
+                    exc,
+                    guild_id=guild_id,
+                    session_id=session_id,
+                    reason="shutdown",
                 )
+            finally:
+                if was_recording:
+                    record(
+                        SESSION_CLOSE_DURATION,
+                        time.monotonic() - started,
+                        end_reason=SHUTDOWN_END_REASON.value,
+                        outcome=outcome,
+                    )
+                self._record_session_close(recording, SHUTDOWN_END_REASON, session_id)
+
+    def _record_session_close(
+        self,
+        recording: _GuildRecording,
+        reason: EndReason | None,
+        session_id: int | None,
+    ) -> None:
+        """Closes out one session's metrics. Idempotent per session.
+
+        `end_reason` is an `EndReason` member -- a fixed source literal, so
+        bounded as a metric label -- and it answers a question nothing else
+        does: are sessions ending because people left, because the idle
+        timeout fired, because a deploy cut them short, or because this
+        process could not hear the channel? Those are four different
+        operational stories that all look like "session closed" today, and
+        the last two are the ones that cost a meeting.
+
+        Called from every path a session can now end on -- the timeout
+        sweep, `/config apply force:true`, and `graceful_shutdown` -- which
+        is why it has to be idempotent rather than merely careful:
+        `started_monotonic` is both the measurement's start and the "this
+        session has already been accounted for" flag.
+
+        `reason=None` means `tick()` raised after moving the machine to
+        CLOSING, so the session did end and nothing can say why. That is
+        recorded as `unknown` rather than skipped: skipping it would leave
+        `sturnus.session.active` counting a session that no longer exists,
+        which is worse than a label admitting ignorance.
+        """
+        if recording.started_monotonic is None:
+            return
+        end_reason = reason.value if reason is not None else "unknown"
+        record(
+            SESSION_DURATION,
+            time.monotonic() - recording.started_monotonic,
+            end_reason=end_reason,
+            guild_id=recording.service.guild_id,
+        )
+        record(SESSION_ACTIVE, -1, guild_id=recording.service.guild_id)
+        recording.started_monotonic = None
+        log_event(
+            log,
+            logging.DEBUG,
+            Event.SESSION_CLOSING,
+            "Session bookkeeping closed out",
+            session_id=session_id,
+            guild_id=recording.service.guild_id,
+            reason=end_reason,
+        )

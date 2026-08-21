@@ -232,7 +232,17 @@ class SpeakerDecoder:
             # frame says nothing about the input stream, so it is not
             # counted as a discard. Not narrowed to `OpusError` either --
             # nothing may escape towards the packet-router thread.
-            log.debug("Packet-loss concealment failed for ssrc=%s: %r", self._ssrc, error)
+            # The exception's *type*, never its `repr`. `%r` of an
+            # arbitrary exception is `str(exc)` in a wrapper, and
+            # `tests/test_logging_discipline.py` rule R6 forbids that
+            # spelling for a reason that applies here too: nothing
+            # constrains what a third-party exception carries in its
+            # message, and this line runs on every concealed frame.
+            log.debug(
+                "Packet-loss concealment failed for ssrc=%s (%s)",
+                self._ssrc,
+                type(error).__qualname__,
+            )
             return None
 
     def _discard(self, code: int | None, error: BaseException) -> None:

@@ -6,6 +6,7 @@ test it breaks inside the running event loop.
 
 import logging
 
+import pytest
 from alembic import command
 from alembic.autogenerate import compare_metadata
 from alembic.config import Config
@@ -13,6 +14,7 @@ from alembic.migration import MigrationContext
 from sqlalchemy import create_engine, text
 
 from sturnus.infrastructure.db.models import Base
+from sturnus.observability import setup
 
 EXPECTED_TABLES = {
     "guild_config",
@@ -72,6 +74,7 @@ def test_models_and_migration_do_not_drift(clean_database: str) -> None:
 
 def test_running_migrations_does_not_silence_the_application_loggers(
     clean_database: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The worker migrates in-process, and `fileConfig` is a global.
 
@@ -83,7 +86,18 @@ def test_running_migrations_does_not_silence_the_application_loggers(
     its life, and reports nothing to Sentry either, since
     `LoggingIntegration` hooks `Logger.callHandlers` and
     `Logger.handle` never gets there for a disabled logger.
+
+    `env.py` now reaches `fileConfig` only when nothing else owns logging
+    yet, so `_configured` is forced back to False for the duration: any test
+    that ran `configure_logging()` earlier in the session would otherwise
+    close the guard, skip `fileConfig` altogether, and leave this test
+    passing without ever exercising the call it exists to constrain. The
+    guard is the other half of the same regression -- see
+    `tests/test_logging_discipline.py` -- and neither half may be tested by
+    accidentally disabling the other.
     """
+    monkeypatch.setattr(setup, "_configured", False)
+
     application_logger = logging.getLogger("sturnus.infrastructure.observability")
     assert application_logger.disabled is False
 

@@ -35,6 +35,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sturnus.application.ports import AudioStore, Clock
 from sturnus.infrastructure.db.models import TranscriptionJob
 from sturnus.infrastructure.discord.permissions import require_admin
+from sturnus.observability.events import Event, log_event
 
 log = logging.getLogger(__name__)
 
@@ -106,7 +107,18 @@ class AudioCog(commands.GroupCog, name="audio", description="Erase recorded audi
         count = await _erase_audio(
             self._session_factory, self._audio_store, interaction.user.id, self._clock.now()
         )
-        log.info("Erased %d recording(s) for user %d via /audio delete", count, interaction.user.id)
+        # The user id is logged deliberately: "did this person's `/audio
+        # delete` actually erase their recordings" is a compliance question,
+        # and it cannot be answered without it.
+        log_event(
+            log,
+            logging.INFO,
+            Event.AUDIO_ERASED,
+            "Erased recordings at the owner's request",
+            discord_user_id=interaction.user.id,
+            deleted=count,
+            reason="self_delete",
+        )
         await interaction.response.send_message(
             f"Deleted {count} recording(s) of your audio. {_TRANSCRIPTS_UNTOUCHED_NOTICE}",
             ephemeral=True,
@@ -121,11 +133,14 @@ class AudioCog(commands.GroupCog, name="audio", description="Erase recorded audi
         count = await _erase_audio(
             self._session_factory, self._audio_store, user.id, self._clock.now()
         )
-        log.info(
-            "Erased %d recording(s) for user %d via /audio purge (requested by %d)",
-            count,
-            user.id,
-            interaction.user.id,
+        log_event(
+            log,
+            logging.INFO,
+            Event.AUDIO_ERASED,
+            "Erased recordings on an administrator's request",
+            discord_user_id=user.id,
+            deleted=count,
+            reason="admin_purge",
         )
         await interaction.response.send_message(
             f"Deleted {count} recording(s) for {user.mention}. {_TRANSCRIPTS_UNTOUCHED_NOTICE}",

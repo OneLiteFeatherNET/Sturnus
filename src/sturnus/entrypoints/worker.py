@@ -71,16 +71,17 @@ from pathlib import Path
 from alembic import command
 from alembic.config import Config
 from pydantic import SecretStr
-from sqlalchemy import select, text, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from sturnus.application.documents import DocumentSink
 from sturnus.application.retention import sweep_expired_audio
 from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.config import StrictSettings
 from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file
 from sturnus.infrastructure.db.config_store import ConfigStore
-from sturnus.infrastructure.db.models import Session, SessionParticipant
+from sturnus.infrastructure.db.models import Session, SessionParticipant, TranscriptionJob
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, JobQueue
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -91,7 +92,29 @@ from sturnus.infrastructure.documents.outline import OutlineSink
 from sturnus.infrastructure.health import ReadinessState, start_health_server
 from sturnus.infrastructure.objectstore import S3AudioStore
 from sturnus.infrastructure.observability import init_sentry
+from sturnus.infrastructure.telemetry import (
+    JOB_OUTCOME,
+    QUEUE_DEPTH,
+    init_telemetry,
+    record,
+    set_span_fields,
+    shutdown_telemetry,
+    span,
+)
+from sturnus.infrastructure.traced import (
+    TracedAudioDownloader,
+    TracedDecryptor,
+    TracedDocumentSink,
+    TracedQueue,
+    TracedTranscriptionEngine,
+)
 from sturnus.infrastructure.whisper import WhisperEngine
+from sturnus.observability.events import Event, log_event, log_exception
+from sturnus.observability.setup import (
+    asyncio_exception_handler,
+    configure_logging,
+    install_excepthooks,
+)
 
 log = logging.getLogger(__name__)
 
@@ -227,11 +250,17 @@ class _KeyWrapperDecryptor:
 
     def decrypt_to(self, source: Path, target: Path, wrapped: bytes, key_id: str) -> None:
         if key_id != self._master_key_id:
-            log.warning(
-                "Job was encrypted with key id %r, but only %r is configured; "
+            # ERROR, not WARNING: this is a rotation misconfiguration that
+            # will silently produce garbage for *every* job, not a transient
+            # fault that retries away.
+            log_event(
+                log,
+                logging.ERROR,
+                Event.KEY_ID_MISMATCH,
+                "Job was encrypted under a different key id than the one configured; "
                 "decrypting with the configured key anyway (no rotation support yet)",
-                key_id,
-                self._master_key_id,
+                key_id=key_id,
+                configured_key_id=self._master_key_id,
             )
         wrapper = KeyWrapper(self._master_key, self._master_key_id)
         data_key = wrapper.unwrap(wrapped)
@@ -375,13 +404,23 @@ async def _retention_sweep_loop(
         try:
             await sweep_expired_audio(jobs, store, datetime.now(UTC))
         except Exception as exc:
-            log.warning("Retention sweep failed; will retry next interval: %s", exc)
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SWEEP_FAILED,
+                "Retention sweep failed; will retry next interval",
+                exc,
+                reason="retention",
+            )
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=_RETENTION_SWEEP_INTERVAL_SECONDS)
 
 
 async def _document_retry_loop(
-    documents: OutlineSink,
+    # The narrow port, not the concrete `OutlineSink`: `_run` passes a
+    # `TracedDocumentSink` wrapping it, and `retry_pending_documents` only
+    # ever calls `create`.
+    documents: DocumentSink,
     sessions: _WorkerSessionStore,
     jobs: JobRepository,
     links: AccountLinkRepository,
@@ -398,7 +437,14 @@ async def _document_retry_loop(
         try:
             await retry_pending_documents(documents, sessions, jobs, links, config, template_source)
         except Exception as exc:
-            log.warning("Document retry sweep failed; will retry next interval: %s", exc)
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SWEEP_FAILED,
+                "Document retry sweep failed; will retry next interval",
+                exc,
+                reason="document_retry",
+            )
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=_DOCUMENT_RETRY_INTERVAL_SECONDS)
 
@@ -440,6 +486,18 @@ async def _run() -> None:
         base_url=settings.outline_base_url,
         api_token=settings.outline_service_key.get_secret_value(),
     )
+
+    # Tracing is applied here, on the way into `process_one`, and nowhere
+    # else. Each wrapper satisfies the same `Protocol` the plain adapter
+    # does, so `sturnus.application.worker` gains a span per pipeline stage
+    # without importing OpenTelemetry -- which it may not do
+    # (`tests/test_architecture.py`) -- and without a single line changing
+    # in that module. See `sturnus.infrastructure.traced`.
+    traced_queue = TracedQueue(queue)
+    traced_engine = TracedTranscriptionEngine(transcription_engine)
+    traced_store = TracedAudioDownloader(store)
+    traced_crypto = TracedDecryptor(crypto)
+    traced_documents = TracedDocumentSink(documents)
     sessions = _WorkerSessionStore(session_factory)
     jobs = JobRepository(session_factory)
     # No fixed provider: `document_provider` is per-guild configuration
@@ -453,17 +511,41 @@ async def _run() -> None:
     readiness = ReadinessState(discord_connected=True)  # this process has no gateway to wait on
 
     async def database_ping() -> bool:
+        """Proves the database answers *and* samples the queue depth.
+
+        This replaces a bare `SELECT 1`. A grouped count over
+        `transcription_job.status` is exactly as good a liveness probe --
+        it is still one round trip that either answers or does not -- and
+        it feeds `sturnus.queue.depth`, the backlog signal that answers
+        "is the worker keeping up". One query, two purposes, no new
+        database load.
+
+        Queue depth is a metric and never a span attribute: it is a
+        property of the system at an instant rather than of any operation,
+        and hanging it off a job span would make it a lie the moment that
+        job ended.
+        """
         try:
             async with session_factory() as session:
-                await session.execute(text("SELECT 1"))
+                rows = (
+                    await session.execute(
+                        select(TranscriptionJob.status, func.count()).group_by(
+                            TranscriptionJob.status
+                        )
+                    )
+                ).all()
         except SQLAlchemyError:
             return False
+        depths = {status: count for status, count in rows}
+        for status in ("pending", "running", "done", "failed", "dead"):
+            record(QUEUE_DEPTH, depths.get(status, 0), status=status)
         return True
 
     health_runner = await start_health_server(readiness, settings.health_port)
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+    loop.set_exception_handler(asyncio_exception_handler)
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
@@ -473,36 +555,98 @@ async def _run() -> None:
     # main loop.
     retention_task = asyncio.create_task(_retention_sweep_loop(jobs, store, stop))
     document_retry_task = asyncio.create_task(
-        _document_retry_loop(documents, sessions, jobs, links, config_store, template_source, stop)
+        # The traced sink here too, not the raw one: the retry sweep is a
+        # second path to the same `DocumentSink.create`, and a histogram
+        # that covered only one of them would understate how often document
+        # creation is actually attempted.
+        _document_retry_loop(
+            traced_documents, sessions, jobs, links, config_store, template_source, stop
+        )
     )
 
-    log.info("Worker started; polling the transcription queue")
+    log_event(
+        log,
+        logging.INFO,
+        Event.WORKER_STARTED,
+        "Worker started; polling the transcription queue",
+        model=settings.whisper_model,
+        device="cpu",
+        compute_type=_WHISPER_COMPUTE_TYPE,
+        lease_seconds=settings.job_lease_seconds,
+        max_attempts=settings.max_job_attempts,
+    )
     try:
         while not stop.is_set():
             readiness.database_reachable = await database_ping()
-            # `process_one` runs to completion before `stop.is_set()` is
-            # checked again -- a SIGTERM during a job lets that job finish
-            # rather than abandoning it mid-decrypt (see the module
-            # docstring).
-            did_work = await process_one(
-                queue=queue,
-                engine=transcription_engine,
-                store=store,
-                crypto=crypto,
-                documents=documents,
-                sessions=sessions,
-                jobs=jobs,
-                links=links,
-                config=config_store,
-                work_dir=settings.work_dir,
-                max_attempts=settings.max_job_attempts,
-                template_source=template_source,
-            )
+            # The root span of the worker's whole trace. It is opened
+            # *before* `process_one` claims anything, which is why
+            # `TracedQueue.claim` stamps `job_id`/`session_id` back onto it
+            # afterwards -- the ids do not exist yet at this point. Moving
+            # `process_one` out of this `with` would silently discard those
+            # attributes; see the matching comment in
+            # `sturnus.infrastructure.traced.TracedQueue.claim`.
+            # **This loop no longer labels the outcome, and that is the
+            # fix.** It used to compute `"done" if did_work else "empty"`,
+            # but `process_one` returns `True` after `queue.fail(...)` as
+            # well: the boolean means "work was attempted", never "work
+            # succeeded", so every failed and every dead job was published
+            # as `outcome="done"` on both the span and the counter. Nothing
+            # here can tell the difference, because nothing here sees the
+            # transition -- so `done` / `failed` / `dead` are now recorded
+            # by `sturnus.infrastructure.db.queue`, which decides them, and
+            # stamped onto this span by `traced.TracedQueue`, which sits on
+            # the way through.
+            #
+            # What is left are the two outcomes this loop *does* own, and
+            # neither is reachable from the queue: nothing was there to
+            # claim, and `process_one` itself raised.
+            with span("job.process") as job_span:
+                try:
+                    # `process_one` runs to completion before
+                    # `stop.is_set()` is checked again -- a SIGTERM during a
+                    # job lets that job finish rather than abandoning it
+                    # mid-decrypt (see the module docstring).
+                    did_work = await process_one(
+                        queue=traced_queue,
+                        engine=traced_engine,
+                        store=traced_store,
+                        crypto=traced_crypto,
+                        documents=traced_documents,
+                        sessions=sessions,
+                        jobs=jobs,
+                        links=links,
+                        config=config_store,
+                        work_dir=settings.work_dir,
+                        max_attempts=settings.max_job_attempts,
+                        template_source=template_source,
+                    )
+                except Exception:
+                    # `process_one` routes every failure it can reach
+                    # through `queue.fail`, so reaching this line means the
+                    # loop itself is about to die with a job possibly still
+                    # `running`. A counter as well as a span, deliberately:
+                    # a span is subject to sampling and to Tempo's
+                    # retention, and "the worker died holding a job" must
+                    # not depend on either.
+                    set_span_fields(job_span, outcome="crashed")
+                    record(JOB_OUTCOME, 1, outcome="crashed")
+                    raise
+                if not did_work:
+                    # Not counted, only labelled: an empty poll happens
+                    # every `_POLL_SECONDS` for as long as the queue is
+                    # idle, and `sturnus.queue.depth` already answers "is
+                    # there work" without a counter that ticks forever.
+                    set_span_fields(job_span, outcome="empty")
             if not did_work:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), timeout=_POLL_SECONDS)
     finally:
-        log.info("Shutdown requested: worker stopping after its current job")
+        log_event(
+            log,
+            logging.INFO,
+            Event.SHUTDOWN_BEGIN,
+            "Shutdown requested: worker stopping after its current job",
+        )
         for task in (retention_task, document_retry_task):
             task.cancel()
         for task in (retention_task, document_retry_task):
@@ -510,16 +654,29 @@ async def _run() -> None:
                 await task
         await health_runner.cleanup()
         await engine.dispose()
+        # Last, and after the health server is down: flushes the batch of
+        # spans describing this very shutdown, which is exactly the batch
+        # someone will be looking for afterwards.
+        shutdown_telemetry()
+        log_event(log, logging.INFO, Event.SHUTDOWN_COMPLETE, "Worker stopped")
 
 
 def main() -> None:
-    # Both run before `_run`, and so before `WorkerSettings()` reads the
+    # All four run before `_run`, and so before `WorkerSettings()` reads the
     # environment: with a DSN configured, a settings `ValidationError` is
     # then itself reported instead of being the one failure Sentry can never
     # see. Without a DSN, `init_sentry` returns having touched nothing at all
     # -- see `sturnus.infrastructure.observability`.
-    logging.basicConfig(level=logging.INFO)
+    #
+    # `configure_logging` is first of all: it installs the handler that
+    # formats and redacts everything the other three might have to report,
+    # and `install_excepthooks` is what stops a settings `ValidationError`
+    # -- whose pydantic message embeds the raw environment dict, token
+    # prefix and all -- reaching stderr unredacted.
+    configure_logging("worker")
+    install_excepthooks()
     init_sentry("worker")
+    init_telemetry("worker")
     asyncio.run(_run())
 
 

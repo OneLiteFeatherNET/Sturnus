@@ -33,6 +33,30 @@ dependencies = [
     # Without a DSN `sentry_sdk.init()` is never called, so nothing is
     # patched and the processes behave exactly as they do without it.
     "sentry-sdk>=2.68",
+    # Traces and metrics (sturnus.infrastructure.telemetry). Runtime
+    # dependencies for the same reason as sentry-sdk above: one image serves
+    # operators with and without a collector, so optionality is a runtime
+    # decision (is STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT set?) rather than an
+    # install-time one. With no endpoint no provider is constructed, so the
+    # API degrades to NonRecordingSpan and no-op instruments and the
+    # processes behave exactly as they do without it.
+    #
+    # `-proto-http` rather than `-proto-grpc`: Alloy accepts both 4317 and
+    # 4318, so the choice is free, and the gRPC exporter drags in grpcio --
+    # a large per-arch binary wheel and a known source of fork/thread hangs.
+    #
+    # **Deliberately no `opentelemetry-instrumentation-*` package.** Every
+    # plausible one is disqualifying in this codebase specifically:
+    # -sqlalchemy adds `db.statement`, and the statement that writes a
+    # transcript *is* the protected content; -botocore adds `aws.s3.key`,
+    # and the key embeds a Discord user id; -httpx adds `url.full`, which
+    # for S3 is a presigned URL carrying X-Amz-Signature; -aiohttp-server
+    # would attach `link`'s `/oauth/callback?code=...`. None of the four
+    # packages below instruments anything on its own.
+    "opentelemetry-api>=1.44",
+    "opentelemetry-sdk>=1.44",
+    "opentelemetry-semantic-conventions>=0.65b0",
+    "opentelemetry-exporter-otlp-proto-http>=1.44",
 ]
 
 [project.scripts]

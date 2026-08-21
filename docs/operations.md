@@ -59,9 +59,15 @@ the Kubernetes `Secret` rather than from plain manifest text (see section
 | `STURNUS_OUTLINE_BASE_URL` | **yes** | no | Base URL of the Outline instance. The bot needs it only to build the authorization URL `/link` sends a user's browser to; it never calls Outline's API itself. |
 | `STURNUS_OUTLINE_CLIENT_ID` | **yes** | no | OAuth client id of the Sturnus application registered in Outline. Public by design — it travels in the query string of the authorization URL every user's browser opens. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL that authorization returns to. Must be the same value `sturnus-link` is given, and must actually route to `link` — see section 1.5. |
-| `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. |
+| `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. `/metrics` answers **`501 Not Implemented`**: metrics are *pushed* over OTLP, not scraped — see section 7. |
 | `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Empty disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Supplied through the `Secret`, and required to be present even when blank; see section 1.4 for why a value that is not a credential is stored like one. |
-| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Names the deployment in Sentry's environment filter **and** supplies OpenTelemetry's `deployment.environment.name`. One variable for both on purpose — `OtelSettings.environment` reads this exact name rather than adding a second one, so the environment filter in Sentry and the one in Grafana can never disagree. |
+| `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT` | unset | no | Base URL of an OTLP/HTTP receiver — in this cluster `http://alloy-receiver.grafana.svc:4318`. Unset or empty — the chart's default — disables traces and metrics entirely: no provider is constructed, so every span is a no-op, nothing connects, nothing retries, and no export failure is ever logged. Give the base URL with no `/v1/traces` suffix; the exporters append their own paths. Not a credential; see section 1.4. |
+| `STURNUS_OTEL_TRACES_SAMPLE_RATIO` | `1.0` | no | Fraction of traces sampled. `1.0` is correct today and the arithmetic is in `sturnus/infrastructure/telemetry.py`: the worker processes one job at a time and each is minutes of CPU work, the bot opens a handful of sessions per guild per day, and the packet path emits no spans at all. This exists as a valve for a future high-volume path. Note that job outcome is *also* an unsampled counter, so sampling can never be why a failed job is invisible. |
+| `STURNUS_OTEL_METRIC_EXPORT_INTERVAL_SECONDS` | `60.0` | no | How often metrics are pushed to the OTLP endpoint. |
+| `STURNUS_LOG_LEVEL` | `INFO` | no | Level for **Sturnus's own** loggers only, and safe to set to `DEBUG` in production: Sturnus's own DEBUG lines are held to ids, counts, sizes and durations by the same field registry that governs INFO. It cannot turn up a third-party logger — see section 7.2 for why that restriction is a security control rather than tidiness. |
+| `STURNUS_LOG_THIRD_PARTY_LEVEL` | `WARNING` | no | Level for every other library. **Raised to `INFO` if you set it lower**, and the per-logger floors in section 7.2 clamp several libraries tighter still; no value here undercuts either. A clamped value is not ignored silently — the process logs one `log.level_clamped` line at startup saying it happened. |
+| `STURNUS_LOG_FORMAT` | `json` (auto) | no | `json` — one object per line on stdout, which is what `alloy-logs` scrapes into Loki — or `console` for a human at a terminal. Defaults to `console` when stdout is a TTY and `json` otherwise, so local development needs no setting. Both formats share the same redaction filter; the choice is presentation only. |
 
 The bot has no `STURNUS_OUTLINE_CLIENT_SECRET`, and that is not an
 oversight: building an authorization URL needs only the public client id,
@@ -89,9 +95,15 @@ in the bot would read it.
 | `STURNUS_WORK_DIR` | `/tmp` | no | Scratch directory the encrypted recording is downloaded and decrypted into before transcription. It must be large enough for the biggest single recording — the chart sizes the corresponding volume with `worker.tmpSizeLimit`. |
 | `STURNUS_MAX_JOB_ATTEMPTS` | `3` | no | How many failed attempts a job gets before `JobQueue.fail` marks it `dead`. See section 5 for what a `dead` job means for the rest of its session. |
 | `STURNUS_JOB_LEASE_SECONDS` | `1800.0` | no | How long a claimed job may stay `running` before `JobQueue.claim` reclaims it for another worker. It is generous on purpose: it must exceed the longest plausible transcription, or a still-running job gets picked up a second time. |
-| `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. |
+| `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. `/metrics` answers **`501 Not Implemented`**: metrics are *pushed* over OTLP, not scraped — see section 7. |
 | `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Empty disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Supplied through the `Secret`, and required to be present even when blank; see section 1.4 for why a value that is not a credential is stored like one. |
-| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Names the deployment in Sentry's environment filter **and** supplies OpenTelemetry's `deployment.environment.name`. One variable for both on purpose — `OtelSettings.environment` reads this exact name rather than adding a second one, so the environment filter in Sentry and the one in Grafana can never disagree. |
+| `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT` | unset | no | Base URL of an OTLP/HTTP receiver — in this cluster `http://alloy-receiver.grafana.svc:4318`. Unset or empty — the chart's default — disables traces and metrics entirely: no provider is constructed, so every span is a no-op, nothing connects, nothing retries, and no export failure is ever logged. Give the base URL with no `/v1/traces` suffix; the exporters append their own paths. Not a credential; see section 1.4. |
+| `STURNUS_OTEL_TRACES_SAMPLE_RATIO` | `1.0` | no | Fraction of traces sampled. `1.0` is correct today and the arithmetic is in `sturnus/infrastructure/telemetry.py`: the worker processes one job at a time and each is minutes of CPU work, the bot opens a handful of sessions per guild per day, and the packet path emits no spans at all. This exists as a valve for a future high-volume path. Note that job outcome is *also* an unsampled counter, so sampling can never be why a failed job is invisible. |
+| `STURNUS_OTEL_METRIC_EXPORT_INTERVAL_SECONDS` | `60.0` | no | How often metrics are pushed to the OTLP endpoint. |
+| `STURNUS_LOG_LEVEL` | `INFO` | no | Level for **Sturnus's own** loggers only, and safe to set to `DEBUG` in production: Sturnus's own DEBUG lines are held to ids, counts, sizes and durations by the same field registry that governs INFO. It cannot turn up a third-party logger — see section 7.2 for why that restriction is a security control rather than tidiness. |
+| `STURNUS_LOG_THIRD_PARTY_LEVEL` | `WARNING` | no | Level for every other library. **Raised to `INFO` if you set it lower**, and the per-logger floors in section 7.2 clamp several libraries tighter still; no value here undercuts either. A clamped value is not ignored silently — the process logs one `log.level_clamped` line at startup saying it happened. |
+| `STURNUS_LOG_FORMAT` | `json` (auto) | no | `json` — one object per line on stdout, which is what `alloy-logs` scrapes into Loki — or `console` for a human at a terminal. Defaults to `console` when stdout is a TTY and `json` otherwise, so local development needs no setting. Both formats share the same redaction filter; the choice is presentation only. |
 
 Whisper's device and compute type are deliberately *not* environment-driven:
 the worker constructs `WhisperEngine` with `"cpu"` and `int8_float32`
@@ -126,7 +138,13 @@ environment variables — see section 4.1.
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL, repeated here because the token exchange sends it again for verification. It must match the bot's value exactly — see section 1.5. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz` and `/oauth/callback` routes are served on. |
 | `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Empty disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Supplied through the `Secret`, and required to be present even when blank; see section 1.4 for why a value that is not a credential is stored like one. |
-| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Value Sentry files events under in its environment filter. Ignored when no DSN is set. |
+| `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Names the deployment in Sentry's environment filter **and** supplies OpenTelemetry's `deployment.environment.name`. One variable for both on purpose — `OtelSettings.environment` reads this exact name rather than adding a second one, so the environment filter in Sentry and the one in Grafana can never disagree. |
+| `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT` | unset | no | Base URL of an OTLP/HTTP receiver — in this cluster `http://alloy-receiver.grafana.svc:4318`. Unset or empty — the chart's default — disables traces and metrics entirely: no provider is constructed, so every span is a no-op, nothing connects, nothing retries, and no export failure is ever logged. Give the base URL with no `/v1/traces` suffix; the exporters append their own paths. Not a credential; see section 1.4. |
+| `STURNUS_OTEL_TRACES_SAMPLE_RATIO` | `1.0` | no | Fraction of traces sampled. `1.0` is correct today and the arithmetic is in `sturnus/infrastructure/telemetry.py`: the worker processes one job at a time and each is minutes of CPU work, the bot opens a handful of sessions per guild per day, and the packet path emits no spans at all. This exists as a valve for a future high-volume path. Note that job outcome is *also* an unsampled counter, so sampling can never be why a failed job is invisible. |
+| `STURNUS_OTEL_METRIC_EXPORT_INTERVAL_SECONDS` | `60.0` | no | How often metrics are pushed to the OTLP endpoint. |
+| `STURNUS_LOG_LEVEL` | `INFO` | no | Level for **Sturnus's own** loggers only, and safe to set to `DEBUG` in production: Sturnus's own DEBUG lines are held to ids, counts, sizes and durations by the same field registry that governs INFO. It cannot turn up a third-party logger — see section 7.2 for why that restriction is a security control rather than tidiness. |
+| `STURNUS_LOG_THIRD_PARTY_LEVEL` | `WARNING` | no | Level for every other library. **Raised to `INFO` if you set it lower**, and the per-logger floors in section 7.2 clamp several libraries tighter still; no value here undercuts either. A clamped value is not ignored silently — the process logs one `log.level_clamped` line at startup saying it happened. |
+| `STURNUS_LOG_FORMAT` | `json` (auto) | no | `json` — one object per line on stdout, which is what `alloy-logs` scrapes into Loki — or `console` for a human at a terminal. Defaults to `console` when stdout is a TTY and `json` otherwise, so local development needs no setting. Both formats share the same redaction filter; the choice is presentation only. |
 
 `link` holds no Discord token, no S3 credentials and no master key — by
 construction, not by omission. It is the only publicly reachable component,
@@ -190,6 +208,19 @@ Two consequences follow, both deliberate:
 
 `STURNUS_SENTRY_ENVIRONMENT` stays in `commonEnv`: it is a label, not a
 key.
+
+So do the OpenTelemetry and logging variables, and for the *first* of the
+two reasons above rather than the second: `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT`
+is a cluster-internal service address, and `STURNUS_LOG_LEVEL`,
+`STURNUS_LOG_THIRD_PARTY_LEVEL` and `STURNUS_LOG_FORMAT` are enum-shaped
+words. None of them authorises anything, so finding one in a public
+repository costs nothing — which is precisely the test the DSN failed.
+`STURNUS_LOG_THIRD_PARTY_LEVEL` is worth one extra sentence because it
+*sounds* like a lever on a security control and is not: any value below
+`INFO` is raised to `INFO` before anything is configured, and the per-logger
+floors in section 7.2 are applied after that. Finding `DEBUG` there in a
+public repository would tell a reader that somebody tried, not that they
+succeeded.
 
 `STURNUS_DATABASE_URL` is the one entry on that list that is not typed
 `SecretStr` in the code — it is a plain `str`, because it is a connection
@@ -873,3 +904,447 @@ consent names the superseded version stop being recorded mid-session, and
 `/consent grant` under the new version is what puts them back. Removing
 the role by hand is not required for a hard cutover, and doing so only
 costs the affected members a second step when they re-consent.
+
+## 7. Observability
+
+Three retained stores hold a copy of what Sturnus emits, and all three are
+reachable by a wider audience than `kubectl`:
+
+| Store | What reaches it | How |
+|---|---|---|
+| **Loki** | pod stdout, one JSON object per line | `alloy-logs` runs as a DaemonSet and scrapes container stdout. Sturnus ships no logs itself. |
+| **Tempo** | spans | pushed over OTLP/HTTP to `alloy-receiver.grafana.svc:4318`, which fans out. |
+| **Sentry** | errors | `sturnus/infrastructure/observability.py`. |
+
+Because Alloy does the shipping, "optimising for Loki" means changing what
+Sturnus *prints*, not adding a log shipper.
+
+### 7.1 One registry decides what may be emitted
+
+`sturnus/observability/fields.py` holds a closed list of field names, and
+`sturnus/observability/redaction.py` holds a single scrubbing function that
+log lines, span attributes and metric labels all pass through. **Adding a
+field is one edit, in one file, and it shows up in review as "we decided to
+put this in Loki, Tempo and Grafana" — which is what it is.**
+
+The list is an allowlist that gets *rebuilt*, not a denylist that gets
+stripped, so an unregistered name is dropped rather than forwarded. The
+failure mode is a missing panel in Grafana, never a transcript in Tempo.
+Read that file before adding to it.
+
+Three things are excluded and the reasons differ:
+
+- **Transcript text, audio bytes, display names, tokens and keys** — the
+  content Spec 15 and the blocking gate in
+  `docs/verification/end-to-end-checklist.md` exist to protect. `bytes` are
+  never rendered at all, whatever they are called, which closes raw PCM,
+  Opus frames and wrapped keys as a class rather than by name.
+- **The S3 object key** — its format is
+  `sessions/{session_id}/speakers/{discord_user_id}.enc`, so it *embeds* a
+  user id, and both halves are separately loggable. Logging the key is pure
+  duplication with a wider blast radius; `audio_key()` reconstructs it.
+- **`discord_user_id` and `external_user_id` in spans and metrics** — these
+  *are* logged, because "did this person's `/audio delete` actually erase
+  their recordings" is a compliance question that cannot be answered
+  without them. They are kept out of Tempo because a user id joined to a
+  session id and precise timestamps in a searchable, trace-indexed store is
+  a record of who was in which voice channel when, which is a different
+  artifact from a line in `kubectl logs`. Nothing is lost: `sturnus.session_id`
+  on the span joins to the row that has the user id.
+
+Exception *messages* never travel unless their class is `OSError` or
+subclasses `DiagnosticSafeError` — one rule, shared with Sentry, in
+`redaction.SAFE_MESSAGE_TYPES`, which
+`sturnus.infrastructure.observability.SAFE_VALUE_TYPES` aliases rather than
+restates. What you get instead is the exception type and a full traceback,
+which locates the failure without carrying whatever the message happened to
+interpolate.
+
+Sentry is *narrower* than that shared rule rather than equal to it, and the
+difference is deliberate: it rebuilds an `OSError` message from `errno`
+instead of reading the exception's own string (section 5 gives the reason).
+The shared list is the gate — a class it does not vouch for says nothing
+anywhere — and each transport may then say less. Narrower is always
+allowed; wider is what the alias makes impossible.
+
+### 7.2 What is safe to raise, and what deliberately is not
+
+**The short version, for 3am.**
+
+| You want | Set | Effect |
+|---|---|---|
+| More detail from Sturnus | `STURNUS_LOG_LEVEL=DEBUG` | Safe. Do it. Restart the affected Deployment. |
+| More detail from `discord.py`, `botocore`, `aiohttp`, SQLAlchemy | `STURNUS_LOG_THIRD_PARTY_LEVEL=DEBUG` | **Does nothing.** The value is raised to `INFO`, and the process logs one `log.level_clamped` line saying so. |
+| Less noise from everything | `STURNUS_LOG_THIRD_PARTY_LEVEL=ERROR` | Works. Quieter than the floor is always allowed. |
+| Third-party `DEBUG` anyway | — | A code change to `THIRD_PARTY_FLOOR` in `sturnus/observability/setup.py`, on a non-production deployment. There is no environment variable for it, on purpose. |
+
+`STURNUS_LOG_LEVEL` applies to `logging.getLogger("sturnus")` and nothing
+else. Turning it up is safe because Sturnus's own DEBUG output goes through
+the same closed field registry as its INFO output (section 7.1): it can
+carry ids, counts, sizes and durations, and structurally cannot carry a
+transcript or a key.
+
+Everything that is not Sturnus is held down by two mechanisms:
+
+1. **`THIRD_PARTY_FLOOR`** — the level below which no logger outside
+   `sturnus.*` may go, including the root logger that every unnamed
+   third-party logger inherits from. Today it is `INFO`.
+2. **`NEVER_BELOW`** — named loggers clamped tighter still, listed below.
+
+This is a security control, not tidiness. Verified against the installed
+packages rather than assumed:
+
+| Logger | At DEBUG it prints |
+|---|---|
+| `botocore.auth` | `CanonicalRequest`, `StringToSign`, and the **SigV4 signature** |
+| `botocore.endpoint` | the prepared request, including the `Authorization` header |
+| `discord.ext.voice_recv.reader` | the **Discord voice secret key** and raw voice payload bytes |
+| `discord.ext.voice_recv.gateway` | the whole voice-gateway payload for every op except 3 and 6 — and op 4 is `SESSION_DESCRIPTION`, which is **where that same secret key comes from** |
+| `discord.ext.voice_recv.voice_client` | the voice state update, which carries the voice `token` and `session_id` |
+| `discord.http` | whole REST **response bodies** — message content, display names, nicknames |
+| `sqlalchemy.engine` | bound parameters, i.e. transcript text on its way into the database |
+| `aiohttp.access` | at **INFO**, `request.path_qs` — the path *with* its query string, and `link`'s only route is `/oauth/callback?code=…&state=…` |
+
+**Why a floor and not just the list.** The list came first and was not
+enough. `NEVER_BELOW` names 17 loggers; a running worker has around 90, and
+a logger absent from the list carries no level of its own and inherits one
+from the root logger. `configure_logging` used to set root to
+`min(sturnus_level, third_party_level)`, so `STURNUS_LOG_LEVEL=DEBUG` — a
+variable whose documented scope is Sturnus's own loggers — put the root
+logger at DEBUG and turned on 24 third-party loggers with it. Rows three
+to seven of that table were reachable that way. The floor is what makes
+the claim structural: it applies to names nobody enumerated, including
+names in libraries this repository has not imported yet, and
+`tests/observability/test_third_party_log_floor.py` asserts it as a
+property over every logger that exists rather than as another list.
+
+**Why `INFO` and not `WARNING`.** `discord.voice_state` logs the voice
+connect narrative at INFO — "Starting voice handshake… (connection attempt
+2)", "Voice handshake complete", "Timed out connecting to voice",
+"Disconnected from voice by discord, close code 4006". That is the evidence
+base for telling apart the three ways capture fails, which is what
+`voice.join_failed` / `voice.reader_stopped` / `voice.decode_failed` exist
+to distinguish, and a WARNING floor would delete it. What `INFO` does cost
+is real and worth naming: gateway IDENTIFY/RESUME and session-invalidation
+tracing ("the bot silently stopped receiving events"), voice websocket
+close codes below the INFO cases, and `discord.http` rate-limit bucket
+diagnosis are no longer reachable without a code change. Those are exactly
+the cases where someone wants DEBUG at 3am — and they are also the cases
+where the same switch would publish a session key, which is why the switch
+is a source edit on a non-production deployment rather than a Helm value.
+
+**Second lock: the value is redacted as well as suppressed.** A level
+control only helps for records that are not emitted. `redaction.PATTERNS`
+carries a `secret_value` rule that scrubs anything assigned to a name in
+`fields.CREDENTIAL_NAMES` — `secret_key: [...]`, `token=…`, `password="…"` —
+in *any* record, including a message string a library composed. It exists
+because the voice secret key has no recognisable shape: it reaches a log
+record as thirty-two small integers, which no token pattern matches, inside
+`record.msg`, where the field allowlist cannot see it. If a future release
+of `discord-ext-voice-recv` moves that line to a level the floor permits,
+the key is still replaced by `«redacted:secret_value»` and the rest of the
+line survives.
+
+**The list itself.** `discord.ext.voice_recv.router` is clamped to
+`WARNING`, which deliberately still lets through its own
+`log.exception("Error in %s loop")` at ERROR — the one library line that
+matters when the packet-router thread dies.
+
+`discord.voice_state` is a level decision rather than a list one, and it is
+the only logger held **open** as well as shut. It is pinned at exactly
+`INFO`, by two entries that check each other:
+
+* `NEVER_BELOW` keeps its DEBUG lines out. They are connection-state
+  transitions and DAVE upgrade notices, and they were read at the installed
+  version and found to carry no secret — but DEBUG is where the leak lives
+  on every other logger in that table, and a name absent from the list
+  reads afterwards as "considered and cleared" when it was never considered
+  at all.
+* `NEVER_ABOVE` keeps its INFO lines in. Those are the connect narrative —
+  "Starting voice handshake… (connection attempt 2)", "Voice handshake
+  complete. Endpoint found: …", "Timed out connecting to voice",
+  "Disconnected from voice by discord, close code 4014" — and they are the
+  evidence base for the capture-failure cooldown and for telling
+  `voice.join_failed` from `voice.reader_stopped` from
+  `voice.decode_failed`. All three entrypoints emitted them before this
+  package existed, because they called `basicConfig(level=INFO)`.
+
+`NEVER_BELOW` alone could not have kept them: it is applied as
+`max(third_party_level, floor)`, so every entry in it can only make a
+logger *quieter*, and with `STURNUS_LOG_THIRD_PARTY_LEVEL` at its default
+of `WARNING` an entry of `INFO` there is a no-op. `NEVER_ABOVE` installs
+the level outright — which is also why it is not an exemption:
+`STURNUS_LOG_THIRD_PARTY_LEVEL=DEBUG` cannot make a pinned logger any
+louder than its pin either.
+
+The `aiohttp.access` row was a live leak before it was clamped: with the
+root logger at `INFO`, every successful account link wrote an Outline
+authorization code into Loki. Nothing is lost by silencing it — the ingress
+already logs requests, and `link.callback_rejected` / `link.established`
+carry the diagnostic content without the credential.
+
+**How to check the floor is doing its job**, on a running deployment:
+
+```logql
+# Should return nothing, ever. If it returns rows, the floor is broken.
+{app_kubernetes_io_name="sturnus"} | json | level="DEBUG" | logger !~ "sturnus.*"
+```
+
+### 7.3 Loki labels: what Alloy may promote
+
+Sturnus cannot set Loki labels; `alloy-logs` derives them from Kubernetes
+metadata. This is the policy for whoever edits the Alloy configuration.
+
+**Already labels, free, no code change:** `namespace`, `pod`, `container`,
+`app_kubernetes_io_name`, `app_kubernetes_io_component` (this is how
+bot/worker/link separate).
+
+**Promote from the JSON line — exactly two:** `level` (5 values) and
+`guild_id` (a handful). `guild_id` is the one dimension an operator
+genuinely slices by, and it is the first thing to review if Sturnus is ever
+deployed multi-tenant at scale.
+
+**Never a label:** `session_id`, `job_id`, `discord_user_id`, `ssrc`,
+`document_id`, `external_user_id`, `trace_id`. Each is unbounded or
+fast-growing, and promoting one multiplies the cluster's stream count
+without limit. They are line content, queried with `| json | session_id="4711"`
+— which is exactly what LogQL's parser stage is for.
+
+`event` (~40 stable values) was considered and rejected: bounded, but
+~40 × 3 components × 5 levels is a few hundred streams for a query that
+`| json | event="job.dead"` answers just as well.
+
+### 7.4 A LogQL cookbook
+
+```logql
+# The whole story of one session, across bot and worker in one stream
+{app_kubernetes_io_name="sturnus"} | json | session_id="4711"
+
+# A session ended having recorded nothing despite participants — the
+# highest-value single query here
+{app_kubernetes_io_name="sturnus"} | json | event="session.closed" | jobs_enqueued == 0
+
+# We were in the channel and could not hear. Three different faults, one
+# question: capture never started, capture died, or nothing decodes any
+# more. Each ends the session with an end_reason that says so, rather than
+# letting it time out looking like a meeting where nobody spoke.
+{app_kubernetes_io_name="sturnus"} | json | event=~"voice.join_failed|voice.reader_stopped|voice.decode_failed"
+
+# The same three, from the metric side, which is what to alert on
+sum by (end_reason) (rate(sturnus_session_duration_count{end_reason=~"capture_failure|decode_failure"}[15m]))
+
+# Permanent loss: audio that will never become a transcript
+{level="error"} | json | event=~"job.dead|session.unrecoverable|session.document_rejected"
+
+# Whisper throughput against real material (Spec 15's unmeasured risk)
+{app_kubernetes_io_component="worker"} | json | event="job.transcribed" | unwrap realtime_factor
+
+# Per-guild error rate — the one place the guild_id label earns itself
+sum by (guild_id) (rate({level="error"}[5m]))
+```
+
+`kubectl logs` shows JSON, which is a genuine regression for a human under
+pressure. Use:
+
+```sh
+kubectl logs deploy/sturnus-worker | jq -r '"\(.ts) \(.level) \(.event) \(.msg)"'
+```
+
+Every line carries `trace_id` when telemetry is enabled, so a Grafana
+derived field turns a Loki row into a click through to the Tempo waterfall
+for the same job.
+
+### 7.5 Metrics are pushed, not scraped
+
+`/metrics` answers **`501 Not Implemented`** and names
+`STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT` in its body. It used to return `200`
+with an empty exposition; that inverts the signal, because an empty `200`
+is indistinguishable from "every counter is legitimately zero", so a
+completely uninstrumented process would look healthy to a ServiceMonitor. A
+`501` marks the target down, which is the true statement.
+
+**Before merging, confirm nothing outside this repository scrapes it.**
+Nothing in `charts/` does, but a cluster-side `ServiceMonitor` or a
+`prometheus.io/scrape` annotation living in another repository would not
+show up in that check.
+
+| Instrument | Type | Unit | Attributes | Question it answers |
+|---|---|---|---|---|
+| `sturnus.job.stage.duration` | histogram | s | `stage`, `outcome` | Which pipeline stage is slow, across all jobs? |
+| `sturnus.job.outcome` | counter | 1 | `outcome` | How many jobs died today? **The alerting signal** — unsampled, unlike a span. `outcome` is one of `done` / `failed` / `dead` / `crashed`, and it is recorded by the transition that decided it (`infrastructure/db/queue.py`), never inferred from the worker loop's return value — see the note below the table. |
+| `sturnus.queue.depth` | gauge | 1 | `status` | Is the worker keeping up? One series per status: `pending`, `running`, `done`, `failed`, `dead`. **Sampled once per poll**, so during a long transcription it is as old as that job — see the caveat below. |
+| `sturnus.transcription.audio_duration` | histogram | s | — | Paired with the `transcribe` stage histogram, gives the realtime factor. |
+| `sturnus.transcription.decoded_seconds` | counter | s | `model` | **Seconds of audio handed to the decoder** — the gated speech, concatenated, not the padded recording it was cut from (§ the worker hands the model only what the speech gate found). Divided by wall time this is the real-time factor, which is the single most useful operational number here — see 7.5.1. |
+| `sturnus.transcription.position_seconds` | gauge | s | `model` | How far into that concatenated speech the job in flight has got. Not a position in the recording: the times that reach the document are mapped back onto the recording's timeline afterwards, these are not. Absent while nothing is transcribing. |
+| `sturnus.transcription.total_seconds` | gauge | s | `model` | How much speech that job has to get through; the denominator for `position_seconds`, on the same timeline. Absent while nothing is transcribing. |
+| `sturnus.transcription.seconds_since_progress` | gauge | s | `model` | Seconds since the job in flight last produced a segment, or since it started. **The alert.** Absent while nothing is transcribing. |
+| `sturnus.session.close.duration` | histogram | s | `end_reason`, `outcome` | **Will a deploy lose a session?** Compare p99 to `terminationGracePeriodSeconds`. |
+| `sturnus.session.duration` | histogram | s | `end_reason`, `guild_id` | Are sessions ending by timeout, by people leaving, or because we could not hear? `end_reason` is one of `empty` / `idle_timeout` / `max_duration` / `shutdown` / `capture_failure` / `decode_failure` / `unknown`. The last three are the ones that cost a meeting; `unknown` means the close itself raised. |
+| `sturnus.session.active` | up/down counter | 1 | `guild_id` | Is anything recording right now — and did a session leak? Incremented when the session *row* opens, decremented on every close path there is, so a capture failure cannot make it drift. |
+| `sturnus.recording.upload.bytes` | histogram | By | — | Capacity planning against the retention window. |
+| `sturnus.voice.packets` | counter | 1 | `outcome`, `guild_id` | **Why is person X missing from the transcript?** `outcome` is one of `recorded` / `no_role` / `no_consent` / `not_recording` / `unknown_user` / `undecodable` / `loop_gone`. `undecodable` is the early warning the decode-failure threshold deliberately does not give — that fires once, after five consecutive seconds of nothing, and this is visible from the first frame. |
+| `sturnus.voice.packet_errors` | counter | 1 | `error_type` | Is the voice adapter throwing? The rate, not the log line: the matching `voice.packet_handler_failed` line is rate limited to one in a thousand because it is per-frame in origin. |
+| `sturnus.document.create.duration` | histogram | s | `outcome` | Is Outline down, slow, or rejecting us? |
+| `sturnus.oauth.callback` | counter | 1 | `outcome` | Are account links failing, and at which step? |
+
+`sturnus.queue.depth` costs no extra database load: the worker's poll loop
+already ran `SELECT 1` as a liveness probe, and that query is now a grouped
+count over `transcription_job.status` — still one round trip that either
+answers or does not, and it feeds the gauge as well. **The caveat that
+comes with that:** it is sampled once per poll, and the worker does not
+poll while it is transcribing. A ninety-minute job means a ninety-minute-old
+depth reading, so alert on it over a long window (`for: 30m`) and use
+`sturnus.transcription.seconds_since_progress` — which does not depend on
+the loop coming back round — for anything sharper.
+
+**`sturnus.job.outcome` says what happened, not what was returned.**
+`process_one` returns `True` after `queue.fail(...)` exactly as it does
+after `queue.complete(...)`: the boolean means "work was attempted", never
+"work succeeded". The worker loop used to turn it into `outcome="done"`, so
+every failed and every dead job was published as a success — a metric that
+reports failures as successes is worse than no metric, because it will be
+believed. The label is now recorded by `JobQueue.complete` and
+`JobQueue.fail`, the two transitions that decide a job's terminal state,
+and `crashed` is the one the loop still owns: `process_one` raised, so the
+worker is about to die with a job possibly stuck in `running` (the lease in
+`JobQueue.claim` is what reclaims it).
+
+### 7.5.1 Transcription progress: telling fast-because-broken from slow-because-working
+
+**Why these four exist.** Whisper's own failure mode is silence. When
+Silero's VAD collapsed on the bit-exact padding Sturnus writes between
+packets, the model was handed a 100-minute recording, returned no segments,
+and the job "finished" in 43 seconds. What everybody saw was an empty
+transcript — which is exactly what a participant who never spoke also
+produces, and it was read as that for a day. What the metric would have
+shown is a real-time factor of **140x**: a hundred minutes of audio decoded
+in forty-three seconds, which is not physically possible. Meanwhile a
+genuine job on that same recording ran for **98 minutes**. The honest range
+is that wide, which is precisely why "it is taking a long time" is not a
+diagnosis and this number is.
+
+`large-v3` on the worker's CPU allocation measures **1.94x** — that is
+`wall / audio`, so audio accrues at roughly half of wall-clock. Read
+"audio" as *speech*: the decoder is handed the gated clips concatenated, so
+a 100-minute recording holding 41 minutes of speech accrues 41 minutes
+here, not 100. That makes the ratio a statement about decoding rather than
+about how much of the meeting was silence, and it leaves the impossible-
+throughput alert below firing on the same failure — the 43-second collapse
+is a rate of ~57 against a ceiling of 10 either way:
+
+```promql
+# Real-time factor, the way the 1.94x figure is quoted (wall per second of audio)
+1 / (sum by (model) (rate(sturnus_transcription_decoded_seconds_total[30m])))
+
+# Alert: physically impossible throughput. Nothing is being decoded.
+sum by (model) (rate(sturnus_transcription_decoded_seconds_total[15m])) > 10
+```
+
+Ten is a deliberately loose ceiling — five times faster than the fastest
+plausible model on this hardware — because the failure it catches is three
+orders of magnitude out, not a few percent.
+
+**The stall alert, which is the one to page on.**
+
+```promql
+# A job that has produced nothing for ten minutes. Absent when idle, so this
+# expression is simply empty on a worker with no work.
+sturnus_transcription_seconds_since_progress > 600
+```
+
+This is the only signal that covers a job which wedges **before its first
+segment** — inside feature extraction or language detection, which is where
+the collapse happened. A position gauge cannot: a job stuck at zero looks
+exactly like a job that has only just started, and every real job passes
+through that state. The clock therefore starts when the model is called,
+not when the first segment arrives.
+
+`position_seconds / total_seconds` is the dashboard number ("this job is 12
+minutes into 43"). Both are on the concatenated-speech timeline, which is
+why the fraction means anything; it is not an alert on its own, since a
+large `total_seconds` is a talkative meeting, not a fault.
+
+**No id is a label on any of these, and that is not an oversight.** A
+session id, job id, guild id or user id would be unbounded cardinality
+*and* a record of who was in which voice channel when, kept for as long as
+the metric store keeps anything. `model` plus the resource's `service.name`
+are enough to read every number above. To go from a suspicious rate to the
+job responsible, jump to the log: `transcription.decoded` and
+`transcription.skipped` carry `speech_seconds`, `clips` and `segments`, and
+`job.transcribed` next to them carries `job_id` and `session_id`.
+
+**The log line that pairs with these.** `speech_seconds` against
+`audio_seconds` on `transcription.decoded` is the speech gate's own
+signature, and it is what would have named Silero as the culprit on the
+first read: one second of speech in two minutes of recording is not a
+plausible meeting.
+
+```logql
+# The gate found almost nothing in a long recording
+{app_kubernetes_io_component="worker"} | json | event="transcription.decoded"
+  | speech_seconds < 5 | audio_seconds > 120
+
+# The model was never called at all — a genuinely silent participant, and
+# the *other* explanation for an empty transcript
+{app_kubernetes_io_component="worker"} | json | event="transcription.skipped"
+```
+
+Histogram buckets are set explicitly. The SDK's defaults top out at 10 000
+in *milliseconds*; Sturnus's durations are seconds and run to an hour, so
+the defaults would put every transcription in one bucket.
+
+### 7.6 Traces
+
+Root spans: `job.process` (worker, per poll), `session.open` and
+`session.close` (bot), `document.create` (Outline).
+
+**The packet path emits no spans, by construction.** `sink.py`'s `write()`
+runs ~50×/s per speaker; ten speakers is 500/s, which at a measured 16.7 µs
+per recorded span is 8.4 ms of CPU per second of wall clock *and* 43 million
+spans a day from one bot. They would also all be orphaned roots, because the
+extension's router thread inherits no context. Counters go there instead, at
+a measured **2.2 µs** per `add` with a provider installed and **0.10 µs**
+without — 1.1 ms/s at 500 packets/s, under 0.15% of one core. That is not a
+consolation prize: a rate graph split by `outcome` answers "why is X missing
+from the transcript" in one panel, which fifty spans a second would not.
+
+`session.close` is the span worth watching. It encrypts, uploads and
+enqueues **serially, per speaker**, and it runs during SIGTERM. If that
+takes longer than `terminationGracePeriodSeconds`, Kubernetes kills the pod
+mid-loop and Spec 15's "the entire session is lost, not just a portion" is
+what happens. Nothing measured that before.
+
+**Traces are not wired into Sentry.** `sentry_sdk` can consume OTel spans,
+and `observability.py` locks that door twice on purpose
+(`traces_sample_rate=0.0` *and* `before_send_transaction=drop_transaction`),
+because `before_send` is never called for transactions and span data would
+route around `scrub_event` entirely. The pod log line, carrying `trace_id`,
+is the correlation point instead.
+
+### 7.7 After a deploy: confirm telemetry actually arrives
+
+If the endpoint is misconfigured, spans and metrics vanish and every
+dashboard shows a flat, healthy-looking zero — which is easy to misread as
+"nothing is wrong".
+
+Export failures are still visible, but only in one place. The OTLP logger is
+clamped to `ERROR`, so a lost batch is one line in Loki rather than the four
+the exporter emits per batch (three retries plus the give-up), and
+`ignore_logger("opentelemetry")` keeps the same failures out of Sentry
+entirely, where an unreachable Alloy would otherwise be an issue per retry
+per batch from all three pods, forever. So:
+
+```logql
+{app_kubernetes_io_name="sturnus"} | json | logger =~ "opentelemetry.*"
+```
+
+is the standing alert for "telemetry is being dropped". A *misconfigured*
+endpoint that happens to resolve — pointing at the wrong service, say —
+produces no error at all, and for that the smoke check below is the only
+detector:
+
+1. `kubectl logs deploy/sturnus-worker | jq 'select(.event=="telemetry.enabled")'` —
+   confirms which endpoint was installed.
+2. In Grafana, search Tempo for `service.name = sturnus-worker` and confirm
+   one `job.process` trace has arrived.
+3. Confirm `sturnus.queue.depth` has a recent sample.

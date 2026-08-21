@@ -1,5 +1,6 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -7,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sturnus.infrastructure.db.models import Base
 from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import JobRepository, SessionRepository
+from sturnus.infrastructure.telemetry import JOB_OUTCOME, record
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 GUILD, CHANNEL, ANNA, BEN = 1, 2, 100, 200
@@ -265,3 +267,121 @@ async def test_a_reclaimed_job_gets_a_fresh_lease(
     assert reclaimed is not None
 
     assert await queue.claim(T0 + timedelta(seconds=90)) is None
+
+
+# ---------------------------------------------------------------------------
+# `sturnus.job.outcome`: what actually happened, not what was returned
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def outcomes(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    """Every `record(...)` this module makes, captured on its way through.
+
+    The real `record` is still called -- this observes the call, it does
+    not replace the recorder -- so the production path, including
+    `_metric_attributes`' allowlist, runs exactly as it does in the worker
+    and a label that would be dropped there is dropped here too.
+
+    A spy rather than a metric reader because installing a `MeterProvider`
+    is a process-global, once-only operation: it would bind every
+    module-level instrument in `sturnus.infrastructure.telemetry` for the
+    rest of the session and silently invalidate
+    `test_spans_and_metrics_are_no_ops_with_no_provider`, which asserts the
+    opposite premise.
+    """
+    seen: list[dict[str, Any]] = []
+
+    def spy(instrument: Any, value: float, **fields: object) -> None:
+        seen.append({"instrument": instrument, "value": value, **fields})
+        record(instrument, value, **fields)
+
+    # Patched by dotted path rather than through the module object: `record`
+    # is not re-exported from `sturnus.infrastructure.db.queue`, and mypy's
+    # `no_implicit_reexport` is right to say so.
+    monkeypatch.setattr("sturnus.infrastructure.db.queue.record", spy)
+    return seen
+
+
+def _job_outcomes(seen: list[dict[str, Any]]) -> list[str]:
+    return [
+        str(call["outcome"])
+        for call in seen
+        if call["instrument"] is JOB_OUTCOME and call["value"] == 1
+    ]
+
+
+async def test_a_completed_job_is_counted_as_done(
+    factory: async_sessionmaker[AsyncSession], outcomes: list[dict[str, Any]]
+) -> None:
+    """The only path that may produce `done`, and it is the one that stored a
+    transcript."""
+    session_id = await seed(factory, [ANNA])
+    queue = JobQueue(factory)
+    job = await queue.claim()
+    assert job is not None
+
+    await queue.complete(job.id, "the transcript")
+
+    assert _job_outcomes(outcomes) == ["done"]
+    assert session_id  # the seed really produced a job to complete
+
+
+async def test_a_job_returned_for_another_attempt_is_counted_as_failed(
+    factory: async_sessionmaker[AsyncSession], outcomes: list[dict[str, Any]]
+) -> None:
+    """The defect this test exists for.
+
+    `process_one` returns `True` after `queue.fail(...)` just as it does
+    after `queue.complete(...)` -- the boolean means "work was attempted",
+    not "work succeeded" -- and the worker loop used to turn that boolean
+    into `outcome="done"`. Every failed job was therefore counted as a
+    success, which is worse than not counting at all: an operator would
+    believe it.
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory)
+    job = await queue.claim()
+    assert job is not None
+
+    assert await queue.fail(job.id, "s3 timed out", 3) is False
+
+    assert _job_outcomes(outcomes) == ["failed"]
+
+
+async def test_a_job_out_of_attempts_is_counted_as_dead_and_says_so(
+    factory: async_sessionmaker[AsyncSession], outcomes: list[dict[str, Any]]
+) -> None:
+    """`dead` is permanent loss and must be distinguishable from a retry.
+
+    The return value is what lets the caller -- and the `job.process` span
+    -- tell the two apart at all: `fail` is the only place that knows,
+    because it is the only place that counts the attempts.
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory)
+    job = await queue.claim()
+    assert job is not None
+
+    assert await queue.fail(job.id, "still broken", 1) is True
+
+    assert _job_outcomes(outcomes) == ["dead"]
+
+
+async def test_the_outcome_counter_never_reports_a_failure_as_a_success(
+    factory: async_sessionmaker[AsyncSession], outcomes: list[dict[str, Any]]
+) -> None:
+    """The property, over one job's whole life: two retries, then death.
+
+    Written as the sequence rather than as three separate assertions
+    because the failure the counter had was precisely a *substitution* --
+    the right number of measurements with the wrong label on them.
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory)
+    for _ in range(3):
+        job = await queue.claim()
+        assert job is not None
+        await queue.fail(job.id, "broken", 3)
+
+    assert _job_outcomes(outcomes) == ["failed", "failed", "dead"]

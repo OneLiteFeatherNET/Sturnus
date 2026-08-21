@@ -1,0 +1,271 @@
+"""The event vocabulary, and the one sanctioned way to emit a log line.
+
+An operator's questions are about a *session*, not about a module. The
+names below are chosen so that `| json | session_id="4711"` in LogQL
+returns one readable narrative that crosses all three processes:
+
+    guild.configured -> voice.joined -> session.opened
+      -> session.speaker_first_packet -> session.closing
+      -> session.speaker_finalized -> session.closed
+      -> job.claimed -> job.transcribed -> session.document_created
+      -> announce.posted
+
+`session_id` is the join key for the whole story and is line content, never
+a Loki label -- it is unbounded, and promoting it would multiply the cluster's
+stream count without limit. `docs/operations.md` section 7 carries the label
+policy and the queries this vocabulary was designed to answer.
+
+Levels are part of the design, not decoration:
+
+- `DEBUG` -- counts, sizes and housekeeping. Sturnus's own DEBUG lines are
+  held to ids, counts, sizes and durations by the same registry that governs
+  INFO; they are never payload.
+- `INFO` -- the narrative above. One line per event, never per packet.
+- `WARNING` -- retried, and expected to self-heal.
+- `ERROR` -- **a human must act.** Reserved for permanent loss, for capture
+  that has silently stopped, and for a guild that has stopped being able to
+  record. `job.dead`, `session.unrecoverable`, `session.document_rejected`,
+  `voice.join_failed`, `voice.reader_stopped`, `voice.decode_failed`,
+  `voice.packet_handler_failed`, `voice.left_failed`,
+  `voice.rejoin_blocked`, `guild.tick_failed` and `session.close_failed`
+  are the ones that earn it.
+
+`voice.join_failed`, `voice.reader_stopped` and `voice.decode_failed` are
+one family and are deliberately not one name. They are the three ways this
+process can end up in a voice channel hearing nothing while everyone in it
+has been told they are recorded: capture never started
+(`voice.join_failed`), capture started and then died
+(`voice.reader_stopped`), or capture is running and no stream decodes any
+more (`voice.decode_failed`). All three end the session with an
+`end_reason` that says "we could not hear" rather than "nobody spoke", and
+telling them apart in Loki is the difference between suspecting libopus,
+suspecting the gateway, and suspecting the channel.
+
+The last four are the bot's *operational* failures, and they were bare
+`log.exception("... %d ...", guild_id)` calls until this vocabulary reached
+them. A `%d`-formatted id is invisible to `| json | guild_id="..."`, which
+is the one query this whole package exists to make possible -- and
+`scrub_event` forwards `LogRecord.msg` to Sentry, so an id interpolated
+into the message is also the half of the line that leaves the pod. They
+carry fields now, and the message stayed a literal.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+from enum import StrEnum
+from typing import Final
+
+
+class Event(StrEnum):
+    """The closed set of event names. New lines pick a name from here."""
+
+    # -- bot: the session story -------------------------------------------
+    GUILD_CONFIGURED = "guild.configured"
+    GUILD_UNCONFIGURED = "guild.unconfigured"
+    BOT_CONNECTED = "bot.connected"
+    VOICE_JOINED = "voice.joined"
+    VOICE_LEFT = "voice.left"
+    VOICE_JOIN_FAILED = "voice.join_failed"
+    VOICE_READER_STOPPED = "voice.reader_stopped"
+    VOICE_DECODE_FAILED = "voice.decode_failed"
+    VOICE_PACKET_REJECTED = "voice.packet_rejected"
+    VOICE_PACKET_HANDLER_FAILED = "voice.packet_handler_failed"
+    VOICE_LEFT_FAILED = "voice.left_failed"
+    VOICE_REJOIN_BLOCKED = "voice.rejoin_blocked"
+    GUILD_TICK_FAILED = "guild.tick_failed"
+    SESSION_CLOSE_FAILED = "session.close_failed"
+    SESSION_OPENED = "session.opened"
+    SESSION_SPEAKER_FIRST_PACKET = "session.speaker_first_packet"
+    #: A speaker whose packets arrive, decode, and carry no audible level --
+    #: what a microphone muted at system level produces. Three lines, because
+    #: the durable record and the message into the room can each fail on
+    #: their own and neither may take the capture path down with it.
+    SPEAKER_AUDIO_SILENT = "speaker.audio_silent"
+    SPEAKER_SILENT_WARNING_FAILED = "speaker.silent_warning_failed"
+    SPEAKER_SILENT_RECORD_FAILED = "speaker.silent_record_failed"
+    SESSION_CLOSING = "session.closing"
+    SESSION_SPEAKER_FINALIZED = "session.speaker_finalized"
+    SESSION_CLOSED = "session.closed"
+    SESSION_RECOVERED = "session.recovered"
+    SESSION_UNRECOVERABLE = "session.unrecoverable"
+    #: `/queue requeue`'s confirmation buttons could not be greyed out. The
+    #: answer the administrator is waiting for is not lost with them -- the
+    #: edit is swallowed on purpose -- so this line is the only trace.
+    QUEUE_VIEW_DISABLE_FAILED = "queue.view_disable_failed"
+    ANNOUNCE_POSTED = "announce.posted"
+    ANNOUNCE_FAILED = "announce.failed"
+    AUDIO_ERASED = "audio.erased"
+
+    # -- worker ------------------------------------------------------------
+    WORKER_STARTED = "worker.started"
+    JOB_CLAIMED = "job.claimed"
+    JOB_TRANSCRIBED = "job.transcribed"
+    TRANSCRIPTION_SKIPPED = "transcription.skipped"
+    TRANSCRIPTION_DECODED = "transcription.decoded"
+    JOB_FAILED = "job.failed"
+    JOB_DEAD = "job.dead"
+    KEY_ID_MISMATCH = "key.id_mismatch"
+    SESSION_DOCUMENT_CREATED = "session.document_created"
+    SESSION_DOCUMENT_REJECTED = "session.document_rejected"
+    SESSION_DOCUMENT_RETRY_FAILED = "session.document_retry_failed"
+    RETENTION_SWEPT = "retention.swept"
+    RETENTION_FAILED = "retention.failed"
+
+    # -- link ---------------------------------------------------------------
+    LINK_STARTED = "link.started"
+    LINK_CALLBACK_REJECTED = "link.callback_rejected"
+    LINK_EXCHANGE_FAILED = "link.exchange_failed"
+    LINK_ESTABLISHED = "link.established"
+    LINK_STATES_PURGED = "link.states_purged"
+
+    # -- cross-cutting ------------------------------------------------------
+    PROCESS_STARTING = "process.starting"
+    SHUTDOWN_BEGIN = "shutdown.begin"
+    SHUTDOWN_COMPLETE = "shutdown.complete"
+    SCHEMA_WAITING = "schema.waiting"
+    #: The startup line that says a requested third-party log level was
+    #: raised to `setup.THIRD_PARTY_FLOOR`. An operator who turned the knob
+    #: up and sees nothing new needs to be told why, in the same place they
+    #: are already looking.
+    LOG_LEVEL_CLAMPED = "log.level_clamped"
+    SWEEP_FAILED = "sweep.failed"
+    TELEMETRY_ENABLED = "telemetry.enabled"
+    UNHANDLED_EXCEPTION = "unhandled.exception"
+
+
+#: Filled in by `sturnus.infrastructure.telemetry.install_trace_context`
+#: once an OpenTelemetry provider exists. A module-level hook rather than an
+#: import because this package is standard-library only (see the package
+#: docstring) and must never reach for the OTel API; with no telemetry
+#: installed it stays `None` and every log line simply has no `trace_id`.
+#:
+#: This is the Loki -> Tempo link: a `trace_id` in the JSON line is what a
+#: Grafana derived field turns into a click through to the waterfall for the
+#: same job.
+_trace_context_provider: Callable[[], dict[str, str]] | None = None
+
+
+def set_trace_context_provider(provider: Callable[[], dict[str, str]] | None) -> None:
+    """Installs (or clears) the hook that supplies `trace_id`/`span_id`."""
+    global _trace_context_provider
+    _trace_context_provider = provider
+
+
+def current_trace_context() -> dict[str, str]:
+    """`{"trace_id": ..., "span_id": ...}` when a span is active, else `{}`.
+
+    Never raises: a broken telemetry provider must not be able to stop a log
+    line being written, because the log line is the fallback for telemetry
+    being broken.
+    """
+    provider = _trace_context_provider
+    if provider is None:
+        return {}
+    try:
+        return provider()
+    except Exception:  # pragma: no cover - defensive; see docstring
+        return {}
+
+
+def log_event(
+    logger: logging.Logger,
+    level: int,
+    event: Event,
+    message: str,
+    /,
+    **fields: object,
+) -> None:
+    """Emits one structured event. The only sanctioned log call shape.
+
+    `message` must be a plain string literal -- no f-string, no `%`
+    interpolation, no concatenation. Everything that varies goes in
+    `**fields`, where `redaction.scrub_fields` rebuilds it from the
+    registry. This is what makes the human-readable half of a line
+    reviewable source text rather than a place data can hide, and it is the
+    same guarantee `sturnus.infrastructure.observability.scrub_event`
+    already relies on when it forwards `logentry.message` and nothing else
+    to Sentry.
+
+    `tests/test_logging_discipline.py` enforces both halves: the literal
+    message, and every field name being registered.
+    """
+    logger.log(
+        level,
+        message,
+        extra={"sturnus_event": str(event), "sturnus_fields": dict(fields)},
+    )
+
+
+def log_exception(
+    logger: logging.Logger,
+    level: int,
+    event: Event,
+    message: str,
+    exc: BaseException,
+    /,
+    **fields: object,
+) -> None:
+    """`log_event` plus a stack trace, with `error_type` filled in.
+
+    Note what is *not* here: the exception is never passed as a `%`
+    argument. `log.warning("failed: %s", exc)` -- twelve of which existed
+    before this package -- prints `str(exc)` verbatim, and a
+    `jinja2.UndefinedError` raised while rendering a transcript through the
+    Outline template carries template context in exactly that string. The
+    type is a registered field, the traceback is rendered by
+    `setup.SafeFormatterMixin` from static program text, and the message
+    itself travels only if `redaction.SAFE_MESSAGE_TYPES` vouches for its
+    class.
+    """
+    from sturnus.observability.redaction import error_type
+
+    logger.log(
+        level,
+        message,
+        exc_info=exc,
+        extra={
+            "sturnus_event": str(event),
+            "sturnus_fields": {"error_type": error_type(exc), **fields},
+        },
+    )
+
+
+class RateLimiter:
+    """Lets the first occurrence through, then one in every `every`.
+
+    For events that are per-packet in origin but must not be per-packet in
+    Loki. `voice.packet_handler_failed` used to be a `log.error` on every
+    failed packet: during a systematic failure -- which is the only time it
+    matters -- that is its own flood, at ~50 lines per second per speaker.
+    One line carrying `count` says strictly more and costs four orders of
+    magnitude less.
+
+    Not thread-safe by construction, and it does not need to be: the
+    counter is a plain `int` increment, the GIL makes that atomic enough for
+    a rate limiter, and the worst outcome of a lost increment is one line
+    logged early.
+    """
+
+    def __init__(self, every: int = 1000) -> None:
+        self._every = every
+        self._count = 0
+
+    def should_log(self) -> bool:
+        self._count += 1
+        return self._count == 1 or self._count % self._every == 0
+
+    @property
+    def count(self) -> int:
+        return self._count
+
+    def reset(self) -> None:
+        self._count = 0
+
+
+#: Level constants re-exported so a call site needs one import, not two.
+DEBUG: Final = logging.DEBUG
+INFO: Final = logging.INFO
+WARNING: Final = logging.WARNING
+ERROR: Final = logging.ERROR

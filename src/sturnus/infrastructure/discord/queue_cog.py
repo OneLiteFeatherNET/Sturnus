@@ -75,6 +75,7 @@ from sturnus.application.requeue import TERMINAL_STATUSES, RequeuePlan, plan_req
 from sturnus.infrastructure.db.models import Session, SessionParticipant, TranscriptionJob
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS
 from sturnus.infrastructure.discord.permissions import require_admin
+from sturnus.observability.events import Event, log_exception
 
 log = logging.getLogger(__name__)
 
@@ -961,7 +962,16 @@ class RequeueConfirmView(discord.ui.View):
         try:
             await self.message.edit(view=self)
         except discord.HTTPException as exc:
-            log.warning("Could not disable the /queue requeue buttons: %s", exc)
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.QUEUE_VIEW_DISABLE_FAILED,
+                "Could not grey out the /queue requeue buttons; a live button on a "
+                "stopped view is refused by the re-check anyway",
+                exc,
+                guild_id=self._guild_id,
+                session_id=self._session_id,
+            )
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.danger)
     async def confirm(

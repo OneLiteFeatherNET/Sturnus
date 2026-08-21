@@ -190,6 +190,35 @@ The worker runs the database migrations at startup, and the bot and link
 wait for the tables. So `sturnus-worker` coming up healthy is the gate —
 if it does not, the other two never will.
 
+**Two things to look at once the pods are up**, both one command each and
+both easier now than after the first real meeting:
+
+```bash
+# 1. Nothing outside sturnus.* may log at DEBUG. This must print nothing.
+#    If it prints anything, stop and read operations.md section 7.2 --
+#    third-party DEBUG is how the Discord voice secret key reaches Loki.
+kubectl -n sturnus logs deploy/sturnus-worker \
+  | jq -r 'select(.level=="DEBUG" and (.logger | startswith("sturnus") | not))'
+
+# 2. Telemetry is OFF by default and looks identical to "healthy" when it
+#    is misconfigured -- every dashboard shows a flat zero either way.
+kubectl -n sturnus logs deploy/sturnus-worker \
+  | jq -r 'select(.event=="telemetry.enabled")'
+```
+
+The second prints nothing at all until `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT`
+is set — the chart ships it empty, which is a deliberate off switch rather
+than an oversight, and with it empty no OpenTelemetry provider is built,
+nothing connects and nothing retries. Set it to
+`http://alloy-receiver.grafana.svc:4318` when you want traces and metrics,
+then follow section 7.7 of `operations.md`, which is the only way to tell a
+*misconfigured* endpoint from a working one.
+
+A third line worth recognising if you see it: `"event":"log.level_clamped"`
+means someone set `STURNUS_LOG_THIRD_PARTY_LEVEL` below `INFO` and the
+process raised it back. The variable is not broken; it is floored on
+purpose.
+
 ## 7. Configure the guild
 
 In Discord, as an administrator:

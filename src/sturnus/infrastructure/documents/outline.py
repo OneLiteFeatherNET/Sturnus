@@ -23,10 +23,14 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
+from opentelemetry.trace import SpanKind
 
 from sturnus.application.documents import CreatedDocument, DocumentSink
+from sturnus.infrastructure.telemetry import set_span_fields, span
+from sturnus.observability.events import Event, log_event
 
 log = logging.getLogger(__name__)
 
@@ -115,27 +119,67 @@ class OutlineSink(DocumentSink):
 
     async def create(self, title: str, body: str, target: str) -> CreatedDocument:
         payload = _build_payload(title=title, body=body, collection_id=target)
-        log.debug(
-            "Creating Outline document (title length=%d, body length=%d)",
-            len(title),
-            len(body),
-        )
-        async with httpx.AsyncClient(
-            base_url=self._base_url,
-            transport=self._transport,
-            headers={"Authorization": f"Bearer {self._api_token}"},
-        ) as client:
-            response = await client.post(_CREATE_DOCUMENT_PATH, json=payload)
+        # The highest-value span per line in this adapter. This file's own
+        # docstring says the endpoint path, the field names and the response
+        # shape are UNVERIFIED guesses against a live Outline -- this span is
+        # what confirms or refutes them in production.
+        #
+        # Sizes only. `title` is derived from the transcript and `body` *is*
+        # the transcript; neither goes anywhere near an attribute. Note also
+        # what is absent: `url.full` would carry the Authorization header's
+        # host and any query string, which is exactly the reason no
+        # `opentelemetry-instrumentation-httpx` is installed.
+        with span(
+            "document.create",
+            SpanKind.CLIENT,
+            http_method="POST",
+            url_path=_CREATE_DOCUMENT_PATH,
+            server_address=urlsplit(self._base_url).hostname or "",
+            collection_id=target,
+            title_chars=len(title),
+            body_bytes=len(body.encode("utf-8")),
+        ) as active:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                transport=self._transport,
+                headers={"Authorization": f"Bearer {self._api_token}"},
+            ) as client:
+                response = await client.post(_CREATE_DOCUMENT_PATH, json=payload)
 
-        if response.status_code in _PERMANENT_STATUS_CODES:
-            log.warning(
-                "Outline permanently rejected document creation (status=%d)",
-                response.status_code,
+            set_span_fields(active, http_status=response.status_code)
+
+            if response.status_code in _PERMANENT_STATUS_CODES:
+                # `permanent` is the operationally decisive bit: 401/403/404
+                # means "this will never succeed, stop retrying", while a
+                # 5xx is swept up again every 300s by
+                # `retry_pending_documents`. From outside, those two look
+                # identical today. `collection_id` earns its place for the
+                # same reason -- a 404 is un-diagnosable without it, because
+                # "is the configured document_target real?" is the whole
+                # question.
+                set_span_fields(active, permanent=True)
+                log_event(
+                    log,
+                    logging.WARNING,
+                    Event.SESSION_DOCUMENT_REJECTED,
+                    "Outline permanently rejected document creation",
+                    http_status=response.status_code,
+                    collection_id=target,
+                )
+                raise PermanentDocumentError(response.status_code)
+
+            response.raise_for_status()
+
+            created = _extract_created_document(response.json(), self._base_url)
+            set_span_fields(active, document_id=created.id)
+            log_event(
+                log,
+                logging.DEBUG,
+                Event.SESSION_DOCUMENT_CREATED,
+                "Created an Outline document",
+                document_id=created.id,
+                collection_id=target,
+                title_chars=len(title),
+                body_bytes=len(body.encode("utf-8")),
             )
-            raise PermanentDocumentError(response.status_code)
-
-        response.raise_for_status()
-
-        created = _extract_created_document(response.json(), self._base_url)
-        log.info("Created Outline document %s", created.id)
-        return created
+            return created

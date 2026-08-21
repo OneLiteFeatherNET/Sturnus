@@ -29,6 +29,8 @@ import logging
 from datetime import datetime
 from typing import Protocol, cast
 
+from sturnus.observability.events import Event, log_exception
+
 log = logging.getLogger(__name__)
 
 
@@ -97,4 +99,11 @@ async def sweep_expired_audio(jobs: JobStore, store: AudioDeleter, now: datetime
             await store.delete(cast(str, job["s3_key"]))
             await jobs.mark_audio_deleted(job_id, now)
         except Exception as exc:
-            log.warning("Failed to delete expired audio for job %d; will retry: %s", job_id, exc)
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.RETENTION_FAILED,
+                "Failed to delete expired audio; will retry next sweep",
+                exc,
+                job_id=job_id,
+            )

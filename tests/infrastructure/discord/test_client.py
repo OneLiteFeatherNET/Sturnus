@@ -56,6 +56,7 @@ from sturnus.infrastructure.discord.client import (
 )
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState
+from sturnus.observability.events import Event
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 GUILD_ID, CHANNEL_ID, ROLE_ID = 1, 2, 3
@@ -242,18 +243,33 @@ class FakeAnnouncer:
 class FakeVoiceReceiver:
     """Satisfies the `VoiceReceiver` port without a real gateway connection."""
 
-    def __init__(self, *, join_fails: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        join_fails: bool = False,
+        leave_fails: bool = False,
+        join_error: BaseException | None = None,
+    ) -> None:
         self.joined: list[int] = []
         self.left = 0
-        self.join_fails = join_fails
+        self.join_fails = join_fails or join_error is not None
+        self.leave_fails = leave_fails
+        #: The exception `join` raises. Configurable because *which* one it
+        #: is changes what the failure line can say -- see
+        #: `infrastructure.discord.voice.voice_close_code`.
+        self.join_error = join_error
 
     async def join(self, channel_id: int) -> None:
+        if self.join_error is not None:
+            raise self.join_error
         if self.join_fails:
             raise RuntimeError("the gateway said no")
         self.joined.append(channel_id)
 
     async def leave(self) -> None:
         self.left += 1
+        if self.leave_fails:
+            raise RuntimeError("the gateway hung up")
 
 
 def _role(role_id: int) -> discord.Role:
@@ -1157,9 +1173,24 @@ async def test_a_failed_upload_must_not_leave_a_guild_recording_nothing(
 
     assert audio.put_calls == 1, "the close really did get as far as the upload"
     assert sessions.closed == [], "and really did fail before closing the row"
-    assert [record for record in caplog.records if record.levelno >= logging.ERROR], (
-        "a close that lost a recording must be visible, not swallowed"
-    )
+    (failure,) = [record for record in caplog.records if record.levelno >= logging.ERROR]
+    # Visible *and* queryable. This was a bare `log.exception("Guild %d:
+    # ...", guild_id)`: the id existed only as characters inside the
+    # rendered message, so `| json | guild_id="..."` -- the query the whole
+    # event vocabulary exists for -- returned nothing, and `scrub_event`
+    # forwards `LogRecord.msg` to Sentry, which made that id the half of
+    # the line that leaves the pod.
+    assert getattr(failure, "sturnus_event", None) == str(Event.SESSION_CLOSE_FAILED)
+    fields = getattr(failure, "sturnus_fields", {})
+    assert fields["guild_id"] == GUILD_ID
+    assert fields["reason"] == "timeout_sweep"
+    assert fields["error_type"] == "RuntimeError"
+    # `record.args` is what `log.exception("Guild %d: ...", guild_id)` left
+    # behind and what `log_exception(..., guild_id=...)` does not: an empty
+    # `args` is the mechanical statement that nothing was interpolated into
+    # the message at all.
+    assert not failure.args, "the id is a %-argument of the message rather than a field"
+    assert failure.getMessage() == failure.msg
 
     # The guild is not wedged: the very next consenting participant records.
     audio.fail = False
@@ -1674,3 +1705,190 @@ async def test_a_pipeline_the_client_builds_can_warn_its_own_channel(tmp_path: P
     assert [(user_id, at) for _, user_id, at in sessions.silent_audio] == [
         (ANNA, T0 + timedelta(seconds=29))
     ]
+
+
+# ---------------------------------------------------------------------------
+# The operational failures, as events rather than as prose
+# ---------------------------------------------------------------------------
+#
+# Every test below drives one of the `log.exception("... %d ...", guild_id)`
+# call sites this file used to carry. Each asserts the same three things,
+# because each was wrong in the same three ways: the event name (so Loki
+# can group them), the fields (so `| json | guild_id="1"` finds them), and
+# an empty `record.args` (so nothing varying is inside the message that
+# `infrastructure.observability.scrub_event` forwards to Sentry).
+
+
+#: `caplog` captures every propagated record, not only the logger named in
+#: `at_level`, and closing a session that recorded nothing legitimately
+#: emits its own ERROR from `sturnus.application.recording`. Filtering by
+#: logger is what keeps these assertions about this module.
+CLIENT_LOGGER = "sturnus.infrastructure.discord.client"
+
+
+def _only_error(caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
+    (record,) = [
+        entry
+        for entry in caplog.records
+        if entry.levelno >= logging.ERROR and entry.name == CLIENT_LOGGER
+    ]
+    return record
+
+
+async def test_a_leave_that_fails_is_an_event_carrying_the_guild(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`_return_to_idle`: the guild must recover, and must say what it lost.
+
+    `leave()` is a gateway call and a failing one must not take `reset()`
+    down with it -- so the failure is swallowed, and the log line is the
+    only trace it ever leaves.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    voice = FakeVoiceReceiver(leave_fails=True)
+    client = _client(clock, config_store=_configured_store())
+    anna, occupied = _capture_guild(client, sessions, voice, tmp_path)
+
+    await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
+    # Everyone leaves, and the empty grace period runs out, so the tick
+    # closes the session and returns the guild to idle through `leave()`.
+    empty = _voice_channel(CHANNEL_ID, members=[])
+    cast(MagicMock, client.get_guild(GUILD_ID)).get_channel.return_value = empty
+    await client.on_voice_state_update(anna, _voice_state(occupied), _voice_state(None))
+    clock.advance(timedelta(seconds=61))
+
+    with caplog.at_level(logging.ERROR, logger="sturnus.infrastructure.discord.client"):
+        await client._tick_all(clock.now())
+
+    failure = _only_error(caplog)
+    assert getattr(failure, "sturnus_event", None) == str(Event.VOICE_LEFT_FAILED)
+    fields = getattr(failure, "sturnus_fields", {})
+    assert fields["guild_id"] == GUILD_ID
+    assert fields["channel_id"] == CHANNEL_ID
+    assert fields["error_type"] == "RuntimeError"
+    assert not failure.args
+    # The point of swallowing it: the guild is recordable again.
+    assert client._guilds[GUILD_ID].service.needs_reset is False
+
+
+async def test_one_guilds_tick_raising_is_reported_and_isolated(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`_tick_all`'s per-guild `try` -- both halves of what it promises.
+
+    The line it logs claims "every other guild is unaffected", and until
+    now nothing checked that claim: this ticks two guilds, breaks the
+    first, and asserts the second still ran. Which guild broke is a field,
+    because an operator with fifty guilds needs to know *which* one.
+    """
+    clock = FakeClock(T0)
+    client = _client(clock, config_store=_configured_store())
+    _capture_guild(client, FakeSessions(), FakeVoiceReceiver(), tmp_path)
+
+    other_guild_id = GUILD_ID + 41
+    ticked: list[int] = []
+
+    async def tick(guild_id: int, now: datetime) -> None:
+        del now
+        ticked.append(guild_id)
+        if guild_id == GUILD_ID:
+            raise RuntimeError("the database went away")
+
+    client._guilds[other_guild_id] = client._guilds[GUILD_ID]
+    client._tick_guild = tick  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.ERROR, logger="sturnus.infrastructure.discord.client"):
+        await client._tick_all(clock.now())
+
+    assert ticked == [GUILD_ID, other_guild_id], "the second guild still got its tick"
+    failure = _only_error(caplog)
+    assert getattr(failure, "sturnus_event", None) == str(Event.GUILD_TICK_FAILED)
+    assert getattr(failure, "sturnus_fields", {})["guild_id"] == GUILD_ID
+    assert not failure.args
+
+
+async def test_the_rejoin_guard_says_which_channel_and_for_how_long(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`_begin_capture_cooldown`, reached the way production reaches it.
+
+    A join that fails ends the session with `capture_failure`, and leaving
+    the channel is itself a voice-state update -- so without the guard the
+    next event walks straight back into the same fault. The line announcing
+    the guard is an ERROR because somebody has to investigate before it
+    lifts, which makes "which channel" and "how long" the two things it has
+    to carry.
+
+    `duration_seconds` rather than the absolute moment the guard lifts:
+    every line already has a `ts`, and the registry deliberately has no
+    field for a timestamp.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    client = _client(clock, config_store=_configured_store())
+    anna, occupied = _capture_guild(client, sessions, FakeVoiceReceiver(join_fails=True), tmp_path)
+
+    await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
+    clock.advance(timedelta(seconds=1))
+
+    with caplog.at_level(logging.ERROR, logger="sturnus.infrastructure.discord.client"):
+        await client._tick_all(clock.now())
+
+    blocked = [
+        entry
+        for entry in caplog.records
+        if getattr(entry, "sturnus_event", None) == str(Event.VOICE_REJOIN_BLOCKED)
+    ]
+    assert len(blocked) == 1
+    fields = getattr(blocked[0], "sturnus_fields", {})
+    assert fields["guild_id"] == GUILD_ID
+    assert fields["channel_id"] == CHANNEL_ID
+    assert fields["end_reason"] == EndReason.CAPTURE_FAILURE.value
+    assert fields["duration_seconds"] == REJOIN_COOLDOWN.total_seconds()
+    assert not blocked[0].args
+
+
+async def test_a_join_refused_by_discord_reports_the_close_code(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`voice.join_failed` where `error_type` alone is not an answer.
+
+    `discord.ConnectionClosed` is raised for "session no longer valid",
+    "you were moved", "rate limited" and "voice server crashed" alike, and
+    `redaction.SAFE_MESSAGE_TYPES` withholds its message -- deliberately,
+    since `sturnus.observability` may not import `discord` to vouch for a
+    type from it. So the close code is lifted out as a field, which is both
+    safe and more queryable than the sentence it came from.
+    """
+    clock = FakeClock(T0)
+    refused = discord.ConnectionClosed(MagicMock(), shard_id=None, code=4006)
+    client = _client(clock, config_store=_configured_store())
+    anna, occupied = _capture_guild(
+        client, FakeSessions(), FakeVoiceReceiver(join_error=refused), tmp_path
+    )
+
+    with caplog.at_level(logging.ERROR, logger=CLIENT_LOGGER):
+        await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
+
+    failure = _only_error(caplog)
+    assert getattr(failure, "sturnus_event", None) == str(Event.VOICE_JOIN_FAILED)
+    fields = getattr(failure, "sturnus_fields", {})
+    assert fields["close_code"] == 4006
+    assert fields["error_type"] == "ConnectionClosed"
+
+
+async def test_a_join_that_failed_for_another_reason_reports_no_close_code(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The control. `None`, never a stand-in value that looks like a code."""
+    clock = FakeClock(T0)
+    client = _client(clock, config_store=_configured_store())
+    anna, occupied = _capture_guild(
+        client, FakeSessions(), FakeVoiceReceiver(join_fails=True), tmp_path
+    )
+
+    with caplog.at_level(logging.ERROR, logger=CLIENT_LOGGER):
+        await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
+
+    assert getattr(_only_error(caplog), "sturnus_fields", {})["close_code"] is None

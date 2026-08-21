@@ -28,6 +28,7 @@ from sturnus.application.ports import AudioStore, Encryptor
 from sturnus.application.recording import JobQueue, SessionRecorder, audio_key
 from sturnus.application.recording import RecordingService as _RecordingService
 from sturnus.domain.session import EndReason, SessionTimeouts
+from sturnus.observability.events import Event, log_event
 
 log = logging.getLogger(__name__)
 
@@ -238,18 +239,28 @@ async def recover_orphans(
             # speaker it had was already uploaded and enqueued before that
             # happened -- these are stale local copies of work already
             # done, not work still owed. See `recover_orphans`'s docstring.
-            log.warning(
-                "Session %d's row is already %s; removing %d leftover file(s) on disk "
-                "instead of reprocessing them, which would duplicate already-enqueued jobs",
-                session_id,
-                status,
-                len(group),
+            log_event(
+                log,
+                logging.WARNING,
+                Event.SESSION_RECOVERED,
+                "Session row is already closed; removing leftover files on disk instead of "
+                "reprocessing them, which would duplicate already-enqueued jobs",
+                session_id=session_id,
+                status=status,
+                count=len(group),
             )
             for orphan in group:
                 orphan.path.unlink(missing_ok=True)
             continue
 
-        log.warning("Recovering %d orphaned recording(s) for session %d", len(group), session_id)
+        log_event(
+            log,
+            logging.WARNING,
+            Event.SESSION_RECOVERED,
+            "Recovering orphaned recordings for a session",
+            session_id=session_id,
+            count=len(group),
+        )
         stored_key = await sessions.session_key(session_id)
 
         plain = [o for o in group if not o.encrypted]
@@ -279,13 +290,20 @@ async def recover_orphans(
 
         if stored_key is None:
             for o in already_encrypted:
-                log.warning(
-                    "Cannot recover session %d speaker %d: session has no stored data "
-                    "key, so the file at %s cannot be decrypted -- skipping instead of "
-                    "enqueuing a job that could never succeed",
-                    session_id,
-                    o.discord_user_id,
-                    o.path,
+                # ERROR, not WARNING: this is permanent data loss. Audio
+                # exists on disk that no stored key can ever decrypt, and no
+                # sweep, retry or restart changes that. The path is
+                # deliberately not logged -- it names the directory where
+                # decrypted speech lives, and `session_id` plus
+                # `discord_user_id` already locate the file exactly.
+                log_event(
+                    log,
+                    logging.ERROR,
+                    Event.SESSION_UNRECOVERABLE,
+                    "Session has no stored data key, so this recording can never be "
+                    "decrypted; skipping instead of enqueuing a job that could never succeed",
+                    session_id=session_id,
+                    discord_user_id=o.discord_user_id,
                 )
             continue
 

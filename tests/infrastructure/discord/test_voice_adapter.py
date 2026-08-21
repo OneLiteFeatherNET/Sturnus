@@ -39,6 +39,7 @@ from sturnus.infrastructure.discord.sink import (
     SpeakerStreamEnded,
 )
 from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter
+from sturnus.observability.redaction import safe_exception_message
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 GUILD_ID, CHANNEL_ID, ROLE_ID = 1, 2, 3
@@ -199,7 +200,19 @@ async def test_capture_stopping_on_its_own_is_logged_at_error(
         await voice._handle(CaptureStopped(RuntimeError("router died")))
 
     assert len(caplog.records) == 1
-    assert "RuntimeError" in caplog.records[0].getMessage()
+    # The exception's type is now a structured field rather than part of the
+    # message. `tests/test_logging_discipline.py` rule R6 forbids
+    # interpolating an exception into a log message at all -- `str(exc)` is
+    # unbounded third-party text and `logentry.message` is what
+    # `infrastructure.observability.scrub_event` forwards to Sentry -- so
+    # `log_exception` puts the class name in `error_type` instead. The
+    # assertion is unchanged in substance: an operator must still be able to
+    # see *what* stopped capture, and `error_type` is now where they see it.
+    # `getattr`, because `sturnus_fields` is an `extra=` key rather than a
+    # declared `LogRecord` attribute -- which is exactly what makes it a
+    # field the registry governs rather than part of the message.
+    fields = getattr(caplog.records[0], "sturnus_fields", {})
+    assert fields["error_type"] == "RuntimeError"
     assert caplog.records[0].exc_info is not None, "the cause is carried, not summarised away"
 
 
@@ -312,13 +325,25 @@ async def test_the_drain_survives_a_handler_that_raises(
     )
     connected(voice)
 
-    with caplog.at_level(logging.ERROR, logger=VOICE_LOGGER):
+    # Captured at WARNING so that a *downgrade* is visible here rather than
+    # silently reducing the record count to zero: the level is asserted
+    # below, against a literal, instead of being implied by the capture
+    # threshold.
+    with caplog.at_level(logging.WARNING, logger=VOICE_LOGGER):
         voice._emit(frame())
         voice._emit(frame())
         await settle()
 
     service.voice_packet.assert_awaited_once()
     assert len(caplog.records) == 1, "the swallowed failure is still reported"
+    # ERROR, and pinned. An exception escaping the message handler is a
+    # defect in this adapter, not a condition it expects to self-heal from:
+    # the frame it was carrying is gone for good, and nothing retries it.
+    # Rate limiting is what keeps a systematic failure from flooding Loki
+    # (`_MESSAGE_ERROR_LOG_EVERY`); rate and severity are separate
+    # decisions, and lowering the severity to buy quiet costs the one
+    # signal that says a human should look.
+    assert caplog.records[0].levelno == logging.ERROR
 
 
 async def test_emit_before_join_is_a_no_op_rather_than_a_crash() -> None:
@@ -405,3 +430,82 @@ async def test_leave_stops_the_drain() -> None:
 
     assert drain_task is not None and drain_task.cancelled()
     assert voice._queue is None
+
+
+# ---------------------------------------------------------------------------
+# `discord.ConnectionClosed`: the exception whose message is withheld
+# ---------------------------------------------------------------------------
+
+
+def _connection_closed(code: int) -> discord.ConnectionClosed:
+    """The exception discord.py raises, built the way discord.py builds it.
+
+    `ConnectionClosed.__init__(socket, *, shard_id, code)` reads
+    `socket.close_code` only when `code` is falsy, so a stand-in socket is
+    never touched here -- the code under test is `exc.code`, and that comes
+    from the keyword argument.
+    """
+    return discord.ConnectionClosed(MagicMock(), shard_id=None, code=code)
+
+
+def test_the_message_of_a_connection_closed_really_is_withheld() -> None:
+    """The premise of the field, asserted rather than assumed.
+
+    If `SAFE_MESSAGE_TYPES` ever grew to admit this type, `close_code`
+    would be duplicating what the message already says and this test is
+    what would notice. Until then the class name is *all* an operator gets
+    from the exception, and "ConnectionClosed" is the least informative
+    true statement available about a bot that cannot hear a channel.
+    """
+    withheld = safe_exception_message(_connection_closed(4014))
+    assert "4014" not in withheld
+    assert withheld == "<message withheld: discord.errors.ConnectionClosed>"
+    # The control: the code really is on the exception, so a test asserting
+    # it reaches the log line is asserting something that could be there.
+    assert _connection_closed(4014).code == 4014
+
+
+@pytest.mark.parametrize(
+    ("code", "what_it_means"),
+    [
+        (4006, "the voice session is no longer valid"),
+        (4009, "the voice session timed out"),
+        (4014, "Discord disconnected us -- moved, or the channel was deleted"),
+        (4015, "the voice server crashed"),
+    ],
+)
+async def test_capture_dropped_from_voice_reports_the_close_code(
+    code: int, what_it_means: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Four different faults that `error_type` cannot tell apart.
+
+    Parametrised over the codes rather than asserted once, because the
+    value has to *travel* -- a call site that hard-coded one, or that
+    passed the exception's own type instead, would pass a single-case
+    test.
+    """
+    voice = adapter()
+
+    with caplog.at_level(logging.ERROR, logger=VOICE_LOGGER):
+        await voice._handle(CaptureStopped(_connection_closed(code)))
+
+    fields = getattr(caplog.records[0], "sturnus_fields", {})
+    assert fields["close_code"] == code, what_it_means
+    assert fields["error_type"] == "ConnectionClosed"
+
+
+async def test_a_stop_with_no_close_code_reports_none_rather_than_inventing_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`OpusNotLoaded`, `OSError` and `TimeoutError` reach the same line.
+
+    `None` is the honest answer for them. A default of `-1` or `0` would
+    be indistinguishable in Loki from a close code that really was
+    reported.
+    """
+    voice = adapter()
+
+    with caplog.at_level(logging.ERROR, logger=VOICE_LOGGER):
+        await voice._handle(CaptureStopped(OpusNotLoaded()))
+
+    assert getattr(caplog.records[0], "sturnus_fields", {})["close_code"] is None

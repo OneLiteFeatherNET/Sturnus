@@ -103,9 +103,61 @@ commonEnv:
   # errors therefore sets the Secret key to the empty string rather than
   # leaving it out. See docs/operations.md section 1.4.
   #
-  # Names the deployment in Sentry's environment filter. Set per cluster.
-  # Not a credential and not secret -- it stays here.
+  # Names the deployment in Sentry's environment filter, AND supplies
+  # OpenTelemetry's `deployment.environment.name` resource attribute --
+  # `sturnus.config.OtelSettings.environment` reads this same variable
+  # rather than introducing a second one. One string, so the environment
+  # filter in Sentry and the one in Grafana can never disagree. Set per
+  # cluster. Not a credential and not secret -- it stays here.
   STURNUS_SENTRY_ENVIRONMENT: "production"
+
+  # Traces and metrics (sturnus/infrastructure/telemetry.py). Empty is the
+  # off switch and the default: with no endpoint, no OpenTelemetry provider
+  # is constructed at all, so every span in the codebase is a
+  # NonRecordingSpan (~0.1us) and every metric call is a no-op. Nothing
+  # connects, nothing retries, and no export failure is ever logged.
+  #
+  # In this cluster the value is the Grafana Alloy OTLP receiver, which
+  # fans out to Tempo for traces and to the metric store:
+  #
+  #   STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT: "http://alloy-receiver.grafana.svc:4318"
+  #
+  # HTTP (4318), not gRPC (4317). Alloy accepts both; the HTTP exporter
+  # avoids pulling in grpcio. The path is appended automatically, so give
+  # the base URL with no /v1/traces suffix.
+  #
+  # Not a credential, and note that this is a different judgement from the
+  # Sentry DSN above rather than the same one: an OTLP endpoint is a
+  # service address that grants nobody anything, so publishing it in the
+  # GitOps repository costs nothing. The DSN moved into the Secret because
+  # that repository is public and a DSN found there lets anyone fill the
+  # project with events -- an argument about who can *write* somewhere,
+  # which an endpoint does not carry. See docs/operations.md section 1.4.
+  STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT: ""
+
+  # Logging (sturnus/observability/setup.py). `json` is one object per line
+  # on stdout, which is what alloy-logs scrapes into Loki; `console` is the
+  # human-readable form and is selected automatically when stdout is a TTY.
+  STURNUS_LOG_FORMAT: "json"
+  # Applies to Sturnus's own loggers ONLY, and DEBUG here is safe: Sturnus's
+  # own DEBUG lines are held to ids, counts and durations by the same field
+  # registry that governs INFO.
+  STURNUS_LOG_LEVEL: "INFO"
+  # Everything that is not Sturnus. Raising this to DEBUG does nothing: the
+  # value is raised to setup.THIRD_PARTY_FLOOR (INFO) before anything is
+  # configured, and the process says so in one WARNING line at startup
+  # (event log.level_clamped) so nobody spends an hour thinking the
+  # variable is unwired.
+  #
+  # That floor is a security control, not tidiness. botocore logs the SigV4
+  # signature at DEBUG, and discord.ext.voice_recv logs the Discord voice
+  # secret key at DEBUG from two different modules (`.reader` and
+  # `.gateway`) plus raw packet bytes; discord.http logs whole REST
+  # response bodies. A production values.yaml must not be able to put any
+  # of that into Loki. Lowering it below INFO is a code change in
+  # sturnus/observability/setup.py, deliberately -- see docs/operations.md
+  # section 7.2.
+  STURNUS_LOG_THIRD_PARTY_LEVEL: "WARNING"
 
 # Every component's health/readiness server listens on this container port
 # (see sturnus/infrastructure/health.py); the container image is the same

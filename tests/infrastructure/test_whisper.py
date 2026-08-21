@@ -1,6 +1,6 @@
 import logging
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,8 +15,15 @@ from faster_whisper.feature_extractor import (  # type: ignore[import-untyped]
 from faster_whisper.transcribe import (  # type: ignore[import-untyped]
     TranscriptionOptions,
 )
+from opentelemetry.metrics import CallbackOptions
 
+from sturnus.infrastructure.telemetry import TRANSCRIPTION_PROGRESS, TranscriptionProgress
 from sturnus.infrastructure.whisper import WhisperEngine, _on_the_frame_grid
+from sturnus.observability.events import Event
+
+#: The module whose lines these tests read. Named once, because `caplog`
+#: captures every propagated record and the engine's collaborators log too.
+WHISPER_LOGGER = "sturnus.infrastructure.whisper"
 
 FIXTURE = Path(__file__).parent.parent / "fixtures" / "hello.wav"
 
@@ -113,8 +120,25 @@ def _as_decoded_from(window_start: float, start: float, end: float, text: str) -
 
 
 class _FakeInfo:
-    def __init__(self, language: str | None) -> None:
+    """The three attributes `_transcribe` reads off a `TranscriptionInfo`.
+
+    `duration_after_vad` defaults to `duration` because that is what the
+    installed faster-whisper does on the path Sturnus takes: it is only
+    reduced under `if vad_filter and clip_timestamps == "0"`, and
+    `WhisperEngine` sets `vad_filter=False` and a clip list. A fake that
+    reported a smaller number here would be modelling a code path this
+    adapter refuses to take.
+    """
+
+    def __init__(
+        self,
+        language: str | None,
+        duration: float = 0.0,
+        duration_after_vad: float | None = None,
+    ) -> None:
         self.language = language
+        self.duration = duration
+        self.duration_after_vad = duration if duration_after_vad is None else duration_after_vad
 
 
 class _RecordingModel:
@@ -159,7 +183,15 @@ class _RecordingModel:
         # faster-whisper returns a generator, so a caller that forgot to
         # consume it would see no segments; returning an iterator keeps the
         # fake honest about that.
-        return iter(segments), _FakeInfo(self.language)
+        #
+        # The durations are computed from the array it was handed, exactly
+        # as the library computes them (`duration = audio.shape[0] /
+        # sampling_rate`). Since the engine hands over the concatenated
+        # speech, that is the speech in the recording rather than the
+        # recording -- which is the point: reporting a constant, or the file
+        # length, would make every progress assertion below a statement about
+        # this fake rather than about the audio the model was given.
+        return iter(segments), _FakeInfo(self.language, duration=len(audio) / 16_000)
 
 
 def _engine_with(model: _RecordingModel, default_language: str = "de") -> WhisperEngine:
@@ -176,6 +208,10 @@ def _engine_with(model: _RecordingModel, default_language: str = "de") -> Whispe
     engine = object.__new__(WhisperEngine)
     engine._model = model
     engine._default_language = default_language
+    # `__init__` keeps the name it was given so that the metrics can be
+    # labelled by model without any call site passing it in again. Bypassing
+    # `__init__` means setting it here too.
+    engine._model_name = "tiny"
     return engine
 
 
@@ -1075,6 +1111,428 @@ async def test_the_veto_on_the_no_speech_skip_is_closed_explicitly(tmp_path: Pat
     assert model.calls[0]["log_prob_threshold"] is None
 
 
+# ---------------------------------------------------------------------------
+# Progress: what the lazy generator was throwing away
+# ---------------------------------------------------------------------------
+#
+# `WhisperModel.transcribe` returns `(Iterable[Segment], TranscriptionInfo)`
+# and the segments are produced as decoding proceeds. Draining them with a
+# tuple comprehension consumed the whole generator in one expression and
+# discarded every intermediate observation, which is why a 100-minute job
+# and a job that decoded nothing at all looked identical from outside until
+# both had finished.
+#
+# Every test below drives the real `WhisperEngine` through the real model
+# seam -- `_RecordingModel`, which hands back a generator exactly as the
+# library does -- and reads the metrics through the same callbacks the
+# OpenTelemetry SDK calls. Nothing here asserts against a meter fake,
+# because a meter fake would only prove that this code can call itself.
+
+
+def _observed(callback: Any) -> list[tuple[float, dict[str, Any]]]:
+    """One instrument's observations, read the way the SDK reads them."""
+    return [
+        (observation.value, dict(observation.attributes or {}))
+        for observation in callback(CallbackOptions())
+    ]
+
+
+def _value_for(callback: Any, model: str) -> float | None:
+    for value, attributes in _observed(callback):
+        if attributes.get("model") == model:
+            return value
+    return None
+
+
+class _WatchingModel(_RecordingModel):
+    """`_RecordingModel` whose caller is watched between segments.
+
+    The whole point of the change under test is that something is reported
+    *while* the generator is still being consumed. A fake that hands back a
+    finished tuple could not tell a loop from a comprehension; this one
+    calls `watcher` after each segment is yielded, so a test can read the
+    live gauges at a moment when decoding is genuinely half done.
+    """
+
+    def __init__(self, segments: tuple[_FakeSegment, ...], watcher: Any, **kwargs: Any) -> None:
+        super().__init__(segments=segments, **kwargs)
+        self._watcher = watcher
+
+    def transcribe(self, audio: Any, **kwargs: Any) -> tuple[Any, _FakeInfo]:
+        self.calls.append({"audio": audio, **kwargs})
+        seconds = len(audio) / 16_000
+
+        def generate() -> Any:
+            for segment in self.segments:
+                yield segment
+                self._watcher()
+
+        return generate(), _FakeInfo(self.language, duration_after_vad=seconds)
+
+
+@pytest.fixture
+def idle_progress() -> Iterator[TranscriptionProgress]:
+    """The module-level progress object, left as it was found.
+
+    It is process-global on purpose -- one worker transcribes one job at a
+    time (Spec 5.3), so "the job in flight" is a singular thing -- and a
+    test that left a job in flight would make the next test's `stall`
+    reading grow forever.
+    """
+    yield TRANSCRIPTION_PROGRESS
+    TRANSCRIPTION_PROGRESS.end()
+
+
+async def test_the_position_is_reported_while_the_generator_is_still_running(
+    tmp_path: Path, idle_progress: TranscriptionProgress
+) -> None:
+    """The defect in one assertion: a comprehension cannot pass this.
+
+    `tuple(... for s in segments)` consumes the generator inside a single
+    expression, so nothing between the first and the last segment is ever
+    observable. This reads the gauge from inside the generator itself.
+    """
+    recording = tmp_path / "speech.wav"
+    # Five seconds of tone, so the concatenated speech the engine hands over
+    # is longer than the last segment claims to reach. The three segments all
+    # come out of the first encoder window, which is where a five-second clip
+    # puts them.
+    _write_wav(recording, np.concatenate([_tone(5.0), np.zeros(16_000 * 8, dtype=np.float32)]))
+
+    seen: list[float | None] = []
+    model = _WatchingModel(
+        segments=(
+            _as_decoded_from(0.0, 0.0, 1.0, " one"),
+            _as_decoded_from(0.0, 1.0, 2.5, " two"),
+            _as_decoded_from(0.0, 2.5, 4.0, " three"),
+        ),
+        watcher=lambda: seen.append(
+            _value_for(idle_progress.observe_position, "tiny"),
+        ),
+    )
+
+    await _engine_with(model).transcribe(recording, language="de", initial_prompt=None)
+
+    assert seen == [1.0, 2.5, 4.0], "progress was only visible after the job had finished"
+
+
+async def test_a_job_is_in_flight_before_the_model_has_yielded_anything(
+    tmp_path: Path, idle_progress: TranscriptionProgress
+) -> None:
+    """The wedge this instrument exists for happens *inside* the library call.
+
+    `WhisperModel.transcribe` extracts features and detects a language
+    before it yields its first segment, and that is where the collapse
+    that produced empty transcripts happened. Starting the clock at the
+    first segment instead would leave a job stuck in there reporting
+    nothing at all -- not a stalled job, no job.
+
+    Asserted from inside the model call rather than around it: the point
+    is the state of the world at a moment that only the model can reach.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    during: list[list[tuple[float, dict[str, Any]]]] = []
+
+    class _ObservingModel(_RecordingModel):
+        def transcribe(self, audio: Any, **kwargs: Any) -> tuple[Any, _FakeInfo]:
+            during.append(_observed(idle_progress.observe_stall))
+            return super().transcribe(audio, **kwargs)
+
+    await _engine_with(_ObservingModel()).transcribe(recording, language="de", initial_prompt=None)
+
+    (observed,) = during
+    assert observed, "no job was in flight while the model was running"
+    (stalled_for, attributes) = observed[0]
+    assert attributes == {"model": "tiny"}
+    assert stalled_for >= 0.0
+
+
+async def test_a_job_in_flight_reports_the_length_it_is_working_through(
+    tmp_path: Path, idle_progress: TranscriptionProgress
+) -> None:
+    """The denominator. A position with no total is a number nobody can read.
+
+    `TranscriptionInfo.duration_after_vad` is what the library reports, and
+    since the engine hands the model the gated speech concatenated rather
+    than the padded track, that is the **speech** in the recording, on the
+    same timeline the positions reported to `advance` are on.
+
+    2.25 s and not 10.0 s, and the difference is the whole assertion: the
+    file is ten seconds long and holds a two-second tone, which the gate
+    widens by `_HANGOVER_SECONDS` at the end and clamps at the start. A
+    denominator that came back as the file length would mean the padded
+    array had reached the model again, and every real-time factor built on
+    it would be wrong by the ratio of silence to speech.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000 * 8, dtype=np.float32)]))
+
+    seen: list[float | None] = []
+    model = _WatchingModel(
+        segments=(_as_decoded_from(0.0, 0.0, 1.0, " one"),),
+        watcher=lambda: seen.append(_value_for(idle_progress.observe_total, "tiny")),
+    )
+
+    await _engine_with(model).transcribe(recording, language="de", initial_prompt=None)
+
+    assert seen == [pytest.approx(2.25, abs=0.05)]
+
+
+async def test_nothing_is_observed_when_no_job_is_in_flight(
+    tmp_path: Path, idle_progress: TranscriptionProgress
+) -> None:
+    """An idle worker must publish no position at all, not a stale one.
+
+    A gauge that keeps reporting the last job's numbers reads as "a job is
+    43 minutes in" forever, and the alert built on
+    `seconds_since_progress` would fire on an idle deployment every time.
+    Emitting no observation lets the series go stale instead, which is what
+    every alert expression in `docs/operations.md` section 7.5 relies on.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+
+    await _engine_with(
+        _RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 1.0, " one"),))
+    ).transcribe(recording, language="de", initial_prompt=None)
+
+    assert _observed(idle_progress.observe_position) == []
+    assert _observed(idle_progress.observe_total) == []
+    assert _observed(idle_progress.observe_stall) == []
+
+
+async def test_the_decoded_counter_totals_the_audio_the_model_was_handed(
+    tmp_path: Path, idle_progress: TranscriptionProgress
+) -> None:
+    """Divided by wall time this is the real-time factor, and that is its job.
+
+    "The audio the model was handed" is read off the call itself rather than
+    written down as a number, because that is precisely the quantity under
+    test: the engine concatenates the gated speech and hands *that* over, so
+    the counter has to total the concatenated seconds and not the ten seconds
+    the file is long. Asserting the file length here would pass just as well
+    if the padded track went back to the model, which is the regression this
+    counter would otherwise hide.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000 * 8, dtype=np.float32)]))
+    before = _value_for(idle_progress.observe_decoded, "tiny") or 0.0
+    model = _RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 2.0, " hallo"),))
+
+    await _engine_with(model).transcribe(recording, language="de", initial_prompt=None)
+
+    handed_over = len(model.calls[0]["audio"]) / 16_000
+    assert handed_over == pytest.approx(2.25, abs=0.05), "the premise: the padding was cut out"
+    after = _value_for(idle_progress.observe_decoded, "tiny")
+    assert after is not None
+    assert after - before == pytest.approx(handed_over, abs=0.05)
+
+
+async def test_a_job_that_decoded_nothing_still_counts_the_audio_it_was_given(
+    tmp_path: Path, idle_progress: TranscriptionProgress
+) -> None:
+    """**The two-day defect, and the reason this counter is worth building.**
+
+    Silero's recurrent state collapsed on the bit-exact padding and the
+    model came back with no segments at all for a 100-minute recording, in
+    well under a minute. The symptom everyone saw was an empty transcript,
+    which is exactly what a participant who never spoke also produces --
+    and it was read as that for a day.
+
+    Counting the audio the model was *given* rather than the audio the
+    segments happen to cover is what turns that into an impossible number:
+    seconds of recording decoded in microseconds is a real-time factor of
+    many thousands, against the 1.94x this hardware actually manages.
+    Counting segment ends instead would have contributed zero here, which
+    is a much quieter way of being wrong.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000 * 8, dtype=np.float32)]))
+    before = _value_for(idle_progress.observe_decoded, "tiny") or 0.0
+    model = _RecordingModel(segments=())
+
+    result = await _engine_with(model).transcribe(recording, language="de", initial_prompt=None)
+
+    assert result.segments == (), "the premise: the model produced nothing"
+    handed_over = len(model.calls[0]["audio"]) / 16_000
+    after = _value_for(idle_progress.observe_decoded, "tiny")
+    assert after is not None
+    # Not zero, which is the entire point, and the seconds the model was
+    # handed rather than a token amount.
+    assert after - before == pytest.approx(handed_over, abs=0.05)
+    assert after - before > 0.0
+
+
+async def test_the_progress_is_cleared_when_the_model_raises(
+    tmp_path: Path, idle_progress: TranscriptionProgress
+) -> None:
+    """A failed job must not be reported as one that wedged.
+
+    Without the `finally`, an exception out of the decoder would leave the
+    job in flight forever and `seconds_since_progress` would climb past
+    every threshold while the worker went happily on to the next job.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+
+    class _ExplodingModel(_RecordingModel):
+        def transcribe(self, audio: Any, **kwargs: Any) -> tuple[Any, _FakeInfo]:
+            del audio, kwargs
+            raise RuntimeError("ct2 died")
+
+    with pytest.raises(RuntimeError):
+        await _engine_with(_ExplodingModel()).transcribe(
+            recording, language="de", initial_prompt=None
+        )
+
+    assert _observed(idle_progress.observe_stall) == []
+
+
+def test_the_stall_clock_runs_from_before_the_first_segment() -> None:
+    """The actual alert condition, and the one a position gauge cannot express.
+
+    A job that wedges *before* producing its first segment has a position
+    of zero and a last-observed-progress of never -- which is
+    indistinguishable from a job that has only just started unless the
+    clock starts at `begin()` rather than at the first `advance()`.
+
+    Driven on its own instance with a clock the test owns: the module-level
+    one reads `time.monotonic`, and waiting five real minutes to assert
+    five minutes is not a test.
+    """
+    ticks = iter([100.0, 105.0, 400.0])
+    progress = TranscriptionProgress(now=lambda: next(ticks))
+
+    progress.begin("large-v3")  # t=100
+
+    # t=105: still nothing decoded, and that is precisely the alert.
+    assert _value_for(progress.observe_stall, "large-v3") == 105.0 - 100.0
+    assert _value_for(progress.observe_position, "large-v3") == 0.0
+
+
+def test_the_stall_clock_is_reset_by_every_segment() -> None:
+    """The other half: a slow job that is still making progress is not stuck."""
+    ticks = iter([0.0, 10.0, 12.0])
+    progress = TranscriptionProgress(now=lambda: next(ticks))
+
+    progress.begin("large-v3")  # t=0
+    progress.advance(30.0)  # t=10, a segment arrived
+
+    assert _value_for(progress.observe_stall, "large-v3") == 12.0 - 10.0
+
+
+def test_progress_never_goes_backwards() -> None:
+    """`advance` is a position, not a delta, and the decoder can repeat one.
+
+    faster-whisper's seek loop can emit a segment whose `end` is not past
+    the previous one -- a clip boundary, a zero-length segment. Subtracting
+    would decrement a counter, which OpenTelemetry treats as a counter
+    reset and Prometheus turns into an enormous spurious rate.
+    """
+    progress = TranscriptionProgress(now=lambda: 0.0)
+    progress.begin("large-v3")
+    progress.advance(30.0)
+    progress.advance(12.0)
+
+    assert _value_for(progress.observe_position, "large-v3") == 30.0
+    assert _value_for(progress.observe_decoded, "large-v3") == 30.0
+
+
+def test_no_progress_metric_carries_an_id_of_any_kind() -> None:
+    """The cardinality and privacy rule, asserted over every observation.
+
+    A session id, job id, guild id or user id on a metric is unbounded
+    cardinality *and* a record of who was in a voice channel when, kept for
+    as long as the metric store keeps anything. Component and model name
+    are enough, and `component` is already a resource attribute rather than
+    a label.
+    """
+    progress = TranscriptionProgress(now=lambda: 0.0)
+    progress.begin("large-v3")
+    progress.set_total(600.0)
+    progress.advance(12.0)
+
+    for callback in (
+        progress.observe_decoded,
+        progress.observe_position,
+        progress.observe_total,
+        progress.observe_stall,
+    ):
+        observations = _observed(callback)
+        assert observations, f"{callback.__name__} observed nothing to check"
+        for _, attributes in observations:
+            assert set(attributes) == {"model"}, attributes
+
+
+# ---------------------------------------------------------------------------
+# The log lines: the gate's own numbers, which nothing else can see
+# ---------------------------------------------------------------------------
+
+
+async def test_a_file_the_gate_rejects_says_so_instead_of_going_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An empty transcript has two causes and they need telling apart.
+
+    Either the gate found nothing above the silence floor, or the model was
+    called and produced nothing. Both end as a participant with no lines in
+    the document, and the second one is the failure that cost this project
+    two days. Only the first produces this line.
+    """
+    silent = tmp_path / "padding.wav"
+    _write_wav(silent, np.zeros(16_000 * 3, dtype=np.float32))
+    model = _RecordingModel()
+
+    with caplog.at_level(logging.INFO, logger=WHISPER_LOGGER):
+        await _engine_with(model).transcribe(silent, language="de", initial_prompt=None)
+
+    assert model.calls == [], "the premise: the model was never called"
+    (line,) = [r for r in caplog.records if r.name == WHISPER_LOGGER]
+    assert getattr(line, "sturnus_event", None) == str(Event.TRANSCRIPTION_SKIPPED)
+    fields = getattr(line, "sturnus_fields", {})
+    assert fields["clips"] == 0
+    assert fields["audio_seconds"] == pytest.approx(3.0, abs=0.05)
+    assert fields["model"] == "tiny"
+
+
+@pytest.mark.usefixtures("idle_progress")
+async def test_a_decoded_job_reports_how_much_of_it_was_speech(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """`speech_seconds` against `audio_seconds` is the gate's own signature.
+
+    It is the number that would have named Silero as the culprit on the
+    first read rather than the third day: "one second of speech in two
+    minutes of recording" is not a plausible meeting, and no other line
+    Sturnus emits can say it -- `job.transcribed` is produced in
+    `sturnus.application.worker`, which cannot see the gate at all.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(
+        recording,
+        np.concatenate([np.zeros(16_000 * 5, dtype=np.float32), _tone(2.0)]),
+    )
+    # On the concatenated timeline the engine hands over, where the one clip
+    # begins at zero -- the tone is at 00:05 in the file and the restore is
+    # what puts it back there.
+    model = _RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 2.0, " hallo"),))
+
+    with caplog.at_level(logging.INFO, logger=WHISPER_LOGGER):
+        await _engine_with(model).transcribe(recording, language="de", initial_prompt=None)
+
+    (line,) = [r for r in caplog.records if r.name == WHISPER_LOGGER]
+    assert getattr(line, "sturnus_event", None) == str(Event.TRANSCRIPTION_DECODED)
+    fields = getattr(line, "sturnus_fields", {})
+    assert fields["clips"] == 1
+    assert fields["audio_seconds"] == pytest.approx(7.0, abs=0.05)
+    # The tone is 2 seconds, plus a quarter-second hangover at each end.
+    assert 2.0 <= float(fields["speech_seconds"]) <= 3.0
+    assert fields["segments"] == 1
+    assert fields["model"] == "tiny"
+    assert not line.args, "everything that varies is a field, not a %-argument"
+
+
 async def test_a_track_the_decoder_emptied_says_so_in_the_log(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1096,20 +1554,30 @@ async def test_a_track_the_decoder_emptied_says_so_in_the_log(
     _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
     engine = _engine_with(_RecordingModel(segments=()))
 
-    with caplog.at_level(logging.WARNING, logger="sturnus.infrastructure.whisper"):
+    with caplog.at_level(logging.WARNING, logger=WHISPER_LOGGER):
         result = await engine.transcribe(recording, language="de", initial_prompt=None)
 
     assert result.segments == ()
     assert len(caplog.records) == 1
-    message = caplog.records[0].getMessage()
-    assert "roomtone.wav" in message
-    # 2.3 s, and none of the other three numbers this file offers. The
-    # recording is 3.0 s long and holds a 2.0 s tone; the gate widens that
-    # tone by `_HANGOVER_SECONDS` at the end and clamps it at the start,
-    # yielding the 2.25 s it actually handed the decoder. So this also fails
-    # if the message reports the file length, the tone length, or a count of
+    record = caplog.records[0]
+    # WARNING, not INFO. The same event is emitted on every job; its severity
+    # is the whole signal here, and an operator filtering for problems sees
+    # this one only if it carries the right level.
+    assert record.levelno == logging.WARNING
+    # The recording is no longer named in the message. Identity travels on the
+    # enclosing `job.transcribe` span and on the worker's own `job.transcribed`
+    # event, which is where this branch puts it deliberately; a filename in a
+    # message string is not something a log query can group by. What the line
+    # must still carry is the number that decides how to read it.
+    fields = record.sturnus_fields  # type: ignore[attr-defined]
+    # 2.25 s of speech, and none of the other three durations this file
+    # offers. The recording is 3.0 s long and holds a 2.0 s tone; the gate
+    # widens that tone by `_HANGOVER_SECONDS` at the end and clamps it at the
+    # start, yielding what it actually handed the decoder. So this also fails
+    # if the event reports the file length, the tone length, or a count of
     # clips dressed up as seconds.
-    assert "2.3 s" in message, message
+    assert fields["speech_seconds"] == pytest.approx(2.25, abs=0.05), fields
+    assert fields["segments"] == 0, fields
 
 
 async def test_a_track_that_produced_text_is_not_reported_as_a_loss(
@@ -1127,7 +1595,7 @@ async def test_a_track_that_produced_text_is_not_reported_as_a_loss(
         _RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 1.5, " Guten Morgen."),))
     )
 
-    with caplog.at_level(logging.WARNING, logger="sturnus.infrastructure.whisper"):
+    with caplog.at_level(logging.WARNING, logger=WHISPER_LOGGER):
         result = await engine.transcribe(recording, language="de", initial_prompt=None)
 
     assert [s.text for s in result.segments] == [" Guten Morgen."]
@@ -1150,7 +1618,7 @@ async def test_the_transcribed_text_is_never_logged(
     secret = " Wir kuendigen den Vertrag mit Beispiel GmbH."
     engine = _engine_with(_RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 1.5, secret),)))
 
-    with caplog.at_level(logging.DEBUG, logger="sturnus.infrastructure.whisper"):
+    with caplog.at_level(logging.DEBUG, logger=WHISPER_LOGGER):
         await engine.transcribe(recording, language="de", initial_prompt=None)
 
     assert caplog.records, "the debug trace exists at all, so this is not vacuous"

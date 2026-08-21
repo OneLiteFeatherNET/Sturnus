@@ -35,6 +35,13 @@ from sturnus.infrastructure.db.repositories import AccountLinkRepository
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.linkserver import build_app
 from sturnus.infrastructure.observability import init_sentry
+from sturnus.infrastructure.telemetry import init_telemetry, shutdown_telemetry
+from sturnus.observability.events import Event, log_event
+from sturnus.observability.setup import (
+    asyncio_exception_handler,
+    configure_logging,
+    install_excepthooks,
+)
 
 log = logging.getLogger(__name__)
 
@@ -89,7 +96,13 @@ async def _wait_for_schema(
                 "The worker owns migrations and must run them before the link "
                 "service can start."
             )
-        log.warning("Waiting for the database schema; missing table(s): %s", sorted(missing))
+        log_event(
+            log,
+            logging.WARNING,
+            Event.SCHEMA_WAITING,
+            "Waiting for the worker to migrate the database schema",
+            missing=sorted(missing),
+        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -134,7 +147,13 @@ async def _run() -> None:
     # bind itself (Spec 13.5).
     site = web.TCPSite(runner, "0.0.0.0", settings.health_port)
     await site.start()
-    log.info("Link service listening on port %d", settings.health_port)
+    log_event(
+        log,
+        logging.INFO,
+        Event.LINK_STARTED,
+        "Link service listening",
+        count=settings.health_port,
+    )
 
     await _wait_for_schema(engine)
     schema_ready = True
@@ -142,25 +161,40 @@ async def _run() -> None:
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
+    loop.set_exception_handler(asyncio_exception_handler)
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
     try:
         await stop.wait()
     finally:
-        log.info("Shutdown requested: stopping the link service")
+        log_event(
+            log,
+            logging.INFO,
+            Event.SHUTDOWN_BEGIN,
+            "Shutdown requested: stopping the link service",
+        )
         await runner.cleanup()
         await engine.dispose()
+        shutdown_telemetry()
+        log_event(log, logging.INFO, Event.SHUTDOWN_COMPLETE, "Link service stopped")
 
 
 def main() -> None:
-    # Both run before `_run`, and so before `LinkSettings()` reads the
+    # All four run before `_run`, and so before `LinkSettings()` reads the
     # environment: with a DSN configured, a settings `ValidationError` is
     # then itself reported instead of being the one failure Sentry can never
     # see. Without a DSN, `init_sentry` returns having touched nothing at all
     # -- see `sturnus.infrastructure.observability`.
-    logging.basicConfig(level=logging.INFO)
+    # `configure_logging` first of all: it installs the handler that formats
+    # and redacts everything the other three might have to report, and
+    # `install_excepthooks` is what stops a settings `ValidationError` --
+    # whose pydantic message embeds the raw environment dict, token prefix
+    # and all -- reaching stderr unredacted.
+    configure_logging("link")
+    install_excepthooks()
     init_sentry("link")
+    init_telemetry("link")
     asyncio.run(_run())
 
 

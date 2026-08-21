@@ -228,6 +228,71 @@ note it and continue.**
   id, or a status code is fine; a log line containing what someone said,
   or the bytes of what they said, or a credential, is not.
 
+  Make it executable rather than a read-through: **speak a rare canary
+  phrase** during the run — something that appears nowhere else, e.g.
+  "aubergine parliament" — and then grep for it, along with the first
+  eight characters of each credential:
+
+  ```sh
+  for c in bot worker link; do
+    kubectl logs deploy/sturnus-$c --since=1h \
+      | grep -iE 'aubergine|<token-prefix>|<masterkey-prefix>|<s3-key-prefix>' \
+      && echo "LEAK in $c"
+  done
+  ```
+
+  A hit is a blocking defect, not a finding to note. The same canary
+  technique runs in CI as `tests/observability/test_no_payload_leaks.py`,
+  which drives `RecordingService.close()` and `process_one()` with
+  canary-laden fakes at DEBUG — so this step is confirming the control
+  survived contact with production, not discovering whether it exists.
+
+- [ ] **No logger outside `sturnus.*` is at DEBUG.** The canary gate above
+  cannot catch this class: a canary is a string *we* planted, and the
+  Discord voice `secret_key` is issued by Discord and printed by
+  `discord.ext.voice_recv`'s own formatter. Nothing we could speak into a
+  meeting would find it.
+
+  ```sh
+  for c in bot worker link; do
+    kubectl logs deploy/sturnus-$c --since=1h \
+      | jq -r 'select(.level=="DEBUG" and (.logger | startswith("sturnus") | not))' \
+      && echo "third-party DEBUG in $c"
+  done
+  ```
+
+  This must be empty at every value of `STURNUS_LOG_LEVEL`, including
+  `DEBUG` — run it once with the worker at `STURNUS_LOG_LEVEL=DEBUG`,
+  because that is the setting the reported leak was found under and the
+  one an operator reaches for during an incident. A hit is a blocking
+  defect. `docs/operations.md` section 7.2 has the floor and the reasoning;
+  `tests/observability/test_third_party_log_floor.py` is the CI half.
+
+- [ ] **The same holds for Tempo and the metric store, not only for pod
+  logs.** This gate predates there being a second and third retained
+  store; spans and metric labels are indexed, retained, and visible to
+  everyone with Grafana access, so they are held to the same standard.
+
+  In Grafana, open one `job.process` trace from this run and one
+  `session.close` trace, and confirm no span attribute contains transcript
+  text, a display name, an S3 object key, or an exception *message* — a
+  failed span should carry `error.type` and a bare `ERROR` status and
+  nothing else. Then confirm no metric series carries a `session_id`,
+  `job_id`, or `discord_user_id` label.
+
+  Note what would make a leak here *permanent* in a way a log leak is not:
+  Loki's retention eventually expires a line, but a metric label that has
+  been created is a time series that persists.
+
+- [ ] **Telemetry actually arrives.** With
+  `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT` set, confirm one trace and one
+  metric reach Grafana (`docs/operations.md` section 7.7). This is not
+  optional polish: OTLP export failures are deliberately kept out of both
+  Loki and Sentry — otherwise an unreachable Alloy is one error per retry
+  per batch from all three pods, forever — so a misconfigured endpoint
+  produces flat, healthy-looking zeroes on every dashboard and **this
+  check is the only thing that detects it**.
+
 ## 5. What to record afterward
 
 Every one of these is an **estimate in the spec today** — this is the

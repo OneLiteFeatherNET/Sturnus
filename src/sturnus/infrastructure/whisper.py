@@ -53,15 +53,39 @@ while Renovate merges on a green build.
 `tests/infrastructure/test_whisper.py::test_a_window_never_spans_two_clips`
 drives the real `generate_segments` — no weights, no download — and fails if
 any of the three stops holding. It is the only upper bound there is.
+
+**This module is where a transcription becomes observable at all**, and it
+is instrumented against one specific way of being wrong. The failure that
+cost this project two days produced an *empty transcript*, which is
+indistinguishable from a participant who never spoke -- and was read as
+exactly that for a day. Two things separate them, and neither is visible
+anywhere else in the codebase:
+
+- `speech_seconds` against `audio_seconds` on `transcription.decoded`,
+  which is the speech gate's own signature. `sturnus.application.worker`
+  emits `job.transcribed` with segment counts and a realtime factor, but it
+  cannot see the gate.
+- `sturnus.transcription.decoded_seconds` divided by wall time, which is a
+  real-time factor computed from the audio the model was *given* rather
+  than from the segments it returned. A hundred minutes "decoded" in
+  forty-three seconds is 140x, which is impossible; the same job measured
+  by its (nonexistent) segments would have contributed nothing at all and
+  said nothing.
+
+See `sturnus.infrastructure.telemetry.TranscriptionProgress` for the live
+half -- position, denominator and the stall clock -- and why they are
+observable instruments rather than gauges this module sets.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from bisect import bisect_right
 from itertools import accumulate
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from faster_whisper import WhisperModel  # type: ignore[import-untyped]
@@ -72,6 +96,10 @@ from sturnus.application.transcription import (
     TranscriptionResult,
 )
 from sturnus.infrastructure.speech_gate import speech_clips
+from sturnus.infrastructure.telemetry import TRANSCRIPTION_PROGRESS, set_current_span_fields
+from sturnus.observability.events import Event, log_event
+
+log = logging.getLogger(__name__)
 
 _SAMPLE_RATE = 16_000
 
@@ -168,6 +196,12 @@ class WhisperEngine:
         default_language: str,
     ) -> None:
         self._model = WhisperModel(model_size, device=device, compute_type=compute_type)
+        # Kept so every measurement below can be labelled by model without a
+        # call site passing it in again. It is the only label these metrics
+        # carry: a real-time factor that mixes `large-v3` with `tiny` says
+        # nothing, and no id may become a metric label (see
+        # `observability.fields.METRIC_LABEL_FIELDS`).
+        self._model_name = model_size
         self._default_language = default_language
 
     async def transcribe(
@@ -184,7 +218,13 @@ class WhisperEngine:
         # clip offsets computed on a different copy of the samples could be
         # misaligned against the one being transcribed.
         audio = decode_audio(str(path), sampling_rate=_SAMPLE_RATE)
+        audio_seconds = audio.shape[0] / _SAMPLE_RATE
         clips = speech_clips(audio, sample_rate=_SAMPLE_RATE)
+        # The gate's own verdict, in seconds. `speech_gate` stays a pure
+        # numpy function with no logger of its own -- it is called once per
+        # job and its result is right here, so reporting it from the caller
+        # costs nothing and keeps a hot array routine free of I/O.
+        speech_seconds = sum(end - start for start, end in clips)
 
         if not clips:
             # Deliberately returning without touching the model, because
@@ -202,6 +242,25 @@ class WhisperEngine:
             # array is an input `FeatureExtractor` has never been exercised
             # against. This one line is what stands between an all-padding
             # track and both failures.
+            #
+            # Announced rather than returned silently, and **not** counted
+            # towards `decoded_seconds`. An empty transcript has exactly two
+            # causes -- the gate found nothing, or the model was called and
+            # produced nothing -- and only the second is a defect. Adding
+            # this file's duration to the decode counter would report a
+            # whole recording processed in the microseconds the gate took,
+            # which is the very signature the counter exists to raise.
+            log_event(
+                log,
+                logging.INFO,
+                Event.TRANSCRIPTION_SKIPPED,
+                "The speech gate found nothing above the silence floor; the model was "
+                "not called and this speaker produced no segments.",
+                model=self._model_name,
+                audio_seconds=round(audio_seconds, 3),
+                speech_seconds=0.0,
+                clips=0,
+            )
             return TranscriptionResult(segments=(), language=self._default_language)
 
         # Seconds are what `speech_clips` speaks in and samples are the only
@@ -272,6 +331,58 @@ class WhisperEngine:
         # `frames_per_second` should fail now, not after a 100-minute decode.
         clip_starts_in_frames = _on_the_frame_grid(concat_starts, self._model.frames_per_second)
 
+        started = time.monotonic()
+        # Before the call, not after it: `transcribe()` extracts features and
+        # detects a language before it yields anything, and a job that wedges
+        # in there has to be distinguishable from one that has merely just
+        # started. See `TranscriptionProgress.begin`.
+        TRANSCRIPTION_PROGRESS.begin(self._model_name)
+        try:
+            return self._decode(
+                speech,
+                language,
+                initial_prompt,
+                clips,
+                bounds,
+                concat_starts,
+                concat_ends,
+                clip_starts_in_frames,
+                offsets,
+                audio_seconds,
+                speech_seconds,
+                started,
+            )
+        finally:
+            # Runs on the failure path too. Without it a decoder that raised
+            # would leave the job "in flight" forever, and
+            # `seconds_since_progress` would climb past every threshold
+            # while the worker moved on to the next job.
+            TRANSCRIPTION_PROGRESS.end()
+
+    def _decode(
+        self,
+        speech: np.ndarray[Any, Any],
+        language: str | None,
+        initial_prompt: str | None,
+        clips: tuple[tuple[float, float], ...],
+        bounds: list[tuple[int, int]],
+        concat_starts: list[float],
+        concat_ends: list[float],
+        clip_starts_in_frames: list[int],
+        offsets: list[float],
+        audio_seconds: float,
+        speech_seconds: float,
+        started: float,
+    ) -> TranscriptionResult:
+        """The model call, the loop that reports while it runs, and the restore.
+
+        Split out of `_transcribe` only so that the `try/finally` around it
+        is one line and cannot accidentally grow to cover the gate. Everything
+        the concatenation produced is handed in rather than recomputed: the
+        arithmetic that undoes the join has to be the arithmetic that made it,
+        and a second derivation of `offsets` from the same clips is a second
+        place for the two to drift apart.
+        """
         segments, info = self._model.transcribe(
             speech,
             language=language,
@@ -419,7 +530,18 @@ class WhisperEngine:
         # restored times are file-relative in exactly the sense `to_absolute`
         # assumes, to within the 10 ms of frame-grid rounding
         # `_on_the_original_timeline` describes.
-        collected = []
+        #
+        # **A loop, not a tuple comprehension, and that is the change.**
+        # `segments` is a lazy generator: a comprehension consumes it inside
+        # a single expression, so nothing between the first segment and the
+        # last is ever observable and a job is only measurable once it has
+        # already finished. Reporting each `end` as it arrives costs one
+        # method call per segment -- a few hundred per job -- and is what
+        # makes a running transcription's position, and a stalled one's
+        # silence, visible at all.
+        total_seconds = float(getattr(info, "duration_after_vad", 0.0) or 0.0)
+        TRANSCRIPTION_PROGRESS.set_total(total_seconds)
+        collected: list[TranscribedSegment] = []
         for segment in segments:
             start, end = _on_the_original_timeline(
                 segment.start,
@@ -430,45 +552,81 @@ class WhisperEngine:
                 offsets,
             )
             collected.append(TranscribedSegment(start=start, end=end, text=segment.text))
-        # The model never sees the padding at all now, so a speaker whose
-        # file opens with twenty minutes of it no longer has their language
-        # guessed from silence.
+            # `segment.end` and not the restored `end`, deliberately. The
+            # denominator set just above is `duration_after_vad`, which is the
+            # concatenated speech the model was handed; the restored end is on
+            # the recording's timeline, up to a whole meeting further along.
+            # Reporting one against the other would put a job that has decoded
+            # its first clip at several hundred percent and make the real-time
+            # factor a number about the removed silence.
+            TRANSCRIPTION_PROGRESS.advance(segment.end)
+        # The decoder walked to the end of the speech it was handed whether or
+        # not the last stretch of it produced a segment, so the counter is
+        # topped up to the audio the model was actually given. This is the line
+        # that makes a job returning nothing at all show up as an impossible
+        # real-time factor rather than as a silent zero.
+        TRANSCRIPTION_PROGRESS.advance(total_seconds)
 
-        # Count what the guard cost, every time, because from in here a track
-        # of room tone correctly rejected and a track of quiet speech wrongly
-        # rejected are the same event. Nothing else in the system can see this
-        # either: `log_prob_threshold=None` makes faster-whisper drop the
-        # window internally, and the only trace it leaves is a DEBUG line on
-        # its own `faster_whisper` logger, which nothing here configures. So a
-        # transcript that came back empty would otherwise be indistinguishable
-        # from a speaker who never spoke -- and that is exactly the failure
-        # this branch exists to make impossible in the document, so it must not
-        # be reintroduced in the logs.
+        wall_seconds = time.monotonic() - started
+        # The model never saw the padding at all, so a speaker whose file
+        # opens with twenty minutes of it no longer has their language guessed
+        # from silence.
+        detected = getattr(info, "language", None) or self._default_language
+        # `job.transcribed` in `sturnus.application.worker` reports a
+        # realtime factor too, computed from the last segment's `end`. That
+        # is the right number for "how long did this take per minute of
+        # speech" and the wrong one for "did this decode anything at all",
+        # because a job with no segments has no denominator there. This one
+        # divides by the audio handed over -- which since the speech is
+        # concatenated is `duration_after_vad`, the gated seconds themselves --
+        # so it is defined exactly when the question is worth asking.
         #
-        # The seconds matter more than the counts and are what the message
-        # leads with: 0.9 s of room tone dropped is the guard working, forty
-        # minutes dropped is an incident, and only the duration tells them
-        # apart. The text itself is never logged -- the worker's logs are not
-        # access-controlled the way the Outline collection is.
-        gated_seconds = sum(end - start for start, end in clips)
+        # WARNING rather than INFO when nothing came back, and the message
+        # says why it matters rather than restating the count. From in here a
+        # track of room tone correctly rejected and a track of quiet speech
+        # wrongly rejected are the same event, and only the seconds below tell
+        # them apart -- 0.9 s dropped is the guard working, forty minutes
+        # dropped is an incident. `log_prob_threshold=None` makes
+        # faster-whisper discard the window internally and leaves no trace
+        # except a DEBUG line on its own logger, which nothing here
+        # configures, so this is the only place it can be seen at all.
         if collected:
-            log.debug(
-                "%s: gate passed %d clip(s)/%.1f s, decoder kept %d segment(s)/%.1f s",
-                path,
-                len(clips),
-                gated_seconds,
-                len(collected),
-                sum(s.end - s.start for s in collected),
+            log_event(
+                log,
+                logging.INFO,
+                Event.TRANSCRIPTION_DECODED,
+                "Decoded one speaker's recording",
+                model=self._model_name,
+                language=detected,
+                audio_seconds=round(audio_seconds, 3),
+                speech_seconds=round(speech_seconds, 3),
+                clips=len(clips),
+                segments=len(collected),
+                wall_seconds=round(wall_seconds, 3),
+                realtime_factor=round(wall_seconds / total_seconds, 4) if total_seconds else None,
             )
         else:
-            log.warning(
-                "%s: gate passed %d clip(s)/%.1f s of audio above the silence floor "
-                "but the decoder judged every window to be silence, so this speaker "
-                "contributes nothing to the protocol",
-                path,
-                len(clips),
-                gated_seconds,
+            log_event(
+                log,
+                logging.WARNING,
+                Event.TRANSCRIPTION_DECODED,
+                "The gate passed audio above the silence floor but the decoder judged "
+                "every window to be silence; this speaker contributes nothing to the "
+                "protocol",
+                model=self._model_name,
+                language=detected,
+                audio_seconds=round(audio_seconds, 3),
+                speech_seconds=round(speech_seconds, 3),
+                clips=len(clips),
+                segments=len(collected),
+                wall_seconds=round(wall_seconds, 3),
+                realtime_factor=round(wall_seconds / total_seconds, 4) if total_seconds else None,
             )
-
-        detected = getattr(info, "language", None) or self._default_language
+        # Onto `job.transcribe`, opened by
+        # `traced.TracedTranscriptionEngine` around this call --
+        # `asyncio.to_thread` copies the context, so the span is the
+        # enclosing one rather than an orphan. The wrapper cannot set these
+        # two: it sees a `TranscriptionResult`, and the gate's numbers are
+        # not in it.
+        set_current_span_fields(speech_seconds=speech_seconds, clips=len(clips))
         return TranscriptionResult(segments=tuple(collected), language=detected)
