@@ -61,12 +61,19 @@ async def test_silence_yields_no_segments(engine: WhisperEngine, tmp_path: Path)
 
 
 class _FakeSegment:
-    """The three attributes `_transcribe` reads off a faster-whisper segment."""
+    """The four attributes `_transcribe` reads off a faster-whisper segment.
 
-    def __init__(self, start: float, end: float, text: str) -> None:
+    `no_speech_prob` defaults to 0.0 -- the model saying "this window was
+    certainly speech" -- so every test written before the filter existed keeps
+    meaning exactly what it meant: the segment it hands back is one the filter
+    has no reason to touch.
+    """
+
+    def __init__(self, start: float, end: float, text: str, no_speech_prob: float = 0.0) -> None:
         self.start = start
         self.end = end
         self.text = text
+        self.no_speech_prob = no_speech_prob
 
 
 class _FakeInfo:
@@ -217,8 +224,17 @@ async def test_the_decoder_side_hallucination_guards_stay_set(tmp_path: Path) ->
 
     An amplitude test admits hum, keyboard clatter and cross-talk that Silero
     would have excluded. That is decode time wasted rather than a correctness
-    bug only because these two thresholds keep filtering the decoder's own
-    output afterwards (Spec 7).
+    bug only because the decoder's own output is filtered afterwards (Spec 7).
+
+    These two thresholds are the part of that filtering the library does. They
+    are necessary and they are not sufficient: a short subtitle credit invented
+    on room tone is fluent and unrepetitive, so `compression_ratio_threshold`
+    cannot see it, and `no_speech_threshold` is vetoed on this path by
+    `log_prob_threshold`. `no_speech_prob` is therefore checked again on our
+    side of the call -- see
+    `test_a_segment_the_model_thinks_was_silence_is_dropped`. Both stay set:
+    each still does its own job, and dropping a partial guard because a hole
+    was found in one of its paths leaves no guard at all.
     """
     recording = tmp_path / "speech.wav"
     _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
@@ -248,6 +264,106 @@ async def test_offsets_are_returned_unchanged(tmp_path: Path) -> None:
     result = await engine.transcribe(recording, language="de", initial_prompt=None)
 
     assert [(s.start, s.end, s.text) for s in result.segments] == [(5.25, 6.75, " hallo")]
+
+
+async def test_a_segment_the_model_thinks_was_silence_is_dropped(tmp_path: Path) -> None:
+    """The guard against invented subtitle credits, which nothing else catches.
+
+    Fed a short fragment of room tone, Whisper writes the text that follows the
+    last line of dialogue in the subtitle files it was trained on -- in
+    production, `" Untertitelung des ZDF, 2020"`, and before the language was
+    pinned, `" Thank you."` and `" Copyright WDR 2021"`. A four-word credit is
+    fluent and unrepetitive, so it sails past `compression_ratio_threshold`,
+    and its `avg_logprob` is *better* than real speech's because a credit is a
+    high-probability token sequence -- which is precisely why the model reaches
+    for one when it has nothing to transcribe. `no_speech_prob` was the only
+    quantity measured that separated the two classes at all.
+
+    Both probabilities are literals taken from that measurement -- 0.906 was an
+    observed hallucination, 0.453 the hardest real case (an isolated 0.4 s word
+    decoded alone in its window) -- and deliberately *not* derived from
+    `_NO_SPEECH_LIMIT`. A test that probes with a value computed from the
+    constant it claims to pin passes for every value of that constant,
+    including the ones that throw away every real word or keep every credit.
+
+    Both segments arrive from the same call, because the filter has to be a
+    per-segment judgement: a track where the speaker says one sentence and then
+    leaves the room must keep the sentence and drop what follows it.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    model = _RecordingModel(
+        segments=(
+            _FakeSegment(0.0, 1.5, " Guten Morgen.", no_speech_prob=0.453),
+            _FakeSegment(1.5, 2.0, " Untertitelung des ZDF, 2020", no_speech_prob=0.906),
+        )
+    )
+    engine = _engine_with(model)
+
+    result = await engine.transcribe(recording, language="de", initial_prompt=None)
+
+    assert [s.text for s in result.segments] == [" Guten Morgen."]
+
+
+async def test_a_track_of_nothing_but_hallucination_yields_no_segments(
+    tmp_path: Path,
+) -> None:
+    """The production case: a track on which nobody spoke, and only credits came back.
+
+    Two short recordings failed this way on the same day, one of them yielding
+    the same invented credit twice. The gate is an amplitude test and admits
+    room tone, so the model does get called and does return something. What
+    must not survive is the something.
+    An empty protocol is obviously empty and sends its reader to ask a person;
+    a protocol carrying `" Untertitelung des ZDF, 2020"` under a named
+    participant's name, timestamped and set in the same typeface as everything
+    real, looks like a result and is unfalsifiable by anyone who was not in the
+    room.
+
+    The detected language deliberately survives the filter. It is only ever
+    stored (`worker.py`, `assembly.py`) and never used to select or reject
+    content, so resetting it here would be a branch pinning nothing.
+    """
+    recording = tmp_path / "roomtone.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    model = _RecordingModel(
+        segments=(
+            _FakeSegment(1.4, 3.1, " Untertitelung des ZDF, 2020", no_speech_prob=0.711),
+            _FakeSegment(15.8, 17.0, " Untertitelung des ZDF, 2020", no_speech_prob=0.906),
+        )
+    )
+    engine = _engine_with(model)
+
+    result = await engine.transcribe(recording, language="de", initial_prompt=None)
+
+    assert result.segments == ()
+    assert result.language == "de"
+
+
+async def test_a_missing_no_speech_probability_is_an_error_and_not_a_pass(
+    tmp_path: Path,
+) -> None:
+    """Read the attribute directly; never `getattr(segment, ..., 0.0)`.
+
+    A default would turn a renamed library field into a guard that silently
+    stops guarding, which is how this defect reached production the first time:
+    the parameters meant to catch it were set and did nothing. `info.language`
+    next to it *is* read with `getattr`, because a missing language has a sane
+    fallback and a missing no-speech probability does not.
+    """
+
+    class _SegmentWithoutTheField:
+        def __init__(self) -> None:
+            self.start = 0.0
+            self.end = 1.0
+            self.text = " hallo"
+
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    engine = _engine_with(_RecordingModel(segments=(_SegmentWithoutTheField(),)))  # type: ignore[arg-type]
+
+    with pytest.raises(AttributeError):
+        await engine.transcribe(recording, language="de", initial_prompt=None)
 
 
 async def test_an_undetected_language_falls_back_to_the_default(tmp_path: Path) -> None:

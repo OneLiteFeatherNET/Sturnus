@@ -12,6 +12,12 @@ word. `tests/infrastructure/test_whisper.py` pins each of them against a
 fake model, because none of them is visible in the output of a passing
 two-second fixture.
 
+The decoder's output is filtered afterwards as well, on the model's own
+`no_speech_prob`. Those parameters alone were not enough: they are built for
+long repetition cascades, and the failure that reached production was a
+single short, fluent subtitle credit invented on room tone. The comment on
+`_NO_SPEECH_LIMIT` and the one beside the filter carry that reasoning.
+
 Silence is cut out before the decoder sees it, but *not* by faster-whisper's
 own `vad_filter`. That option runs Silero, whose recurrent state collapses on
 the bit-exact zero padding `SpeakerWriter` writes between packets — it
@@ -36,6 +42,28 @@ from sturnus.application.transcription import (
 from sturnus.infrastructure.speech_gate import speech_clips
 
 _SAMPLE_RATE = 16_000
+
+# Whisper's own estimate that a decoded window contained no speech at all.
+#
+# One constant for one judgement, passed to the library as
+# `no_speech_threshold` *and* applied by us to the segments it hands back.
+# Those are the same question -- "did the model believe there was anything
+# there?" -- and giving them two numbers would be two thresholds that have to
+# be reasoned about together and will drift apart the first time either moves.
+#
+# The value sits between the two classes measured on real audio through this
+# exact call path: every genuine decode scored at most 0.453 (an isolated
+# 0.4 s word, alone in its window, the hardest real case found), and every
+# reproduced hallucination scored at least 0.711. 0.6 is near the midpoint,
+# 0.147 above the worst real case and 0.111 below the mildest invented one,
+# and adjacent to neither.
+#
+# The honest limits of that evidence: one speech fixture, one speaker, one
+# language, and the `tiny` model only. 0.147 of margin is real but narrow, and
+# it rests on a single observation of the hardest real case. Whoever moves this
+# number next should move it against a second real utterance, not against
+# intuition.
+_NO_SPEECH_LIMIT = 0.6
 
 
 class WhisperEngine:
@@ -104,10 +132,14 @@ class WhisperEngine:
             # long audio (Spec 7). They matter more now than they did, not
             # less: the gate is an amplitude test with no phonetic
             # discrimination, so it lets through hum and cross-talk that
-            # Silero would have excluded, and these two thresholds are what
-            # filter the decoder's output on it.
+            # Silero would have excluded, and these two are the part of the
+            # filtering the library itself does. They are not the whole of it
+            # -- neither can see a short subtitle credit invented on room
+            # tone, which is what the `_NO_SPEECH_LIMIT` filter below the call
+            # is for, and the comment there explains why `no_speech_threshold`
+            # in particular does not fire on one.
             compression_ratio_threshold=2.4,
-            no_speech_threshold=0.6,
+            no_speech_threshold=_NO_SPEECH_LIMIT,
             # The library defaults this to `True`, which feeds each
             # segment's own text back in as the prompt for the next one.
             # One hallucinated segment then becomes the context every
@@ -135,8 +167,53 @@ class WhisperEngine:
         # `time_offset = seek * time_per_frame` is already on the original
         # timeline. These offsets stay file-relative in exactly the sense
         # `sturnus.application.transcription.to_absolute` assumes.
+
+        # The filter is what stops a silent track from producing a document
+        # that reads like a result. Given a short fragment of room tone the
+        # decoder writes what follows the last line of dialogue in the subtitle
+        # files it was trained on -- observed in production as " Untertitelung
+        # des ZDF, 2020", and before the language was pinned as " Thank you."
+        # and " Copyright WDR 2021". Neither threshold above sees it: a
+        # four-word credit compresses like a four-word sentence (0.69 measured,
+        # against 0.43 for real speech, so it is *less* repetitive than the
+        # thing we want to keep), and `no_speech_threshold` is vetoed before it
+        # can fire -- faster-whisper computes `should_skip = no_speech_prob >
+        # no_speech_threshold` and then clears it again when `avg_logprob >
+        # log_prob_threshold` (`transcribe.py:1215-1233`). A credit's
+        # `avg_logprob` is about -0.88, above the library's -1.0 default, so
+        # the guard disables itself on exactly the segments it exists for. That
+        # is why lowering `no_speech_threshold` to 0.4 was measured to change
+        # nothing at all, and why the next reader should not try it.
+        #
+        # So the same judgement is made here instead, on the segments that
+        # survived. We deliberately do not pass `log_prob_threshold=None` to
+        # close the veto in the library: that parameter also drives temperature
+        # fallback and the silence early-out for *all* audio, and the cost of
+        # changing it for genuine long segments could not be measured, only
+        # guessed at.
+        #
+        # `s.no_speech_prob` is read directly and not through `getattr` with a
+        # default. If faster-whisper ever renames the field we want an
+        # AttributeError in the worker, not a guard that quietly stops
+        # guarding -- a guard that vanishes without a test failing is how this
+        # reached production in the first place. `info.language` below is read
+        # with `getattr` because a missing language has a sane fallback; a
+        # missing no-speech probability does not.
+        #
+        # What this costs: an isolated, short utterance decoded in a window
+        # with nothing else in it. Being alone is what drives `no_speech_prob`
+        # up -- the full 4.1 s fixture scored 0.014 and the *same audio 34 dB
+        # quieter* scored 0.011, while slicing it down scored 0.137 at 1.0 s
+        # and 0.453 at 0.4 s -- and `_MERGE_GAP_SECONDS` puts any word spoken
+        # near other speech into the same clip and the same window as it. So
+        # the realistic loss is a lone "Mhm." on an otherwise silent track. A
+        # reader loses nothing to a dropped backchannel; a reader who was not
+        # in the room, which is who this feature is for, has no way at all to
+        # tell an invented line from a real one.
         collected = tuple(
-            TranscribedSegment(start=s.start, end=s.end, text=s.text) for s in segments
+            TranscribedSegment(start=s.start, end=s.end, text=s.text)
+            for s in segments
+            if s.no_speech_prob <= _NO_SPEECH_LIMIT
         )
         # With `clip_timestamps` set, detection starts at the first clip
         # instead of at second 0, so a speaker whose file opens with twenty

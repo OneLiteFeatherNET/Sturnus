@@ -25,7 +25,6 @@ from sturnus.infrastructure.speech_gate import (
     _FRAME_SAMPLES,
     _HANGOVER_SECONDS,
     _MERGE_GAP_SECONDS,
-    _SILENCE_PEAK,
     _frame_peaks,
     speech_clips,
 )
@@ -125,8 +124,18 @@ def test_bursts_separated_by_a_short_gap_become_one_clip() -> None:
     Whisper pads any clip shorter than 30 seconds up to a full 30-second
     window, so two clips 1 second apart cost twice what one clip spanning
     both costs. Merging is why `_MERGE_GAP_SECONDS` is generous.
+
+    The gap is the literal 1.5 s an ordinary turn-taking pause lasts, not
+    `_MERGE_GAP_SECONDS / 2.0`. A gap derived from the constant is always half
+    of it, so the old form merged for every value and pinned nothing -- and it
+    was worse than merely vacuous, because `_HANGOVER_SECONDS` widens each
+    burst by 0.25 s at both ends and so eats 0.5 s of whatever gap is written
+    here. 1.5 s leaves 1.0 s of real separation after the hangover, which must
+    still come back as one clip. Verified by mutation: `_MERGE_GAP_SECONDS =
+    0.6` -- nowhere near the "deliberately generous" its comment claims --
+    passed the old form and fails this one.
     """
-    gap = _MERGE_GAP_SECONDS / 2.0
+    gap = 1.5
     audio = np.concatenate([_zeros(2.0), _tone(1.0), _zeros(gap), _tone(1.0), _zeros(2.0)])
 
     clips = speech_clips(audio)
@@ -142,8 +151,14 @@ def test_bursts_separated_by_a_long_gap_stay_separate() -> None:
 
     Without this, the merge would eventually swallow the whole file and the
     gate would be doing nothing at all.
+
+    A literal 6 s, for the same reason as the merge case above: a gap written
+    as `_MERGE_GAP_SECONDS * 4.0` stays four times the constant and separates
+    for every value of it. 6 s leaves 5.5 s after the hangover, which is real
+    silence by any reading. Together the two tests bound the constant into
+    roughly (1.0, 5.5) seconds, which is what "a couple of seconds" means.
     """
-    gap = _MERGE_GAP_SECONDS * 4.0
+    gap = 6.0
     audio = np.concatenate([_zeros(2.0), _tone(1.0), _zeros(gap), _tone(1.0), _zeros(2.0)])
 
     clips = speech_clips(audio)
@@ -224,12 +239,28 @@ def test_audio_shorter_than_the_minimum_run_yields_no_clips() -> None:
 def test_the_floor_sits_just_above_the_padding_and_far_below_speech() -> None:
     """The threshold is a boundary test, so pin both sides of it.
 
-    Below the floor the gate must still exclude; the padding is at exactly
-    0.0 so it clears this by an enormous margin, and that margin is the
-    reason a threshold this crude is safe at all.
+    Below the floor the gate must still exclude; the padding is at exactly 0.0
+    so it clears this by an enormous margin, and that margin is the reason a
+    threshold this crude is safe at all.
+
+    **Both levels are literals chosen independently of `_SILENCE_PEAK`, and
+    must stay that way.** This test used to probe `_SILENCE_PEAK / 2.0` and
+    `_SILENCE_PEAK * 2.0`, which every positive threshold whatsoever passes by
+    construction -- one level is below it and the other above it however absurd
+    it is. Verified by mutation: `_SILENCE_PEAK = 0.049`, fifty times too high
+    and well up inside ordinary speech, left the old form green. Refactoring
+    these numbers back into expressions over the constant restores that.
+
+    The two levels encode what the constant's own comment claims:
+
+    * 0.0009 is a shade under -60 dBFS, which is where the floor says it sits,
+      and must be excluded.
+    * 0.005 is about -46 dBFS. The real German fixture attenuated by 40 dB
+      peaks near 0.007 and still gates correctly, so this level is inside the
+      range of quiet-but-real speech and must be kept.
     """
-    quiet = np.full(SAMPLE_RATE, _SILENCE_PEAK / 2.0, dtype=np.float32)
-    loud = np.full(SAMPLE_RATE, _SILENCE_PEAK * 2.0, dtype=np.float32)
+    quiet = np.full(SAMPLE_RATE, 0.0009, dtype=np.float32)
+    loud = np.full(SAMPLE_RATE, 0.005, dtype=np.float32)
 
     assert speech_clips(quiet) == ()
     assert len(speech_clips(loud)) == 1
