@@ -1,7 +1,10 @@
 from datetime import UTC, datetime
 
+import pytest
+
 from sturnus.application.publishing import (
     announce_ready_sessions,
+    render_announcement,
     render_silent_audio_warning,
     sessions_to_announce,
 )
@@ -15,6 +18,7 @@ def session(
     document_url: str | None = "https://outline.example/doc/1",
     announced: datetime | None = None,
     channel_id: int = 999,
+    participant_ids: tuple[int, ...] = (),
 ) -> dict[str, object]:
     return {
         "id": session_id,
@@ -22,6 +26,7 @@ def session(
         "document_url": document_url,
         "announced_at": announced,
         "channel_id": channel_id,
+        "participant_ids": participant_ids,
     }
 
 
@@ -149,3 +154,79 @@ def test_the_silent_audio_warning_says_the_recording_continues() -> None:
     arriving audibly.
     """
     assert "Recording continues." in render_silent_audio_warning(100)
+
+
+# ---------------------------------------------------------------------------
+# The mentions: a protocol is written for the people who were in the room,
+# so the message carrying its link addresses them by name.
+# ---------------------------------------------------------------------------
+
+
+def test_the_announcement_mentions_every_participant() -> None:
+    text = render_announcement("https://outline.example/doc/1", (100, 200))
+    assert "<@100>" in text
+    assert "<@200>" in text
+
+
+def test_the_announcement_still_carries_the_link_alongside_the_mentions() -> None:
+    """The link is the message; the mentions only decide who is told."""
+    text = render_announcement("https://outline.example/doc/1", (100,))
+    assert "https://outline.example/doc/1" in text
+
+
+def test_the_mentions_come_before_the_link_on_their_own_line() -> None:
+    """Discord renders a mention as a chip: leading with them is what makes
+    the message read as addressed to somebody rather than as a stray link.
+    """
+    text = render_announcement("https://outline.example/doc/1", (100, 200))
+    first_line, _, rest = text.partition("\n")
+    assert first_line == "<@100> <@200>"
+    assert "https://outline.example/doc/1" in rest
+
+
+def test_a_session_with_no_known_participants_posts_the_link_alone() -> None:
+    """No mentions is a degraded announcement, not a missing one -- and the
+    template must not leave a blank first line where they would have been.
+    """
+    text = render_announcement("https://outline.example/doc/1")
+    assert not text.startswith("\n")
+    assert "https://outline.example/doc/1" in text
+    assert "<@" not in text
+
+
+def test_a_participant_id_cannot_smuggle_a_broadcast_mention() -> None:
+    """`format_mentions` puts every id through `int()`.
+
+    Nothing user-controlled reaches these ids today -- they come from a
+    `BigInteger` column -- but this template does not autoescape and its
+    output is posted verbatim into a channel, so an id that arrived as a
+    string must not be able to carry `@everyone` with it.
+    """
+    with pytest.raises(ValueError):
+        render_announcement("https://outline.example/doc/1", ["@everyone"])  # type: ignore[list-item]
+
+
+async def test_the_posted_announcement_mentions_the_sessions_participants() -> None:
+    """End to end through the sweep: the ids the reader supplies are the
+    ids that reach the channel.
+    """
+    sessions = FakeSessions([session(1, channel_id=42, participant_ids=(100, 200))])
+    announcer = FakeAnnouncer()
+    await announce_ready_sessions(sessions, announcer, T0)
+    _, text = announcer.posted[0]
+    assert "<@100>" in text
+    assert "<@200>" in text
+
+
+async def test_a_reader_that_supplies_no_participants_still_gets_the_link_posted() -> None:
+    """`participant_ids` is read with `.get`: an implementation of
+    `SessionReader` that predates it loses the mentions, not the
+    announcement.
+    """
+    candidate = session(1, channel_id=42)
+    del candidate["participant_ids"]
+    sessions = FakeSessions([candidate])
+    announcer = FakeAnnouncer()
+    await announce_ready_sessions(sessions, announcer, T0)
+    assert sessions.announced == [1]
+    assert "https://outline.example/doc/1" in announcer.posted[0][1]

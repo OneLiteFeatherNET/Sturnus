@@ -22,6 +22,28 @@ from __future__ import annotations
 
 import discord
 
+#: Which mentions in a posted message Discord may turn into an actual
+#: notification. Both messages that go out through this adapter name
+#: people on purpose -- the document link mentions everyone the session
+#: recorded, the silent-audio warning names the one speaker it is about --
+#: and a mention nobody is notified by defeats the reason either message
+#: names anyone at all.
+#:
+#: Everything except `users` is off. `sturnus.application.publishing`
+#: renders no role or `@everyone` mention in either template, so allowing
+#: them could only ever grant reach to something that reached the text by
+#: accident; denying them here is the layer that makes that harmless
+#: rather than merely improbable. `replied_user` is irrelevant -- nothing
+#: posted here is a reply -- and off for the same reason.
+#:
+#: Set explicitly rather than left to the library default: discord.py
+#: falls back to the client's own `allowed_mentions`, which is a
+#: process-wide setting anything else could change without this file's
+#: knowledge.
+_ALLOWED_MENTIONS = discord.AllowedMentions(
+    everyone=False, users=True, roles=False, replied_user=False
+)
+
 
 class DiscordAnnouncer:
     """Satisfies `sturnus.application.publishing.Announcer` over the gateway."""
@@ -35,4 +57,4 @@ class DiscordAnnouncer:
         )
         if not isinstance(channel, discord.abc.Messageable):
             raise ValueError(f"channel {channel_id} cannot receive messages")
-        await channel.send(text)
+        await channel.send(text, allowed_mentions=_ALLOWED_MENTIONS)

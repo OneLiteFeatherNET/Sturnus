@@ -49,6 +49,7 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.discord.announcer import _ALLOWED_MENTIONS
 from sturnus.infrastructure.discord.client import (
     REJOIN_COOLDOWN,
     SturnusClient,
@@ -1700,7 +1701,8 @@ async def test_a_pipeline_the_client_builds_can_warn_its_own_channel(tmp_path: P
 
     channel.send.assert_awaited_once_with(  # type: ignore[attr-defined]
         "Audio is arriving from <@100> but at no audible level. The microphone is "
-        "most likely muted at system level. Recording continues."
+        "most likely muted at system level. Recording continues.",
+        allowed_mentions=_ALLOWED_MENTIONS,
     )
     assert [(user_id, at) for _, user_id, at in sessions.silent_audio] == [
         (ANNA, T0 + timedelta(seconds=29))

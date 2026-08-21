@@ -547,6 +547,61 @@ async def test_candidates_for_announcement_returns_documented_sessions(
     assert candidates[0]["announced_at"] is None
 
 
+async def test_candidates_for_announcement_carries_the_participants_to_mention(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The announcement mentions everyone the session recorded, so the ids
+    have to travel with the candidate row -- in the order they first spoke,
+    which is what makes a re-posted announcement read identically.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await repo.add_participant(session_id, ANNA, "Anna", T0)
+    await repo.add_participant(session_id, BEN, "Ben", T0 + timedelta(minutes=1))
+    await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await _mark_documented(factory, session_id)
+
+    candidates = await repo.candidates_for_announcement()
+    assert candidates[0]["participant_ids"] == (ANNA, BEN)
+
+
+async def test_candidates_for_announcement_gives_a_speakerless_session_no_participants(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A session nobody spoke in still gets its link posted; the key is
+    present and empty rather than missing, so the caller never has to ask
+    whether the reader supplied it.
+    """
+    repo = SessionRepository(factory)
+    session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await _mark_documented(factory, session_id)
+
+    assert (await repo.candidates_for_announcement())[0]["participant_ids"] == ()
+
+
+async def test_one_sessions_participants_do_not_leak_into_another(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two sessions are read in one sweep and regrouped in Python; a wrong
+    grouping would mention the wrong people in the wrong channel, which is
+    a privacy failure, not a cosmetic one.
+    """
+    repo = SessionRepository(factory)
+    first = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await repo.add_participant(first, ANNA, "Anna", T0)
+    await repo.close_session(first, T0 + timedelta(hours=1), "empty")
+    await _mark_documented(factory, first)
+
+    second = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0 + timedelta(hours=2))
+    await repo.add_participant(second, BEN, "Ben", T0 + timedelta(hours=2))
+    await repo.close_session(second, T0 + timedelta(hours=3), "empty")
+    await _mark_documented(factory, second)
+
+    by_id = {c["id"]: c["participant_ids"] for c in await repo.candidates_for_announcement()}
+    assert by_id == {first: (ANNA,), second: (BEN,)}
+
+
 async def test_candidates_for_announcement_excludes_a_session_still_open(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
