@@ -1123,7 +1123,9 @@ async def test_a_track_that_produced_text_is_not_reported_as_a_loss(
     """
     recording = tmp_path / "speech.wav"
     _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
-    engine = _engine_with(_RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 1.5, " Guten Morgen."),)))
+    engine = _engine_with(
+        _RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 1.5, " Guten Morgen."),))
+    )
 
     with caplog.at_level(logging.WARNING, logger="sturnus.infrastructure.whisper"):
         result = await engine.transcribe(recording, language="de", initial_prompt=None)
