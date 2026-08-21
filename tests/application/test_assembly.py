@@ -125,3 +125,70 @@ async def test_display_names_come_from_the_session_not_from_now() -> None:
         1, FakeSessions(), FakeJobs({ANNA: result((0.0, 1.0, "x"))}), FakeLinks(), tz=UTC
     )
     assert transcript.blocks[0].speaker.discord_display_name == "anna"
+
+
+async def test_a_recorded_speaker_whose_decode_came_back_empty_stays_an_attendee() -> None:
+    """The case this branch created, and the one the roster exists for.
+
+    Ben's track was recorded -- he has an audio epoch, which is the record
+    that audio existed -- gated, and decoded. What came back was invented
+    subtitle credits, which faster-whisper now drops at the window, so his
+    stored transcript is empty. He was still at the meeting, and the protocol
+    has to keep saying so.
+    """
+    transcript = await assemble(
+        1,
+        FakeSessions(),
+        FakeJobs({ANNA: result((0.0, 1.0, "hallo")), BEN: result()}),
+        FakeLinks(),
+        tz=UTC,
+    )
+
+    assert [b.text for b in transcript.blocks] == ["hallo"]
+    assert [p.discord_user_id for p in transcript.participants] == [ANNA, BEN]
+    assert transcript.participants[1].discord_display_name == "ben"
+
+
+async def test_a_speaker_without_an_epoch_is_not_an_attendee_either() -> None:
+    """The other half of the same judgement, and the reason it is not just
+    "list everyone with a job row".
+
+    No audio epoch means no audio was ever recorded for them -- they were in
+    the channel but nothing of theirs was captured, so there is no recording
+    for the pipeline to have mishandled. `assemble` already refuses to place
+    their words in time for that reason; it must refuse to vouch for their
+    attendance on the same evidence.
+    """
+    sessions = FakeSessions()
+    sessions.epochs.pop(BEN)
+
+    transcript = await assemble(
+        1,
+        sessions,
+        FakeJobs({ANNA: result((0.0, 1.0, "hallo")), BEN: result()}),
+        FakeLinks(),
+        tz=UTC,
+    )
+
+    assert [p.discord_user_id for p in transcript.participants] == [ANNA]
+
+
+async def test_a_silent_attendee_carries_their_linked_identity() -> None:
+    """The roster goes through the same identity resolution as the segments.
+
+    A linked account is rendered as an Outline mention rather than a Discord
+    link (Spec 8.3), and the participants list is one of the two places that
+    rendering happens. A silent attendee arriving without their link would be
+    the only row in the document that names a linked person as a stranger.
+    """
+    transcript = await assemble(
+        1,
+        FakeSessions(),
+        FakeJobs({ANNA: result((0.0, 1.0, "hallo")), BEN: result()}),
+        FakeLinks({BEN: ("out-2", "Ben Example")}),
+        tz=UTC,
+    )
+
+    ben = transcript.participants[1]
+    assert ben.external_user_id == "out-2"
+    assert ben.external_display_name == "Ben Example"

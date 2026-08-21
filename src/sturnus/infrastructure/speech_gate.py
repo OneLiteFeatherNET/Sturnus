@@ -39,10 +39,13 @@ positive floor excludes it with enormous margin.
 
 The accepted cost: with no phonetic discrimination the gate admits hum,
 keyboard clatter and cross-talk that Silero would have excluded. That is
-decode time wasted, not a wrong transcript, and Whisper's own
-`no_speech_threshold` and `compression_ratio_threshold` — which
-`WhisperEngine` keeps set — remain the second line against hallucinating on
-it.
+decode time wasted, not a wrong transcript, so long as the decoder rejects
+what the gate let through — which is `WhisperEngine`'s job and not this
+module's. Do not read the existence of that second line as a reason to relax
+this one: it was set and it still shipped `" Untertitelung des ZDF, 2020"`
+under a participant's name, because `no_speech_threshold` was silently
+vetoed by a library default `WhisperEngine` had not overridden. That is
+fixed there, and the comments there say how.
 
 This module lives in `infrastructure` and not in `domain` because it needs
 numpy, and `tests/test_architecture.py` enforces that `sturnus.domain` imports

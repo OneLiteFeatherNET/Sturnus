@@ -1033,3 +1033,124 @@ async def test_a_detection_that_came_up_empty_falls_back_to_the_default(spy: _Mo
     spy.detected = None
     result = await _engine(default_language="de").transcribe(FIXTURE, None, None)
     assert result.language == "de"
+
+
+async def test_the_veto_on_the_no_speech_skip_is_closed_explicitly(tmp_path: Path) -> None:
+    """`log_prob_threshold=None`, which is what actually catches the credits.
+
+    Everything else in this adapter is set to a number. This one is set to
+    `None`, and that is the whole point, so it needs its own test: an argument
+    whose value is the absence of a value is exactly the kind that gets tidied
+    away by someone who reads it as a leftover.
+
+    What it does. In the sequential path faster-whisper decides silence like
+    this (`transcribe.py:1215-1233`)::
+
+        should_skip = result.no_speech_prob > options.no_speech_threshold
+        if (options.log_prob_threshold is not None
+                and avg_logprob > options.log_prob_threshold):
+            should_skip = False
+
+    `log_prob_threshold` is not a floor that rejects low-confidence output --
+    on this path it is a *veto on the no-speech skip*. Its -1.0 default, which
+    Sturnus used to inherit, therefore switches `no_speech_threshold` off for
+    any decode fluent enough to clear -1.0. A subtitle credit is a
+    high-probability token sequence -- that is why the model reaches for one
+    when it has nothing to transcribe -- so `" Untertitelung des ZDF, 2020"`
+    at an `avg_logprob` of about -0.88 disabled the very guard aimed at it.
+    Measured through this call path: with the veto in place, 11 of 111
+    non-speech inputs came back carrying invented text; with
+    `log_prob_threshold=None`, 0 of 111 did.
+
+    That also explains a dead end worth not repeating: lowering
+    `no_speech_threshold` to 0.4 was measured to change nothing at all,
+    because the veto fires whatever the threshold is.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    engine = _engine_with(model := _RecordingModel())
+
+    await engine.transcribe(recording, language="de", initial_prompt=None)
+
+    assert model.calls[0]["log_prob_threshold"] is None
+
+
+async def test_a_track_the_decoder_emptied_says_so_in_the_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A guard whose cost never shows up anywhere is one nobody can audit.
+
+    This is the shape of the guard firing: the gate found audio above the
+    silence floor, the model was called on it, and every decoded window came
+    back judged as silence, so the speaker contributes nothing to the
+    document. That is the intended outcome for a track of room tone and the
+    failure mode for a track of quiet speech, and the two are indistinguishable
+    from inside this adapter -- which is precisely why it has to be visible
+    from outside it.
+
+    The line carries the gated duration rather than only a count, because that
+    is the number that separates the two readings: 0.9 s of room tone dropped
+    is the guard working, 40 minutes dropped is an incident.
+    """
+    recording = tmp_path / "roomtone.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    engine = _engine_with(_RecordingModel(segments=()))
+
+    with caplog.at_level(logging.WARNING, logger="sturnus.infrastructure.whisper"):
+        result = await engine.transcribe(recording, language="de", initial_prompt=None)
+
+    assert result.segments == ()
+    assert len(caplog.records) == 1
+    message = caplog.records[0].getMessage()
+    assert "roomtone.wav" in message
+    # 2.3 s, and none of the other three numbers this file offers. The
+    # recording is 3.0 s long and holds a 2.0 s tone; the gate widens that
+    # tone by `_HANGOVER_SECONDS` at the end and clamps it at the start,
+    # yielding the 2.25 s it actually handed the decoder. So this also fails
+    # if the message reports the file length, the tone length, or a count of
+    # clips dressed up as seconds.
+    assert "2.3 s" in message, message
+
+
+async def test_a_track_that_produced_text_is_not_reported_as_a_loss(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The counterpart, and the reason the level is WARNING and not INFO.
+
+    Most jobs transcribe fine. If the ordinary case warned too, the warning
+    would carry no information and would be filtered out by the first person
+    who reads the worker's logs -- taking the case that matters with it.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    engine = _engine_with(_RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 1.5, " Guten Morgen."),)))
+
+    with caplog.at_level(logging.WARNING, logger="sturnus.infrastructure.whisper"):
+        result = await engine.transcribe(recording, language="de", initial_prompt=None)
+
+    assert [s.text for s in result.segments] == [" Guten Morgen."]
+    assert caplog.records == []
+
+
+async def test_the_transcribed_text_is_never_logged(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """What a participant said is the one thing this adapter must not emit.
+
+    The worker's logs are not the protocol and are not access-controlled like
+    it: the document goes to a named Outline collection, the logs go wherever
+    the cluster ships them. The counting added for auditability must count,
+    not quote -- the same rule `infrastructure/documents/outline.py` follows
+    when it logs a request without its body.
+    """
+    recording = tmp_path / "speech.wav"
+    _write_wav(recording, np.concatenate([_tone(2.0), np.zeros(16_000, dtype=np.float32)]))
+    secret = " Wir kuendigen den Vertrag mit Beispiel GmbH."
+    engine = _engine_with(_RecordingModel(segments=(_as_decoded_from(0.0, 0.0, 1.5, secret),)))
+
+    with caplog.at_level(logging.DEBUG, logger="sturnus.infrastructure.whisper"):
+        await engine.transcribe(recording, language="de", initial_prompt=None)
+
+    assert caplog.records, "the debug trace exists at all, so this is not vacuous"
+    assert "Vertrag" not in caplog.text
+    assert "Beispiel" not in caplog.text
