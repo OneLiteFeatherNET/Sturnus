@@ -286,7 +286,8 @@ worker:
   tmpSizeLimit: 4Gi
   # Sized for large-v3 at int8_float32 with beam_size 8, which is a
   # different budget from the large-v3-turbo/beam 5 these numbers were set
-  # for. Three parts, added up rather than guessed at:
+  # for. Four parts, added up rather than guessed at -- except the last,
+  # which peaks before the second one starts and so overlaps it:
   #
   #   * The weights, resident for the life of the process. 1.55B
   #     parameters quantised to one byte each is ~1.55GB, against ~0.81GB
@@ -302,11 +303,28 @@ worker:
   #     that share by 8/5, so ~2.2GB.
   #   * The process itself -- interpreter, numpy, soxr, boto3, SQLAlchemy,
   #     one decrypted WAV read through it. A few hundred MB; call it 0.5GB.
+  #   * The log-mel extraction, which is transient and peaks *before* any
+  #     decoding starts, so it overlaps with the second item rather than
+  #     adding to it. Linear in the array handed to the model, at roughly
+  #     50MB per minute of it: 2.0GB for the 40.2 minutes of speech in a
+  #     100-minute session. This is the term nobody costed and the reason
+  #     this limit had to be overridden to 12Gi in the deployment repo --
+  #     `WhisperEngine` used to hand faster-whisper the *whole* padded
+  #     track and mark the speech with `clip_timestamps`, and the library
+  #     shrinks the array only in the `vad_filter` branch that setting clips
+  #     skips, so extraction scaled with session length and cost 4.94GB for
+  #     that same session. It now concatenates the gated speech before the
+  #     call (`sturnus.infrastructure.whisper`), which is what makes the
+  #     arithmetic here true again and lets the 12Gi override go back to the
+  #     6Gi below. For scale: on the old path a four-hour session
+  #     extrapolates to ~11.9GB of extraction alone, i.e. it would have
+  #     burst even the 12Gi stopgap.
   #
   # ~4.25GB at peak, and measured at **4.11GB** on an x86 CPU pinned to
   # four threads, transcribing 4.7 minutes of German speech -- close enough
   # to the arithmetic above to trust it for longer jobs, since only the
-  # second item grows with the audio. For comparison the previous
+  # second and fourth items grow with the audio and the fourth peaks first.
+  # For comparison the previous
   # configuration (large-v3-turbo, int8, beam 5) peaked at 1.96GB, which is
   # why the old 2560Mi limit held.
   #
@@ -321,9 +339,15 @@ worker:
   #
   # Measured, that ceiling is further away than it looks. The same run
   # transcribed 282s of speech in 145s -- 1.94x faster than real time,
-  # against 4.6x for the old configuration. `vad_filter` means only the
-  # *speech* in a track is decoded, not its padded length, so 1800s of
-  # lease covers roughly 58 minutes of one person actually talking. Beyond
+  # against 4.6x for the old configuration. The gate finds the speech and
+  # `WhisperEngine` concatenates it before the model sees it, so both
+  # extraction and decoding scale with what was said and not with the padded
+  # length of a track: 1800s of lease covers roughly 58 minutes of one
+  # person actually talking. That is also what keeps the memory limit off
+  # the critical path -- 6Gi covers roughly 60 minutes of one speaker's
+  # actual speech (60 x 50MB of extraction + 1.55 + 0.5 ~= 5.1GB) and the
+  # lease expires just before that, so for a four-hour session the lease,
+  # not this limit, is the number to revisit. Beyond
   # that the lease expires mid-job; with `replicas: 1` (hardcoded in the
   # Deployment template) and the worker processing one job at a time,
   # nothing else can claim it, so the only consequence today is that a
