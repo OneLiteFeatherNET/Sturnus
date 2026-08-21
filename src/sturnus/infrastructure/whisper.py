@@ -12,6 +12,12 @@ word. `tests/infrastructure/test_whisper.py` pins each of them against a
 fake model, because none of them is visible in the output of a passing
 two-second fixture.
 
+One of them is set to `None` rather than to a number, which reads like an
+omission and is not: `log_prob_threshold` is a veto on faster-whisper's
+own silence check, not a quality floor, and leaving it at the library
+default is what let a subtitle credit invented on room tone reach a
+production protocol. The comment beside it carries the mechanism.
+
 Silence is cut out before the decoder sees it, but *not* by faster-whisper's
 own `vad_filter`. That option runs Silero, whose recurrent state collapses on
 the bit-exact zero padding `SpeakerWriter` writes between packets — it
@@ -24,6 +30,7 @@ amplitude test; its module docstring carries the full reasoning.
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 from faster_whisper import WhisperModel  # type: ignore[import-untyped]
@@ -36,6 +43,8 @@ from sturnus.application.transcription import (
 from sturnus.infrastructure.speech_gate import speech_clips
 
 _SAMPLE_RATE = 16_000
+
+log = logging.getLogger(__name__)
 
 
 class WhisperEngine:
@@ -104,10 +113,79 @@ class WhisperEngine:
             # long audio (Spec 7). They matter more now than they did, not
             # less: the gate is an amplitude test with no phonetic
             # discrimination, so it lets through hum and cross-talk that
-            # Silero would have excluded, and these two thresholds are what
-            # filter the decoder's output on it.
+            # Silero would have excluded, and these are what filter the
+            # decoder's output on it.
+            #
+            # `compression_ratio_threshold` catches repetition and nothing
+            # else; a four-word subtitle credit compresses like a four-word
+            # sentence (0.69 measured, against 0.43 for real speech, so the
+            # invented line is *less* repetitive than the thing we want to
+            # keep). `no_speech_threshold` is the one that catches the credit,
+            # and only because of the argument below it.
             compression_ratio_threshold=2.4,
             no_speech_threshold=0.6,
+            # `None`, deliberately, and this is the fix for the credits.
+            #
+            # Despite the name, `log_prob_threshold` does not reject
+            # low-confidence output anywhere in this library. On the
+            # sequential path it is a *veto on the no-speech skip*
+            # (`transcribe.py:1215-1233`):
+            #
+            #     should_skip = result.no_speech_prob > no_speech_threshold
+            #     if log_prob_threshold is not None and avg_logprob > log_prob_threshold:
+            #         should_skip = False
+            #
+            # A subtitle credit is a fluent, high-probability token sequence --
+            # that is precisely why the model reaches for one when there is
+            # nothing to transcribe -- so its `avg_logprob` of about -0.88 sits
+            # above the library's -1.0 default and switches off the guard aimed
+            # at it. That is how `" Untertitelung des ZDF, 2020"` reached a
+            # protocol with `no_speech_threshold` already set. It is also why
+            # lowering that threshold to 0.4 was measured to change *nothing*:
+            # the veto fires wherever the threshold sits, so do not try it.
+            #
+            # Measured through this exact call path, `tiny`, German, over 111
+            # non-speech inputs the gate let through and 31 real utterances
+            # sliced out of `tests/fixtures/hello.wav`: with the veto in place
+            # 11 non-speech inputs came back carrying invented text and 28 of
+            # 31 real utterances survived; with `None`, 0 invented lines
+            # survived and 27 of 31 real ones did. The whole price of the fix,
+            # on the whole measured set, is that one: a 0.4 s fragment cut out
+            # of the middle of a word, which the model rendered " Ah, ja." at
+            # a `no_speech_prob` of 0.607. Decode time over the real set also
+            # fell, from 14.0 s to 11.2 s, because `None` stops `avg_logprob`
+            # triggering the temperature ladder -- the cost this fix was
+            # suspected of having, measured, with the opposite sign.
+            #
+            # What it costs, stated at the right unit: `no_speech_prob` is one
+            # number per decoded 30-second window, not per segment
+            # (`transcribe.py:1364` copies it onto every `Segment` cut from the
+            # window), so a window that loses this argument loses *all* of it,
+            # sentences included. Two mitigations, both measured rather than
+            # assumed. `clip_timestamps` bounds a window by its clip --
+            # `segment_size = min(nb_max_frames, content_frames - seek,
+            # seek_clip_end - seek)` at `transcribe.py:1173-1177` -- so only
+            # audio the gate already merged into one clip, less than
+            # `speech_gate._MERGE_GAP_SECONDS` apart, can ever share a window.
+            # And where real speech and room tone did share a
+            # window, the speech dominated: `no_speech_prob` came out at
+            # 0.018-0.058 and the model transcribed the sentence instead of
+            # inventing anything. The residual loss is a lone short utterance
+            # alone in its window, which is what drives the probability up:
+            # the full 4.1 s fixture scored 0.014 and the same audio 34 dB
+            # quieter scored 0.011, while 0.4 s fragments of it scored
+            # 0.39-0.80.
+            #
+            # Do not read that band as a margin. It is not one: real 0.4 s
+            # fragments reached 0.804 while invented lines went as low as
+            # 0.639, so the two classes overlap and no threshold separates
+            # them. 0.6 is the library's own default, it is where this file has
+            # always had `no_speech_threshold`, and on the measured set it
+            # rejects every invented line at the cost of four 0.4 s fragments
+            # of a real word. Whoever moves it should move it against a second
+            # speaker and a second fixture, and should expect to trade, not to
+            # find a gap.
+            log_prob_threshold=None,
             # The library defaults this to `True`, which feeds each
             # segment's own text back in as the prompt for the next one.
             # One hallucinated segment then becomes the context every
@@ -135,9 +213,47 @@ class WhisperEngine:
         # `time_offset = seek * time_per_frame` is already on the original
         # timeline. These offsets stay file-relative in exactly the sense
         # `sturnus.application.transcription.to_absolute` assumes.
+
         collected = tuple(
             TranscribedSegment(start=s.start, end=s.end, text=s.text) for s in segments
         )
+
+        # Count what the guard cost, every time, because from in here a track
+        # of room tone correctly rejected and a track of quiet speech wrongly
+        # rejected are the same event. Nothing else in the system can see this
+        # either: `log_prob_threshold=None` makes faster-whisper drop the
+        # window internally, and the only trace it leaves is a DEBUG line on
+        # its own `faster_whisper` logger, which nothing here configures. So a
+        # transcript that came back empty would otherwise be indistinguishable
+        # from a speaker who never spoke -- and that is exactly the failure
+        # this branch exists to make impossible in the document, so it must not
+        # be reintroduced in the logs.
+        #
+        # The seconds matter more than the counts and are what the message
+        # leads with: 0.9 s of room tone dropped is the guard working, forty
+        # minutes dropped is an incident, and only the duration tells them
+        # apart. The text itself is never logged -- the worker's logs are not
+        # access-controlled the way the Outline collection is.
+        gated_seconds = sum(end - start for start, end in clips)
+        if collected:
+            log.debug(
+                "%s: gate passed %d clip(s)/%.1f s, decoder kept %d segment(s)/%.1f s",
+                path,
+                len(clips),
+                gated_seconds,
+                len(collected),
+                sum(s.end - s.start for s in collected),
+            )
+        else:
+            log.warning(
+                "%s: gate passed %d clip(s)/%.1f s of audio above the silence floor "
+                "but the decoder judged every window to be silence, so this speaker "
+                "contributes nothing to the protocol",
+                path,
+                len(clips),
+                gated_seconds,
+            )
+
         # With `clip_timestamps` set, detection starts at the first clip
         # instead of at second 0, so a speaker whose file opens with twenty
         # minutes of padding no longer has their language guessed from it.

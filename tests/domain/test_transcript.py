@@ -151,3 +151,87 @@ def test_merge_continues_across_a_display_name_change() -> None:
     assert len(t.blocks) == 1
     assert t.blocks[0].text == "before rename after rename"
     assert t.blocks[0].speaker.discord_user_id == 1
+
+
+CHRIS = SpeakerIdentity(3, "chris")
+
+
+def test_a_recorded_speaker_with_no_usable_text_is_still_an_attendee() -> None:
+    """Being in the room and saying something quotable are different facts.
+
+    `participants` is rendered as the protocol's attendee list *and* as its
+    headline count, so leaving a recorded speaker out of it is not a gap in
+    the transcript -- it is the document stating that someone was not at the
+    meeting. Which is a claim the transcription pipeline is in no position to
+    make: a track reaches this point only after the speaker was in the
+    channel, consented, was recorded, was gated and was decoded, and the last
+    of those steps drops a whole 30-second window at a time on a judgement the
+    model itself calls a probability.
+
+    So the two are separated. `blocks` stays exactly as it was -- a speaker
+    with nothing to quote is quoted nowhere -- while `participants` reports
+    everyone the caller says was recorded.
+    """
+    t = build_transcript([seg(ANNA, 0, 1, "hallo")], T0, T0 + timedelta(hours=1), recorded=[BEN])
+
+    assert t.participants == (ANNA, BEN)
+    assert [b.text for b in t.blocks] == ["hallo"]
+
+
+def test_a_recorded_speaker_who_also_spoke_is_listed_once() -> None:
+    """The roster and the segments overlap on almost every real session."""
+    t = build_transcript(
+        [seg(ANNA, 0, 1, "hallo")], T0, T0 + timedelta(hours=1), recorded=[ANNA, BEN]
+    )
+
+    assert t.participants == (ANNA, BEN)
+
+
+def test_a_speaking_participant_keeps_the_richer_identity_over_the_roster() -> None:
+    """The roster must not overwrite an external link the segments carried.
+
+    `assemble` builds both from the same `SpeakerIdentity`, so this cannot
+    diverge today -- but a roster that replaced the identity would silently
+    strip the Outline mention off a linked account, which is the one thing
+    these identities exist to carry.
+    """
+    plain_anna = SpeakerIdentity(1, "anna")
+    t = build_transcript(
+        [seg(ANNA, 0, 1, "hallo")], T0, T0 + timedelta(hours=1), recorded=[plain_anna]
+    )
+
+    assert t.participants == (ANNA,)
+    assert t.participants[0].external_user_id == "out-1"
+
+
+def test_the_roster_orders_silent_attendees_after_the_speakers() -> None:
+    """Speakers first in the order they spoke, then whoever did not.
+
+    Chronological order is the only order the speaking half has, and a silent
+    attendee has no time to be placed at. Appending them keeps the top of the
+    list reading the way it did before the roster existed, and keeps the
+    rendering deterministic rather than dependent on how the repository
+    happened to return the jobs.
+    """
+    t = build_transcript(
+        [seg(BEN, 30, 1, "ben"), seg(ANNA, 0, 1, "anna")],
+        T0,
+        T0 + timedelta(hours=1),
+        recorded=[CHRIS, BEN, ANNA],
+    )
+
+    assert t.participants == (ANNA, BEN, CHRIS)
+
+
+def test_a_session_where_nobody_produced_text_still_names_who_was_recorded() -> None:
+    """The production failure, with the invented lines correctly removed.
+
+    Two recordings came back holding nothing but `" Untertitelung des ZDF,
+    2020"`. With that text now dropped the protocol is empty, which is
+    truthful; a protocol that additionally reported zero participants for a
+    call two people were recorded on would not be.
+    """
+    t = build_transcript([], T0, T0 + timedelta(hours=1), recorded=[ANNA, BEN])
+
+    assert t.blocks == ()
+    assert t.participants == (ANNA, BEN)

@@ -50,8 +50,27 @@ def build_transcript(
     session_started_at: datetime,
     session_ended_at: datetime,
     merge_gap: timedelta = DEFAULT_MERGE_GAP,
+    *,
+    recorded: Iterable[SpeakerIdentity] = (),
 ) -> Transcript:
-    """Orders segments from all speakers chronologically and merges them into blocks."""
+    """Orders segments from all speakers chronologically and merges them into blocks.
+
+    `recorded` is who was actually recorded, which is not the same set as who
+    produced quotable text and must not be inferred from it. `participants` is
+    rendered both as the attendee list and as the headline count, so a speaker
+    missing from it is the document asserting they were not at the meeting.
+    Transcription cannot support that claim: faster-whisper drops a whole
+    decoded window whenever it judges it to be silence, so a recorded, gated,
+    decoded speaker can arrive here with no segments at all. Callers that know
+    the roster (`sturnus.application.assembly.assemble` does -- an audio epoch
+    is exactly the record that audio existed) pass it; the default keeps the
+    old behaviour for callers that do not.
+
+    Identity resolution stays with the segments. Where the same
+    `discord_user_id` appears in both, the segments' variant wins if it is the
+    richer one, so a roster entry can never strip an external link off a
+    speaker who was linked mid-session.
+    """
     usable = sorted(
         (s for s in segments if s.text.strip()),
         key=lambda s: (s.start, s.speaker.discord_user_id),
@@ -118,6 +137,15 @@ def build_transcript(
         open_end = max(open_end, segment.end) if open_end is not None else segment.end
 
     flush()
+
+    # Appended, not merged in chronologically: a speaker who said nothing has
+    # no time to be ordered by, and appending leaves the top of the list
+    # reading exactly as it did before the roster existed. The order within
+    # the tail is the caller's, which keeps the rendering deterministic
+    # instead of dependent on how the repository returned the jobs.
+    for speaker in recorded:
+        if not any(p.discord_user_id == speaker.discord_user_id for p in participants):
+            participants.append(speaker)
 
     return Transcript(
         session_started_at=session_started_at,
