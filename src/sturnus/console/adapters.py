@@ -19,29 +19,37 @@ own makes that unrepresentable rather than merely unlikely.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.linking import new_state
 from sturnus.console.ports import (
     AdminDirectory,
+    ConsentHolder,
     QueueSnapshot,
     QueueSpeaker,
     RequeueOutcome,
+    RevocationOutcome,
+    SettingsStore,
     Track,
 )
+from sturnus.domain import settings
+from sturnus.domain.consent import ConsentRecord, is_consent_active
 from sturnus.infrastructure.db.models import (
     AccountLink,
+    Consent,
     ConsoleState,
     SessionParticipant,
     SessionTag,
     TranscriptionJob,
 )
 from sturnus.infrastructure.db.models import Session as SessionRow
+from sturnus.infrastructure.db.repositories import ConsentRepository
 from sturnus.infrastructure.db.requeue import (
     SessionView,
     apply_requeue,
@@ -420,3 +428,249 @@ def refusal_reason(view: SessionView) -> str:
         "There is nothing to re-queue: every recording in this session has been erased, or it "
         "never had any."
     )
+
+
+#: Why a revocation did nothing. Bounded literals from this file rather
+#: than sentences, because they travel into a log line as `reason` -- a
+#: field the observability registry admits precisely on the grounds that
+#: its values are fixed literals from this repository's own source. The
+#: sentences a person reads are the console's, next to the button that
+#: produced them.
+NO_CONSENT_ON_RECORD = "no_consent_on_record"
+ALREADY_REVOKED = "already_revoked"
+
+
+@dataclass(frozen=True)
+class _ConsentRow:
+    """One `consent` row, with the columns the table declares NOT NULL.
+
+    Not `ConsentRecord`: that one makes `granted_at` and `policy_version`
+    optional, because the *absence* of a record is one of the states it
+    represents. A row that was read out of the table is not absent, and
+    carrying the optionality forward would push a `None` check into every
+    caller that cannot happen.
+    """
+
+    granted_at: datetime
+    revoked_at: datetime | None
+    policy_version: str
+
+
+class ConsoleConsentDirectory:
+    """Who has consented in a guild, and an administrator's power to end it.
+
+    The authorisation is here rather than in a handler, exactly as it is
+    for `ConsoleTrackDirectory` and `ConsoleQueueControl`: every method
+    asks `AdminDirectory` whether this person administers *this* guild and
+    answers `None` when they do not. There is no method that can be called
+    without `requested_by`, so there is no filter to forget.
+
+    **The write is `ConsentRepository.record_revocation`, unwrapped.** That
+    is the same statement `/consent revoke` makes -- newest row by
+    `granted_at`, `revoked_at` stamped rather than a new row inserted,
+    because the history keeps grants and a revocation modifies the grant
+    it revokes. A console that reimplemented it would be a second
+    definition of what a revocation is, and the two would agree right up
+    until one of them changed.
+
+    **What this cannot do, and what follows from that.** Consent is two
+    layers (Spec 3.1). The Discord role is checked synchronously on every
+    frame with no cache; the stored record is checked on every frame
+    through `ConsentCache`'s five second TTL. This process holds no
+    Discord token (Spec 13.2) so it writes the record and leaves the role
+    alone -- which stops the recording within five seconds, mid-session,
+    because the stored record is the layer that exists precisely because
+    the role can be bypassed. It does not take the role away, and the
+    console says so rather than letting an administrator infer it.
+
+    It also does not erase anything already recorded. `/audio purge`
+    does, it is admin-gated, and it is deliberately a separate act:
+    withdrawing consent is a decision about the future, and deleting a
+    meeting a team has already read is not the same decision. Every
+    holder therefore carries `recordings_with_audio`, so nobody has to
+    guess which of the two they just did.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        admins: AdminDirectory,
+        config: SettingsStore,
+        now: Callable[[], datetime],
+    ) -> None:
+        self._session_factory = session_factory
+        self._admins = admins
+        self._config = config
+        self._consents = ConsentRepository(session_factory)
+        self._now = now
+
+    async def holders(
+        self, guild_id: int, *, requested_by: int
+    ) -> tuple[ConsentHolder, ...] | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+
+        newest = await self._newest_consent_per_person(guild_id)
+        if not newest:
+            return ()
+
+        people = tuple(newest)
+        names = await self._latest_display_names(guild_id, people)
+        held = await self._recordings_with_audio(guild_id, people)
+        # Read once for the whole listing rather than per person: whether
+        # a grant is still active depends on the guild's current policy
+        # version, and that is one value, not one per row.
+        policy = (await self._config.snapshot(guild_id)).get(settings.POLICY_VERSION, "")
+
+        return tuple(
+            ConsentHolder(
+                discord_user_id=discord_user_id,
+                display_name=names.get(discord_user_id),
+                policy_version=row.policy_version,
+                granted_at=row.granted_at,
+                revoked_at=row.revoked_at,
+                # The domain's rule, not a reimplementation of it. An
+                # administrator must be shown the same verdict the
+                # recorder acts on -- including the case nobody expects,
+                # where a policy bump has quietly ended a consent nobody
+                # withdrew.
+                active=is_consent_active(
+                    ConsentRecord(
+                        granted_at=row.granted_at,
+                        revoked_at=row.revoked_at,
+                        policy_version=row.policy_version,
+                    ),
+                    policy,
+                ),
+                recordings_with_audio=held.get(discord_user_id, 0),
+            )
+            # By id, so two page loads agree. What order a *person*
+            # wants to read this in is the console's decision, made in
+            # `~/utils/consents` where it can be tested without a
+            # database.
+            for discord_user_id, row in sorted(newest.items())
+        )
+
+    async def revoke(
+        self, guild_id: int, discord_user_id: int, *, requested_by: int
+    ) -> RevocationOutcome | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+
+        # Read before writing, only so the answer can say what happened.
+        # `record_revocation` is idempotent and silent -- it stamps the
+        # newest row or does nothing -- and an administrator told
+        # "revoked" for somebody who never consented would believe a
+        # protection is in place that never was.
+        record = await self._consents.current(discord_user_id, guild_id)
+        if record is None or record.granted_at is None:
+            return RevocationOutcome(revoked=False, refusal=NO_CONSENT_ON_RECORD)
+        if record.revoked_at is not None:
+            return RevocationOutcome(revoked=False, refusal=ALREADY_REVOKED)
+
+        # A grant naming a superseded `policy_version` is revoked rather
+        # than refused, even though it is already inactive. It is inactive
+        # *because of a setting*, and a setting can be set back; stamping
+        # `revoked_at` is the only thing that survives somebody restoring
+        # the old policy version.
+        await self._consents.record_revocation(discord_user_id, guild_id, self._now())
+        return RevocationOutcome(revoked=True, refusal=None)
+
+    async def _newest_consent_per_person(self, guild_id: int) -> dict[int, _ConsentRow]:
+        """The newest grant per person in this guild.
+
+        Ordered and folded rather than a window function, and ordered by
+        `granted_at` descending because that is the rule
+        `ConsentRepository.current` applies -- the console must show the
+        row the recorder acts on, not a different one. `id` descending is
+        added as a tiebreak the repository does not have: two grants at
+        the same instant are not a thing that happens, and a listing whose
+        order the planner decides is a listing that changes between two
+        refreshes for no reason.
+        """
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(
+                        Consent.discord_user_id,
+                        Consent.granted_at,
+                        Consent.revoked_at,
+                        Consent.policy_version,
+                    )
+                    .where(Consent.guild_id == guild_id)
+                    .order_by(
+                        Consent.discord_user_id,
+                        Consent.granted_at.desc(),
+                        Consent.id.desc(),
+                    )
+                )
+            ).all()
+
+        newest: dict[int, _ConsentRow] = {}
+        for discord_user_id, granted_at, revoked_at, policy_version in rows:
+            newest.setdefault(
+                discord_user_id,
+                _ConsentRow(granted_at, revoked_at, policy_version),
+            )
+        return newest
+
+    async def _latest_display_names(self, guild_id: int, people: Sequence[int]) -> dict[int, str]:
+        """The name each person last appeared under in this guild.
+
+        `consent` stores no name, and a page of eighteen-digit numbers is
+        not a page an administrator can act on. The most recent
+        `session_participant` row is the closest thing the system holds --
+        the name at the time of somebody's last recorded meeting -- and it
+        is scoped to this guild, because a display name is per-guild and
+        borrowing one from another guild would put a nickname from
+        somewhere else next to a decision about this one.
+        """
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(
+                        SessionParticipant.discord_user_id,
+                        SessionParticipant.discord_display_name,
+                        SessionRow.started_at,
+                    )
+                    .join(SessionRow, SessionRow.id == SessionParticipant.session_id)
+                    .where(
+                        SessionRow.guild_id == guild_id,
+                        SessionParticipant.discord_user_id.in_(people),
+                    )
+                    .order_by(
+                        SessionParticipant.discord_user_id,
+                        SessionRow.started_at.desc(),
+                    )
+                )
+            ).all()
+
+        names: dict[int, str] = {}
+        for discord_user_id, display_name, _started_at in rows:
+            names.setdefault(discord_user_id, display_name)
+        return names
+
+    async def _recordings_with_audio(self, guild_id: int, people: Sequence[int]) -> dict[int, int]:
+        """How many recordings of each person this guild still holds.
+
+        `audio_deleted_at IS NULL` is the only claim that an object is
+        still in the store: the retention sweep erases the object first
+        and stamps the row second, so a stamped row is one whose audio is
+        already gone. Counting stamped rows would tell an administrator
+        that revoking consent leaves recordings behind which were erased
+        weeks ago.
+        """
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(TranscriptionJob.discord_user_id, func.count())
+                    .join(SessionRow, SessionRow.id == TranscriptionJob.session_id)
+                    .where(
+                        SessionRow.guild_id == guild_id,
+                        TranscriptionJob.discord_user_id.in_(people),
+                        TranscriptionJob.audio_deleted_at.is_(None),
+                    )
+                    .group_by(TranscriptionJob.discord_user_id)
+                )
+            ).all()
+        return {discord_user_id: held for discord_user_id, held in rows}

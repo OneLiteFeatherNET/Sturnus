@@ -164,6 +164,20 @@ class Event(StrEnum):
     #: about what a valid value is.
     CONSOLE_SETTING_REJECTED = "console.setting_rejected"
 
+    #: An administrator withdrew somebody else's consent to be recorded.
+    #: **WARNING, and for a stronger reason than `console.requeue_applied`
+    #: has:** this is a third party acting on a person's own consent, and
+    #: `consent.revoked_at` records only that it happened, never who did
+    #: it. This line is the entire answer to "who withdrew whose consent,
+    #: and when" -- `guild_id`, `discord_user_id` (whose consent) and
+    #: `requested_by` (who withdrew it).
+    CONSOLE_CONSENT_REVOKED = "console.consent_revoked"
+    #: A revocation that changed nothing, because there was no consent on
+    #: record or it had already been withdrawn. INFO: two administrators
+    #: reaching for the same name is this feature working. `reason` says
+    #: which of the two it was.
+    CONSOLE_CONSENT_REVOKE_REFUSED = "console.consent_revoke_refused"
+
     # -- cross-cutting ------------------------------------------------------
     PROCESS_STARTING = "process.starting"
     SHUTDOWN_BEGIN = "shutdown.begin"
