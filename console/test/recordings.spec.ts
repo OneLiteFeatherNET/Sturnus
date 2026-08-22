@@ -23,8 +23,12 @@ import {
   queueProgress,
   queueSpeakerLabel,
   queueStatusPath,
+  queueStatusWords,
   recordingPath,
   requeuePath,
+  seekTarget,
+  SEEK_NUDGE_SECONDS,
+  SEEK_STRIDE_SECONDS,
   sessionLength,
   spectrogramUrl,
   speechShare,
@@ -406,5 +410,64 @@ describe('the transcription queue', () => {
   it('falls back to the id for a speaker who has left the guild', () => {
     expect(queueSpeakerLabel(speaker('done', { display_name: null }))).toBe('2')
     expect(queueSpeakerLabel(speaker('done', { display_name: '  ' }))).toBe('2')
+  })
+})
+
+
+describe('saying what a transcription job is doing', () => {
+  it('says a job gave up rather than that it is dead', () => {
+    // "dead" is the value in the table. A speaker's row showing it is a
+    // database enum put in front of a human.
+    expect(queueStatusWords('dead')).toBe('gave up')
+  })
+
+  it('says a job is transcribing rather than running', () => {
+    expect(queueStatusWords('running')).toBe('transcribing')
+  })
+
+  it('passes a status it has not been taught through unchanged', () => {
+    // More use to whoever is debugging than a word that hides it.
+    expect(queueStatusWords('quarantined')).toBe('quarantined')
+  })
+})
+
+describe('seeking a track from the keyboard', () => {
+  it('steps back a sentence on the left arrow', () => {
+    expect(seekTarget('ArrowLeft', 30, 600)).toBe(30 - SEEK_NUDGE_SECONDS)
+  })
+
+  it('steps forward a sentence on the right arrow', () => {
+    expect(seekTarget('ArrowRight', 30, 600)).toBe(30 + SEEK_NUDGE_SECONDS)
+  })
+
+  it('strides an exchange on the page keys', () => {
+    expect(seekTarget('PageUp', 30, 600)).toBe(30 + SEEK_STRIDE_SECONDS)
+    expect(seekTarget('PageDown', 300, 600)).toBe(300 - SEEK_STRIDE_SECONDS)
+  })
+
+  it('goes to the start and the end', () => {
+    expect(seekTarget('Home', 300, 600)).toBe(0)
+    expect(seekTarget('End', 300, 600)).toBe(600)
+  })
+
+  it('does not step off the front of a track', () => {
+    // A negative currentTime throws in some browsers.
+    expect(seekTarget('ArrowLeft', 1, 600)).toBe(0)
+  })
+
+  it('does not step off the end of one', () => {
+    expect(seekTarget('ArrowRight', 599, 600)).toBe(600)
+  })
+
+  it('says nothing about a key it does not handle', () => {
+    // `null` rather than the unchanged position, because it is what
+    // decides whether the caller calls `preventDefault` — swallowing Tab
+    // to save writing out the list is how a control becomes a trap.
+    expect(seekTarget('Tab', 30, 600)).toBeNull()
+    expect(seekTarget('a', 30, 600)).toBeNull()
+  })
+
+  it('says nothing about a track with no length yet', () => {
+    expect(seekTarget('ArrowRight', 0, 0)).toBeNull()
   })
 })

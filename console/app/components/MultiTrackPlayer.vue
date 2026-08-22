@@ -145,7 +145,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
         type="range"
         min="0"
         step="0.1"
-        class="h-1.5 min-w-40 flex-1 cursor-pointer appearance-none rounded-full accent-[var(--color-brand-cyan)]"
+        class="h-1.5 w-full min-w-32 flex-1 cursor-pointer appearance-none rounded-full accent-[var(--color-brand-cyan)]"
         :style="{ background: 'var(--surface-sunken)' }"
         :max="scrubMax"
         :value="state.position"
@@ -189,13 +189,32 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
       <li
         v-for="track in session.tracks"
         :key="track.discord_user_id"
-        class="rounded-lg p-3 transition-opacity"
+        class="rounded-lg p-3"
         :style="{ background: 'var(--surface-raised)' }"
-        :class="isAudible(track.discord_user_id, state) ? '' : 'opacity-55'"
       >
         <div class="flex flex-wrap items-center gap-3">
-          <span class="min-w-32 flex-1 truncate text-sm font-medium">
+          <span
+            class="min-w-0 flex-1 truncate text-sm font-medium"
+            :class="isAudible(track.discord_user_id, state) ? '' : 'opacity-60'"
+          >
             {{ trackLabel(track) }}
+          </span>
+
+          <!-- Said in words, and only the name is faded.
+               The whole row used to be dimmed to 55%, which put the very
+               Solo and Mute buttons somebody needs to undo it at about
+               2.4:1 against their background -- the least readable thing
+               on the page being the way out of the state. It was also the
+               only signal: soloing one speaker silences seven others
+               while each of their Mute buttons still reports
+               `aria-pressed="false"`, so a reader who could not see the
+               fade was told nothing had changed. -->
+          <span
+            v-if="!isAudible(track.discord_user_id, state)"
+            class="rounded-full px-2 py-0.5 text-xs"
+            :style="{ background: 'var(--surface-sunken)', color: 'var(--text-muted)' }"
+          >
+            {{ state.muted.includes(track.discord_user_id) ? 'muted' : 'silenced by solo' }}
           </span>
 
           <span

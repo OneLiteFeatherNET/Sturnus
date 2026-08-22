@@ -46,7 +46,7 @@ const others = computed(() =>
     :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
   >
     <div class="flex flex-wrap items-start gap-4 p-4">
-      <div class="min-w-56 flex-1">
+      <div class="min-w-0 flex-1 sm:min-w-56">
         <h2 class="flex flex-wrap items-center gap-2 text-base font-semibold">
           <span>{{ channelLabel(session) }}</span>
           <span
@@ -68,7 +68,10 @@ const others = computed(() =>
            one is hidden nowhere: "no protocol" is usually the answer
            somebody came looking for, and a row that quietly omitted the
            link would send them to look for a bug instead. -->
-      <div class="flex shrink-0 items-center gap-2">
+      <!-- Wraps rather than refusing to shrink. Three controls with an
+           intrinsic width of about 230 px, marked `shrink-0`, were what a
+           375 px screen could not fit. -->
+      <div class="flex flex-wrap items-center gap-2">
         <a
           v-if="hasProtocol(session)"
           :href="protocolUrl"
