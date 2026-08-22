@@ -212,3 +212,79 @@ export function audioUrl(base: string, sessionId: string, discordUserId: string)
   const root = base.replace(/\/+$/, '')
   return `${root}/sessions/${encodeURIComponent(sessionId)}/tracks/${encodeURIComponent(discordUserId)}/audio`
 }
+
+/**
+ * Where one speaker's spectrogram is fetched from.
+ *
+ * Same shape and same escaping as `audioUrl`, and behind the same
+ * authorisation: a spectrogram is a rendering of somebody's voice and
+ * shows when they spoke, so it is not public just because it is not
+ * audible.
+ */
+export function spectrogramUrl(sessionId: string, discordUserId: string): string {
+  return `/sessions/${encodeURIComponent(sessionId)}/tracks/${encodeURIComponent(discordUserId)}/spectrogram`
+}
+
+/**
+ * A track drawn as a picture: `bins` rows of `columns` cells, one byte
+ * each, row 0 the lowest frequency.
+ *
+ * `hz_per_bin` is what labels the frequency axis. It is a number the API
+ * derives rather than one this file assumes -- assuming an audio format
+ * is what made every recording in this console play back at six times
+ * speed, and the fix was to stop assuming anywhere.
+ */
+export interface SpectrogramResponse {
+  columns: number
+  bins: number
+  sample_rate: number
+  hz_per_bin: number
+  duration_seconds: number
+  /** Base64 of `bins * columns` bytes, row-major. */
+  magnitudes: string
+}
+
+/** The matrix as bytes, or `null` if the payload is not the promised size. */
+export function decodeMagnitudes(picture: SpectrogramResponse): Uint8Array | null {
+  let binary: string
+  try {
+    binary = atob(picture.magnitudes)
+  } catch {
+    return null
+  }
+  const expected = picture.bins * picture.columns
+  if (binary.length !== expected) return null
+  const bytes = new Uint8Array(expected)
+  for (let i = 0; i < expected; i += 1) bytes[i] = binary.charCodeAt(i)
+  return bytes
+}
+
+/**
+ * The canonical address of one recording.
+ *
+ * One recording, one URL — so a link in a protocol, a chat message or a
+ * bookmark lands on the recording itself rather than on a list somebody
+ * then has to search. Everything about that session hangs off this page.
+ */
+export function recordingPath(sessionId: string): string {
+  return `/recordings/${encodeURIComponent(sessionId)}`
+}
+
+/**
+ * Where a track's audio sits within the session's own timeline.
+ *
+ * A speaker's file begins at their first packet, not at the start of the
+ * meeting, so two tracks of the same length can describe different
+ * stretches of it. Returns `null` when there is nothing to place it
+ * against, which is honest rather than a zero that reads as "from the
+ * beginning".
+ */
+export function trackCoverage(
+  session: RecordedSession,
+  track: SessionTrack,
+): { share: number } | null {
+  const total = sessionLength(session)
+  if (total === null || total <= 0) return null
+  if (track.audio_seconds === null) return null
+  return { share: Math.min(1, Math.max(0, track.audio_seconds / total)) }
+}

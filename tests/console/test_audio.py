@@ -252,7 +252,7 @@ async def test_a_truncated_recording_is_refused(track: bytes, tmp_path: Path) ->
 
 _SERVING_PATH = (
     Path(__file__).parent.parent.parent / "src" / "sturnus" / "console",
-    ("audio.py", "routes_audio.py"),
+    ("audio.py", "routes_audio.py", "spectrogram.py"),
 )
 
 _WRITES_TO_DISK = frozenset(

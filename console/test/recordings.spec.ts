@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest'
 import {
   audioUrl,
   channelLabel,
+  decodeMagnitudes,
   formatCount,
   formatMeasurement,
   formatSeconds,
@@ -18,11 +19,15 @@ import {
   formatTimestamp,
   hasProtocol,
   isInProgress,
+  recordingPath,
   sessionLength,
+  spectrogramUrl,
   speechShare,
+  trackCoverage,
   trackLabel,
   type RecordedSession,
   type SessionTrack,
+  type SpectrogramResponse,
 } from '../app/utils/recordings'
 
 function track(over: Partial<SessionTrack> = {}): SessionTrack {
@@ -248,5 +253,90 @@ describe('where a track is streamed from', () => {
     // Ids are strings from an API, and a string that is allowed to contain
     // a slash is allowed to address a different endpoint.
     expect(audioUrl('/api', 'a/b', 'c?d')).toBe('/api/sessions/a%2Fb/tracks/c%3Fd/audio')
+  })
+})
+
+describe('the canonical address of a recording', () => {
+  it('is one path per session, so a link lands on the recording itself', () => {
+    expect(recordingPath('4711')).toBe('/recordings/4711')
+  })
+
+  it('escapes the id, because a string that may contain a slash may address another page', () => {
+    expect(recordingPath('a/b')).toBe('/recordings/a%2Fb')
+  })
+})
+
+describe('the spectrogram endpoint', () => {
+  it('sits beside the audio, under the same authorisation', () => {
+    expect(spectrogramUrl('1', '2')).toBe('/sessions/1/tracks/2/spectrogram')
+  })
+
+  it('escapes both ids for the same reason audioUrl does', () => {
+    expect(spectrogramUrl('a/b', 'c/d')).toBe('/sessions/a%2Fb/tracks/c%2Fd/spectrogram')
+  })
+})
+
+describe('decoding a spectrogram payload', () => {
+  const picture = (bytes: number[], bins: number, columns: number): SpectrogramResponse => ({
+    columns,
+    bins,
+    sample_rate: 16000,
+    hz_per_bin: 62.5,
+    duration_seconds: 10,
+    magnitudes: btoa(String.fromCharCode(...bytes)),
+  })
+
+  it('returns the matrix when the payload is the size it promised', () => {
+    const decoded = decodeMagnitudes(picture([1, 2, 3, 4], 2, 2))
+    expect(decoded).toEqual(new Uint8Array([1, 2, 3, 4]))
+  })
+
+  it('refuses a payload that is not the promised size', () => {
+    // Drawing it anyway would assemble a picture from the wrong offsets --
+    // wrong in a way that still looks like a spectrogram, which is worse
+    // than not drawing one.
+    expect(decodeMagnitudes(picture([1, 2, 3], 2, 2))).toBeNull()
+  })
+
+  it('refuses a payload that is not base64 at all', () => {
+    expect(decodeMagnitudes({ ...picture([1], 1, 1), magnitudes: 'not base64!!' })).toBeNull()
+  })
+})
+
+describe('how much of a session a track covers', () => {
+  const session = (duration: number | null): RecordedSession => ({
+    id: '1',
+    started_at: '2026-08-01T10:00:00+00:00',
+    ended_at: '2026-08-01T10:10:00+00:00',
+    duration_seconds: duration,
+    channel_id: '9',
+    channel_name: 'standup',
+    document_url: null,
+    other_participants: [],
+    tracks: [],
+  })
+  const track = (audio: number | null): SessionTrack => ({
+    discord_user_id: '2',
+    display_name: 'Anna',
+    audio_seconds: audio,
+    speech_seconds: null,
+    segment_count: null,
+  })
+
+  it('is the share of the meeting that track has audio for', () => {
+    expect(trackCoverage(session(600), track(300))).toEqual({ share: 0.5 })
+  })
+
+  it('never exceeds the whole, however the two numbers were measured', () => {
+    expect(trackCoverage(session(600), track(900))).toEqual({ share: 1 })
+  })
+
+  it('has no answer when the track was never measured', () => {
+    expect(trackCoverage(session(600), track(null))).toBeNull()
+  })
+
+  it('has no answer when the session has no length to measure against', () => {
+    const open = { ...session(null), ended_at: null }
+    expect(trackCoverage(open, track(300))).toBeNull()
   })
 })
