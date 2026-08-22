@@ -16,11 +16,17 @@ unattributed audio. Invisible either way.
 
 The uncertainty this measures is not a detail. A Discord client
 *subscribes* to the video streams it wants; the server does not push them
-unasked. Neither this library nor `discord.py` sends that subscription,
-and the behaviour for bots is undocumented. If nothing arrives, no amount
-of H.264 depacketisation, DAVE `MediaType.video` decryption or ffmpeg
-plumbing will produce a recording -- and all of that is weeks of work
-resting on an assumption nobody has checked.
+unasked. If nothing arrives, no amount of H.264 depacketisation, DAVE
+`MediaType.video` decryption or ffmpeg plumbing will produce a recording
+-- and all of that is weeks of work resting on an assumption nobody has
+checked.
+
+The first run of this probe found something blunter than "announced but
+not delivered": **nothing was announced either.** What the connection was
+missing is now known and is sent by `.video_subscription` -- `video: true`
+in `IDENTIFY`, op 12, op 15 -- so the probe has to report what was asked
+for as well as what came back. "We asked and got nothing" and "we never
+asked" are the same log line otherwise, and they mean opposite things.
 
 **So this checks it, and nothing else.** It pairs what the gateway
 announces with what the socket delivers:
@@ -33,6 +39,11 @@ Packets arriving means the rest is worth building. Announcements with no
 packets means Discord is not sending them to us, and the next question is
 subscription rather than decoding -- a completely different problem, found
 in one recording instead of after the fact.
+
+**It reports on a timer, not at the end.** The first version only spoke
+from `cleanup()`, so the answer to "is this working" arrived after the
+call was over and after the operator had stopped watching. A share that
+starts twenty minutes in is worth knowing about at minute twenty-one.
 
 **It records no video and cannot.** SSRCs, counts and sizes; not one byte
 of any payload is read, let alone kept. It also changes nothing: packets
@@ -55,6 +66,16 @@ log = logging.getLogger(__name__)
 #: How many announced streams to describe per report. A screen share and a
 #: camera from four people is already eight, and the shape repeats.
 MAX_DESCRIBED_STREAMS = 6
+
+#: Seconds between reports. Long enough that a two-hour meeting costs a
+#: couple of hundred log lines, short enough that somebody who starts a
+#: share to test this does not have to end the call to find out.
+DEFAULT_REPORT_INTERVAL = 60.0
+
+#: How long `clear()` waits for the timer thread. It only ever sits in
+#: `Event.wait`, so it returns at once; the timeout is there because
+#: `clear()` can be reached from the garbage collector.
+TIMER_JOIN_TIMEOUT = 2.0
 
 
 @dataclass
@@ -89,15 +110,51 @@ def size_band(size: int) -> str:
 class VideoProbe:
     """Pairs announced video streams with packets that actually arrive."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, report_every: float = DEFAULT_REPORT_INTERVAL) -> None:
         self._streams: dict[int, AnnouncedStream] = {}
-        # `announce` runs on the sink-event-router thread and `observe` on
-        # the packet-router thread.
+        # `announce` runs on the sink-event-router thread, `observe` on the
+        # packet-router thread, `note_request` on the event loop and
+        # `report` on the timer thread below -- four, so the lock is not
+        # optional.
         self._lock = threading.Lock()
         #: Packets on an SSRC nobody announced. A non-zero count with zero
         #: announced packets would mean video arrives before the gateway
         #: says so, which changes where the mapping has to be built.
         self.unannounced_packets = 0
+        #: What was actually sent to ask for video, by name. Empty is the
+        #: single most misreadable state this probe can be in: it looks
+        #: exactly like "Discord refused us" and means "we never asked".
+        self._requests: dict[str, bool] = {}
+        self._report_every = report_every
+        self._stop = threading.Event()
+        self._timer: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Begins reporting on a timer. Idempotent."""
+        if self._timer is not None or self._report_every <= 0:
+            return
+        # Daemon, because this must never be the thread that keeps a pod
+        # from shutting down. `clear()` stops it properly on the normal
+        # path; the daemon flag only covers the paths where it is not
+        # reached at all.
+        self._timer = threading.Thread(
+            target=self._report_periodically, name="video-probe", daemon=True
+        )
+        self._timer.start()
+
+    def _report_periodically(self) -> None:
+        while not self._stop.wait(self._report_every):
+            try:
+                self.report()
+            except Exception:
+                # A diagnostic thread that dies takes the diagnosis with
+                # it, silently, for the rest of the capture.
+                log.exception("Error reporting the video probe")
+
+    def note_request(self, what: str, *, sent: bool) -> None:
+        """Records that a video request was attempted, and whether it went out."""
+        with self._lock:
+            self._requests[what] = sent
 
     def announce(
         self,
@@ -146,12 +203,18 @@ class VideoProbe:
             self.unannounced_packets += 1
 
     def report(self) -> None:
-        """Says whether the announced streams ever delivered anything."""
+        """Says what was asked for and what came back.
+
+        **Reports even when there is nothing to report**, which the first
+        version did not. Silence was indistinguishable from the probe
+        being off, from the switch not being set, and from the deployment
+        not carrying the probe at all -- and "nothing was announced" is
+        not the absence of a finding, it is the finding.
+        """
         with self._lock:
             streams = list(self._streams.values())
             unannounced = self.unannounced_packets
-        if not streams and not unannounced:
-            return
+            requests = dict(self._requests)
 
         arrived = sum(1 for stream in streams if stream.packets)
         described = ", ".join(
@@ -167,20 +230,69 @@ class VideoProbe:
             for stream in streams[:MAX_DESCRIBED_STREAMS]
         )
         log.warning(
-            "video probe: %d stream(s) announced, %d delivered any packet | %s | "
-            "packets on unannounced ssrcs: %d || Packets arriving means recording a shared "
-            "screen is worth building. Announcements with no packets means Discord is not "
-            "sending them to this bot, and the next question is stream subscription rather "
-            "than decoding.",
+            "video probe: asked for video with [%s] | %d stream(s) announced, %d delivered "
+            "any packet | %s | packets on unannounced ssrcs: %d || %s",
+            _describe_requests(requests),
             len(streams),
             arrived,
             described or "none",
             unannounced,
+            _verdict(requests, len(streams), arrived),
         )
 
     def clear(self) -> None:
         """Reports once and forgets, at the end of a capture."""
+        self._stop.set()
+        timer, self._timer = self._timer, None
+        if timer is not None:
+            # Bounded, and on the sink-cleanup path: `AudioSink.__del__`
+            # can reach `cleanup()` from the garbage collector, and a
+            # cleanup that blocked there would stall an arbitrary thread.
+            timer.join(timeout=TIMER_JOIN_TIMEOUT)
         self.report()
         with self._lock:
             self._streams.clear()
             self.unannounced_packets = 0
+            self._requests.clear()
+
+
+def _describe_requests(requests: dict[str, bool]) -> str:
+    """The request state, so a reader can tell refusal from omission."""
+    if not requests:
+        return "nothing -- this build does not ask for video at all"
+    return ", ".join(
+        f"{what}={'sent' if sent else 'FAILED'}" for what, sent in sorted(requests.items())
+    )
+
+
+def _verdict(requests: dict[str, bool], announced: int, arrived: int) -> str:
+    """One sentence naming what the numbers above decide.
+
+    Written out rather than left to the reader because the three outcomes
+    lead to three different projects, and the difference between them is
+    not obvious from two integers.
+    """
+    if arrived:
+        return (
+            "Video packets are reaching this bot. Depacketisation, DAVE decryption for "
+            "MediaType.video and storage are worth building -- and a consent role for "
+            "screen sharing is needed before any of it records anything."
+        )
+    if announced:
+        return (
+            "Discord announces video to this bot but sends none of it. The next question "
+            "is subscription -- whether op 15 named the right SSRCs -- not decoding."
+        )
+    if not any(requests.values()):
+        return (
+            "Nothing was asked for, so nothing can be concluded. Check that "
+            "STURNUS_CAPTURE_DIAGNOSTICS is set and that this build carries "
+            "video_subscription."
+        )
+    return (
+        "Discord did not announce a single video stream even though this connection "
+        "declared video support and asked for every stream. If somebody was sharing a "
+        "screen, note that Go Live is a separate RTC connection reached through an "
+        "undocumented user-client gateway opcode, which this bot does not attempt -- so "
+        "a camera test tells the two failures apart."
+    )
