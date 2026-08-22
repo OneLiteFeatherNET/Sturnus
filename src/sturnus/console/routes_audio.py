@@ -1,6 +1,13 @@
-"""The one endpoint that plays somebody's voice back.
+"""The endpoints that reach somebody's voice, and the one gate in front of them.
 
-`GET /api/sessions/{session_id}/tracks/{discord_user_id}/audio`
+- `GET /api/sessions/{session_id}/tracks/{discord_user_id}/audio`
+- `GET /api/sessions/{session_id}/tracks/{discord_user_id}/spectrogram`
+
+Both reach the same object under the same rule, so the rule is written
+once, in `_authorised_track`, and each handler is what is left after it:
+the shape of one HTTP response. A second copy of an authorisation check is
+a second thing to keep in step with the first, and the two only have to
+disagree once.
 
 This is the console's most consequential route, and the design says why
 (section 1.1): playing a recording back is a wider use of it than writing a
@@ -37,6 +44,7 @@ that belongs.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 
 from aiohttp import web
 
@@ -49,6 +57,8 @@ from sturnus.console.audio import (
     stored_length,
     stream_wav,
 )
+from sturnus.console.ports import Track
+from sturnus.console.spectrogram import spectrogram
 from sturnus.observability.events import Event, log_event, log_exception
 
 log = logging.getLogger(__name__)
@@ -58,16 +68,29 @@ log = logging.getLogger(__name__)
 AUDIO_DELIVERY = web.AppKey("audio_delivery", AudioDelivery)
 
 _PATH = "/api/sessions/{session_id}/tracks/{discord_user_id}/audio"
+_SPECTROGRAM_PATH = "/api/sessions/{session_id}/tracks/{discord_user_id}/spectrogram"
 
 
-async def track_audio(request: web.Request) -> web.StreamResponse:
-    """Streams one speaker's recording as WAV, decrypting as it goes.
+@dataclass(frozen=True)
+class _AuthorisedTrack:
+    """A track this request has been found entitled to, and its size."""
 
-    The order below is the security-relevant part. Authorisation happens
-    before the object store is touched and before any `Range` is parsed,
-    because a 416 carrying the length of a recording is still a fact about
-    a recording -- and a stranger who asks for an impossible range must
-    learn no more than a stranger who asks for a possible one.
+    track: Track
+    ciphertext_bytes: int
+    session_id: int
+    speaker_id: int
+    listener: int
+
+
+async def _authorised_track(request: web.Request) -> _AuthorisedTrack | web.Response:
+    """The whole access rule for audio, or the refusal to answer with.
+
+    Everything security-relevant about these routes is in the order here.
+    Authorisation happens before the object store is touched and before
+    any `Range` is parsed, because a 416 carrying the length of a
+    recording is still a fact about a recording -- and a stranger who asks
+    for an impossible range must learn no more than a stranger who asks
+    for a possible one.
     """
     # Imported here rather than at module scope: `sturnus.console.app`
     # imports this module in order to call `register`, and importing back
@@ -134,8 +157,76 @@ async def track_audio(request: web.Request) -> web.StreamResponse:
         )
         return _no_such_recording()
 
+    return _AuthorisedTrack(track, ciphertext_bytes, session_id, speaker_id, listener)
+
+
+async def track_spectrogram(request: web.Request) -> web.StreamResponse:
+    """One track as a picture of where its speech is.
+
+    Behind the same gate as the audio itself, and that is not a formality:
+    a spectrogram is a rendering of somebody's voice, and it shows when
+    they spoke and for how long. It is less than the audio; it is not
+    nothing, and the rule that governs the audio is the right one for it.
+
+    Answered as a whole small JSON body rather than streamed. The payload
+    is a fixed 600 by 128 bytes whatever the meeting's length, so there is
+    nothing to page through -- the streaming happens on the way *in*, past
+    the FFT, which is where the size of a recording actually matters.
+    """
+    resolved = await _authorised_track(request)
+    if isinstance(resolved, web.Response):
+        return resolved
+
+    delivery = request.app[AUDIO_DELIVERY]
+    data_key = delivery.keys.unwrap(resolved.track.wrapped_data_key)
     try:
-        total = stored_length(ciphertext_bytes)
+        picture = await spectrogram(
+            delivery.source,
+            resolved.track.s3_key,
+            data_key,
+            stored_length(resolved.ciphertext_bytes),
+        )
+    except CorruptRecording as exc:
+        log_exception(
+            log,
+            logging.ERROR,
+            Event.CONSOLE_TRACK_UNREADABLE,
+            "A stored recording could not be drawn",
+            exc,
+            session_id=resolved.session_id,
+            discord_user_id=resolved.speaker_id,
+            object_bytes=resolved.ciphertext_bytes,
+        )
+        return _unreadable()
+
+    return web.json_response(
+        {
+            "columns": picture.columns,
+            "bins": picture.bins,
+            "sample_rate": picture.sample_rate,
+            "hz_per_bin": round(picture.hz_per_bin, 4),
+            "duration_seconds": picture.duration_seconds,
+            "magnitudes": picture.magnitudes,
+        },
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+async def track_audio(request: web.Request) -> web.StreamResponse:
+    """Streams one speaker's recording as WAV, decrypting as it goes.
+
+    What is left here after `_authorised_track` is the shape of the HTTP:
+    which status, which headers, and the order the two are decided in.
+    """
+    resolved = await _authorised_track(request)
+    if isinstance(resolved, web.Response):
+        return resolved
+    track, session_id = resolved.track, resolved.session_id
+    speaker_id, listener = resolved.speaker_id, resolved.listener
+
+    delivery = request.app[AUDIO_DELIVERY]
+    try:
+        total = stored_length(resolved.ciphertext_bytes)
     except CorruptRecording as exc:
         log_exception(
             log,
@@ -145,7 +236,7 @@ async def track_audio(request: web.Request) -> web.StreamResponse:
             exc,
             session_id=session_id,
             discord_user_id=speaker_id,
-            object_bytes=ciphertext_bytes,
+            object_bytes=resolved.ciphertext_bytes,
         )
         return _unreadable()
 
@@ -251,4 +342,9 @@ def register(app: web.Application) -> None:
     # `require_session(handler)` is exactly what `@require_session` does.
     from sturnus.console.app import require_session
 
-    app.add_routes([web.get(_PATH, require_session(track_audio))])
+    app.add_routes(
+        [
+            web.get(_PATH, require_session(track_audio)),
+            web.get(_SPECTROGRAM_PATH, require_session(track_spectrogram)),
+        ]
+    )

@@ -225,6 +225,35 @@ surprise worth discovering in production.
 - Never writes plaintext audio to disk. The decrypted bytes exist only in
   the chunk buffer on their way to the socket.
 
+`GET /api/sessions/{id}/tracks/{discord_user_id}/spectrogram`
+
+- Behind the *same* authorisation, expressed as the same function
+  (`_authorised_track`) rather than as a second copy of the rule. A
+  spectrogram shows when somebody spoke and for how long; it is less than
+  the audio and it is not nothing.
+- Answers a fixed-size picture — 600 columns by 128 rows, one byte per
+  cell, base64 — whatever the meeting's length, so a client can size a
+  canvas before it has the data.
+- Streams the track past an FFT in one forward pass and never buffers it:
+  an hour of one speaker is about 115 MB, and the output size is fixed up
+  front, so the hop between windows is derived from the track's length
+  rather than the other way round.
+- Reads the sample rate from the track's own RIFF header. Nothing on this
+  path states an audio format; stating one is what made every recording
+  play back at six times speed.
+
+## 5.1 The recording page
+
+`/recordings/{id}` is the canonical address of one recording, so a link in
+a protocol or a chat message lands on the recording rather than on a list
+somebody then has to search. It carries the session's metadata, the
+multi-track transport, and — per speaker — an independent player and a
+spectrogram.
+
+The list at `/recordings` deliberately shows less. Ten sessions loading
+what this page loads would pull hundreds of megabytes for somebody
+scanning for a protocol link.
+
 ### 5.1 What is deliberately not built
 
 **No transcoding.** Opus would be a tenth of the bytes, but it needs

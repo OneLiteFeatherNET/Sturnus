@@ -15,10 +15,12 @@ they might ask about it.
 
 from __future__ import annotations
 
-from datetime import timedelta
+import base64
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import boto3  # type: ignore[import-untyped]
+import numpy as np
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient
@@ -32,8 +34,10 @@ from sturnus.console.ports import (
     TrackDirectory,
 )
 from sturnus.console.session import SessionCookie, SignedSession
+from sturnus.infrastructure.audio import TARGET_RATE
 from sturnus.infrastructure.crypto import CHUNK_SIZE, KeyWrapper, encrypt_file
 from sturnus.infrastructure.objectstore import S3AudioStore
+from sturnus.infrastructure.recording_adapters import FileAudioWriterFactory
 from tests.console.conftest import (
     ANNA,
     BEN,
@@ -382,3 +386,81 @@ async def test_a_player_can_ask_for_the_length_without_the_audio(
     assert int(response.headers["Content-Length"]) == len(TRACK)
     assert response.headers["Accept-Ranges"] == "bytes"
     assert await response.read() == b""
+
+
+# ---------------------------------------------------------------------------
+# The spectrogram, behind the same gate
+# ---------------------------------------------------------------------------
+
+
+def spectrogram_url(session_id: int = SESSION, speaker_id: int = ANNA) -> str:
+    return f"/api/sessions/{session_id}/tracks/{speaker_id}/spectrogram"
+
+
+def _real_track(tmp_path: Path) -> bytes:
+    """A track the writer could actually have produced, with sound on it."""
+    epoch = datetime(2026, 1, 1, tzinfo=UTC)
+    writer = FileAudioWriterFactory(tmp_path / "recordings").open(SESSION, ANNA, epoch)
+    t = np.arange(48_000 * 3) / 48_000
+    mono = (np.sin(2 * np.pi * 440 * t) * 0.5 * 32767).astype(np.int16)
+    stereo = np.repeat(mono[:, None], 2, axis=1)
+    for index in range(len(mono) // 960):
+        writer.write(
+            epoch + timedelta(seconds=index * 960 / 48_000),
+            stereo[index * 960 : (index + 1) * 960].reshape(-1).astype("<i2").tobytes(),
+        )
+    writer.close()
+    return writer.path.read_bytes()
+
+
+async def test_a_participant_can_see_the_shape_of_a_track(
+    aiohttp_client: AiohttpClientFactory, tracks: FakeTracks, tmp_path: Path
+) -> None:
+    """The picture describes the track the writer wrote, read from its own
+    header rather than assumed -- which is the whole lesson of the format
+    defect that preceded this view."""
+    source = FakeAudioSource({S3_KEY: sealed(_real_track(tmp_path), tmp_path)})
+    client = await signed_in(aiohttp_client, build(tracks, source))
+    response = await client.get(spectrogram_url())
+    assert response.status == 200
+
+    body = await response.json()
+    assert body["sample_rate"] == TARGET_RATE
+    assert body["duration_seconds"] == pytest.approx(3.0, abs=0.05)
+    assert len(base64.b64decode(body["magnitudes"])) == body["bins"] * body["columns"]
+    assert body["hz_per_bin"] == pytest.approx(TARGET_RATE / 2 / body["bins"])
+
+
+async def test_a_stranger_cannot_see_the_shape_of_a_track_either(
+    aiohttp_client: AiohttpClientFactory, tracks: FakeTracks, source: FakeAudioSource
+) -> None:
+    """A spectrogram shows when somebody spoke and for how long.
+
+    It is less than the audio; it is not nothing, and the rule that governs
+    the audio is the right one for it. If this ever answered 200 where the
+    audio answers 404, the console would have grown a way to confirm the
+    existence of a meeting somebody was not in.
+    """
+    stranger = 999
+    client = await signed_in(aiohttp_client, build(tracks, source), as_user=stranger)
+    response = await client.get(spectrogram_url())
+    assert response.status == 404
+
+
+async def test_the_spectrogram_of_a_recording_that_is_gone_is_not_found(
+    aiohttp_client: AiohttpClientFactory, tracks: FakeTracks
+) -> None:
+    client = await signed_in(aiohttp_client, build(tracks, FakeAudioSource({})))
+    response = await client.get(spectrogram_url())
+    assert response.status == 404
+
+
+async def test_a_spectrogram_is_never_cached_by_anything_in_between(
+    aiohttp_client: AiohttpClientFactory, tracks: FakeTracks, tmp_path: Path
+) -> None:
+    """Same reason as the audio: a shared cache holding a copy would hand
+    it to the next person through the same proxy."""
+    source = FakeAudioSource({S3_KEY: sealed(_real_track(tmp_path), tmp_path)})
+    client = await signed_in(aiohttp_client, build(tracks, source))
+    response = await client.get(spectrogram_url())
+    assert response.headers["Cache-Control"] == "private, no-store"

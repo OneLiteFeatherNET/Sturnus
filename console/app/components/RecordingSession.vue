@@ -14,6 +14,7 @@ import {
   formatTimestamp,
   hasProtocol,
   isInProgress,
+  recordingPath,
   sessionLength,
   trackLabel,
   type RecordedSession,
@@ -101,6 +102,19 @@ const others = computed(() =>
         >
           {{ open ? 'Close' : 'Listen' }}
         </button>
+
+        <!-- The canonical address of this recording. The row above plays
+             it in place, which is what somebody scanning a list wants;
+             this is the link they send to a colleague, and the page that
+             has the spectrograms, the per-track players and everything
+             that is too heavy to put in a list ten of these long. -->
+        <NuxtLink
+          :to="recordingPath(session.id)"
+          class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+          :style="{ color: 'var(--color-brand-cyan)' }"
+        >
+          Open
+        </NuxtLink>
       </div>
     </div>
 
