@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.9.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.8.1...v0.9.0) (2026-08-22)
+
+
+### Features
+
+* **console:** a canonical page per recording, with spectrograms ([#80](https://github.com/OneLiteFeatherNET/Sturnus/issues/80)) ([4334cca](https://github.com/OneLiteFeatherNET/Sturnus/commit/4334cca8e634e9b0dbb11439de429e2ae38432db))
+* **console:** let an administrator re-run a transcription, and watch it ([#83](https://github.com/OneLiteFeatherNET/Sturnus/issues/83)) ([86f4c73](https://github.com/OneLiteFeatherNET/Sturnus/commit/86f4c737a434553e4336aa0aba5585020d619f0a))
+* **scripts:** let an operator listen to a slice of a recording ([#59](https://github.com/OneLiteFeatherNET/Sturnus/issues/59)) ([7515520](https://github.com/OneLiteFeatherNET/Sturnus/commit/7515520a184f2db437122fb72f9ad7c20b8dfb86))
+
 ## [0.8.1](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.8.0...v0.8.1) (2026-08-22)
 
 
