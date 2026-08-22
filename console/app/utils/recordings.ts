@@ -47,8 +47,23 @@ export interface RecordedSession {
   tags: string[]
 }
 
+/**
+ * One page of the recordings list.
+ *
+ * `total` is how many recordings this person has in all, not how many are
+ * in `sessions` -- it is what lets the list say "1-20 of 47", and a list
+ * that cannot say how much it is not showing is one people scroll to the
+ * bottom of to find out.
+ *
+ * `limit` and `offset` are echoed back by the API so a slow response
+ * arriving after a second click can be recognised as the wrong page
+ * rather than rendered under the right page number.
+ */
 export interface SessionsResponse {
   sessions: RecordedSession[]
+  total: number
+  limit: number
+  offset: number
 }
 
 /**

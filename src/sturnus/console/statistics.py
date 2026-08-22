@@ -62,6 +62,28 @@ class Track:
 
 
 @dataclass(frozen=True)
+class SessionPage:
+    """One page of somebody's recordings, and how many there are in all.
+
+    The total travels with the page rather than being asked for
+    separately, because the two must describe the same instant: a count
+    fetched by a second request can be one meeting older than the rows,
+    and a list that says "showing 1-20 of 47" while holding 21 rows is
+    worse than one that says nothing.
+
+    `offset` is echoed back for the same reason a page number is: the
+    caller asked for a window and the answer has to name which window it
+    is, or a slow response arriving after a second click renders the
+    wrong page under the right number.
+    """
+
+    sessions: tuple[AttendedSession, ...]
+    total: int
+    limit: int
+    offset: int
+
+
+@dataclass(frozen=True)
 class TagUse:
     """One label this person uses, and how many of their recordings carry it.
 
@@ -160,6 +182,19 @@ class SessionJson(TypedDict):
     other_participants: list[ParticipantJson]
     tracks: list[TrackJson]
     tags: list[str]
+
+
+class SessionPageJson(TypedDict):
+    """A page of the recordings list, as the console consumes it."""
+
+    sessions: list[SessionJson]
+    #: How many recordings this person has in all, not how many are on
+    #: this page. It is what lets the list say "1-20 of 47" -- and a list
+    #: that cannot say how much it is not showing is a list people scroll
+    #: to the bottom of to find out.
+    total: int
+    limit: int
+    offset: int
 
 
 class DashboardJson(TypedDict):
@@ -264,6 +299,16 @@ def tags_json(uses: Sequence[TagUse]) -> list[TagUseJson]:
     a key in every client that will ever read this.
     """
     return [TagUseJson(tag=use.tag, sessions=use.sessions) for use in uses]
+
+
+def session_page_json(page: SessionPage, viewer: int) -> SessionPageJson:
+    """One page of recordings, with the count it is a page of."""
+    return SessionPageJson(
+        sessions=[session_json(session, viewer) for session in page.sessions],
+        total=page.total,
+        limit=page.limit,
+        offset=page.offset,
+    )
 
 
 def count_words(transcripts: Iterable[str]) -> int:

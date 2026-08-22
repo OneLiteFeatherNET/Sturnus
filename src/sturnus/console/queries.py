@@ -32,6 +32,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sturnus.console.statistics import (
     AttendedSession,
     Participant,
+    SessionPage,
     TagUse,
     Track,
     day_bounds,
@@ -59,8 +60,50 @@ class ConsoleQueries:
         self._session_factory = session_factory
 
     async def sessions_for(self, discord_user_id: int) -> tuple[AttendedSession, ...]:
-        """Every session this person was in, newest first."""
+        """Every session this person was in, newest first.
+
+        Unpaged, and the two callers that use it need it that way: the
+        dashboard's figures are over everything somebody ever did, and a
+        dashboard whose totals changed when you turned a page would be
+        answering a different question on every page. The recordings list
+        uses `sessions_page`.
+        """
         return await self._sessions(discord_user_id)
+
+    async def sessions_page(self, discord_user_id: int, *, limit: int, offset: int) -> SessionPage:
+        """One window of this person's sessions, and how many there are.
+
+        Two statements rather than a `count(*) OVER ()` on the first.
+        The window function would come back attached to the rows -- so a
+        request for a window past the end returns no rows and therefore
+        no count, and the list could not say "you asked for page five of
+        three" because it would not know there were three.
+
+        The count is issued first, so that a session opened between the
+        two makes the list one row short of its own total rather than
+        one row longer than it: an off-by-one that reads as "there is
+        more" is easier to recover from than one that reads as "there is
+        less than you can already see".
+        """
+        total = await self._count(discord_user_id)
+        found = await self._sessions(discord_user_id, limit=limit, offset=offset)
+        return SessionPage(sessions=found, total=total, limit=limit, offset=offset)
+
+    async def _count(self, discord_user_id: int) -> int:
+        """How many sessions this person was in.
+
+        Scoped by the same subquery as everything else. A count is a
+        smaller disclosure than a list and is not therefore a free one:
+        "how many meetings are there" asked without a scope answers a
+        question about everybody.
+        """
+        async with self._session_factory() as db:
+            counted = await db.scalar(
+                select(func.count())
+                .select_from(Session)
+                .where(Session.id.in_(self._attended_by(discord_user_id)))
+            )
+            return counted or 0
 
     async def session_for(self, discord_user_id: int, session_id: int) -> AttendedSession | None:
         """One session, or `None` if this person was not in it.
@@ -148,8 +191,19 @@ class ConsoleQueries:
         )
 
     async def _sessions(
-        self, discord_user_id: int, *conditions: ColumnElement[bool]
+        self,
+        discord_user_id: int,
+        *conditions: ColumnElement[bool],
+        limit: int | None = None,
+        offset: int = 0,
     ) -> tuple[AttendedSession, ...]:
+        """The sessions matching `conditions`, and everything hanging off them.
+
+        `limit` and `offset` narrow the *first* statement only. The three
+        that follow are given the ids it returned, so a page of twenty
+        sessions fetches twenty sessions' participants, tags and tracks
+        and not a whole history's.
+        """
         scope = self._attended_by(discord_user_id)
         async with self._session_factory() as db:
             rows = (
@@ -165,8 +219,16 @@ class ConsoleQueries:
                     .where(Session.id.in_(scope), *conditions)
                     # By id as well as by time, so two sessions that
                     # opened in the same instant do not swap places
-                    # between two page loads.
+                    # between two page loads -- which for a paged list is
+                    # not cosmetic: an order the database is free to vary
+                    # is one where the same row can appear on two
+                    # consecutive pages and another on neither.
                     .order_by(Session.started_at.desc(), Session.id.desc())
+                    # `None` rather than a large number for "no window":
+                    # a default limit here would be a second, quieter
+                    # place where a list gets truncated.
+                    .limit(limit)
+                    .offset(offset)
                 )
             ).all()
             if not rows:
