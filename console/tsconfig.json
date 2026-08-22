@@ -1,8 +1,8 @@
 {
-  // Nuxt generates the real configuration into `.nuxt`, which is not
-  // committed -- so `npm run typecheck` had nothing to find and failed
-  // before it checked anything. This is the one file that points at the
-  // generated one; the settings themselves stay Nuxt's, so they cannot
-  // drift out of step with the framework version.
+  // Nuxt writes the real configuration into `.nuxt`, which is generated and
+  // not committed. Without this file `nuxt typecheck` has nothing to extend
+  // and fails before it checks anything -- so the script existed and proved
+  // nothing. This points at the generated one; the settings themselves stay
+  // Nuxt's, so they cannot drift out of step with the framework version.
   "extends": "./.nuxt/tsconfig.json"
 }
