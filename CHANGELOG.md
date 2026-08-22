@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.12.1...v0.13.0) (2026-08-22)
+
+
+### Features
+
+* **bot:** find out whether Discord sends this bot video at all ([#95](https://github.com/OneLiteFeatherNET/Sturnus/issues/95)) ([c4b39db](https://github.com/OneLiteFeatherNET/Sturnus/commit/c4b39db80e16b26cd1745619aebca8674e3fda25))
+
+
+### Bug Fixes
+
+* **audio:** give the resampler the frame before the one it is converting ([#96](https://github.com/OneLiteFeatherNET/Sturnus/issues/96)) ([1c20918](https://github.com/OneLiteFeatherNET/Sturnus/commit/1c20918e821aa8a57f0ac9556326beec9dbf3c29))
+
 ## [0.12.1](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.12.0...v0.12.1) (2026-08-22)
 
 
