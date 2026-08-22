@@ -33,7 +33,7 @@ from sturnus.console.ports import (
     Track,
 )
 from sturnus.console.session import SessionCookie
-from sturnus.console.statistics import AttendedSession, TagUse
+from sturnus.console.statistics import AttendedSession, SessionPage, TagUse
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
 
@@ -191,10 +191,29 @@ class FakeReads:
         self.asked_for: list[int] = []
         self.years: list[int] = []
         self.days: list[date] = []
+        #: Every window this was asked for, as `(limit, offset)`. The
+        #: route tests assert on it, because "the handler served the
+        #: window the query string named" cannot be seen in a body that
+        #: happens to be short.
+        self.windows: list[tuple[int, int]] = []
 
     async def sessions_for(self, discord_user_id: int) -> Sequence[AttendedSession]:
         self.asked_for.append(discord_user_id)
         return self.sessions
+
+    async def sessions_page(self, discord_user_id: int, *, limit: int, offset: int) -> SessionPage:
+        # Windowed in Python, which a double may do and the real query may
+        # not: what the route tests need from this is that the handler
+        # passed the window it parsed, and `self.windows` is where they
+        # read that off.
+        self.asked_for.append(discord_user_id)
+        self.windows.append((limit, offset))
+        return SessionPage(
+            sessions=self.sessions[offset : offset + limit],
+            total=len(self.sessions),
+            limit=limit,
+            offset=offset,
+        )
 
     async def session_for(self, discord_user_id: int, session_id: int) -> AttendedSession | None:
         self.asked_for.append(discord_user_id)

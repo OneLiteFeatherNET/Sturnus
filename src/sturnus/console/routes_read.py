@@ -30,12 +30,14 @@ from datetime import date
 from aiohttp import web
 
 from sturnus.console.app import current_user, require_session
+from sturnus.console.paging import InvalidPage, page_request
 from sturnus.console.ports import SessionReads
 from sturnus.console.statistics import (
     calendar_year,
     dashboard,
     day_timeline,
     session_json,
+    session_page_json,
     year_bounds,
 )
 
@@ -82,9 +84,27 @@ async def dashboard_view(request: web.Request) -> web.Response:
 
 @require_session
 async def sessions_view(request: web.Request) -> web.Response:
+    """One page of this person's recordings, and how many there are.
+
+    Paged rather than whole. A person who has been in three hundred
+    meetings was previously served three hundred sessions with every
+    participant, every tag and every track inline, in one body, on every
+    visit to the list -- and the page then rendered an article for each.
+
+    A window that falls past the end is an empty page and not a refusal:
+    it is what a bookmark to page five looks like after a retention sweep,
+    and the total travelling with it is what lets the console say so
+    rather than claim the person has no recordings.
+    """
     viewer = current_user(request).discord_user_id
-    found = await request.app[READS].sessions_for(viewer)
-    return web.json_response({"sessions": [session_json(s, viewer) for s in found]})
+    try:
+        window = page_request(request.query.get("limit"), request.query.get("offset"))
+    except InvalidPage as refusal:
+        # `str(refusal)` is a fixed sentence from `sturnus.console.paging`
+        # and never the value that broke the rule.
+        return _malformed(str(refusal))
+    page = await request.app[READS].sessions_page(viewer, limit=window.limit, offset=window.offset)
+    return web.json_response(session_page_json(page, viewer))
 
 
 @require_session
