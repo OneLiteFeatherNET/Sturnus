@@ -72,6 +72,21 @@ describe('who is offered the Admin View', () => {
     expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('Queue')
   })
 
+  it('offers the reporting to an administrator', () => {
+    expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('Reporting')
+  })
+
+  it('hides the reporting from somebody who administers nothing', () => {
+    // The report describes a whole server -- how much of it was recorded,
+    // how much of that was written up -- which is a thing an administrator
+    // is accountable for and a thing a participant has no standing to
+    // read. The endpoint answers 404 to them, the same answer it gives for
+    // a server that does not exist, so an entry left visible would offer a
+    // page that can only ever refuse them.
+    expect(visibleEntries(PARTICIPANT).map((e) => e.label)).not.toContain('Reporting')
+    expect(visibleEntries(null).map((e) => e.label)).not.toContain('Reporting')
+  })
+
   it('hides the queue from somebody who administers nothing', () => {
     // The queue endpoint answers 404 to a non-administrator -- the same
     // answer it gives for a guild that does not exist -- so an entry left
@@ -86,10 +101,14 @@ describe('who is offered the Admin View', () => {
     // that one member, which is rarer and always deliberate. The queue is
     // rarer still and is never scanned -- it is opened because a protocol
     // did not appear, which is a question somebody arrives holding.
+    // Reporting is last because it is the only entry nothing is ever
+    // wrong on: it is read on a schedule, or when somebody asks how much
+    // this server actually uses Sturnus, and never in a hurry.
     expect(ADMIN_VIEW.entries.map((e) => e.label)).toEqual([
       'Bot Settings',
       'User Settings',
       'Queue',
+      'Reporting',
     ])
   })
 

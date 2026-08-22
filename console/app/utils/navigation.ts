@@ -96,6 +96,17 @@ export const ADMIN_VIEW: NavSection = {
       icon: 'M12 2 2 7l10 5 10-5-10-5Zm0 20 10-5-2.5-1.25L12 19.5 4.5 15.75 2 17l10 5Zm0-5.5 10-5-2.5-1.25L12 14 4.5 10.25 2 11.5l10 5Z',
       adminOnly: true,
     },
+    {
+      to: '/admin/reporting',
+      label: 'Reporting',
+      // Three bars of different heights, which is what the page's
+      // by-month breakdown actually looks like. Deliberately not a pie:
+      // this report is a run of months, and a pie would promise a
+      // breakdown of a whole into named parts -- which is precisely the
+      // per-person readout the page refuses to be.
+      icon: 'M4 20V10h4v10H4Zm6 0V4h4v16h-4Zm6 0v-7h4v7h-4Z',
+      adminOnly: true,
+    },
   ],
 }
 
