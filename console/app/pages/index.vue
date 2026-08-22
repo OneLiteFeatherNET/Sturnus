@@ -39,12 +39,12 @@ const { data, status, error, refresh } = useAsyncData<DashboardSummary>(
       return await api<DashboardSummary>('/dashboard')
     }
     catch (cause) {
-      // Rethrown with a message of our own, and this is not cosmetic.
-      // `$fetch` names the URL it called in the error it throws, during a
-      // server render that URL is the API's in-cluster address, and Nuxt
-      // serialises the error into the payload the browser receives -- so
-      // the raw message would publish an internal hostname in the page
-      // source of every failing dashboard, whether or not it is displayed.
+      // The hostname leak this used to guard against is now closed one
+      // layer down: `useApi` throws only an `ApiError`, which carries a
+      // status and a relative path and nothing else. This catch survives
+      // for a different job -- turning that into a Nuxt error with a
+      // status code, so a failed dashboard renders as the failure it is
+      // rather than as an empty page.
       throw createError({
         statusCode: failureStatus(cause) ?? undefined,
         statusMessage: 'The dashboard could not be loaded.',
