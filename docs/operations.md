@@ -921,6 +921,121 @@ consent names the superseded version stop being recorded mid-session, and
 the role by hand is not required for a hard cutover, and doing so only
 costs the affected members a second step when they re-consent.
 
+## 6.2 The console
+
+A web console at `https://sturnus.onelitefeather.dev` where somebody who
+took part in recorded meetings can see what Sturnus holds about them, play
+back the sessions they were in, and — if they administer the bot — change
+its runtime settings without `kubectl` or a slash command.
+
+Design: `docs/superpowers/specs/2026-08-21-sturnus-console-design.md`.
+
+### 6.2.1 Before switching it on
+
+**The consent question is not a technicality, and the code cannot answer
+it.** Audio playback is a wider use of a recording than a transcript is.
+The people in a session consented to being recorded so that a protocol
+could be written; playing their voice back to another participant is a
+different act, even though that participant heard them live.
+
+Three things make it defensible, and the implementation can only enforce
+the first two:
+
+1. **Only participants of the same session may play its audio.** Checked
+   per request against `session_participant`, scoped in the query rather
+   than filtered afterwards. Not administrators-in-general, not anyone
+   with a link.
+2. **Everyone in a session already heard everyone else in it.** The
+   console gives back what was in the room, to the people who were in it.
+3. **It is stated in the policy.** `policy_version` must be bumped and the
+   document at `policy_url` updated to say that participants can play back
+   the audio, *before* the console is reachable in production.
+
+The third is yours. Bumping `policy_version` invalidates every consent
+naming the old one (Section 6), which is the mechanism working: people
+re-consent under wording that covers what the system now does. An operator
+who skips it has a working console and no lawful basis for its second
+section.
+
+### 6.2.2 What each process holds
+
+| Process | Discord token | S3 + master key | OAuth secret | Database |
+|---|---|---|---|---|
+| `bot` | yes | yes | no | yes |
+| `worker` | no | yes | no | yes |
+| `link` | no | no | yes | yes |
+| `api` | **no** | **yes** | yes | yes |
+| `console` | no | no | no | **no** |
+
+`api` holds S3 and the master key because it decrypts audio on the way to
+the browser. It must never hold the Discord token: a process that can read
+every recording ever made is not one to also give the ability to act as
+the bot. Which guilds somebody administers is therefore read from
+`admin_member`, mirrored by the bot on its ordinary tick, rather than
+asked of Discord.
+
+`console` holds nothing at all. `sturnus.secretEnv` in the chart refuses
+outright to render a `secretKeyRef` for it, and the chart job asserts the
+absence.
+
+### 6.2.3 Signing in
+
+OAuth against Outline, then **the identity is looked up in
+`account_link`**. No link, no session: every console query is scoped by
+Discord id, because that is what `session_participant` names, and the only
+bridge from an Outline identity to one is a link the person made
+themselves with `/link`. The console says so specifically, because "run
+`/link` in Discord" is an instruction somebody can act on.
+
+`STURNUS_SESSION_SECRET` signs the session cookie (HMAC-SHA256, at least
+32 bytes — `SessionCookie` refuses shorter at construction, so a
+placeholder fails at startup rather than serving forgeable sessions).
+Rotating it signs everybody out and does nothing else: there is no
+server-side session store, the cookie *is* the session.
+
+**Two callbacks, two paths, deliberately.** `/oauth/callback` completes
+`/link` in Discord and belongs to the `link` service;
+`/api/auth/callback` completes a console sign-in and belongs to `api`.
+Both must be registered as redirect URIs on the Outline OAuth
+application. Registering one for both sends each flow into the other's
+service, and each failure looks like the other's bug.
+
+### 6.2.4 Saving a setting is not the same as it taking effect
+
+`api` has no Discord gateway, so a write through the console is a database
+write and nothing more. `/config set` in Discord writes *and* reconciles;
+the console can only do the first half. Every settings response therefore
+carries `takes_effect`:
+
+| Value | What happens |
+|---|---|
+| `immediately` | Read per use — `policy_version`, `policy_url`, `admin_role_id` |
+| `next_reconcile` | Cached by the bot; picked up within about ten seconds |
+| `process_restart` | Read once at startup — `publish_poll_seconds`. **No amount of waiting lands it**; the deployment has to be restarted |
+
+Plus `deferred_while_recording` for `voice_channel_id` and
+`consent_role_id`, which a reconcile holds back for the length of a
+running session.
+
+There is no console equivalent of `/config apply force:true`, and there
+cannot be without giving `api` a Discord token.
+
+### 6.2.5 Known costs
+
+- **Administrator membership is stale by up to one bot tick** (~10 s). A
+  revoked administrator keeps console write access until the next sweep.
+  That is the price of the mirror, and it is what buys the API having no
+  Discord token.
+- **The calendar groups by UTC day.** `timezone` is per guild and one
+  person's sessions can span guilds, so no guild's zone is right on the
+  server; the console converts for display. A meeting at 00:30 Berlin time
+  falls on the previous UTC day in the underlying data.
+- **A track with no `session_participant` row keeps its audio and loses
+  its name.** There is no foreign key from `transcription_job` to
+  `session_participant`, so a job whose participant row is gone still has
+  a recording. The console shows the track and omits the speaker rather
+  than dropping a recording that exists.
+
 ## 7. Observability
 
 Three retained stores hold a copy of what Sturnus emits, and all three are
