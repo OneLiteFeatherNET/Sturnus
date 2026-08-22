@@ -187,6 +187,7 @@ class SturnusClient(commands.Bot):
         link_states: LinkStateStore,
         account_links: AccountLinkRepository,
         tick_interval_seconds: float = TICK_INTERVAL_SECONDS,
+        capture_diagnostics: bool = False,
     ) -> None:
         intents = discord.Intents.default()
         # `members` is a privileged intent and must also be turned on for
@@ -222,6 +223,7 @@ class SturnusClient(commands.Bot):
         self._link_states = link_states
         self._account_links = account_links
         self._tick_interval_seconds = tick_interval_seconds
+        self._capture_diagnostics = capture_diagnostics
 
         self._guilds: dict[int, _GuildRecording] = {}
         self._tick_task: asyncio.Task[None] | None = None
@@ -673,7 +675,12 @@ class SturnusClient(commands.Bot):
         needing `discord-ext-voice-recv` and a live gateway connection.
         """
         return VoiceReceiveAdapter(
-            self, service, self._config_store, self._clock, self._consent_repo
+            self,
+            service,
+            self._config_store,
+            self._clock,
+            self._consent_repo,
+            capture_diagnostics=self._capture_diagnostics,
         )
 
     async def _retarget(

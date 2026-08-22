@@ -174,6 +174,12 @@ class Settings(StrictSettings):
     outline_client_id: str
     outline_redirect_uri: str
     health_port: int = 8080
+    # Off by default, and meant to be turned on for one recording at a
+    # time. Measures what Discord actually sends and what the Opus decoder
+    # makes of it, which is the one thing a finished WAV cannot show --
+    # see `sturnus.infrastructure.discord.capture_diagnostics`. Records no
+    # audio: packet sizes, packet shapes and three aggregate numbers.
+    capture_diagnostics: bool = False
 
 
 @lru_cache(maxsize=1)

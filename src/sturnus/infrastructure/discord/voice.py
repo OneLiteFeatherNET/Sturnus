@@ -58,6 +58,7 @@ from sturnus.domain import settings
 from sturnus.domain.session import EndReason
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.repositories import ConsentRepository
+from sturnus.infrastructure.discord.capture_diagnostics import CaptureDiagnostics
 from sturnus.infrastructure.discord.consent_cache import ConsentCache
 from sturnus.infrastructure.discord.decoding import (
     DecoderFactory,
@@ -136,6 +137,7 @@ class VoiceReceiveAdapter:
         consent_repo: ConsentRepository,
         *,
         decoder_factory: DecoderFactory = new_opus_decoder,
+        capture_diagnostics: bool = False,
     ) -> None:
         self._client = client
         self._service = service
@@ -143,6 +145,10 @@ class VoiceReceiveAdapter:
         self._clock = clock
         self._consent_cache = ConsentCache(consent_repo, config_store, clock)
         self._decoder_factory = decoder_factory
+        # One recording at a time, turned on deliberately. See
+        # `sturnus.infrastructure.discord.capture_diagnostics` for what it
+        # measures and why a finished WAV cannot answer the same question.
+        self._capture_diagnostics = capture_diagnostics
 
         self._voice_client: voice_recv.VoiceRecvClient | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -261,6 +267,7 @@ class VoiceReceiveAdapter:
         decoder = ResilientOpusDecoder(
             factory=self._decoder_factory,
             on_decode_failure=self._on_decode_failure,
+            diagnostics=CaptureDiagnostics() if self._capture_diagnostics else None,
         )
         sink = RecordingSink(
             consent_role_id=consent_role_id,

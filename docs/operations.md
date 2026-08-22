@@ -1102,6 +1102,48 @@ Two things the output reports are worth reading before the audio itself:
   the rail are not recoverable signal, and a decoder reads them as noise.
   A handful is normal; a sustained fraction is not.
 
+### 6.4 Measuring a live capture
+
+`audio_sample.py` above answers "what is on this track". When the answer is
+"noise", the next question is where the noise came from — and a finished
+WAV cannot say, because both candidates (the frames Discord sends, and what
+the Opus decoder makes of them) live upstream of it.
+
+`STURNUS_CAPTURE_DIAGNOSTICS=true` on the **bot** turns on a measurement of
+exactly that. It is off by default and meant to be turned on for one
+recording, then off again.
+
+```bash
+kubectl set env -n sturnus deploy/sturnus-bot STURNUS_CAPTURE_DIAGNOSTICS=true
+# ... have somebody speak in the recorded channel for a minute ...
+kubectl logs -n sturnus deploy/sturnus-bot | grep "capture diagnostics"
+kubectl set env -n sturnus deploy/sturnus-bot STURNUS_CAPTURE_DIAGNOSTICS-
+```
+
+Each line covers one speaker and carries two halves.
+
+**What arrived.** Packet count, the shape libopus reads out of each packet's
+TOC byte, and the size distribution. A healthy stream is `1f/960spf/2ch` and
+nothing else — one 20 ms stereo frame per packet, which is what Discord
+sends. Any other shape, or a non-zero `unreadable`, means the bytes handed
+to the decoder are not the packet that was sent: a header not stripped, a
+payload cut short, an offset out by a few. Sizes should spread across
+several bands; voice is variable-bitrate, so a stream where every packet
+lands in one band is not voice.
+
+**What came out of the decoder**, measured before anything else touches it.
+`autocorr` above 0.4 with `step/rms` below 0.3 is speech. The four degraded
+tracks that prompted this read **autocorr 0.21–0.26 and step/rms about
+0.44**, so a live capture reading the same confirms the damage is already
+present at the decoder's output — and a live capture reading clean means it
+is done later, by `to_mono_16k` or the writer.
+
+**It records no audio.** Counts, size bands and three aggregate numbers over
+sampled frames; no frame and no sample is kept, which is what makes it safe
+to run against a real conversation — the only kind that reproduces the
+defect. One frame in fifty is measured, so the cost on the capture thread is
+a dictionary bump per packet.
+
 ## 7. Observability
 
 Three retained stores hold a copy of what Sturnus emits, and all three are

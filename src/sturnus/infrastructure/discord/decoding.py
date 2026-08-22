@@ -77,6 +77,8 @@ from typing import Literal, Protocol, overload
 
 from discord.opus import Decoder, OpusError
 
+from sturnus.infrastructure.discord.capture_diagnostics import CaptureDiagnostics
+
 log = logging.getLogger(__name__)
 
 #: A hard ceiling on live decoders. One native decoder per SSRC, and an
@@ -283,10 +285,15 @@ class ResilientOpusDecoder:
         factory: DecoderFactory = new_opus_decoder,
         max_streams: int = DEFAULT_MAX_STREAMS,
         on_decode_failure: Callable[[], None] | None = None,
+        diagnostics: CaptureDiagnostics | None = None,
     ) -> None:
         if max_streams <= 0:
             raise ValueError("max_streams must be positive")
         self._factory = factory
+        # `None` unless STURNUS_CAPTURE_DIAGNOSTICS is set, which makes the
+        # whole facility one `is not None` on the hot path. See
+        # `.capture_diagnostics` for what it is for and why it is off.
+        self._diagnostics = diagnostics
         self._max_streams = max_streams
         self._on_decode_failure = on_decode_failure
         # Ordered by least-recently-used, so the backstop can evict in O(1)
@@ -330,17 +337,34 @@ class ResilientOpusDecoder:
         """
         with self._lock:
             self._streams.pop(ssrc, None)
+        if self._diagnostics is not None:
+            self._diagnostics.drop(ssrc)
 
     def clear(self) -> None:
-        """Forgets every stream. Idempotent; safe from any thread."""
+        """Forgets every stream. Idempotent; safe from any thread.
+
+        Also the last chance to report diagnostics: a session that ends
+        cleanly gets here, and a report that only ever fired on a full
+        window would miss every recording shorter than one.
+        """
         with self._lock:
             self._streams.clear()
+        if self._diagnostics is not None:
+            self._diagnostics.clear()
 
     def _decode(self, ssrc: int, frame: bytes | None) -> bytes | None:
         stream = self._stream(ssrc)
         if not frame:
             return stream.conceal()
+        if self._diagnostics is not None:
+            # Before the decode, on the bytes the decoder is about to be
+            # given: whatever is wrong with them is wrong here.
+            self._diagnostics.observe_packet(ssrc, frame)
         pcm = stream.decode(frame)
+        if pcm is not None and self._diagnostics is not None:
+            # And immediately after, before `to_mono_16k` or the writer can
+            # be blamed for what the decoder produced.
+            self._diagnostics.observe_pcm(ssrc, pcm)
         # Edge-triggered on purpose: `==` fires the report exactly once per
         # run of failures. A stream failing at 50 frames a second would
         # otherwise produce three thousand ERROR lines a minute, which is
