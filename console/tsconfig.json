@@ -1,0 +1,7 @@
+{
+  // Nuxt writes the real configuration into `.nuxt`, which is generated and
+  // not committed. Without this file `nuxt typecheck` has nothing to extend
+  // and fails before it checks anything -- so the script existed and proved
+  // nothing.
+  "extends": "./.nuxt/tsconfig.json"
+}
