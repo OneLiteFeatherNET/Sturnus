@@ -26,6 +26,7 @@ from datetime import datetime
 
 from aiohttp import web
 
+from sturnus.console import routes_settings
 from sturnus.console.audio import AudioDelivery
 from sturnus.console.auth import (
     ConsoleAuth,
@@ -38,6 +39,7 @@ from sturnus.console.ports import (
     LinkDirectory,
     OAuthClient,
     SessionReads,
+    SettingsStore,
     StateStore,
 )
 from sturnus.console.routes_audio import AUDIO_DELIVERY
@@ -256,6 +258,7 @@ def build_api(
     links: LinkDirectory,
     admins: AdminDirectory,
     reads: SessionReads,
+    config: SettingsStore,
     sessions: SessionCookie,
     now: Clock,
     schema_ready: ReadinessCheck,
@@ -280,6 +283,7 @@ def build_api(
     app[_SESSIONS] = sessions
     app[_ADMINS] = admins
     app[routes_read.READS] = reads
+    app[routes_settings.SETTINGS_STORE] = config
     app[_NOW] = now
     app[_SCHEMA_READY] = schema_ready
     app[_CONSOLE_ORIGIN] = console_origin
@@ -296,4 +300,5 @@ def build_api(
     )
     routes_read.register(app)
     register_audio(app)
+    routes_settings.register(app)
     return app

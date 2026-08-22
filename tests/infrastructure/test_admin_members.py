@@ -135,3 +135,33 @@ async def test_is_admin_anywhere_answers_without_naming_a_guild(
     await store.replace(OTHER_GUILD, [BEN], T0)
     assert await store.is_admin_anywhere(BEN) is True
     assert await store.is_admin_anywhere(ANNA) is False
+
+
+async def test_the_guilds_one_person_administers_can_be_listed(
+    store: AdminMemberStore,
+) -> None:
+    """The reverse of `administrators`, and what the console's guild picker
+    is: a person signs in knowing no guild, and this is the only thing that
+    tells them which ones are theirs to configure.
+    """
+    await store.replace(GUILD, [ANNA, BEN], T0)
+    await store.replace(OTHER_GUILD, [BEN], T0)
+    assert await store.administered_guilds(ANNA) == (GUILD,)
+
+
+async def test_somebody_who_administers_nothing_gets_an_empty_list(
+    store: AdminMemberStore,
+) -> None:
+    """An ordinary state, not an error: a participant who signed in to look
+    at their own recordings administers nothing at all.
+    """
+    await store.replace(GUILD, [BEN], T0)
+    assert await store.administered_guilds(ANNA) == ()
+
+
+async def test_the_guild_listing_is_ordered_so_two_reads_agree(
+    store: AdminMemberStore,
+) -> None:
+    await store.replace(OTHER_GUILD, [ANNA], T0)
+    await store.replace(GUILD, [ANNA], T0)
+    assert await store.administered_guilds(ANNA) == tuple(sorted((GUILD, OTHER_GUILD)))

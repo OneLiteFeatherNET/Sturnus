@@ -19,7 +19,15 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from sturnus.console.app import build_api
 from sturnus.console.audio import AudioDelivery
-from sturnus.console.ports import Track
+from sturnus.console.ports import (
+    AdminDirectory,
+    LinkDirectory,
+    OAuthClient,
+    SessionReads,
+    SettingsStore,
+    StateStore,
+    Track,
+)
 from sturnus.console.session import SessionCookie
 from sturnus.console.statistics import AttendedSession
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
@@ -32,6 +40,11 @@ AiohttpClientFactory = Callable[
 T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 SECRET = "s" * 32
 ANNA, BEN = 100, 200
+
+#: The guild a test means when it does not name one. Real-shaped rather
+#: than a small integer, so a test that confuses a guild id with a user id
+#: fails rather than coincidentally passing.
+GUILD = 4711
 ANNA_OUTLINE = "c9a1b2e3-4f5a-4b3c-8d2e-1a2b3c4d5e6f"
 
 
@@ -101,11 +114,46 @@ class FakeLinks:
 
 
 class FakeAdmins:
-    def __init__(self, admins: set[int] | None = None) -> None:
-        self.admins = admins or set()
+    """The mirrored administrator membership, in memory.
+
+    One source of truth -- the per-guild mapping -- because that is what
+    `admin_member` is. `admins` is shorthand for "administers the one
+    guild the test did not bother to name", and every question is derived
+    from the mapping rather than tracked beside it: a double that can
+    answer "yes" to `is_admin_anywhere` and "no" to every `is_admin` would
+    prove the opposite of what a test using it claims.
+
+    The endpoints themselves are tested against the real `AdminMemberStore`
+    on the real database (`tests/console/test_settings_routes.py`), since
+    a per-guild authorisation rule is not worth proving against a
+    dictionary.
+    """
+
+    def __init__(
+        self,
+        admins: set[int] | None = None,
+        by_guild: dict[int, set[int]] | None = None,
+    ) -> None:
+        self.by_guild: dict[int, set[int]] = {
+            guild_id: set(members) for guild_id, members in (by_guild or {}).items()
+        }
+        if admins:
+            self.by_guild.setdefault(GUILD, set()).update(admins)
 
     async def is_admin_anywhere(self, discord_user_id: int) -> bool:
-        return discord_user_id in self.admins
+        return any(discord_user_id in members for members in self.by_guild.values())
+
+    async def administered_guilds(self, discord_user_id: int) -> Sequence[int]:
+        return tuple(
+            sorted(
+                guild_id
+                for guild_id, members in self.by_guild.items()
+                if discord_user_id in members
+            )
+        )
+
+    async def is_admin(self, guild_id: int, discord_user_id: int) -> bool:
+        return discord_user_id in self.by_guild.get(guild_id, set())
 
 
 def now_at(moment: datetime = T0) -> Callable[[], datetime]:
@@ -274,6 +322,35 @@ async def collect(pieces: AsyncIterator[bytes]) -> bytes:
     return b"".join([piece async for piece in pieces])
 
 
+class FakeConfig:
+    """A settings store for tests that are not about settings.
+
+    The settings endpoints themselves are tested against the real
+    `ConfigStore` on the real database (`test_settings_routes.py`), because
+    the value validation they enforce is the store's and a fake would have
+    had to reimplement it -- which is the drift the endpoints exist to
+    avoid.
+
+    This exists only so `build_test_api` can construct an application for
+    the other test modules. A test that reaches for it to assert something
+    about settings is asking the wrong object.
+    """
+
+    def __init__(self, values: dict[int, dict[str, str]] | None = None) -> None:
+        self.values: dict[int, dict[str, str]] = values or {}
+
+    async def snapshot(self, guild_id: int) -> dict[str, str]:
+        return dict(self.values.get(guild_id, {}))
+
+    async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None:
+        del now
+        guild = self.values.setdefault(guild_id, {})
+        if value is None:
+            guild.pop(key, None)
+        else:
+            guild[key] = value
+
+
 # ---------------------------------------------------------------------------
 # The application under test
 # ---------------------------------------------------------------------------
@@ -281,17 +358,24 @@ async def collect(pieces: AsyncIterator[bytes]) -> bytes:
 
 def build_test_api(
     *,
-    oauth: FakeOAuth | None = None,
-    states: FakeStates | None = None,
-    links: FakeLinks | None = None,
-    admins: FakeAdmins | None = None,
-    reads: FakeReads | None = None,
+    oauth: OAuthClient | None = None,
+    states: StateStore | None = None,
+    links: LinkDirectory | None = None,
+    admins: AdminDirectory | None = None,
+    reads: SessionReads | None = None,
+    config: SettingsStore | None = None,
     audio: AudioDelivery | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
 ) -> web.Application:
     """Builds the console API with every collaborator defaulted.
+
+    Typed to the ports rather than to the doubles, so a test may hand it
+    a real store where a real one is what it means to exercise --
+    `test_settings_routes` passes the actual `ConfigStore`, because the
+    validation under test is the store's and a fake would have had to
+    reimplement it.
 
     One factory rather than one per test module. Three modules each
     constructing the application themselves meant that adding a
@@ -307,6 +391,7 @@ def build_test_api(
         links=links or FakeLinks(),
         admins=admins or FakeAdmins(),
         reads=reads or FakeReads(),
+        config=config or FakeConfig(),
         audio=audio
         or AudioDelivery(
             tracks=FakeTracks(),

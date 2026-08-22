@@ -125,6 +125,12 @@ _LITERALS = frozenset(
         "is_last",
         "listening",
         "missing",
+        #: A key of `sturnus.domain.settings` -- one of seventeen literals
+        #: from this repository's own source, and checked against the
+        #: registry before anything logs it. The *value* is not here and
+        #: must not be: `transcription_prompt` is free text an
+        #: administrator typed, and `policy_url` is a URL.
+        "config_key",
     }
 )
 
