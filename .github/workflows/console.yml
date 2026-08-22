@@ -1,0 +1,94 @@
+name: console
+
+# The Nuxt console is a second build with a second toolchain, so it gets a
+# job of its own rather than being bolted onto the Python one. The path
+# filter keeps a change to the bot from running a Node build that could not
+# possibly be affected by it.
+on:
+  pull_request:
+    paths:
+      - 'console/**'
+      - '.github/workflows/console.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'console/**'
+      - '.github/workflows/console.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: console-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: console
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+
+      # `ci`, not `install`: the lockfile is the input, and a job that
+      # quietly re-resolved it would test something other than what ships.
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npm run test
+
+      # Typecheck, which was silently a no-op until `console/tsconfig.json`
+      # existed: Nuxt writes the real configuration into the generated
+      # `.nuxt`, so the script had nothing to extend and failed before it
+      # checked anything.
+      - run: npm run typecheck
+
+      # The build is the real check. Every one of the above passes on a
+      # component that a template error would stop dead, and the browser is
+      # where that would otherwise be discovered.
+      - run: npm run build
+
+  image:
+    runs-on: ubuntu-latest
+    # A build that would not produce a working image is not worth the
+    # minutes, so this waits on the checks above rather than racing them.
+    needs: check
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build the image
+        run: docker build -f console/Dockerfile -t sturnus-console:ci .
+
+      # The same reasoning as the Python image's entrypoint job: a unit
+      # suite running against a dev tree cannot see what the shipped image
+      # is missing. This starts it and asks for a page.
+      - name: The image must serve its sign-in page
+        run: |
+          set -euo pipefail
+          cid=$(docker run -d -p 3000:3000 sturnus-console:ci)
+          trap 'docker logs "$cid" || true; docker rm -f "$cid" >/dev/null' EXIT
+
+          for _ in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:3000/sign-in; then
+              body=$(curl -s http://127.0.0.1:3000/sign-in)
+              grep -q "Sign in with Outline" <<<"$body"
+              echo "The console served its sign-in page."
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "::error::The console image never served /sign-in."
+          exit 1

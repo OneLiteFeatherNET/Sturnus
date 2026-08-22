@@ -1,0 +1,47 @@
+@import "tailwindcss";
+
+/* The brand palette, taken from the OneLiteFeather mark rather than
+   invented -- the same colours `docs/brand/README.md` records for the
+   Sturnus icon, so the console and the bot's avatar read as one thing.
+
+   A starling's plumage is iridescent: black that throws green, violet and
+   blue depending on the light. The organisation's own mark is a feather in
+   a full spectrum. One gradient does both jobs. */
+@theme {
+  --color-brand-green: #1bc755;
+  --color-brand-cyan: #06c5e8;
+  --color-brand-blue: #114cc8;
+  --color-brand-magenta: #b119b9;
+  --color-brand-red: #d52a23;
+  --color-brand-yellow: #f7cc2e;
+  --color-brand-field: #131260;
+  --color-brand-deep: #0b0b1f;
+}
+
+/* Dark and light both, following the viewer's system preference. The
+   console is read at a desk in the afternoon and at midnight after a
+   meeting, and neither reading deserves to be the compromised one. */
+:root {
+  --surface: #ffffff;
+  --surface-raised: #f6f7fb;
+  --surface-sunken: #eceefa;
+  --border: #d9dcec;
+  --text: #16172b;
+  --text-muted: #5b5d78;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface: #0b0b1f;
+    --surface-raised: #14152e;
+    --surface-sunken: #090917;
+    --border: #262845;
+    --text: #eceefa;
+    --text-muted: #9a9cba;
+  }
+}
+
+body {
+  background: var(--surface-sunken);
+  color: var(--text);
+}
