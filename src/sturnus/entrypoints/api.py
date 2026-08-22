@@ -33,6 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sturnus.config import StrictSettings
 from sturnus.console.adapters import ConsoleLinkDirectory, ConsoleStateStore
 from sturnus.console.app import build_api
+from sturnus.console.queries import ConsoleQueries
 from sturnus.console.session import SessionCookie
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.models import AccountLink, AdminMember, ConsoleState
@@ -137,6 +138,7 @@ async def _run() -> None:
         states=ConsoleStateStore(session_factory),
         links=ConsoleLinkDirectory(session_factory),
         admins=AdminMemberStore(session_factory),
+        reads=ConsoleQueries(session_factory),
         sessions=SessionCookie(settings.session_secret.get_secret_value(), _SESSION_LIFETIME),
         now=lambda: datetime.now(UTC),
         schema_ready=lambda: schema_ready,

@@ -27,6 +27,7 @@ from tests.console.conftest import (
     FakeAdmins,
     FakeLinks,
     FakeOAuth,
+    FakeReads,
     FakeStates,
     now_at,
 )
@@ -46,6 +47,7 @@ def app(
         states=states or FakeStates(),
         links=links or FakeLinks(),
         admins=admins or FakeAdmins(),
+        reads=FakeReads(),
         sessions=SessionCookie(SECRET, timedelta(hours=12)),
         now=now_at(),
         schema_ready=lambda: schema_ready,
