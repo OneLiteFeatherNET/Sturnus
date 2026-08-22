@@ -74,6 +74,7 @@ from sturnus.infrastructure.discord.sink import (
     RecordingSink,
     SpeakerStreamEnded,
 )
+from sturnus.infrastructure.discord.video_probe import VideoProbe
 from sturnus.infrastructure.telemetry import VOICE_PACKET_ERRORS, VOICE_PACKETS, record
 from sturnus.observability.events import Event, RateLimiter, log_event, log_exception
 
@@ -286,6 +287,7 @@ class VoiceReceiveAdapter:
             guild_id=self._guild_id,
             diagnostics=diagnostics,
             dave=DaveDecryptor(session_source_for(self._voice_client)),
+            video_probe=VideoProbe() if self._capture_diagnostics else None,
         )
         self._voice_client.listen(sink, after=self._on_listen_stopped)
 

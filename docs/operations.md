@@ -1144,6 +1144,35 @@ to run against a real conversation — the only kind that reproduces the
 defect. One frame in fifty is measured, so the cost on the capture thread is
 a dictionary bump per packet.
 
+### 6.5 Does Discord send this bot video at all?
+
+The same switch answers a second question, and one that decides whether
+recording a shared screen is possible: `discord-ext-voice-recv` handles the
+`VIDEO` gateway op but registers **only the audio SSRC**, so a video packet
+-- if one ever arrives -- is logged as an unknown SSRC and discarded as
+unattributable audio. Invisible either way.
+
+With `STURNUS_CAPTURE_DIAGNOSTICS=true`, one line per capture pairs the two:
+
+```
+video probe: 2 stream(s) announced, 0 delivered any packet |
+  ssrc=5001/screen@1920x1080 user=... packets=0, ssrc=5002/video@1280x720 ... |
+  packets on unannounced ssrcs: 0
+```
+
+**Announced but nothing delivered** means Discord is not sending video to
+this bot. A client *subscribes* to the streams it wants and the server does
+not push them unasked; neither library sends that subscription and the
+behaviour for bots is undocumented. The next question would then be
+subscription, not decoding -- a different problem entirely, and worth
+knowing before anyone writes an H.264 depacketiser.
+
+**Packets arriving** means the rest is worth building: depacketisation,
+DAVE decryption for `MediaType.video`, and storage.
+
+It reads no payload byte and records no video -- SSRCs, counts and size
+bands only.
+
 ## 7. Observability
 
 Three retained stores hold a copy of what Sturnus emits, and all three are
@@ -1421,7 +1450,7 @@ show up in that check.
 | `sturnus.session.duration` | histogram | s | `end_reason`, `guild_id` | Are sessions ending by timeout, by people leaving, or because we could not hear? `end_reason` is one of `empty` / `idle_timeout` / `max_duration` / `shutdown` / `capture_failure` / `decode_failure` / `unknown`. The last three are the ones that cost a meeting; `unknown` means the close itself raised. |
 | `sturnus.session.active` | up/down counter | 1 | `guild_id` | Is anything recording right now — and did a session leak? Incremented when the session *row* opens, decremented on every close path there is, so a capture failure cannot make it drift. |
 | `sturnus.recording.upload.bytes` | histogram | By | — | Capacity planning against the retention window. |
-| `sturnus.voice.packets` | counter | 1 | `outcome`, `guild_id` | **Why is person X missing from the transcript?** `outcome` is one of `recorded` / `no_role` / `no_consent` / `not_recording` / `unknown_user` / `undecryptable` / `undecodable` / `loop_gone`. `undecryptable` is Discord's end-to-end layer (DAVE) refusing a frame: a handful during a key rotation is ordinary, a sustained run means this session is not in the group and **no audio is being recorded at all**. `undecodable` is the early warning the decode-failure threshold deliberately does not give — that fires once, after five consecutive seconds of nothing, and this is visible from the first frame. |
+| `sturnus.voice.packets` | counter | 1 | `outcome`, `guild_id` | **Why is person X missing from the transcript?** `outcome` is one of `recorded` / `no_role` / `no_consent` / `not_recording` / `unknown_user` / `video` / `undecryptable` / `undecodable` / `loop_gone`. `undecryptable` is Discord's end-to-end layer (DAVE) refusing a frame: a handful during a key rotation is ordinary, a sustained run means this session is not in the group and **no audio is being recorded at all**. `undecodable` is the early warning the decode-failure threshold deliberately does not give — that fires once, after five consecutive seconds of nothing, and this is visible from the first frame. |
 | `sturnus.voice.packet_errors` | counter | 1 | `error_type` | Is the voice adapter throwing? The rate, not the log line: the matching `voice.packet_handler_failed` line is rate limited to one in a thousand because it is per-frame in origin. |
 | `sturnus.document.create.duration` | histogram | s | `outcome` | Is Outline down, slow, or rejecting us? |
 | `sturnus.oauth.callback` | counter | 1 | `outcome` | Are account links failing, and at which step? |
