@@ -25,7 +25,13 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.linking import new_state
-from sturnus.infrastructure.db.models import AccountLink, ConsoleState
+from sturnus.console.ports import Track
+from sturnus.infrastructure.db.models import (
+    AccountLink,
+    ConsoleState,
+    SessionParticipant,
+    TranscriptionJob,
+)
 
 #: How long a sign-in may take. Ten minutes is a browser round trip
 #: through a login page with room for somebody to be interrupted, and it
@@ -108,3 +114,60 @@ class ConsoleLinkDirectory:
                 .limit(1)
             )
             return found
+
+
+class ConsoleTrackDirectory:
+    """One speaker's recording, if the person asking was in the session.
+
+    The authorisation rule for audio, expressed as one statement rather
+    than as a check a handler makes and a query a handler makes. The
+    `EXISTS` clause naming `requested_by` is not decoration on top of the
+    lookup -- it is part of it, and there is no method on this class that
+    performs the lookup without it.
+
+    That is the design's rule for the whole console (section 3.3): every
+    query is scoped by the signed-in Discord id at the repository layer,
+    not filtered afterwards in a handler. A filter that can be forgotten is
+    a filter that will be, and the thing being forgotten here is somebody's
+    voice.
+
+    `audio_deleted_at IS NULL` belongs in the same statement for a
+    different reason: the retention sweep erases the object first and
+    stamps the row second, so a row without the stamp is the only claim
+    that the object is still there. Offering a stamped row would send a
+    participant to S3 for a key that was deleted on purpose.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def track_for(
+        self, session_id: int, speaker_id: int, *, requested_by: int
+    ) -> Track | None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(
+                        TranscriptionJob.s3_key,
+                        TranscriptionJob.encryption_key_id,
+                        TranscriptionJob.wrapped_data_key,
+                    ).where(
+                        TranscriptionJob.session_id == session_id,
+                        TranscriptionJob.discord_user_id == speaker_id,
+                        TranscriptionJob.audio_deleted_at.is_(None),
+                        select(SessionParticipant.id)
+                        .where(
+                            SessionParticipant.session_id == session_id,
+                            SessionParticipant.discord_user_id == requested_by,
+                        )
+                        .exists(),
+                    )
+                )
+            ).first()
+            if row is None:
+                return None
+            return Track(
+                s3_key=row.s3_key,
+                encryption_key_id=row.encryption_key_id,
+                wrapped_data_key=row.wrapped_data_key,
+            )
