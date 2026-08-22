@@ -15,7 +15,7 @@ from datetime import timedelta
 import pytest
 from aiohttp import web
 
-from sturnus.console.app import build_api
+from sturnus.console.audio import AudioDelivery
 from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 from tests.console.conftest import (
@@ -25,10 +25,14 @@ from tests.console.conftest import (
     T0,
     AiohttpClientFactory,
     FakeAdmins,
+    FakeAudioSource,
+    FakeKeys,
     FakeLinks,
     FakeOAuth,
+    FakeReads,
     FakeStates,
-    UnusedSettings,
+    FakeTracks,
+    build_test_api,
     now_at,
 )
 
@@ -42,16 +46,16 @@ def app(
     admins: FakeAdmins | None = None,
     schema_ready: bool = True,
 ) -> web.Application:
-    return build_api(
+    return build_test_api(
         oauth=oauth or FakeOAuth(),
         states=states or FakeStates(),
         links=links or FakeLinks(),
         admins=admins or FakeAdmins(),
-        config=UnusedSettings(),
+        reads=FakeReads(),
         sessions=SessionCookie(SECRET, timedelta(hours=12)),
         now=now_at(),
-        schema_ready=lambda: schema_ready,
-        console_origin="https://sturnus.example",
+        schema_ready=schema_ready,
+        audio=AudioDelivery(tracks=FakeTracks(), source=FakeAudioSource(), keys=FakeKeys()),
     )
 
 

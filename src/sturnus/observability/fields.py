@@ -84,7 +84,12 @@ _IDENTIFIERS = frozenset(
 #: already logs the Discord one.
 #:
 #: They are nonetheless **log-only**: see `LOG_ONLY_FIELDS`.
-_SUBJECT_IDENTIFIERS = frozenset({"discord_user_id", "external_user_id"})
+#:
+#: `requested_by` is the second person in a line that has two: the console
+#: serves one participant's voice to another, and an access log for that
+#: which records only whose voice it was answers half the question anyone
+#: would ever ask of it.
+_SUBJECT_IDENTIFIERS = frozenset({"discord_user_id", "external_user_id", "requested_by"})
 
 #: Fixed literals from this repository's own source: enum members, stage
 #: names, outcome words. Bounded by construction, which is what makes them

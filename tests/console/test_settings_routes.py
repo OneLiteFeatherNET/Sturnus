@@ -28,7 +28,6 @@ import pytest
 from aiohttp import web
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from sturnus.console.app import build_api
 from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.domain import settings
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
@@ -41,10 +40,7 @@ from tests.console.conftest import (
     SECRET,
     T0,
     AiohttpClientFactory,
-    FakeLinks,
-    FakeOAuth,
-    FakeStates,
-    now_at,
+    build_test_api,
 )
 
 SESSION_COOKIE = "sturnus_session"
@@ -72,17 +68,11 @@ async def stores(clean_database: str) -> Stores:
 
 
 def api(stores: Stores) -> web.Application:
-    return build_api(
-        oauth=FakeOAuth(),
-        states=FakeStates(),
-        links=FakeLinks(),
-        admins=stores.admins,
-        config=stores.config,
-        sessions=SessionCookie(SECRET, timedelta(hours=12)),
-        now=now_at(),
-        schema_ready=lambda: True,
-        console_origin="https://sturnus.example",
-    )
+    # Through the shared factory, which defaults every collaborator these
+    # tests are not about. The two that matter here are the real ones: the
+    # value validation under test is `ConfigStore`'s, and a per-guild
+    # authorisation rule is not worth proving against a dictionary.
+    return build_test_api(admins=stores.admins, config=stores.config)
 
 
 def token(discord_user_id: int = ANNA) -> str:
