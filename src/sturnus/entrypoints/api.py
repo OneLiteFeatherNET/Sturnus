@@ -35,7 +35,8 @@ from sturnus.console.adapters import ConsoleLinkDirectory, ConsoleStateStore
 from sturnus.console.app import build_api
 from sturnus.console.session import SessionCookie
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
-from sturnus.infrastructure.db.models import AccountLink, AdminMember, ConsoleState
+from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.models import AccountLink, AdminMember, ConsoleState, GuildConfig
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.observability import init_sentry
 from sturnus.infrastructure.telemetry import init_telemetry, shutdown_telemetry
@@ -62,6 +63,9 @@ _REQUIRED_TABLES = frozenset(
         AccountLink.__tablename__,
         AdminMember.__tablename__,
         ConsoleState.__tablename__,
+        # The settings section reads and writes this one. Without it here,
+        # `/readyz` would pass while the first settings page 500s.
+        GuildConfig.__tablename__,
         "session",
         "session_participant",
         "transcription_job",
@@ -137,6 +141,9 @@ async def _run() -> None:
         states=ConsoleStateStore(session_factory),
         links=ConsoleLinkDirectory(session_factory),
         admins=AdminMemberStore(session_factory),
+        # The same store `/config` writes through, so the console and the
+        # slash command cannot disagree about what a valid value is.
+        config=ConfigStore(session_factory),
         sessions=SessionCookie(settings.session_secret.get_secret_value(), _SESSION_LIFETIME),
         now=lambda: datetime.now(UTC),
         schema_ready=lambda: schema_ready,

@@ -15,6 +15,7 @@ invitation for the next handler to reach for something it should not have.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Protocol
 
@@ -53,6 +54,48 @@ class LinkDirectory(Protocol):
 
 
 class AdminDirectory(Protocol):
-    """Whether somebody administers any guild the bot serves."""
+    """Who administers what, as far as the console is allowed to know.
+
+    Three questions rather than one, because the console asks three
+    genuinely different ones and answering the narrow one with the wide
+    one is the failure this protocol exists to make hard to write:
+
+    * `is_admin_anywhere` decides whether the settings section is offered
+      at all. It is a rendering hint and never a control.
+    * `administered_guilds` is what the guild picker lists.
+    * `is_admin` is the only one that authorises anything. Every settings
+      read and every settings write goes through it, per guild, because
+      an administrator of one guild is nobody in another.
+
+    Read from `admin_member`, which `bot` mirrors on its sweep. The API
+    process has no gateway to ask Discord directly, deliberately: a
+    process that can decrypt every recording ever made is not one to also
+    hand the ability to act as the bot (Spec 13.2).
+    """
 
     async def is_admin_anywhere(self, discord_user_id: int) -> bool: ...
+
+    async def administered_guilds(self, discord_user_id: int) -> Sequence[int]: ...
+
+    async def is_admin(self, guild_id: int, discord_user_id: int) -> bool: ...
+
+
+class SettingsStore(Protocol):
+    """Per-guild runtime configuration, read whole and written one key at a time.
+
+    Narrow to two methods on purpose. In particular there is no
+    `get`/`get_stored` here: the listing endpoint reads a guild's whole
+    configuration in one query rather than one per key, and a protocol
+    that offered the per-key read would be an invitation for the next
+    handler to loop over `KNOWN_KEYS` doing seventeen round trips.
+
+    **`set` is where value validation lives, and it must stay there.** It
+    refuses an unknown key and refuses a non-positive-integer for an
+    integer key, and the API's job is to turn that `ValueError` into a
+    400 -- never to check the same thing first. Two copies of a
+    validation rule is how the two drift.
+    """
+
+    async def snapshot(self, guild_id: int) -> dict[str, str]: ...
+
+    async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None: ...

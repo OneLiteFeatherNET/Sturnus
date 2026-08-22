@@ -26,6 +26,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from sturnus.application.reconfigure import (
+    RESTART_REQUIRED_KEYS,
     Reconfigure,
     ReconfigureAction,
     ReconfigureResult,
@@ -41,14 +42,15 @@ log = logging.getLogger(__name__)
 #: Every key `ConfigStore.set` accepts — the same union it validates against.
 _KNOWN_KEYS: frozenset[str] = frozenset(settings.DEFAULTS) | settings.REQUIRED_KEYS
 
-#: Keys the process reads exactly once, at start, and therefore cannot pick
-#: up while running. Today that is only `publish_poll_seconds`: the publish
-#: sweep runs on one process-wide interval taken from the setting's default
-#: rather than per-guild scheduling — a deliberate simplification, see the
-#: comment above `_PUBLISH_POLL_SECONDS` in `sturnus.entrypoints.bot`. It is
-#: named here, in one place, so the notice is derived rather than hardcoded
-#: into a reply string.
-RESTART_REQUIRED_KEYS: frozenset[str] = frozenset({settings.PUBLISH_POLL_SECONDS})
+#: Re-exported from `sturnus.application.reconfigure`, which is where the
+#: fact now lives: "read once at process start" is a property of how the bot
+#: reads a key, exactly like `IDENTITY_KEYS` and `TUNABLE_KEYS` beside it —
+#: and it has a second reader now. The console's API process has no gateway
+#: and cannot reconcile at all (Spec 13.2), so it must tell an operator
+#: which of the three classes their write falls into, and a second
+#: hand-maintained list of restart-only keys is a list that disagrees with
+#: this one the day a fourth key joins it.
+__all__ = ["RESTART_REQUIRED_KEYS", "ConfigCog"]
 
 #: Keys whose shortening can close the session already in progress.
 _TIMEOUT_KEYS: frozenset[str] = frozenset(

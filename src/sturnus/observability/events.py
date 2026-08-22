@@ -125,6 +125,18 @@ class Event(StrEnum):
     CONSOLE_SIGNED_IN = "console.signed_in"
     CONSOLE_SIGN_IN_REJECTED = "console.sign_in_rejected"
     CONSOLE_STATES_PURGED = "console.states_purged"
+    #: An administrator changed a guild's runtime configuration from the
+    #: web console. The only trace such a change leaves: a slash command
+    #: at least leaves the administrator holding its reply, while a form
+    #: submission leaves nothing behind but this line. It names who, which
+    #: guild and which key -- never the value, since `transcription_prompt`
+    #: is free text somebody typed.
+    CONSOLE_SETTING_WRITTEN = "console.setting_written"
+    #: `ConfigStore.set` refused the value. Ordinary in the sense that a
+    #: typo in a number field produces it, and worth a line anyway: it is
+    #: the one place where the console and the store could ever disagree
+    #: about what a valid value is.
+    CONSOLE_SETTING_REJECTED = "console.setting_rejected"
 
     # -- cross-cutting ------------------------------------------------------
     PROCESS_STARTING = "process.starting"

@@ -26,13 +26,20 @@ from datetime import datetime
 
 from aiohttp import web
 
+from sturnus.console import routes_settings
 from sturnus.console.auth import (
     ConsoleAuth,
     ExchangeRefused,
     NotLinked,
     UnknownState,
 )
-from sturnus.console.ports import AdminDirectory, LinkDirectory, OAuthClient, StateStore
+from sturnus.console.ports import (
+    AdminDirectory,
+    LinkDirectory,
+    OAuthClient,
+    SettingsStore,
+    StateStore,
+)
 from sturnus.console.session import (
     ExpiredSession,
     InvalidSession,
@@ -246,6 +253,7 @@ def build_api(
     states: StateStore,
     links: LinkDirectory,
     admins: AdminDirectory,
+    config: SettingsStore,
     sessions: SessionCookie,
     now: Clock,
     schema_ready: ReadinessCheck,
@@ -263,6 +271,7 @@ def build_api(
     app[_AUTH] = ConsoleAuth(oauth, states, links)
     app[_SESSIONS] = sessions
     app[_ADMINS] = admins
+    app[routes_settings.SETTINGS_STORE] = config
     app[_NOW] = now
     app[_SCHEMA_READY] = schema_ready
     app[_CONSOLE_ORIGIN] = console_origin
@@ -276,4 +285,5 @@ def build_api(
             web.get("/api/me", me),
         ]
     )
+    routes_settings.register(app)
     return app
