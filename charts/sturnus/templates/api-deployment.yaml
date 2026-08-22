@@ -1,0 +1,99 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sturnus.fullname" . }}-api
+  labels:
+    {{- include "sturnus.componentLabels" (dict "root" . "component" "api") | nindent 4 }}
+spec:
+  replicas: {{ .Values.api.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "sturnus.componentSelectorLabels" (dict "root" . "component" "api") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sturnus.componentLabels" (dict "root" . "component" "api") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "sturnus.serviceAccountName" . }}
+      # api never calls the Kubernetes API; the projected token would be a
+      # standing credential with no job to do -- and api is reachable from
+      # the internet through the same hostname the console is.
+      automountServiceAccountToken: false
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: api
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: {{ include "sturnus.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            {{- toYaml .Values.api.command | nindent 12 }}
+          # Exactly the secret keys ApiSettings declares, one
+          # `secretKeyRef` each rather than `envFrom` over the whole Secret.
+          # This component does hold S3 and the master key -- it decrypts
+          # audio on the way to the browser -- and deliberately never holds
+          # STURNUS_DISCORD_TOKEN: a process that can read every recording
+          # ever made is not one to also give the ability to act as the bot.
+          # See `sturnus.secretEnv` in _helpers.tpl, where that list is
+          # enforced rather than merely documented.
+          env:
+            {{- include "sturnus.secretEnv" (dict "root" . "component" "api") | nindent 12 }}
+            {{- range $k, $v := .Values.commonEnv }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- range $k, $v := .Values.api.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: health
+              containerPort: {{ .Values.healthPort }}
+              protocol: TCP
+          {{- with .Values.api.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.api.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # readOnlyRootFilesystem: true. api writes nothing of its own
+            # -- decrypted audio never touches disk, it goes from the chunk
+            # buffer to the socket -- so only Python/library scratch writes
+            # to /tmp need this.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.api.tmpSizeLimit }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

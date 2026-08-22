@@ -78,10 +78,27 @@ Create the name of the service account to use
 {{- end }}
 
 {{/*
-The image reference shared by all three components.
+The image reference shared by the four Python components.
 */}}
 {{- define "sturnus.image" -}}
 {{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) }}
+{{- end }}
+
+{{/*
+The console's image, which is a different one.
+
+Not tidiness: the console is a Node process and the rest are Python, the two
+fail differently -- a crashed renderer is an outage of the page, a crashed
+API is an outage of the data -- and building one image for both would put a
+Node runtime in the Python image, which is the larger of the two by a wide
+margin.
+
+It defaults to the same tag as the rest, because the two are released
+together and a console that is a version behind its API is a console whose
+pages call endpoints that may not exist yet.
+*/}}
+{{- define "sturnus.consoleImage" -}}
+{{- printf "%s:%s" .Values.consoleImage.repository (.Values.consoleImage.tag | default .Chart.AppVersion) }}
 {{- end }}
 
 {{/*
@@ -142,11 +159,29 @@ to be read back. Refusing to start is the loud version of the same event, and
   so a cluster that does not report errors sets it to the empty string
   rather than omitting it.
 */ -}}
+{{- /*
+  `api` holds S3 and the master key because it decrypts audio on the way to
+  the browser, and the OAuth client secret because it completes the console's
+  sign-in. It does NOT hold STURNUS_DISCORD_TOKEN, and that absence is the
+  point rather than an oversight: a process that can read every recording
+  ever made is not one to also give the ability to act as the bot. Whether
+  somebody administers a guild is read from `admin_member`, which the bot
+  mirrors, precisely so this process never needs a gateway.
+
+  `console` has no list at all -- not an empty one, none. It renders and
+  calls `api`; every credential and every authorisation decision lives on
+  the other side of that boundary, so a `secretKeyRef` on it could only ever
+  be a mistake. See the explicit refusal below.
+*/ -}}
 {{- $lists := dict
       "bot" (list "STURNUS_DISCORD_TOKEN" "STURNUS_DATABASE_URL" "STURNUS_S3_ACCESS_KEY" "STURNUS_S3_SECRET_KEY" "STURNUS_MASTER_KEY" "STURNUS_SENTRY_DSN")
       "worker" (list "STURNUS_DATABASE_URL" "STURNUS_S3_ACCESS_KEY" "STURNUS_S3_SECRET_KEY" "STURNUS_MASTER_KEY" "STURNUS_OUTLINE_SERVICE_KEY" "STURNUS_SENTRY_DSN")
       "link" (list "STURNUS_DATABASE_URL" "STURNUS_OUTLINE_CLIENT_SECRET" "STURNUS_SENTRY_DSN")
+      "api" (list "STURNUS_DATABASE_URL" "STURNUS_OUTLINE_CLIENT_SECRET" "STURNUS_S3_ACCESS_KEY" "STURNUS_S3_SECRET_KEY" "STURNUS_MASTER_KEY" "STURNUS_SESSION_SECRET" "STURNUS_SENTRY_DSN")
 -}}
+{{- if eq .component "console" -}}
+{{- fail "sturnus.secretEnv: the console must never be given a credential. It renders pages and calls the API; every credential and every authorisation decision lives on the other side of that boundary, so a secretKeyRef on it could only ever be a mistake." -}}
+{{- end -}}
 {{- if not (hasKey $lists .component) -}}
 {{- fail (printf "sturnus.secretEnv: no secret key list defined for component %q" .component) -}}
 {{- end -}}
@@ -161,18 +196,18 @@ to be read back. Refusing to start is the loud version of the same event, and
   to the list above, where the decision is reviewed, rather than routing
   around it from a cluster values file.
 
-  Both maps are checked against the union of all three components' lists,
-  not just this component's, so a credential cannot be smuggled onto one
+  Both maps are checked against the union of every component's list, not
+  just this component's, so a credential cannot be smuggled onto one
   component by naming a key another component legitimately reads.
 */ -}}
 {{- $componentEnv := (index $.root.Values .component | default dict).env | default dict -}}
 {{- $shared := $.root.Values.commonEnv | default dict -}}
-{{- range $all := (concat (index $lists "bot") (index $lists "worker") (index $lists "link")) -}}
+{{- range $all := (concat (index $lists "bot") (index $lists "worker") (index $lists "link") (index $lists "api")) -}}
 {{- if hasKey $componentEnv $all -}}
 {{- fail (printf "sturnus.secretEnv: %s.env sets the credential %s as a plain env value. Credentials reach a component only through the Secret named by existingSecret; add it to the key list in _helpers.tpl if this component genuinely needs it." $.component $all) -}}
 {{- end -}}
 {{- if hasKey $shared $all -}}
-{{- fail (printf "sturnus.secretEnv: commonEnv sets the credential %s as a plain env value, which would place it on all three components at once. Credentials reach a component only through the Secret named by existingSecret." $all) -}}
+{{- fail (printf "sturnus.secretEnv: commonEnv sets the credential %s as a plain env value, which would place it on every component at once. Credentials reach a component only through the Secret named by existingSecret." $all) -}}
 {{- end -}}
 {{- end -}}
 {{- range (index $lists .component) }}

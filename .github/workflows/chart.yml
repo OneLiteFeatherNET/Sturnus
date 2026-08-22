@@ -91,8 +91,8 @@ jobs:
 
           deployments = {d['metadata']['name']: d for d in cluster
                          if d['kind'] == 'Deployment'}
-          check(len(deployments) == 3,
-                f'expected 3 Deployments, rendered {sorted(deployments)}')
+          check(len(deployments) == 5,
+                f'expected 5 Deployments, rendered {sorted(deployments)}')
 
           # A Deployment that mounts a ReadWriteOnce claim cannot roll: the new
           # pod blocks on a multi-attach error while the old one holds the
@@ -134,6 +134,26 @@ jobs:
               check(startup_budget > live_budget,
                     f'{name} allows {startup_budget}s to start but liveness would have '
                     f'killed it after {live_budget}s; the startupProbe buys nothing')
+
+          # Two properties the derived comparison below cannot state, because
+          # they are about an *absence* and a diff of two sorted lists does
+          # not say why one is missing.
+          def secret_keys(dep):
+              container = dep['spec']['template']['spec']['containers'][0]
+              return {
+                  e['valueFrom']['secretKeyRef']['key']
+                  for e in container.get('env', [])
+                  if 'secretKeyRef' in (e.get('valueFrom') or {})
+              }
+
+          check('STURNUS_DISCORD_TOKEN' not in secret_keys(deployments['sturnus-api']),
+                'sturnus-api has the Discord token. It already holds the master key, so it '
+                'can decrypt every recording ever made -- it must not also be able to act '
+                'as the bot.')
+          check(secret_keys(deployments['sturnus-console']) == set(),
+                'sturnus-console has a credential. It renders pages and calls the API; '
+                'every credential and every authorisation decision lives on the other '
+                'side of that boundary.')
 
           # podLabels must reach every pod, and must never reach a selector:
           # selectors are immutable on a live Deployment.

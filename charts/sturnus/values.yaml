@@ -13,6 +13,15 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# The console runs a different image: it is a Node process and the rest are
+# Python. Defaults to the same tag, because the two are released together --
+# a console a version behind its API is a console whose pages call endpoints
+# that may not exist yet.
+consoleImage:
+  repository: harbor.onelitefeather.dev/onelitefeather/sturnus-console
+  pullPolicy: IfNotPresent
+  tag: ""
+
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
@@ -334,6 +343,112 @@ link:
       path: /readyz
       port: health
     initialDelaySeconds: 5
+    periodSeconds: 10
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 80
+
+# The console's API. It holds S3 and the master key -- it decrypts audio on
+# the way to the browser -- and the OAuth client secret, and deliberately
+# never the Discord token: a process that can read every recording ever made
+# is not one to also give the ability to act as the bot. That list is
+# enforced in `_helpers.tpl` rather than configurable here, for the reason
+# stated there.
+api:
+  command: ["sturnus-api"]
+  # Two, because this one is user-facing: a rolling deploy or a drained node
+  # must not be a console outage. The session is a signed cookie with no
+  # server-side state (see `sturnus.console.session`), so a request may land
+  # on either replica -- which is the property that makes more than one
+  # replica possible at all.
+  replicaCount: 2
+  env: {}
+  # Writes nothing but Python/library scratch to /tmp under
+  # readOnlyRootFilesystem. Decrypted audio never touches disk: it goes from
+  # the chunk buffer to the socket, which is the property the whole
+  # encryption scheme exists for.
+  tmpSizeLimit: 128Mi
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      # Higher than `link`'s because this one streams: decrypting a chunk at
+      # a time is cheap per chunk and constant per request, and several
+      # people playing back at once is the ordinary case rather than the
+      # exceptional one.
+      cpu: 500m
+      memory: 384Mi
+  # The same 5-minute budget, for the same reason, as `link` and `bot`: the
+  # OpenTelemetry import graph is what takes the time, not work, and a
+  # startupProbe is what keeps a slow start from being mistaken for a hung
+  # process. See link.startupProbe below for the incident this comes from.
+  startupProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    periodSeconds: 10
+    failureThreshold: 30
+  livenessProbe:
+    httpGet:
+      path: /healthz
+      port: health
+    initialDelaySeconds: 5
+    periodSeconds: 20
+  readinessProbe:
+    httpGet:
+      path: /readyz
+      port: health
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  service:
+    enabled: true
+    type: ClusterIP
+    port: 80
+
+# The console: a Nuxt server that renders pages and calls the API. The one
+# component with no credentials at all -- `_helpers.tpl` refuses outright to
+# render a secretKeyRef for it.
+console:
+  replicaCount: 2
+  env: {}
+  containerPort: 3000
+  tmpSizeLimit: 64Mi
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      cpu: 300m
+      # Node's baseline is higher than Python's for a process this small,
+      # and a server-side render holds a page's worth of DOM while it works.
+      memory: 384Mi
+  # Nitro starts in a second or two -- there is no OpenTelemetry import
+  # graph here -- but the budget is generous for the same reason it is
+  # elsewhere: the cost of being generous is noticing a wedged process
+  # later, and the cost of being tight is a crash loop on a cold node.
+  startupProbe:
+    httpGet:
+      path: /sign-in
+      port: http
+    periodSeconds: 5
+    failureThreshold: 24
+  livenessProbe:
+    httpGet:
+      path: /sign-in
+      port: http
+    initialDelaySeconds: 5
+    periodSeconds: 20
+  # The same path as liveness, and that is honest rather than lazy: this
+  # process has no dependency to be ready for. It renders, and a render that
+  # needs the API asks for it per request -- so "can it serve a page" is the
+  # whole of what readiness could mean here.
+  readinessProbe:
+    httpGet:
+      path: /sign-in
+      port: http
+    initialDelaySeconds: 3
     periodSeconds: 10
   service:
     enabled: true
