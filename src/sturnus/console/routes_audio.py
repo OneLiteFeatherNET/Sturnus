@@ -281,6 +281,31 @@ async def track_audio(request: web.Request) -> web.StreamResponse:
     try:
         async for piece in stream_wav(delivery.source, track.s3_key, data_key, span):
             await response.write(piece)
+    except ConnectionError:
+        # The listener went away mid-track, and that is the *ordinary* end
+        # of an audio stream rather than a fault. A browser closes one
+        # whenever somebody navigates away, seeks past the buffered range,
+        # or lets an `<audio>` element decide it has enough -- and the
+        # recording page mounts one player per speaker plus the transport,
+        # so a single visit that ends normally can drop a handful at once.
+        #
+        # aiohttp logs the resulting `ConnectionResetError` at ERROR with a
+        # full traceback if nothing catches it, which is how leaving a
+        # recording page became several tracebacks in the log of a service
+        # that is working perfectly. DEBUG, and no traceback: there is
+        # nothing for a human to act on, and a genuinely broken transfer
+        # still arrives as `CorruptRecording` below.
+        #
+        # `ConnectionResetError` is a subclass, so one clause covers both.
+        # `asyncio.CancelledError` deliberately is *not* caught -- it
+        # inherits from `BaseException`, and swallowing it would break
+        # graceful shutdown.
+        log.debug(
+            "The listener disconnected partway through a recording (session %s, speaker %s)",
+            session_id,
+            speaker_id,
+        )
+        return response
     except CorruptRecording as exc:
         # The status line left with the headers, so there is no status to
         # change: the response ends short of its declared length, which is
