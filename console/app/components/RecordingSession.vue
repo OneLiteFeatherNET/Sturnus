@@ -130,6 +130,19 @@ const others = computed(() =>
         <span :style="{ color: 'var(--text-muted)' }">Also in the channel, not recorded:</span>
         {{ others }}
       </p>
+      <!-- The reader's own labels, read-only here. A list is for finding
+           a meeting, not for editing one; the editor is on the recording's
+           own page, where there is room to say who can see them. -->
+      <ul v-if="session.tags.length > 0" class="mt-2 flex flex-wrap gap-1.5">
+        <li
+          v-for="tag in session.tags"
+          :key="tag"
+          class="rounded-full px-2 py-0.5 text-xs"
+          :style="{ background: 'var(--surface-raised)', color: 'var(--text-muted)' }"
+        >
+          {{ tag }}
+        </li>
+      </ul>
     </div>
 
     <div :id="panelId" class="px-4 pb-4">

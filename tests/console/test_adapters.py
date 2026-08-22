@@ -10,17 +10,20 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.console.adapters import (
     ConsoleLinkDirectory,
     ConsoleStateStore,
+    ConsoleTagWriter,
     ConsoleTrackDirectory,
 )
 from sturnus.infrastructure.db.models import (
     Base,
     Session,
     SessionParticipant,
+    SessionTag,
     TranscriptionJob,
 )
 from sturnus.infrastructure.db.repositories import AccountLinkRepository
@@ -238,3 +241,139 @@ async def test_a_session_that_does_not_exist_yields_nothing(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     assert await ConsoleTrackDirectory(factory).track_for(9_999, ANNA, requested_by=ANNA) is None
+
+
+# ---------------------------------------------------------------------------
+# The tag writer: whose label this is, and whose meeting it may be put on
+# ---------------------------------------------------------------------------
+
+
+async def stored_tags(
+    factory: async_sessionmaker[AsyncSession], session_id: int, owner: int
+) -> tuple[str, ...]:
+    """What the table actually holds, read without going through the writer."""
+    async with factory() as db:
+        rows = await db.execute(
+            select(SessionTag.tag)
+            .where(
+                SessionTag.session_id == session_id,
+                SessionTag.discord_user_id == owner,
+            )
+            .order_by(SessionTag.tag)
+        )
+        return tuple(rows.scalars().all())
+
+
+async def test_a_participant_may_label_their_own_meeting(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA,))
+
+    stored = await ConsoleTagWriter(factory).replace(
+        session_id, owner=ANNA, tags=("retro",), now=T0
+    )
+
+    assert stored == ("retro",)
+    assert await stored_tags(factory, session_id, ANNA) == ("retro",)
+
+
+async def test_somebody_who_was_not_in_the_meeting_cannot_label_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`None` rather than a refusal with a reason: "no such session" and
+    "you were not in it" must look the same from outside, which is the
+    same 404 the audio endpoint gives for the same reason."""
+    session_id = await seed_session(factory, participants=(BEN,))
+
+    stored = await ConsoleTagWriter(factory).replace(
+        session_id, owner=ANNA, tags=("retro",), now=T0
+    )
+
+    assert stored is None
+    assert await stored_tags(factory, session_id, ANNA) == ()
+
+
+async def test_labelling_a_meeting_that_does_not_exist_writes_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    assert (
+        await ConsoleTagWriter(factory).replace(9999, owner=ANNA, tags=("retro",), now=T0) is None
+    )
+
+
+async def test_a_replaced_set_is_exactly_what_was_asked_for(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The write is "these are my labels now", so a label left out of the
+    second call is a label removed."""
+    session_id = await seed_session(factory, participants=(ANNA,))
+    writer = ConsoleTagWriter(factory)
+    await writer.replace(session_id, owner=ANNA, tags=("retro", "kunde"), now=T0)
+
+    await writer.replace(session_id, owner=ANNA, tags=("kunde",), now=T0)
+
+    assert await stored_tags(factory, session_id, ANNA) == ("kunde",)
+
+
+async def test_clearing_every_label_is_a_write_and_not_a_refusal(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Removing the last chip is how somebody undoes a tagging."""
+    session_id = await seed_session(factory, participants=(ANNA,))
+    writer = ConsoleTagWriter(factory)
+    await writer.replace(session_id, owner=ANNA, tags=("retro",), now=T0)
+
+    assert await writer.replace(session_id, owner=ANNA, tags=(), now=T0) == ()
+    assert await stored_tags(factory, session_id, ANNA) == ()
+
+
+async def test_a_label_that_survives_an_edit_keeps_when_it_was_first_written(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The reason the write is a difference rather than a delete and a
+    re-insert. Rewriting `created_at` on every edit would make it record
+    when somebody last added a *different* tag."""
+    session_id = await seed_session(factory, participants=(ANNA,))
+    writer = ConsoleTagWriter(factory)
+    later = T0 + timedelta(days=1)
+    await writer.replace(session_id, owner=ANNA, tags=("retro",), now=T0)
+
+    await writer.replace(session_id, owner=ANNA, tags=("retro", "kunde"), now=later)
+
+    async with factory() as db:
+        rows = (
+            await db.execute(
+                select(SessionTag.tag, SessionTag.created_at).where(
+                    SessionTag.session_id == session_id,
+                    SessionTag.discord_user_id == ANNA,
+                )
+            )
+        ).all()
+    written: dict[str, datetime] = {row.tag: row.created_at for row in rows}
+    assert written == {"retro": T0, "kunde": later}
+
+
+async def test_replacing_your_labels_leaves_everybody_elses_alone(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two people in one meeting, each with their own word for it."""
+    session_id = await seed_session(factory, participants=(ANNA, BEN))
+    writer = ConsoleTagWriter(factory)
+    await writer.replace(session_id, owner=BEN, tags=("planung",), now=T0)
+
+    await writer.replace(session_id, owner=ANNA, tags=("retro",), now=T0)
+
+    assert await stored_tags(factory, session_id, BEN) == ("planung",)
+    assert await stored_tags(factory, session_id, ANNA) == ("retro",)
+
+
+async def test_the_same_label_written_twice_is_not_an_error(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two tabs saving the same set at the same moment: the row they both
+    want exists either way, which is all either of them asked for."""
+    session_id = await seed_session(factory, participants=(ANNA,))
+    writer = ConsoleTagWriter(factory)
+    await writer.replace(session_id, owner=ANNA, tags=("retro",), now=T0)
+
+    assert await writer.replace(session_id, owner=ANNA, tags=("retro",), now=T0) == ("retro",)

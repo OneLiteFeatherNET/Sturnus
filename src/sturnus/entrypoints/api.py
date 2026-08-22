@@ -42,6 +42,7 @@ from sturnus.console.adapters import (
     ConsoleLinkDirectory,
     ConsoleQueueControl,
     ConsoleStateStore,
+    ConsoleTagWriter,
     ConsoleTrackDirectory,
 )
 from sturnus.console.app import build_api
@@ -201,6 +202,7 @@ async def _run() -> None:
         console_origin=settings.console_origin,
         audio=audio,
         queue=ConsoleQueueControl(session_factory, admins),
+        tags=ConsoleTagWriter(session_factory),
     )
 
     runner = web.AppRunner(app)

@@ -12,11 +12,11 @@ There is deliberately no "all sessions" method for a handler to reach
 for. The narrowest thing this class can express is already scoped, so
 nothing wider exists to be misused later.
 
-Reading happens in three statements rather than one join, because a join
-across participants and jobs multiplies rows: a session with five
-speakers and five tracks comes back twenty-five times, and the
-de-duplication that follows is more code than the second and third
-statements are. Shaping the rows into the dataclasses is left to
+Reading happens in four statements rather than one join, because a join
+across participants, jobs and tags multiplies rows: a session with five
+speakers and five tracks comes back twenty-five times before tags are
+even considered, and the de-duplication that follows is more code than
+the other three statements are. Shaping the rows into the dataclasses is left to
 `sturnus.console.statistics`, which is where it can be tested without a
 database.
 """
@@ -26,17 +26,24 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date
 
-from sqlalchemy import ColumnElement, Select, select
+from sqlalchemy import ColumnElement, Select, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.console.statistics import (
     AttendedSession,
     Participant,
+    TagUse,
     Track,
     day_bounds,
     year_bounds,
 )
-from sturnus.infrastructure.db.models import Session, SessionParticipant, TranscriptionJob
+from sturnus.console.tags import tag_counts
+from sturnus.infrastructure.db.models import (
+    Session,
+    SessionParticipant,
+    SessionTag,
+    TranscriptionJob,
+)
 
 #: The one job status whose `transcript` column holds a transcript.
 #: `pending` and `running` have not written one yet, and `dead` (a job
@@ -100,11 +107,37 @@ class ConsoleQueries:
             )
             return tuple(transcript for transcript in rows.scalars() if transcript is not None)
 
+    async def tags_of(self, discord_user_id: int) -> tuple[TagUse, ...]:
+        """Every label this person uses, with how many recordings carry it.
+
+        Scoped twice, like everything else here. `discord_user_id` on
+        `session_tag` is what makes these their own labels rather than
+        everybody's; `session_id.in_(scope)` is what keeps a label from
+        outliving the participation that justified it -- somebody removed
+        from a session's participants can no longer see that session, and
+        a filter chip counting it would say how many meetings they were in
+        that they can no longer open.
+        """
+        scope = self._attended_by(discord_user_id)
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(SessionTag.tag, func.count())
+                    .where(
+                        SessionTag.discord_user_id == discord_user_id,
+                        SessionTag.session_id.in_(scope),
+                    )
+                    .group_by(SessionTag.tag)
+                )
+            ).all()
+        counted = tag_counts([(row[0], row[1]) for row in rows])
+        return tuple(TagUse(tag=tag, sessions=sessions) for tag, sessions in counted)
+
     def _attended_by(self, discord_user_id: int) -> Select[tuple[int]]:
         """The scope, as a subquery: the ids of sessions this person was in.
 
-        Applied to all three statements below, including the two that are
-        already given ids drawn from the first. That looks redundant and
+        Applied to all four statements below, including the three that
+        are already given ids drawn from the first. That looks redundant and
         is not: without it, the only thing keeping the participants and
         the tracks in scope is a property of a *different* statement, and
         a later edit that widens the first one widens all three in
@@ -170,12 +203,35 @@ class ConsoleQueries:
                     .order_by(TranscriptionJob.discord_user_id)
                 )
             ).all()
+            # The fourth statement, and the one that must name the reader
+            # twice: `discord_user_id` because a tag belongs to whoever
+            # wrote it and this reader may only have their own, and the
+            # scope subquery for the same reason the two above carry it --
+            # so that widening the session statement later cannot widen
+            # this one in silence.
+            labels = (
+                await db.execute(
+                    select(SessionTag.session_id, SessionTag.tag)
+                    .where(
+                        SessionTag.session_id.in_(found),
+                        SessionTag.session_id.in_(scope),
+                        SessionTag.discord_user_id == discord_user_id,
+                    )
+                    # Alphabetical, so a recording's chips do not
+                    # rearrange themselves between two page loads.
+                    .order_by(SessionTag.tag)
+                )
+            ).all()
 
         names: dict[int, dict[int, str]] = defaultdict(dict)
         attendees: dict[int, list[Participant]] = defaultdict(list)
         for session_id, participant_id, display_name in people:
             names[session_id][participant_id] = display_name
             attendees[session_id].append(Participant(participant_id, display_name))
+
+        tagged: dict[int, list[str]] = defaultdict(list)
+        for session_id, tag in labels:
+            tagged[session_id].append(tag)
 
         tracks: dict[int, list[Track]] = defaultdict(list)
         for session_id, speaker_id, audio_seconds, speech_seconds, segment_count in jobs:
@@ -206,6 +262,7 @@ class ConsoleQueries:
                 document_url=row.document_url,
                 participants=tuple(attendees[row.id]),
                 tracks=tuple(tracks[row.id]),
+                tags=tuple(tagged[row.id]),
             )
             for row in rows
         )

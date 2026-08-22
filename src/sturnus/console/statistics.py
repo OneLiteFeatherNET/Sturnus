@@ -62,6 +62,21 @@ class Track:
 
 
 @dataclass(frozen=True)
+class TagUse:
+    """One label this person uses, and how many of their recordings carry it.
+
+    The count is what orders the filter bar: the labels somebody reaches
+    for are the ones they have already used, and it counts only their own
+    recordings -- a count across everybody's tags would be a statement
+    about how other people label their meetings, which is exactly what
+    keeping tags private means not doing.
+    """
+
+    tag: str
+    sessions: int
+
+
+@dataclass(frozen=True)
 class AttendedSession:
     """A session the signed-in person was in.
 
@@ -79,6 +94,17 @@ class AttendedSession:
     document_url: str | None
     participants: tuple[Participant, ...]
     tracks: tuple[Track, ...]
+    #: The labels the *viewer* put on this session, alphabetical. Never
+    #: anybody else's: `session_tag` is keyed by its owner and the query
+    #: that fills this names the signed-in person, so a session two people
+    #: both tagged carries only the reader's own words (see
+    #: `sturnus.console.tags` for why that is the decision).
+    #:
+    #: Defaulted so that the many places which build one of these to talk
+    #: about durations do not have to say "and no tags"; a session with no
+    #: labels and a session whose labels were not asked for look the same
+    #: here, and nothing distinguishes them because nothing needs to.
+    tags: tuple[str, ...] = ()
 
     @property
     def duration_seconds(self) -> float | None:
@@ -118,6 +144,11 @@ class SessionSummaryJson(TypedDict):
     channel_name: str | None
 
 
+class TagUseJson(TypedDict):
+    tag: str
+    sessions: int
+
+
 class SessionJson(TypedDict):
     id: str
     started_at: str
@@ -128,6 +159,7 @@ class SessionJson(TypedDict):
     document_url: str | None
     other_participants: list[ParticipantJson]
     tracks: list[TrackJson]
+    tags: list[str]
 
 
 class DashboardJson(TypedDict):
@@ -202,6 +234,11 @@ def session_json(session: AttendedSession, viewer: int) -> SessionJson:
             for person in session.participants
             if person.discord_user_id != viewer
         ],
+        # The viewer's own labels and nobody else's. The query that
+        # filled these named the signed-in person; this serialiser could
+        # not widen that if it tried, which is the point of doing the
+        # scoping there rather than here.
+        tags=list(session.tags),
         tracks=[
             TrackJson(
                 discord_user_id=str(track.discord_user_id),
@@ -216,6 +253,17 @@ def session_json(session: AttendedSession, viewer: int) -> SessionJson:
             for track in session.tracks
         ],
     )
+
+
+def tags_json(uses: Sequence[TagUse]) -> list[TagUseJson]:
+    """The signed-in person's labels, as the filter bar consumes them.
+
+    A plain list rather than an object keyed by tag: a tag is text
+    somebody typed, and text somebody typed makes a poor JSON key --
+    `constructor` and `__proto__` are valid tags and neither behaves like
+    a key in every client that will ever read this.
+    """
+    return [TagUseJson(tag=use.tag, sessions=use.sessions) for use in uses]
 
 
 def count_words(transcripts: Iterable[str]) -> int:

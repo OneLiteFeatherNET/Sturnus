@@ -39,6 +39,12 @@ export interface RecordedSession {
    *  not consent, who are therefore in this list and not in `tracks`. */
   other_participants: SessionParticipant[]
   tracks: SessionTrack[]
+  /** The labels *this reader* put on the session, alphabetical. Never
+   *  anybody else's: `session_tag` is keyed by its owner and the query
+   *  that fills it names the signed-in person, so a meeting two people
+   *  both tagged carries only the reader's own words. See
+   *  `~/utils/tagging`. */
+  tags: string[]
 }
 
 export interface SessionsResponse {

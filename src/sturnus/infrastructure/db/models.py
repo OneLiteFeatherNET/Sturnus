@@ -148,6 +148,43 @@ class SessionParticipant(Base):
     )
 
 
+class SessionTag(Base):
+    """One label one person put on one meeting they were in.
+
+    **The owner is part of the primary key, and that is the privacy
+    story rather than a detail of it.** A tag is not a property of the
+    meeting: it is a remark about a conversation other people were also
+    in. Keying it by `(session_id, discord_user_id, tag)` means two
+    participants can label the same session differently without
+    overwriting each other, and every read names `discord_user_id` -- so
+    nobody ever sees anybody else's labels, and no query can be written
+    that returns a tag without saying whose it is.
+
+    Tags shared between a session's participants were considered and not
+    built. Sharing is the irreversible direction: private tags can be
+    made visible later by a decision, and tags people have already read
+    cannot be made private again.
+
+    `created_at` is here so a tag list can eventually be ordered by when
+    somebody started using a label. There is no `updated_at`: a tag has
+    no content to edit, and the write path replaces one owner's whole set
+    for a session rather than editing a row.
+    """
+
+    __tablename__ = "session_tag"
+
+    session_id: Mapped[int] = mapped_column(
+        ForeignKey("session.id", ondelete="CASCADE"), primary_key=True
+    )
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    tag: Mapped[str] = mapped_column(Text, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    # Owner first, so that the index answering "which labels do I use"
+    # cannot be walked usefully without naming whose labels are wanted.
+    __table_args__ = (Index("ix_session_tag_owner", "discord_user_id", "tag"),)
+
+
 class AdminMember(Base):
     """One Discord administrator of one guild, mirrored for `api` to read.
 

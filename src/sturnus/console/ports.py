@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
 
-from sturnus.console.statistics import AttendedSession
+from sturnus.console.statistics import AttendedSession, TagUse
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 
@@ -115,6 +115,12 @@ class SessionReads(Protocol):
     #: how much *they* said, and the transcript is the protected content.
     async def transcripts_of(self, discord_user_id: int) -> Sequence[str]: ...
 
+    #: Every label this person has put on a recording, with how many
+    #: recordings carry it. Theirs and only theirs -- `session_tag` is
+    #: keyed by its owner, so there is no reading of it that does not
+    #: name whose labels are wanted.
+    async def tags_of(self, discord_user_id: int) -> Sequence[TagUse]: ...
+
 
 @dataclass(frozen=True)
 class Track:
@@ -150,6 +156,31 @@ class TrackDirectory(Protocol):
     async def track_for(
         self, session_id: int, speaker_id: int, *, requested_by: int
     ) -> Track | None: ...
+
+
+class TagWriter(Protocol):
+    """The one way a label is written, and it names its owner.
+
+    Separate from `SessionReads` because it is the only write the console
+    has that is not a settings change, and because the read side of tags
+    is answered inside the session query rather than through a port of its
+    own (see `sturnus.console.queries`).
+
+    `owner` is not optional and there is no method here without it. It is
+    both halves of the rule at once: a tag belongs to the person who wrote
+    it, and a person may only tag a session they were in. The second half
+    is checked by the statement -- `replace` answers `None` for a session
+    that does not exist *and* for one this person was not in, because
+    from outside those must look the same, which is the same 404 the audio
+    endpoint gives for the same reason.
+    """
+
+    #: The tags as they were stored, or `None` if this person was not in
+    #: that session. The stored form is the answer rather than the
+    #: submitted one, because normalisation may have merged two of them.
+    async def replace(
+        self, session_id: int, *, owner: int, tags: Sequence[str], now: datetime
+    ) -> tuple[str, ...] | None: ...
 
 
 class KeyUnwrapper(Protocol):

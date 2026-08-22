@@ -26,7 +26,7 @@ from datetime import datetime
 
 from aiohttp import web
 
-from sturnus.console import routes_settings
+from sturnus.console import routes_settings, routes_tags
 from sturnus.console.audio import AudioDelivery
 from sturnus.console.auth import (
     ConsoleAuth,
@@ -42,6 +42,7 @@ from sturnus.console.ports import (
     SessionReads,
     SettingsStore,
     StateStore,
+    TagWriter,
 )
 from sturnus.console.routes_audio import AUDIO_DELIVERY
 from sturnus.console.routes_audio import register as register_audio
@@ -268,6 +269,7 @@ def build_api(
     console_origin: str,
     audio: AudioDelivery,
     queue: QueueControl,
+    tags: TagWriter,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
 
@@ -293,6 +295,7 @@ def build_api(
     app[_CONSOLE_ORIGIN] = console_origin
     app[AUDIO_DELIVERY] = audio
     app[QUEUE_CONTROL] = queue
+    app[routes_tags.TAG_WRITER] = tags
     app.add_routes(
         [
             web.get("/healthz", healthz),
@@ -307,4 +310,5 @@ def build_api(
     register_audio(app)
     register_queue(app)
     routes_settings.register(app)
+    routes_tags.register(app)
     return app

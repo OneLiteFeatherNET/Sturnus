@@ -58,6 +58,7 @@ function session(over: Partial<RecordedSession> = {}): RecordedSession {
     channel_name: 'standup',
     document_url: 'https://outline.example/doc/standup-abc',
     other_participants: [],
+    tags: [],
     tracks: [],
     ...over,
   }
