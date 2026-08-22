@@ -1036,6 +1036,72 @@ cannot be without giving `api` a Discord token.
   a recording. The console shows the track and omits the speaker rather
   than dropping a recording that exists.
 
+### 6.3 Listening to a recording by hand
+
+Every automated check this system has can describe a track — its level,
+its spectrum, its autocorrelation, whether a model produced words from it
+— without answering the one question that decides what to do next: **is
+there speech on it, and is it speech a person could understand?** Only
+ears answer that. `scripts/audio_sample.py` is how a recording is put in
+front of any.
+
+It exists because of one track that measured speech-like on every axis
+(lag-1 autocorrelation 0.756, 26% of its energy in the 2–8 Hz syllable
+band) and that neither `tiny` nor `large-v3` could transcribe a word of.
+When there is nothing left to measure, somebody has to listen.
+
+**What comes out is other people's voices.** It is personal data under
+the consent those speakers gave for a transcript, and for nothing else.
+Write it somewhere private, listen to what you need, delete it. Do not
+forward it — not into a chat, not into a bug report, not to a colleague
+who was not in the meeting. `--duration` defaults to 60 seconds rather
+than the whole track for that reason.
+
+From a workstation, both services have to be reachable and the
+credentials have to be in the environment. The secret is read straight
+into the shell rather than written anywhere:
+
+```bash
+kubectl port-forward -n cnpg-system svc/feather-core-cluster-pg-pooler-rw 15432:5432 &
+kubectl port-forward -n rook-ceph-fr01 svc/rook-ceph-rgw-feather-s3 18081:80 &
+
+sec() { kubectl get secret sturnus-secrets -n sturnus -o jsonpath="{.data.$1}" | base64 -d; }
+export STURNUS_DATABASE_URL="$(sec STURNUS_DATABASE_URL | sed -E 's#@[^/]+/#@127.0.0.1:15432/#')"
+export STURNUS_S3_ENDPOINT="http://127.0.0.1:18081"
+export STURNUS_S3_ACCESS_KEY="$(sec STURNUS_S3_ACCESS_KEY)"
+export STURNUS_S3_SECRET_KEY="$(sec STURNUS_S3_SECRET_KEY)"
+export STURNUS_S3_BUCKET="sturnus-audio"
+export STURNUS_MASTER_KEY="$(sec STURNUS_MASTER_KEY)"
+
+uv run python scripts/audio_sample.py list
+uv run python scripts/audio_sample.py extract 4 --start 4:00 --out ~/sample.wav
+```
+
+`list` shows every job and whether its audio still exists — a job the
+retention sweep has already cleaned up cannot be sampled, and saying so
+up front beats a 404 from S3 later. `extract` writes a WAV any player
+opens.
+
+Two things the output reports are worth reading before the audio itself:
+
+- **The track's real length, and its sample rate.** The length is the
+  *file's*, which is not the meeting's: the writer only extends a
+  speaker's track while packets arrive from them, so a speaker who said
+  little has a short track and that is not a fault.
+
+  The rate is printed because it is read from the file rather than
+  assumed. An earlier draft of this script assumed 48 kHz stereo against
+  a track that is 16 kHz mono and reported every length at a sixth of the
+  truth — which is where the "52-minute session, 8:41 track" reading came
+  from. That track was 52 minutes long; the reader was wrong. If a length
+  here looks impossible, check the rate on the same line before
+  concluding anything about the recording.
+- **The peak.** A peak of exactly 0 means the slice is digital silence
+  rather than quiet speech, which is a different fault with a different
+  cause. A peak at 32767/-32768 means the track clips — samples pinned to
+  the rail are not recoverable signal, and a decoder reads them as noise.
+  A handful is normal; a sustained fraction is not.
+
 ## 7. Observability
 
 Three retained stores hold a copy of what Sturnus emits, and all three are
