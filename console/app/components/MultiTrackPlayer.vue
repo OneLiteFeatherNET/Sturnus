@@ -127,7 +127,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
       <button
         type="button"
         class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--surface)] transition-opacity hover:opacity-85"
-        :style="{ background: 'var(--color-brand-cyan)' }"
+        :style="{ background: 'var(--action)' }"
         :aria-label="state.playing ? 'Pause every track' : 'Play every track'"
         @click="transport.toggle()"
       >
@@ -145,7 +145,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
         type="range"
         min="0"
         step="0.1"
-        class="h-1.5 w-full min-w-32 flex-1 cursor-pointer appearance-none rounded-full accent-[var(--color-brand-cyan)]"
+        class="h-1.5 w-full min-w-32 flex-1 cursor-pointer appearance-none rounded-full accent-[var(--action)]"
         :style="{ background: 'var(--surface-sunken)' }"
         :max="scrubMax"
         :value="state.position"
@@ -167,7 +167,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
           min="0"
           max="1"
           step="0.05"
-          class="h-1.5 w-24 cursor-pointer appearance-none rounded-full accent-[var(--color-brand-cyan)]"
+          class="h-1.5 w-24 cursor-pointer appearance-none rounded-full accent-[var(--action)]"
           :style="{ background: 'var(--surface-sunken)' }"
           :value="state.volume"
           @input="onVolume"
@@ -220,7 +220,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
           <span
             v-if="failed[track.discord_user_id]"
             class="text-xs"
-            :style="{ color: 'var(--color-brand-red)' }"
+            :style="{ color: 'var(--danger)' }"
           >
             Audio unavailable
           </span>
@@ -238,7 +238,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
               class="rounded-md px-2 py-1 text-xs font-semibold transition-colors"
               :style="
                 state.soloed.includes(track.discord_user_id)
-                  ? { background: 'var(--color-brand-cyan)', color: 'var(--surface)' }
+                  ? { background: 'var(--action)', color: 'var(--action-contrast)' }
                   : { background: 'var(--surface)', color: 'var(--text-muted)' }
               "
               :aria-pressed="state.soloed.includes(track.discord_user_id)"
@@ -252,7 +252,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
               class="rounded-md px-2 py-1 text-xs font-semibold transition-colors"
               :style="
                 state.muted.includes(track.discord_user_id)
-                  ? { background: 'var(--color-brand-red)', color: 'var(--surface)' }
+                  ? { background: 'var(--danger)', color: 'var(--danger-contrast)' }
                   : { background: 'var(--surface)', color: 'var(--text-muted)' }
               "
               :aria-pressed="state.muted.includes(track.discord_user_id)"

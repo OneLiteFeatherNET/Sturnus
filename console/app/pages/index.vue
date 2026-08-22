@@ -109,7 +109,7 @@ const rest = computed(() => figures.value.slice(1))
       v-else-if="error"
       role="alert"
       class="rounded-2xl border p-6"
-      :style="{ borderColor: 'var(--color-brand-red)', background: 'var(--surface)' }"
+      :style="{ borderColor: 'var(--danger)', background: 'var(--surface)' }"
     >
       <h2 class="mb-2 text-base font-medium">Your figures could not be loaded.</h2>
       <p class="mb-4 text-sm" :style="{ color: 'var(--text-muted)' }">
@@ -212,7 +212,7 @@ const rest = computed(() => figures.value.slice(1))
           >
             <p
               class="text-xs font-medium tracking-wide uppercase"
-              :style="{ color: 'var(--color-brand-cyan)' }"
+              :style="{ color: 'var(--action)' }"
             >
               {{ highlight.label }}
             </p>

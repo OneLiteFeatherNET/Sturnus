@@ -156,7 +156,7 @@ onMounted(() => {
     <div
       v-if="error"
       class="rounded-2xl border p-6"
-      :style="{ borderColor: 'var(--color-brand-red)' }"
+      :style="{ borderColor: 'var(--danger)' }"
     >
       <p class="text-sm font-medium">Your sessions could not be loaded.</p>
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
@@ -165,7 +165,7 @@ onMounted(() => {
       <button
         type="button"
         class="mt-3 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-60"
-        :style="{ color: 'var(--color-brand-cyan)' }"
+        :style="{ color: 'var(--action)' }"
         :disabled="refreshing"
         @click="refresh()"
       >
@@ -200,7 +200,7 @@ onMounted(() => {
       <NuxtLink
         :to="{ path: '/recordings', query: filtersToRouteQuery(filters) }"
         class="mt-3 inline-block rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-        :style="{ color: 'var(--color-brand-cyan)' }"
+        :style="{ color: 'var(--action)' }"
       >
         Back to the first page
       </NuxtLink>
@@ -221,7 +221,7 @@ onMounted(() => {
       <NuxtLink
         to="/recordings"
         class="mt-3 inline-block rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-        :style="{ color: 'var(--color-brand-cyan)' }"
+        :style="{ color: 'var(--action)' }"
       >
         Show all recordings
       </NuxtLink>

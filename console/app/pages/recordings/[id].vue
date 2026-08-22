@@ -160,7 +160,7 @@ const others = computed(() => session.value?.other_participants ?? [])
     <div
       v-else-if="error"
       class="rounded-2xl border p-6"
-      :style="{ borderColor: 'var(--color-brand-red)' }"
+      :style="{ borderColor: 'var(--danger)' }"
     >
       <p class="text-sm font-medium">This recording could not be loaded.</p>
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
@@ -173,7 +173,7 @@ const others = computed(() => session.value?.other_participants ?? [])
       <button
         type="button"
         class="mt-3 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-60"
-        :style="{ color: 'var(--color-brand-cyan)' }"
+        :style="{ color: 'var(--action)' }"
         :disabled="status === 'pending'"
         @click="refresh()"
       >
@@ -192,7 +192,7 @@ const others = computed(() => session.value?.other_participants ?? [])
           <span
             v-if="isInProgress(session)"
             class="rounded-full px-2 py-0.5 text-xs font-medium"
-            :style="{ background: 'var(--color-brand-green)', color: 'var(--surface)' }"
+            :style="{ background: 'var(--positive)', color: 'var(--positive-contrast)' }"
           >
             Recording now
           </span>
@@ -228,7 +228,7 @@ const others = computed(() => session.value?.other_participants ?? [])
             target="_blank"
             rel="noreferrer"
             class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-            :style="{ color: 'var(--color-brand-cyan)' }"
+            :style="{ color: 'var(--action)' }"
           >
             Open the protocol ↗
           </a>

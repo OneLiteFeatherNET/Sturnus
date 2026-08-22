@@ -213,7 +213,7 @@ function onKey(event: KeyboardEvent) {
       v-if="status === 'idle' || status === 'loading'"
       type="button"
       class="w-full rounded-lg border border-dashed px-3 py-4 text-xs transition-colors hover:bg-[var(--surface-raised)] disabled:cursor-progress"
-      :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+      :style="{ borderColor: 'var(--control-border)', color: 'var(--text-muted)' }"
       :disabled="status === 'loading'"
       @click="load()"
     >
@@ -233,7 +233,7 @@ function onKey(event: KeyboardEvent) {
       <button
         type="button"
         class="mt-1 rounded-lg px-2 py-1 font-medium underline transition-colors hover:bg-[var(--surface-raised)]"
-        :style="{ color: 'var(--color-brand-cyan)' }"
+        :style="{ color: 'var(--action)' }"
         @click="retry()"
       >
         Try again
@@ -248,7 +248,7 @@ function onKey(event: KeyboardEvent) {
            something that was not in the tab order at all. -->
       <div
         class="relative cursor-pointer overflow-hidden rounded-lg focus-visible:outline focus-visible:outline-2"
-        :style="{ background: 'var(--surface-sunken)', outlineColor: 'var(--color-brand-cyan)' }"
+        :style="{ background: 'var(--surface-sunken)', outlineColor: 'var(--action)' }"
         role="slider"
         tabindex="0"
         aria-label="Position in this track"
@@ -268,7 +268,7 @@ function onKey(event: KeyboardEvent) {
         <div
           v-if="playheadPercent !== null"
           class="pointer-events-none absolute inset-y-0 w-px"
-          :style="{ left: `${playheadPercent}%`, background: 'var(--color-brand-cyan)' }"
+          :style="{ left: `${playheadPercent}%`, background: 'var(--action)' }"
         />
       </div>
 

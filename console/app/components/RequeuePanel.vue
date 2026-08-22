@@ -155,9 +155,9 @@ const progress = computed(() => (snapshot.value ? queueProgress(snapshot.value) 
 const busy = computed(() => (snapshot.value ? isQueueBusy(snapshot.value) : false))
 
 const STATUS_COLOUR: Record<string, string> = {
-  done: 'var(--color-brand-green)',
-  running: 'var(--color-brand-cyan)',
-  dead: 'var(--color-brand-red)',
+  done: 'var(--positive)',
+  running: 'var(--action)',
+  dead: 'var(--danger)',
 }
 function statusColour(status: string): string {
   return STATUS_COLOUR[status] ?? 'var(--text-muted)'
@@ -186,8 +186,8 @@ function statusColour(status: string): string {
         type="button"
         class="shrink-0 rounded-lg px-3 py-1.5 text-sm font-medium transition-opacity disabled:cursor-not-allowed disabled:opacity-50"
         :style="{
-          background: snapshot.can_requeue ? 'var(--color-brand-cyan)' : 'var(--surface-raised)',
-          color: snapshot.can_requeue ? 'var(--surface)' : 'var(--text-muted)',
+          background: snapshot.can_requeue ? 'var(--action)' : 'var(--surface-raised)',
+          color: snapshot.can_requeue ? 'var(--action-contrast)' : 'var(--text-muted)',
         }"
         :disabled="!snapshot.can_requeue || working || busy"
         @click="requeue()"
@@ -209,11 +209,11 @@ function statusColour(status: string): string {
       class="mt-3 rounded-lg p-3 text-sm"
       :style="{ background: 'var(--surface-raised)' }"
     >
-      <p :style="{ color: 'var(--color-brand-red)' }">{{ failure }}</p>
+      <p :style="{ color: 'var(--danger)' }">{{ failure }}</p>
       <button
         type="button"
         class="mt-2 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-sunken)]"
-        :style="{ color: 'var(--color-brand-cyan)' }"
+        :style="{ color: 'var(--action)' }"
         @click="retry()"
       >
         Try again
@@ -251,7 +251,7 @@ function statusColour(status: string): string {
       >
         <div
           class="h-full transition-all duration-500"
-          :style="{ width: `${progress * 100}%`, background: 'var(--color-brand-cyan)' }"
+          :style="{ width: `${progress * 100}%`, background: 'var(--action)' }"
         />
       </div>
 
@@ -278,7 +278,7 @@ function statusColour(status: string): string {
           <span
             v-if="speaker.error"
             class="w-full truncate text-xs"
-            :style="{ color: 'var(--color-brand-red)' }"
+            :style="{ color: 'var(--danger)' }"
             :title="speaker.error"
           >
             {{ speaker.error }}
