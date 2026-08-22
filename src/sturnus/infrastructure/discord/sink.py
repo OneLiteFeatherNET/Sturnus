@@ -58,6 +58,7 @@ from discord.ext import voice_recv
 from sturnus.application.ports import Clock
 from sturnus.infrastructure.discord.capture_diagnostics import CaptureDiagnostics
 from sturnus.infrastructure.discord.dave import DaveDecryptor
+from sturnus.infrastructure.discord.video_probe import VideoProbe
 from sturnus.infrastructure.telemetry import VOICE_PACKETS, record
 
 log = logging.getLogger(__name__)
@@ -66,6 +67,22 @@ log = logging.getLogger(__name__)
 #: `ResilientOpusDecoder` caps its decoders: this process stays up for
 #: hours and an SSRC is not a stable identity.
 MAX_TRACKED_UNATTRIBUTED = 256
+
+
+def _member_id(member: object) -> int | None:
+    """A member's id, or `None`; the library passes `None` for a stranger."""
+    found = getattr(member, "id", None)
+    return int(found) if isinstance(found, int) else None
+
+
+def _resolution_of(resolution: object) -> str:
+    """`WxH`, or a placeholder. Never raises: this is diagnostic text."""
+    width = getattr(resolution, "width", None)
+    height = getattr(resolution, "height", None)
+    if width is None or height is None:
+        return "?"
+    return f"{width}x{height}"
+
 
 #: How often an *unexpected* error inside `write()` is logged with its
 #: traceback. The first one always is; after that one in this many, so a
@@ -150,6 +167,7 @@ class RecordingSink(voice_recv.AudioSink):
         guild_id: int | None = None,
         diagnostics: CaptureDiagnostics | None = None,
         dave: DaveDecryptor | None = None,
+        video_probe: VideoProbe | None = None,
     ) -> None:
         # No destination: this sink is an endpoint, not a link in a
         # transformer chain, so it registers no child.
@@ -178,6 +196,11 @@ class RecordingSink(voice_recv.AudioSink):
         # `None` means "not wired yet", and a frame then passes through
         # exactly as it did before this existed.
         self._dave = dave
+        # Whether Discord sends a bot the video it announces is unknown and
+        # decides whether recording a shared screen is possible at all. The
+        # packets, if they come, arrive here as unattributable audio -- see
+        # `.video_probe`.
+        self._video_probe = video_probe
         self._unattributed: set[int] = set()
         self._sink_errors = 0
         self._cleaned_up = False
@@ -233,6 +256,15 @@ class RecordingSink(voice_recv.AudioSink):
                 decoder.clear()
             except Exception:
                 log.exception("Error releasing Opus decoders during sink cleanup")
+        probe = getattr(self, "_video_probe", None)
+        if probe is not None:
+            try:
+                # The only place the answer is complete: a stream that was
+                # announced and never delivered is only knowable once the
+                # capture is over.
+                probe.clear()
+            except Exception:
+                log.exception("Error reporting the video probe during sink cleanup")
         unattributed = getattr(self, "_unattributed", None)
         if unattributed is not None:
             unattributed.clear()
@@ -259,6 +291,17 @@ class RecordingSink(voice_recv.AudioSink):
         self, user: discord.Member | discord.User | None, data: voice_recv.VoiceData
     ) -> None:
         ssrc = data.packet.ssrc
+
+        if self._video_probe is not None and not isinstance(user, discord.Member):
+            # Before the unattributed path swallows it: a video packet has
+            # no member mapped, because the library registers only the
+            # audio SSRC (`gateway.py:93`). Counted, then handled exactly
+            # as before -- nothing is decoded and nothing is recorded.
+            payload = data.opus or b""
+            if self._video_probe.observe(ssrc, len(payload)):
+                record(VOICE_PACKETS, 1, outcome="video", guild_id=self._guild_id)
+                return
+            self._video_probe.note_unannounced()
 
         if not isinstance(user, discord.Member):
             # Either the SSRC has no member mapped yet (a speaker who was
@@ -334,6 +377,39 @@ class RecordingSink(voice_recv.AudioSink):
                 captured_at=self._clock.now(),
             )
         )
+
+    # The library's decorator carries no annotations; the method below is
+    # fully typed.
+    @voice_recv.AudioSink.listener()  # type: ignore[untyped-decorator]
+    def on_voice_member_video(self, member: object, streams: object) -> None:
+        """Records which video streams Discord says exist.
+
+        The supported hook for it: `gateway.py` dispatches this on the
+        `VIDEO` op with everything the payload carried. Pairing it with
+        what arrives on the socket is the whole measurement.
+
+        Reads defensively throughout -- this is an alpha library and a
+        listener that raised would run on the sink-event-router thread,
+        which dispatches while holding the packet router's lock.
+        """
+        if self._video_probe is None:
+            return
+        try:
+            user_id = getattr(getattr(streams, "member", None), "id", None)
+            for stream in getattr(streams, "streams", None) or []:
+                resolution = getattr(stream, "max_resolution", None)
+                self._video_probe.announce(
+                    ssrc=int(getattr(stream, "ssrc", 0) or 0),
+                    discord_user_id=user_id if user_id is not None else _member_id(member),
+                    # Discord's own label, kept verbatim: `screen` and
+                    # `video` are what the consent model has to tell apart,
+                    # and interpreting it here would bake in a guess.
+                    kind=str(getattr(stream, "type", "?")),
+                    active=bool(getattr(stream, "active", False)),
+                    resolution=_resolution_of(resolution),
+                )
+        except Exception:
+            log.debug("Could not record an announced video stream", exc_info=True)
 
     def _note_packet_shape(self, ssrc: int, data: voice_recv.VoiceData) -> None:
         """Reports how the payload was cut out of the packet around it.
