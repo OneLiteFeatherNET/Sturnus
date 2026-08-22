@@ -1304,28 +1304,68 @@ a dictionary bump per packet.
 ### 6.5 Does Discord send this bot video at all?
 
 The same switch answers a second question, and one that decides whether
-recording a shared screen is possible: `discord-ext-voice-recv` handles the
-`VIDEO` gateway op but registers **only the audio SSRC**, so a video packet
--- if one ever arrives -- is logged as an unknown SSRC and discarded as
-unattributable audio. Invisible either way.
+recording a shared screen is possible at all.
 
-With `STURNUS_CAPTURE_DIAGNOSTICS=true`, one line per capture pairs the two:
+**What the first measurement found.** With a screen share running, the bot
+received **no `VIDEO` gateway event and no video packets** -- not a stream
+that failed to arrive, but a share Discord never mentioned. The listener
+was registered, the session closed cleanly. That is upstream of every
+decoding question.
+
+**Why.** A `discord.py` voice connection never asks for video, in three
+separate places, none of them documented by Discord:
+
+| Missing | Where | Consequence |
+|---|---|---|
+| `video: true` in `IDENTIFY` | `DiscordVoiceWebSocket.identify` omits the field, which defaults to false | The connection declares itself video-incapable, so the server has no reason to describe video to it |
+| op 12 (`VIDEO`) outbound | `DiscordVoiceWebSocket.client_connect` builds this payload and is **called from nowhere** | *"You must send at least one Video payload before sending or receiving video data, or you will be disconnected with an Invalid SSRC error"* |
+| op 15 (`MEDIA_SINK_WANTS`) | `voice_recv/gateway.py` labels it `(useless)` and never sends it | This is how a receiver names the SSRCs it wants and at what layer; the SFU forwards nothing it was not asked for |
+
+`STURNUS_CAPTURE_DIAGNOSTICS=true` now sends all three
+(`sturnus/infrastructure/discord/video_subscription.py`) and reports the
+result **once a minute**, not once per capture -- the previous version only
+spoke from `cleanup()`, so whoever started a share to test it had to end
+the call to learn anything:
 
 ```
-video probe: 2 stream(s) announced, 0 delivered any packet |
+video probe: asked for video with [op12-video=sent, op15-any=sent] |
+  2 stream(s) announced, 0 delivered any packet |
   ssrc=5001/screen@1920x1080 user=... packets=0, ssrc=5002/video@1280x720 ... |
-  packets on unannounced ssrcs: 0
+  packets on unannounced ssrcs: 0 || <what that means>
 ```
 
-**Announced but nothing delivered** means Discord is not sending video to
-this bot. A client *subscribes* to the streams it wants and the server does
-not push them unasked; neither library sends that subscription and the
-behaviour for bots is undocumented. The next question would then be
-subscription, not decoding -- a different problem entirely, and worth
-knowing before anyone writes an H.264 depacketiser.
+The line ends with the conclusion spelled out, because the three outcomes
+lead to three different projects:
 
-**Packets arriving** means the rest is worth building: depacketisation,
-DAVE decryption for `MediaType.video`, and storage.
+- **Packets arriving** -- the rest is worth building: depacketisation, DAVE
+  decryption for `MediaType.video`, storage, and a **second consent role**,
+  since consent to be recorded speaking is not consent to have a screen
+  recorded.
+- **Announced but nothing delivered** -- the subscription is wrong, not the
+  decoding. Check which SSRCs op 15 named.
+- **Nothing announced** -- Discord is refusing a bot outright, *or* the
+  thing being tested was Go Live.
+
+**The Go Live caveat, which decides how to read a negative result.** "Share
+Your Screen" in a guild voice channel is Go Live, and Go Live is a
+*separate* RTC connection: a client watches one by sending main-gateway op
+20 `WATCH_STREAM` and opening a second voice websocket from the resulting
+`STREAM_SERVER_UPDATE`. Op 20 is an undocumented user-client opcode with no
+bot-API equivalent, and Sturnus does not attempt it. So **test with a
+camera as well as a screen share** -- a camera that works while a share does
+not is a completely different finding from neither working, and only the
+camera test tells them apart.
+
+**Also known:** Discord blocks bots from *sending* video (which is why
+`Discord-video-stream` requires a user token). Nothing in the protocol
+documentation conditions receiving on account type, and `self_video` is an
+outbound flag, not a receive gate -- but no working implementation of a bot
+receiving video was found either. This is an experiment, not a capability.
+
+**The switch is why this is not on in production.** Declaring video support
+changes the live voice handshake, and a handshake Discord rejects is a bot
+that cannot join a channel at all. Without the switch the connection is
+byte-for-byte the one that has been working.
 
 It reads no payload byte and records no video -- SSRCs, counts and size
 bands only.

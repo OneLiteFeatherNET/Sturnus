@@ -24,6 +24,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
+from discord.ext import voice_recv
 from discord.opus import OpusNotLoaded
 
 from sturnus.application.ports import SessionKey
@@ -38,6 +39,7 @@ from sturnus.infrastructure.discord.sink import (
     DecodeFailure,
     SpeakerStreamEnded,
 )
+from sturnus.infrastructure.discord.video_subscription import VideoCapableVoiceClient
 from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter
 from sturnus.observability.redaction import safe_exception_message
 
@@ -419,6 +421,84 @@ async def test_a_failed_connect_leaves_no_task_running_behind_it() -> None:
     assert voice._drain_task is None
     assert voice._queue is None
     assert asyncio.all_tasks() == before
+
+
+def _joinable() -> tuple[MagicMock, MagicMock]:
+    channel = MagicMock(spec=discord.VoiceChannel)
+    channel.guild = MagicMock(id=GUILD_ID)
+    # A plain `MagicMock` for the client itself: an `AsyncMock`'s children
+    # are `AsyncMock`s too, so `listen()` would hand back an un-awaited
+    # coroutine and the resulting warnings would drown the assertion.
+    channel.connect = AsyncMock(return_value=MagicMock(disconnect=AsyncMock()))
+    client = MagicMock(spec=discord.Client)
+    client.get_channel = MagicMock(return_value=channel)
+    return client, channel
+
+
+def _adapter_for(client: MagicMock, *, capture_diagnostics: bool) -> VoiceReceiveAdapter:
+    return VoiceReceiveAdapter(
+        client,
+        MagicMock(spec=RecordingService),
+        MagicMock(spec=ConfigStore, get=AsyncMock(return_value=str(ROLE_ID))),
+        FakeClock(),
+        MagicMock(spec=ConsentRepository),
+        decoder_factory=lambda: MagicMock(),
+        capture_diagnostics=capture_diagnostics,
+    )
+
+
+async def test_a_normal_recording_does_not_change_the_voice_handshake() -> None:
+    """Declaring video support is a change to the live handshake, and a
+    handshake Discord rejects is a bot that cannot join a channel at all.
+
+    That risk belongs to one deliberate measurement, not to every
+    recording -- so without the diagnostics switch the connection is
+    exactly the one that has been working.
+    """
+    client, channel = _joinable()
+
+    await _adapter_for(client, capture_diagnostics=False).join(CHANNEL_ID)
+
+    assert channel.connect.await_args.kwargs["cls"] is voice_recv.VoiceRecvClient
+
+
+async def test_the_diagnostics_switch_declares_video_during_the_handshake() -> None:
+    """`IDENTIFY` is sent once, so this is the one part of asking Discord
+    for video that cannot be added after connecting."""
+    client, channel = _joinable()
+
+    await _adapter_for(client, capture_diagnostics=True).join(CHANNEL_ID)
+
+    assert channel.connect.await_args.kwargs["cls"] is VideoCapableVoiceClient
+
+
+async def test_asking_for_video_cannot_take_the_recording_down_with_it(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`join` must still succeed when the requests fail.
+
+    Everything after `_start_listening` is diagnostic. A capture that
+    records audio correctly must never be lost because a question could
+    not be asked -- which is exactly what a raising send would do, on the
+    join path, before a single frame arrives.
+    """
+    client, channel = _joinable()
+    channel.connect.return_value._connection.ws.send_as_json = AsyncMock(
+        side_effect=RuntimeError("closed")
+    )
+    voice = _adapter_for(client, capture_diagnostics=True)
+
+    await voice.join(CHANNEL_ID)
+
+    probe = voice._video_probe
+    assert probe is not None
+    with caplog.at_level(logging.WARNING):
+        probe.report()
+    await voice.leave()
+
+    # And the failure is on the record rather than silently absent: a send
+    # that never went out must not read as Discord staying silent.
+    assert "op12-video=FAILED" in "\n".join(r.getMessage() for r in caplog.records)
 
 
 async def test_leave_stops_the_drain() -> None:

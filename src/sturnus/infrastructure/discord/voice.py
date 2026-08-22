@@ -75,6 +75,12 @@ from sturnus.infrastructure.discord.sink import (
     SpeakerStreamEnded,
 )
 from sturnus.infrastructure.discord.video_probe import VideoProbe
+from sturnus.infrastructure.discord.video_subscription import (
+    VideoCapableVoiceClient,
+    announce_video_capability,
+    request_all_video,
+    request_video_streams,
+)
 from sturnus.infrastructure.telemetry import VOICE_PACKET_ERRORS, VOICE_PACKETS, record
 from sturnus.observability.events import Event, RateLimiter, log_event, log_exception
 
@@ -157,6 +163,7 @@ class VoiceReceiveAdapter:
         self._queue: asyncio.Queue[CaptureMessage] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._guild_id: int | None = None
+        self._video_probe: VideoProbe | None = None
         self._stopping = False
         self._message_errors = RateLimiter(_MESSAGE_ERROR_LOG_EVERY)
 
@@ -191,7 +198,17 @@ class VoiceReceiveAdapter:
         # orphaned task behind whenever `connect` failed -- one that would
         # outlive the failed join and keep running against a channel
         # nobody was ever going to speak into.
-        self._voice_client = await channel.connect(cls=voice_recv.VoiceRecvClient)
+        # Under diagnostics the connection declares video support during
+        # the handshake, which is the one thing that cannot be added
+        # afterwards -- see `.video_subscription` for why that field is
+        # upstream of every other question about screen recording. Plain
+        # `VoiceRecvClient` otherwise: a handshake Discord rejects is a
+        # bot that cannot join at all, and that risk belongs to a
+        # deliberate measurement, not to every recording.
+        client_class: type[voice_recv.VoiceRecvClient] = (
+            VideoCapableVoiceClient if self._capture_diagnostics else voice_recv.VoiceRecvClient
+        )
+        self._voice_client = await channel.connect(cls=client_class)
 
         self._guild_id = channel.guild.id
         self._stopping = False
@@ -208,6 +225,9 @@ class VoiceReceiveAdapter:
             # the bot would sit in the channel recording nothing.
             await self.leave()
             raise
+        # After the sink is attached, so a stream that starts answering
+        # immediately is counted rather than missed.
+        await self._ask_for_video()
         log_event(
             log,
             logging.INFO,
@@ -242,6 +262,10 @@ class VoiceReceiveAdapter:
 
         self._queue = None
         self._loop = None
+        # The sink's `cleanup()` already reported and stopped it; dropping
+        # the reference here keeps a finished capture's probe from being
+        # written to by a late gateway event.
+        self._video_probe = None
         # The counterpart of `voice.joined`, and the reason
         # `_on_listen_stopped` does not log a clean stop: a stop we asked
         # for is reported by the side that asked. Everything else that
@@ -270,6 +294,12 @@ class VoiceReceiveAdapter:
         # decoder sees the bytes cut out of it, and the whole question is
         # whether those two agree.
         diagnostics = CaptureDiagnostics() if self._capture_diagnostics else None
+        # Owned here rather than by the sink so `join` can record what it
+        # asked Discord for on the same object that reports what arrived.
+        # The sink's `cleanup()` is what stops and drains it.
+        self._video_probe = VideoProbe() if self._capture_diagnostics else None
+        if self._video_probe is not None:
+            self._video_probe.start()
         decoder = ResilientOpusDecoder(
             factory=self._decoder_factory,
             on_decode_failure=self._on_decode_failure,
@@ -287,9 +317,61 @@ class VoiceReceiveAdapter:
             guild_id=self._guild_id,
             diagnostics=diagnostics,
             dave=DaveDecryptor(session_source_for(self._voice_client)),
-            video_probe=VideoProbe() if self._capture_diagnostics else None,
+            video_probe=self._video_probe,
         )
         self._voice_client.listen(sink, after=self._on_listen_stopped)
+
+    async def _ask_for_video(self) -> None:
+        """Asks Discord for video, and records that it asked.
+
+        Three sends, in the order the protocol requires (see
+        `.video_subscription`): the `IDENTIFY` flag already went out with
+        the handshake, then op 12 to declare SSRC ownership -- without
+        which video is refused outright -- then op 15 to say which streams
+        this connection wants.
+
+        The per-stream op 15 cannot be sent yet, because no SSRC is known
+        until the server announces one, so a listener sends it then.
+        Registered on the voice client rather than the sink: it has to run
+        on the event loop to touch the websocket, and the sink's listeners
+        run on the extension's own thread.
+
+        Every failure here is recorded and none of it raises. A capture
+        that records audio correctly must not be lost because a diagnostic
+        could not ask a question.
+        """
+        probe, client = self._video_probe, self._voice_client
+        if probe is None or client is None:
+            return
+        probe.note_request("op12-video", sent=await announce_video_capability(client))
+        probe.note_request("op15-any", sent=await request_all_video(client))
+        client.add_listener(self._on_video_announced, name="on_voice_member_video")
+
+    async def _on_video_announced(self, member: object, streams: object) -> None:
+        """Subscribes to the SSRCs Discord just named. Event loop.
+
+        Reads defensively: `voice_recv` is alpha, and an exception in a
+        listener it dispatched would be logged by the library and lose the
+        subscription silently. The probe records the outcome either way,
+        which is what makes "we asked" and "we never asked" different
+        lines in the log.
+        """
+        del member
+        probe, client = self._video_probe, self._voice_client
+        if probe is None or client is None:
+            return
+        try:
+            ssrcs = [
+                int(getattr(stream, "ssrc", 0) or 0)
+                for stream in getattr(streams, "streams", None) or []
+            ]
+            ssrcs = [ssrc for ssrc in ssrcs if ssrc]
+        except Exception:
+            log.debug("Could not read announced video SSRCs", exc_info=True)
+            return
+        if not ssrcs:
+            return
+        probe.note_request("op15-per-ssrc", sent=await request_video_streams(client, ssrcs))
 
     def _emit(self, message: CaptureMessage) -> None:
         """Hands one message to the event loop. Called from the extension's threads.
