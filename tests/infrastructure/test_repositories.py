@@ -648,7 +648,7 @@ async def test_mark_announced_does_not_stamp_a_session_that_was_requeued_meanwhi
     session_id = await repo.open_session(GUILD, CHANNEL, "meeting-raum", T0)
     await repo.close_session(session_id, T0 + timedelta(hours=1), "empty")
     await _mark_documented(factory, session_id)
-    # The re-queue, exactly as `queue_cog._apply_requeue` writes it, while
+    # The re-queue, exactly as `queue_cog.apply_requeue` writes it, while
     # the sweep is somewhere inside `announcer.post`.
     await _requeue(factory, session_id)
 

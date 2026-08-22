@@ -254,6 +254,36 @@ The list at `/recordings` deliberately shows less. Ten sessions loading
 what this page loads would pull hundreds of megabytes for somebody
 scanning for a protocol link.
 
+## 5.2 Re-queueing, for administrators
+
+`GET /api/sessions/{id}/queue` and `POST /api/sessions/{id}/queue/requeue`
+
+The rule here is **administrator of the session's guild**, not participant
+of the session — the only place in the console where those differ.
+Everywhere else the question is "was this your meeting", because playing
+your own recording back is a use of your own data. A re-queue spends
+worker time, clears transcripts, replaces a shared document and
+re-announces it: an operation on the system rather than a use of one's own
+recording. Non-administrators get 404, the same answer as "no such
+session", and the panel renders nothing rather than a disabled control
+that would confirm the endpoint exists.
+
+No decision is taken in the console. Whether a session may be re-queued is
+`sturnus.application.requeue.plan_requeue`, and the write is
+`sturnus.infrastructure.db.requeue.apply_requeue` — the same function and
+the same row lock the `/queue requeue` command uses. That module was
+extracted from `queue_cog` precisely so there would not be a second
+implementation of the write: it takes a lock in a specific order and spans
+two tables in one transaction, and every one of those decisions exists
+because getting it wrong strands a session with no document and no error
+anywhere.
+
+The progress half is not decoration. A re-queue is not instantaneous, and
+a control that reports nothing after being pressed is one people press
+twice — the second press landing while the first redo is `running`, which
+is exactly the state `plan_requeue` refuses. So the queue is polled while
+it is moving, and the poll stops when the jobs do.
+
 ### 5.1 What is deliberately not built
 
 **No transcoding.** Opus would be a tenth of the bytes, but it needs

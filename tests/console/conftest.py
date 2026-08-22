@@ -23,6 +23,9 @@ from sturnus.console.ports import (
     AdminDirectory,
     LinkDirectory,
     OAuthClient,
+    QueueControl,
+    QueueSnapshot,
+    RequeueOutcome,
     SessionReads,
     SettingsStore,
     StateStore,
@@ -356,6 +359,36 @@ class FakeConfig:
 # ---------------------------------------------------------------------------
 
 
+class FakeQueue:
+    """A transcription queue nobody administers, until a test says otherwise.
+
+    Defaults to answering `None` everywhere, which is what the real
+    control answers for "no such session or not yours" -- so a test that
+    has no interest in re-queueing gets 404s rather than a fake that
+    quietly authorises everything.
+    """
+
+    def __init__(
+        self,
+        snapshot: QueueSnapshot | None = None,
+        outcome: RequeueOutcome | None = None,
+    ) -> None:
+        self.snapshot = snapshot
+        self.outcome = outcome
+        self.requeued: list[tuple[int, int]] = []
+
+    async def status_for(self, session_id: int, *, requested_by: int) -> QueueSnapshot | None:
+        del session_id, requested_by
+        return self.snapshot
+
+    async def requeue(self, session_id: int, *, requested_by: int) -> RequeueOutcome | None:
+        # Recorded rather than merely counted: "an administrator's own id
+        # reached the write, not one from the URL" is the property the
+        # authorisation tests assert on.
+        self.requeued.append((session_id, requested_by))
+        return self.outcome
+
+
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
@@ -365,6 +398,7 @@ def build_test_api(
     reads: SessionReads | None = None,
     config: SettingsStore | None = None,
     audio: AudioDelivery | None = None,
+    queue: QueueControl | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -398,6 +432,7 @@ def build_test_api(
             keys=FakeKeys(),
             source=FakeAudioSource(),
         ),
+        queue=queue or FakeQueue(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,

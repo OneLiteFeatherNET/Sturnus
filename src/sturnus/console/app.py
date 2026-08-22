@@ -38,12 +38,15 @@ from sturnus.console.ports import (
     AdminDirectory,
     LinkDirectory,
     OAuthClient,
+    QueueControl,
     SessionReads,
     SettingsStore,
     StateStore,
 )
 from sturnus.console.routes_audio import AUDIO_DELIVERY
 from sturnus.console.routes_audio import register as register_audio
+from sturnus.console.routes_queue import QUEUE_CONTROL
+from sturnus.console.routes_queue import register as register_queue
 from sturnus.console.session import (
     ExpiredSession,
     InvalidSession,
@@ -264,6 +267,7 @@ def build_api(
     schema_ready: ReadinessCheck,
     console_origin: str,
     audio: AudioDelivery,
+    queue: QueueControl,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
 
@@ -288,6 +292,7 @@ def build_api(
     app[_SCHEMA_READY] = schema_ready
     app[_CONSOLE_ORIGIN] = console_origin
     app[AUDIO_DELIVERY] = audio
+    app[QUEUE_CONTROL] = queue
     app.add_routes(
         [
             web.get("/healthz", healthz),
@@ -300,5 +305,6 @@ def build_api(
     )
     routes_read.register(app)
     register_audio(app)
+    register_queue(app)
     routes_settings.register(app)
     return app

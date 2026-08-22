@@ -47,15 +47,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sturnus.application.requeue import RequeuePlan
 from sturnus.infrastructure.db.models import Base, Session, TranscriptionJob
 from sturnus.infrastructure.db.repositories import JobRepository, SessionRepository
+from sturnus.infrastructure.db.requeue import JobLine, SessionSummary, apply_requeue
 from sturnus.infrastructure.discord.permissions import _has_admin_access
 from sturnus.infrastructure.discord.queue_cog import (
     DISCORD_MESSAGE_LIMIT,
     NO_SUCH_SESSION,
-    JobLine,
     QueueCog,
     RequeueConfirmView,
-    SessionSummary,
-    _apply_requeue,
     render_requeue_confirmation,
     render_requeue_refusal,
     render_session,
@@ -1081,7 +1079,7 @@ async def test_confirming_disables_the_buttons(
 
 
 # ---------------------------------------------------------------------------
-# `_apply_requeue` on its own. Both of these cover a guarantee no path
+# `apply_requeue` on its own. Both of these cover a guarantee no path
 # through the cog can reach, which is exactly why they exist: a mutation
 # run showed the suite passing in full with either one removed from the
 # implementation.
@@ -1103,7 +1101,7 @@ async def test_the_write_refuses_another_guilds_session_on_its_own(
     """
     session_id = await seed(factory, [Speaker(ANNA)], guild=OTHER_GUILD)
 
-    assert await _apply_requeue(factory, GUILD, session_id) is None
+    assert await apply_requeue(factory, GUILD, session_id) is None
     assert (await read_jobs(factory, session_id))[ANNA].status == "done"
 
 
@@ -1123,7 +1121,7 @@ async def test_the_write_refuses_a_session_that_is_not_documented_on_its_own(
     """
     session_id = await seed(factory, [Speaker(ANNA)], session_status="open")
 
-    view = await _apply_requeue(factory, GUILD, session_id)
+    view = await apply_requeue(factory, GUILD, session_id)
 
     assert view is not None
     assert view.is_refused is True
@@ -1169,7 +1167,7 @@ async def test_the_write_waits_for_a_worker_holding_the_sessions_jobs(
             )
             .values(status="running")
         )
-        task = asyncio.create_task(_apply_requeue(factory, GUILD, session_id))
+        task = asyncio.create_task(apply_requeue(factory, GUILD, session_id))
         # Long enough for the task to reach the database and stop there.
         await asyncio.sleep(0.3)
         assert not task.done(), "the re-queue must wait on the lock, not race it"
@@ -1287,7 +1285,10 @@ def test_a_refusal_naming_a_whole_channel_of_erased_speakers_is_still_sendable()
 
     text = render_requeue_refusal(
         _summary(),
-        RequeuePlan(resettable_job_ids=(), erased_user_ids=erased, active_user_ids=()),
+        RequeuePlan(
+        resettable_job_ids=(),
+        resettable_user_ids=(),
+        erased_user_ids=erased, active_user_ids=()),
         names,
     )
 
@@ -1298,7 +1299,10 @@ def test_a_confirmation_for_a_session_that_was_never_documented_says_so() -> Non
     """There is no first document to orphan, so promising one would be wrong."""
     text = render_requeue_confirmation(
         _summary(status="closed", document_url=None, announced_at=None),
-        RequeuePlan(resettable_job_ids=(1,), erased_user_ids=(), active_user_ids=()),
+        RequeuePlan(
+        resettable_job_ids=(1,),
+        resettable_user_ids=(),
+        erased_user_ids=(), active_user_ids=()),
         names={},
     )
 
