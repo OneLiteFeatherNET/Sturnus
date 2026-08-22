@@ -32,7 +32,13 @@ from sturnus.console.auth import (
     NotLinked,
     UnknownState,
 )
-from sturnus.console.ports import AdminDirectory, LinkDirectory, OAuthClient, StateStore
+from sturnus.console.ports import (
+    AdminDirectory,
+    LinkDirectory,
+    OAuthClient,
+    SessionReads,
+    StateStore,
+)
 from sturnus.console.session import (
     ExpiredSession,
     InvalidSession,
@@ -246,6 +252,7 @@ def build_api(
     states: StateStore,
     links: LinkDirectory,
     admins: AdminDirectory,
+    reads: SessionReads,
     sessions: SessionCookie,
     now: Clock,
     schema_ready: ReadinessCheck,
@@ -259,10 +266,16 @@ def build_api(
     this server before waiting for them, so `/healthz` answers from the
     first moment while `/readyz` stays 503.
     """
+    # Imported here rather than at module scope: `routes_read` imports
+    # `require_session` from this module, so a top-level import in both
+    # directions is a cycle that fails on whichever is loaded first.
+    from sturnus.console import routes_read
+
     app = web.Application()
     app[_AUTH] = ConsoleAuth(oauth, states, links)
     app[_SESSIONS] = sessions
     app[_ADMINS] = admins
+    app[routes_read.READS] = reads
     app[_NOW] = now
     app[_SCHEMA_READY] = schema_ready
     app[_CONSOLE_ORIGIN] = console_origin
@@ -276,4 +289,5 @@ def build_api(
             web.get("/api/me", me),
         ]
     )
+    routes_read.register(app)
     return app
