@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.11.0...v0.12.0) (2026-08-22)
+
+
+### Features
+
+* **bot:** check the arithmetic that cuts the payload out of the packet ([#91](https://github.com/OneLiteFeatherNET/Sturnus/issues/91)) ([109fe8e](https://github.com/OneLiteFeatherNET/Sturnus/commit/109fe8ed71ae5aa6dba53ad9db65cdde97b4c145))
+
 ## [0.11.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.10.0...v0.11.0) (2026-08-22)
 
 
