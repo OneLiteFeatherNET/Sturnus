@@ -19,6 +19,14 @@
  * by `?page=`, so that a list somebody has paged into is a place with an
  * address rather than a state that the back button loses.
  *
+ * **The filter is in the URL too, and it resets the page.** A filtered
+ * list is a place: it can be bookmarked, opened in a second tab, and sent
+ * to a colleague as "the retro meetings from August" rather than as
+ * instructions. Changing the filter drops `?page=`, because page four of
+ * the old list names nothing in the new one -- and landing on an empty
+ * page after a search reads as "nothing matched" when it means "you are
+ * still on page four".
+ *
  * **The rows stay on screen while the next page loads.** Replacing them
  * with a loading box collapses the document from a couple of thousand
  * pixels to seventy, throws away the scroll position and moves whatever
@@ -26,7 +34,21 @@
  * milliseconds. `aria-busy` says what is happening for a reader who
  * cannot see the list dim.
  */
-import { offsetForPage, PAGE_SIZE, isPastTheEnd, pageCount, pageFromQuery, pageSummary } from '~/utils/paging'
+import {
+  isPastTheEnd,
+  offsetForPage,
+  PAGE_SIZE,
+  pageCount,
+  pageFromQuery,
+  pageSummary,
+} from '~/utils/paging'
+import {
+  filteredSessionsPath,
+  filtersFromQuery,
+  filtersToRouteQuery,
+  hasActiveFilters,
+  type RecordingFilters,
+} from '~/utils/recordingFilters'
 import type { RecordedSession, SessionsResponse } from '~/utils/recordings'
 
 useHead({ title: 'Recordings' })
@@ -34,20 +56,33 @@ useHead({ title: 'Recordings' })
 const route = useRoute()
 const api = useApi()
 
+const router = useRouter()
+
 const page = computed(() => pageFromQuery(route.query.page))
+const filters = computed(() => filtersFromQuery(route.query))
+const filtered = computed(() => hasActiveFilters(filters.value))
 
 const { data, status, error, refresh } = await useAsyncData(
   'recordings',
   () =>
     api<SessionsResponse>(
-      `/sessions?limit=${PAGE_SIZE}&offset=${offsetForPage(page.value, PAGE_SIZE)}`,
+      filteredSessionsPath(filters.value, PAGE_SIZE, offsetForPage(page.value, PAGE_SIZE)),
     ),
-  // One key for the list rather than one per page: the payload from the
-  // server render is for whichever page was rendered, and a key carrying
-  // the page number would make every other page a cache miss that the
-  // hydration payload cannot serve anyway.
-  { watch: [page] },
+  // One key for the list rather than one per page or per filter: the
+  // payload from the server render is for whichever list was rendered,
+  // and a key carrying the query would make every other combination a
+  // cache miss that the hydration payload cannot serve anyway.
+  { watch: [page, filters] },
 )
+
+/** Applying a filter is a navigation, so that the address bar and the
+ *  list always describe the same thing. `page` is dropped rather than
+ *  kept: page four of the old list names nothing in the new one, and
+ *  landing on an empty page after a search reads as "nothing matched"
+ *  when it means "you are still on page four". */
+function apply(next: RecordingFilters) {
+  router.push({ path: route.path, query: filtersToRouteQuery(next) })
+}
 
 const sessions = computed<RecordedSession[]>(() => data.value?.sessions ?? [])
 const total = computed(() => data.value?.total ?? 0)
@@ -74,7 +109,7 @@ function toggle(id: string) {
 // the player is about to be replaced by a different meeting's. Clearing
 // it here rather than letting the `v-if` do it silently keeps the state
 // and the screen agreeing.
-watch(page, () => {
+watch([page, filters], () => {
   openId.value = null
 })
 
@@ -111,6 +146,8 @@ onMounted(() => {
         when a protocol reads wrong, this is where the answer is.
       </p>
     </header>
+
+    <RecordingsFilterBar :filters="filters" :total="total" @apply="apply" />
 
     <p
       v-if="loadingFirst"
@@ -152,12 +189,36 @@ onMounted(() => {
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
         You have {{ total }} recordings, and this page is past the end of them.
       </p>
+      <!-- Keeps the filter and drops only the page: somebody who paged
+           past the end of a search wants the first page of that search,
+           not the first page of everything. -->
+      <NuxtLink
+        :to="{ path: '/recordings', query: filtersToRouteQuery(filters) }"
+        class="mt-3 inline-block rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+        :style="{ color: 'var(--color-brand-cyan)' }"
+      >
+        Back to the first page
+      </NuxtLink>
+    </div>
+
+    <!-- Two different sentences, because they mean different things to
+         somebody who was recorded yesterday. A filtered list that says
+         "no recordings yet" tells them their meetings are gone. -->
+    <div
+      v-else-if="sessions.length === 0 && filtered"
+      class="rounded-2xl border p-6"
+      :style="{ borderColor: 'var(--border)' }"
+    >
+      <p class="text-sm font-medium">Nothing matched what you asked for.</p>
+      <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+        Your recordings are all still there — this search just does not describe any of them.
+      </p>
       <NuxtLink
         to="/recordings"
         class="mt-3 inline-block rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
         :style="{ color: 'var(--color-brand-cyan)' }"
       >
-        Back to the first page
+        Show all recordings
       </NuxtLink>
     </div>
 

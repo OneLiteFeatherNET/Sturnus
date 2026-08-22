@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
 
+from sturnus.console.filters import SessionFilter
 from sturnus.console.statistics import AttendedSession, SessionPage, TagUse
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
@@ -104,8 +105,17 @@ class SessionReads(Protocol):
     #: because a caller that forgot to pass a window would silently get
     #: the whole history -- and the endpoint that serialises a whole
     #: history is the one this method exists to stop existing.
+    #: `matching` narrows inside the statement rather than afterwards,
+    #: which is why it is a parameter here and not something a handler
+    #: does to the answer: a filter applied to results is a filter that
+    #: has already fetched what it is about to discard.
     async def sessions_page(
-        self, discord_user_id: int, *, limit: int, offset: int
+        self,
+        discord_user_id: int,
+        *,
+        limit: int,
+        offset: int,
+        matching: SessionFilter,
     ) -> SessionPage: ...
 
     #: `None` for a session that does not exist *and* for one this person

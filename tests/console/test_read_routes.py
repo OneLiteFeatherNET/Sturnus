@@ -20,6 +20,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
+from sturnus.console.filters import NO_FILTER
 from sturnus.console.paging import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.console.statistics import AttendedSession, Participant, Track
@@ -505,3 +506,123 @@ async def test_the_dashboard_still_counts_a_whole_history(
 
     assert body["sessions_attended"] == 30
     assert reads.windows == []
+
+
+# ---------------------------------------------------------------------------
+# Narrowing the list from the query string
+# ---------------------------------------------------------------------------
+
+
+async def test_a_list_with_no_query_string_narrows_nothing(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    reads = FakeReads(sessions=(attended(1),))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions")
+
+    assert reads.filters == [NO_FILTER]
+
+
+async def test_a_search_reaches_the_query_rather_than_the_handler(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The narrowing belongs in the statement. A handler that filtered the
+    answer would have fetched a whole history to show twelve rows of it,
+    which is the thing this endpoint was changed to stop doing."""
+    reads = FakeReads(sessions=(attended(1),))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions?q=weekly%20retro")
+
+    assert reads.filters[0].text == "weekly retro"
+
+
+async def test_every_tag_in_the_query_string_is_read(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """A set of chips is written `?tag=retro&tag=kunde`, and reading only
+    the first would answer a narrower question than the screen asked."""
+    reads = FakeReads(sessions=(attended(1),))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions?tag=retro&tag=Kunde")
+
+    assert reads.filters[0].tags == ("retro", "kunde")
+
+
+async def test_a_date_range_reaches_the_query(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    reads = FakeReads(sessions=(attended(1),))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions?from=2026-08-01&to=2026-08-21")
+
+    assert (str(reads.filters[0].since), str(reads.filters[0].until)) == (
+        "2026-08-01",
+        "2026-08-21",
+    )
+
+
+async def test_asking_for_recordings_without_a_protocol_reaches_the_query(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    reads = FakeReads(sessions=(attended(1),))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions?protocol=without")
+
+    assert reads.filters[0].protocol is False
+
+
+async def test_a_filter_and_a_page_are_read_from_the_same_request(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    reads = FakeReads(sessions=tuple(attended(index) for index in range(1, 6)))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions?q=retro&limit=2&offset=2")
+
+    assert (reads.windows, reads.filters[0].text) == ([(2, 2)], "retro")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "from=yesterday",
+        "to=2026-13-01",
+        "from=2026-08-21&to=2026-08-01",
+        "protocol=maybe",
+        "tag=",
+    ],
+)
+async def test_a_filter_that_cannot_be_applied_is_refused(
+    aiohttp_client: AiohttpClientFactory, query: str
+) -> None:
+    """Answered with an empty list it would be indistinguishable from a
+    correct query for a quiet fortnight."""
+    client = await signed_in(aiohttp_client)
+    assert (await client.get(f"/api/sessions?{query}")).status == 400
+
+
+async def test_a_refused_filter_never_echoes_what_was_asked_for(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    client = await signed_in(aiohttp_client)
+
+    response = await client.get("/api/sessions?from=%3Cscript%3Ealert(1)%3C/script%3E")
+
+    assert response.status == 400
+    assert "script" not in (await response.text())
+
+
+async def test_a_refused_filter_reads_nothing(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    reads = FakeReads(sessions=(attended(1),))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions?protocol=maybe")
+
+    assert reads.filters == []

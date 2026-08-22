@@ -17,6 +17,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from sturnus.console.filters import session_filter
 from sturnus.console.queries import ConsoleQueries
 from sturnus.infrastructure.db.models import (
     Base,
@@ -585,3 +586,235 @@ async def test_a_page_carries_the_participants_and_tracks_of_its_own_rows(
 
     assert [session.id for session in page.sessions] == [recent]
     assert len(page.sessions[0].tracks) == 1
+
+
+# ---------------------------------------------------------------------------
+# Narrowing a history, in the statement rather than afterwards
+# ---------------------------------------------------------------------------
+
+
+async def matching(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    who: int = ANNA,
+    text: str | None = None,
+    tags: list[str] | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    protocol: str | None = None,
+) -> list[int]:
+    """The ids a filter selects, newest first."""
+    page = await ConsoleQueries(factory).sessions_page(
+        who,
+        limit=100,
+        offset=0,
+        matching=session_filter(
+            text=text, tags=tags or [], since=since, until=until, protocol=protocol
+        ),
+    )
+    return [session.id for session in page.sessions]
+
+
+async def test_a_search_finds_a_channel_by_part_of_its_name(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wanted = await a_session(factory, channel_name="weekly retro")
+    await a_session(factory, channel_name="standup")
+    assert await matching(factory, text="retro") == [wanted]
+
+
+async def test_a_search_ignores_the_case_a_channel_was_named_in(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Nobody types a channel name the way it was written."""
+    wanted = await a_session(factory, channel_name="Weekly Retro")
+    assert await matching(factory, text="retro") == [wanted]
+
+
+async def test_a_search_finds_a_meeting_by_who_was_in_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A name is already in the response this same person gets for these
+    sessions, so searching it narrows what they can see rather than
+    widening it."""
+    wanted = await a_session(factory, people={ANNA: "anna", BEN: "bernd"})
+    await a_session(factory, people={ANNA: "anna", CARL: "carla"})
+    assert await matching(factory, text="bern") == [wanted]
+
+
+async def test_a_search_finds_a_meeting_by_your_own_label_for_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wanted = await a_session(factory)
+    await a_session(factory)
+    await a_tag(factory, wanted, ANNA, "kundengespräch")
+    assert await matching(factory, text="kunden") == [wanted]
+
+
+async def test_a_search_does_not_find_a_meeting_by_somebody_elses_label(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Ben's word for a meeting is not Anna's to search by, for the same
+    reason it is not hers to read."""
+    ours = await a_session(factory, people={ANNA: "anna", BEN: "ben"})
+    await a_tag(factory, ours, BEN, "zeitverschwendung")
+    assert await matching(factory, text="zeit") == []
+
+
+async def test_a_search_never_reaches_a_session_you_were_not_in(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The scope survives the filter. A search is a narrowing of what
+    somebody may already see, never a way to reach past it."""
+    await a_session(factory, channel_name="weekly retro", people={BEN: "ben"})
+    assert await matching(factory, text="retro") == []
+
+
+async def test_a_percent_sign_in_a_search_is_a_percent_sign(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Honoured as a wildcard it would match every recording there is."""
+    await a_session(factory, channel_name="standup")
+    wanted = await a_session(factory, channel_name="100% done")
+    assert await matching(factory, text="100%") == [wanted]
+
+
+async def test_an_underscore_in_a_search_is_an_underscore(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await a_session(factory, channel_name="axb")
+    wanted = await a_session(factory, channel_name="a_b")
+    assert await matching(factory, text="a_b") == [wanted]
+
+
+async def test_a_channel_that_was_never_named_does_not_match_a_search(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`channel_name` is null for sessions from before the column. A null
+    matches no pattern, which is right: the recording has no name to have
+    been searched for."""
+    await a_session(factory, channel_name=None)
+    assert await matching(factory, text="retro") == []
+
+
+async def test_a_tag_filter_selects_only_the_meetings_carrying_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wanted = await a_session(factory)
+    await a_session(factory)
+    await a_tag(factory, wanted, ANNA, "retro")
+    assert await matching(factory, tags=["retro"]) == [wanted]
+
+
+async def test_two_tags_select_the_meetings_carrying_both(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A second chip narrows. Selecting "retro" and "kunde" and getting
+    more rows than "retro" alone is the opposite of what pressing it
+    looks like."""
+    both = await a_session(factory)
+    only_one = await a_session(factory)
+    await a_tag(factory, both, ANNA, "retro")
+    await a_tag(factory, both, ANNA, "kunde")
+    await a_tag(factory, only_one, ANNA, "retro")
+    assert await matching(factory, tags=["retro", "kunde"]) == [both]
+
+
+async def test_a_tag_filter_never_matches_somebody_elses_label(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ours = await a_session(factory, people={ANNA: "anna", BEN: "ben"})
+    await a_tag(factory, ours, BEN, "retro")
+    assert await matching(factory, tags=["retro"]) == []
+
+
+async def test_a_range_keeps_the_whole_of_the_day_it_ends_on(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Somebody who picks "to 21 August" means the whole of the 21st, and
+    a bound at midnight silently drops the day they named."""
+    late = await a_session(factory, started_at=datetime(2026, 8, 21, 23, 30, tzinfo=UTC))
+    assert await matching(factory, since="2026-08-21", until="2026-08-21") == [late]
+
+
+async def test_a_range_excludes_what_started_outside_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await a_session(factory, started_at=datetime(2026, 8, 20, 23, 59, tzinfo=UTC))
+    inside = await a_session(factory, started_at=datetime(2026, 8, 21, 9, 0, tzinfo=UTC))
+    await a_session(factory, started_at=datetime(2026, 8, 22, 0, 1, tzinfo=UTC))
+    assert await matching(factory, since="2026-08-21", until="2026-08-21") == [inside]
+
+
+async def test_asking_for_recordings_with_a_protocol(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    documented = await a_session(factory, document_url="https://outline.example/d/1")
+    await a_session(factory)
+    assert await matching(factory, protocol="with") == [documented]
+
+
+async def test_asking_for_recordings_without_one(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """How you find the meeting whose document never got written."""
+    await a_session(factory, document_url="https://outline.example/d/1")
+    undocumented = await a_session(factory)
+    assert await matching(factory, protocol="without") == [undocumented]
+
+
+async def test_filters_combine_by_narrowing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wanted = await a_session(
+        factory,
+        channel_name="weekly retro",
+        started_at=datetime(2026, 8, 21, 9, 0, tzinfo=UTC),
+        document_url="https://outline.example/d/1",
+    )
+    await a_session(
+        factory, channel_name="weekly retro", started_at=datetime(2026, 8, 21, 9, 0, tzinfo=UTC)
+    )
+    await a_session(
+        factory,
+        channel_name="standup",
+        started_at=datetime(2026, 8, 21, 9, 0, tzinfo=UTC),
+        document_url="https://outline.example/d/2",
+    )
+    found = await matching(
+        factory, text="retro", since="2026-08-21", until="2026-08-21", protocol="with"
+    )
+    assert found == [wanted]
+
+
+async def test_the_total_counts_what_the_filter_matched_and_not_the_history(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A total counted under a different filter than the rows is a list
+    saying "1-20 of 47" over twelve results."""
+    await a_session(factory, channel_name="weekly retro")
+    await a_session(factory, channel_name="standup")
+    page = await ConsoleQueries(factory).sessions_page(
+        ANNA,
+        limit=100,
+        offset=0,
+        matching=session_filter(text="retro", tags=[], since=None, until=None, protocol=None),
+    )
+    assert page.total == 1
+
+
+async def test_a_filtered_list_is_still_paged(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    for index in range(3):
+        await a_session(
+            factory, channel_name="weekly retro", started_at=T0 + timedelta(hours=index)
+        )
+    await a_session(factory, channel_name="standup")
+    page = await ConsoleQueries(factory).sessions_page(
+        ANNA,
+        limit=2,
+        offset=0,
+        matching=session_filter(text="retro", tags=[], since=None, until=None, protocol=None),
+    )
+    assert (len(page.sessions), page.total) == (2, 3)
