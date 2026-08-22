@@ -491,3 +491,97 @@ async def test_a_label_on_a_meeting_you_are_no_longer_in_is_not_counted(
     theirs = await a_session(factory, people={BEN: "ben"})
     await a_tag(factory, theirs, ANNA, "retro")
     assert await ConsoleQueries(factory).tags_of(ANNA) == ()
+
+
+# ---------------------------------------------------------------------------
+# One page of a history, and how long the history is
+# ---------------------------------------------------------------------------
+
+
+async def a_history(factory: async_sessionmaker[AsyncSession], length: int) -> list[int]:
+    """`length` sessions Anna was in, an hour apart, oldest first."""
+    return [
+        await a_session(factory, started_at=T0 + timedelta(hours=index)) for index in range(length)
+    ]
+
+
+async def test_a_page_holds_only_what_was_asked_for(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await a_history(factory, 5)
+    page = await ConsoleQueries(factory).sessions_page(ANNA, limit=2, offset=0)
+    assert len(page.sessions) == 2
+
+
+async def test_a_page_says_how_many_there_are_in_all(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The number the list needs to say "1-2 of 5". Without it a reader
+    has to page to the end to find out how much they are not seeing."""
+    await a_history(factory, 5)
+    page = await ConsoleQueries(factory).sessions_page(ANNA, limit=2, offset=0)
+    assert page.total == 5
+
+
+async def test_the_pages_of_a_history_do_not_overlap_or_skip(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two adjacent windows must together be exactly the whole history.
+
+    This is what the tie-break in the ordering buys: without ordering by
+    id as well as by time, two sessions that opened in the same instant
+    are free to swap, and the same row can land on both pages while
+    another lands on neither.
+    """
+    await a_history(factory, 5)
+    queries = ConsoleQueries(factory)
+    first = await queries.sessions_page(ANNA, limit=3, offset=0)
+    second = await queries.sessions_page(ANNA, limit=3, offset=3)
+    seen = [session.id for session in (*first.sessions, *second.sessions)]
+    assert len(seen) == len(set(seen)) == 5
+
+
+async def test_a_page_is_still_newest_first(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = await a_history(factory, 3)
+    page = await ConsoleQueries(factory).sessions_page(ANNA, limit=3, offset=0)
+    assert [session.id for session in page.sessions] == list(reversed(sessions))
+
+
+async def test_a_window_past_the_end_is_empty_and_still_counts(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """What a bookmark to page five looks like after a retention sweep.
+    The count is what lets the console say so rather than claim this
+    person has never been recorded."""
+    await a_history(factory, 3)
+    page = await ConsoleQueries(factory).sessions_page(ANNA, limit=10, offset=50)
+    assert (page.sessions, page.total) == ((), 3)
+
+
+async def test_the_count_is_of_your_own_meetings_and_nobody_elses(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A count is a smaller disclosure than a list and is not therefore a
+    free one: "how many meetings are there" asked without a scope answers
+    a question about everybody."""
+    await a_session(factory, people={ANNA: "anna"})
+    await a_session(factory, people={BEN: "ben"})
+    assert (await ConsoleQueries(factory).sessions_page(ANNA, limit=10, offset=0)).total == 1
+
+
+async def test_a_page_carries_the_participants_and_tracks_of_its_own_rows(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The narrowing has to reach the other three statements too, or a
+    page of twenty fetches a whole history's tracks to throw most away."""
+    old = await a_session(factory, started_at=T0, people={ANNA: "anna", BEN: "ben"})
+    await a_track(factory, old, ANNA)
+    recent = await a_session(factory, started_at=T0 + timedelta(hours=1))
+    await a_track(factory, recent, ANNA)
+
+    page = await ConsoleQueries(factory).sessions_page(ANNA, limit=1, offset=0)
+
+    assert [session.id for session in page.sessions] == [recent]
+    assert len(page.sessions[0].tracks) == 1

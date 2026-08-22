@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Protocol
 
-from sturnus.console.statistics import AttendedSession, TagUse
+from sturnus.console.statistics import AttendedSession, SessionPage, TagUse
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 
@@ -94,7 +94,19 @@ class SessionReads(Protocol):
     filter somebody can forget.
     """
 
+    #: Everything this person was in. Unpaged, and its two callers need
+    #: it that way: the dashboard's figures are over a whole history, and
+    #: the calendar draws a whole year.
     async def sessions_for(self, discord_user_id: int) -> Sequence[AttendedSession]: ...
+
+    #: One window of the same list, with how many there are in all. A
+    #: separate method rather than optional arguments on the one above,
+    #: because a caller that forgot to pass a window would silently get
+    #: the whole history -- and the endpoint that serialises a whole
+    #: history is the one this method exists to stop existing.
+    async def sessions_page(
+        self, discord_user_id: int, *, limit: int, offset: int
+    ) -> SessionPage: ...
 
     #: `None` for a session that does not exist *and* for one this person
     #: was not in. The handler answers 404 to both, deliberately.

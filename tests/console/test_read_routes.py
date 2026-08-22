@@ -20,6 +20,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
+from sturnus.console.paging import DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE
 from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.console.statistics import AttendedSession, Participant, Track
 from tests.console.conftest import (
@@ -389,3 +390,118 @@ async def test_a_refusal_never_repeats_what_was_asked_for(
     response = await client.get("/api/calendar?year=<script>alert(1)</script>")
     assert response.status == 400
     assert "script" not in await response.text()
+
+
+# ---------------------------------------------------------------------------
+# The recordings list is a page of a history, not the whole of one
+# ---------------------------------------------------------------------------
+
+
+async def test_the_list_serves_the_first_page_when_none_is_asked_for(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """A plain link to the list has to mean something, and the first page
+    is what it means."""
+    reads = FakeReads(sessions=tuple(attended(index) for index in range(1, 4)))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions")
+
+    assert reads.windows == [(DEFAULT_PAGE_SIZE, 0)]
+
+
+async def test_the_list_serves_the_window_the_query_string_names(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    reads = FakeReads(sessions=tuple(attended(index) for index in range(1, 6)))
+    client = await signed_in(aiohttp_client, reads)
+
+    body = await (await client.get("/api/sessions?limit=2&offset=2")).json()
+
+    assert reads.windows == [(2, 2)]
+    assert [session["id"] for session in body["sessions"]] == ["3", "4"]
+
+
+async def test_the_list_says_how_many_recordings_there_are_in_all(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """A page that cannot say how much it is not showing is a page people
+    scroll to the bottom of to find out."""
+    reads = FakeReads(sessions=tuple(attended(index) for index in range(1, 6)))
+    client = await signed_in(aiohttp_client, reads)
+
+    body = await (await client.get("/api/sessions?limit=2")).json()
+
+    assert body["total"] == 5
+
+
+async def test_the_list_names_the_window_it_answered_with(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """A slow response arriving after a second click would otherwise
+    render the wrong page under the right page number."""
+    client = await signed_in(aiohttp_client, FakeReads(sessions=(attended(1),)))
+    body = await (await client.get("/api/sessions?limit=3&offset=0")).json()
+    assert (body["limit"], body["offset"]) == (3, 0)
+
+
+async def test_a_window_past_the_end_is_an_empty_page_and_not_a_refusal(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    client = await signed_in(aiohttp_client, FakeReads(sessions=(attended(1),)))
+
+    response = await client.get("/api/sessions?offset=500")
+
+    assert response.status == 200
+    body = await response.json()
+    assert (body["sessions"], body["total"]) == ([], 1)
+
+
+@pytest.mark.parametrize(
+    "query",
+    ["limit=0", "limit=-1", f"limit={MAX_PAGE_SIZE + 1}", "limit=lots", "offset=-1", "offset=x"],
+)
+async def test_a_window_that_cannot_be_served_is_refused(
+    aiohttp_client: AiohttpClientFactory, query: str
+) -> None:
+    client = await signed_in(aiohttp_client)
+    assert (await client.get(f"/api/sessions?{query}")).status == 400
+
+
+async def test_a_refused_window_never_echoes_what_was_asked_for(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    client = await signed_in(aiohttp_client)
+
+    response = await client.get("/api/sessions?limit=%3Cscript%3Ealert(1)%3C/script%3E")
+
+    assert response.status == 400
+    assert "script" not in (await response.text())
+
+
+async def test_a_refused_window_reads_nothing(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The refusal happens before the query, so a malformed link costs a
+    parse and not a database round trip."""
+    reads = FakeReads(sessions=(attended(1),))
+    client = await signed_in(aiohttp_client, reads)
+
+    await client.get("/api/sessions?limit=0")
+
+    assert reads.windows == []
+
+
+async def test_the_dashboard_still_counts_a_whole_history(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Its figures are over everything somebody ever did. A dashboard
+    whose totals changed when you turned a page on another screen would
+    be answering a different question every time."""
+    reads = FakeReads(sessions=tuple(attended(index) for index in range(1, 31)))
+    client = await signed_in(aiohttp_client, reads)
+
+    body = await (await client.get("/api/dashboard")).json()
+
+    assert body["sessions_attended"] == 30
+    assert reads.windows == []
