@@ -24,7 +24,6 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 from moto import mock_aws
 
-from sturnus.console.app import build_api
 from sturnus.console.audio import WAV_HEADER_BYTES, AudioDelivery, wav_header
 from sturnus.console.ports import (
     EncryptedAudioSource,
@@ -51,6 +50,7 @@ from tests.console.conftest import (
     FakeOAuth,
     FakeStates,
     FakeTracks,
+    build_test_api,
     now_at,
     sealed,
 )
@@ -82,15 +82,14 @@ def build(
     source: EncryptedAudioSource,
     keys: KeyUnwrapper | None = None,
 ) -> web.Application:
-    return build_api(
+    return build_test_api(
         oauth=FakeOAuth(),
         states=FakeStates(),
         links=FakeLinks(),
         admins=FakeAdmins(),
         sessions=SessionCookie(SECRET, timedelta(hours=12)),
         now=now_at(),
-        schema_ready=lambda: True,
-        console_origin="https://sturnus.example",
+        schema_ready=True,
         audio=AudioDelivery(tracks=tracks, source=source, keys=keys or FakeKeys()),
     )
 

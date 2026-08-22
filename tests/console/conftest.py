@@ -9,15 +9,19 @@ need on pytest-asyncio's loop instead.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
-from datetime import UTC, datetime
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from sturnus.console.app import build_api
+from sturnus.console.audio import AudioDelivery
 from sturnus.console.ports import Track
+from sturnus.console.session import SessionCookie
+from sturnus.console.statistics import AttendedSession
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
 
@@ -106,6 +110,55 @@ class FakeAdmins:
 
 def now_at(moment: datetime = T0) -> Callable[[], datetime]:
     return lambda: moment
+
+
+class FakeReads:
+    """The console's reads, in memory.
+
+    Note what this does *not* do: it does not scope. Scoping is a property
+    of the SQL and is tested against the real database in
+    `tests/console/test_queries.py` -- a double that filtered in Python
+    would only ever prove that the double filters. What the route tests
+    use it for is the other half: that each handler asks for the
+    signed-in user and nobody else, and what it does with the answer.
+    """
+
+    def __init__(
+        self,
+        sessions: Sequence[AttendedSession] = (),
+        transcripts: Sequence[str] = (),
+    ) -> None:
+        self.sessions = tuple(sessions)
+        self.transcripts = tuple(transcripts)
+        #: Every Discord id this was asked about, in order. The route
+        #: tests assert on it, because "the handler passed the session's
+        #: own user id through" is the thing that cannot be checked from
+        #: the response body.
+        self.asked_for: list[int] = []
+        self.years: list[int] = []
+        self.days: list[date] = []
+
+    async def sessions_for(self, discord_user_id: int) -> Sequence[AttendedSession]:
+        self.asked_for.append(discord_user_id)
+        return self.sessions
+
+    async def session_for(self, discord_user_id: int, session_id: int) -> AttendedSession | None:
+        self.asked_for.append(discord_user_id)
+        return next((s for s in self.sessions if s.id == session_id), None)
+
+    async def sessions_in_year(self, discord_user_id: int, year: int) -> Sequence[AttendedSession]:
+        self.asked_for.append(discord_user_id)
+        self.years.append(year)
+        return self.sessions
+
+    async def sessions_on_day(self, discord_user_id: int, day: date) -> Sequence[AttendedSession]:
+        self.asked_for.append(discord_user_id)
+        self.days.append(day)
+        return self.sessions
+
+    async def transcripts_of(self, discord_user_id: int) -> Sequence[str]:
+        self.asked_for.append(discord_user_id)
+        return self.transcripts
 
 
 # ---------------------------------------------------------------------------
@@ -219,3 +272,49 @@ class FakeTracks:
 
 async def collect(pieces: AsyncIterator[bytes]) -> bytes:
     return b"".join([piece async for piece in pieces])
+
+
+# ---------------------------------------------------------------------------
+# The application under test
+# ---------------------------------------------------------------------------
+
+
+def build_test_api(
+    *,
+    oauth: FakeOAuth | None = None,
+    states: FakeStates | None = None,
+    links: FakeLinks | None = None,
+    admins: FakeAdmins | None = None,
+    reads: FakeReads | None = None,
+    audio: AudioDelivery | None = None,
+    sessions: SessionCookie | None = None,
+    now: Callable[[], datetime] | None = None,
+    schema_ready: bool = True,
+) -> web.Application:
+    """Builds the console API with every collaborator defaulted.
+
+    One factory rather than one per test module. Three modules each
+    constructing the application themselves meant that adding a
+    collaborator broke the two files that had no interest in it -- which is
+    precisely what happened when the audio and read changes met. Here a new
+    collaborator is one default in one place.
+
+    Every argument is an override, so a test names only what it is about.
+    """
+    return build_api(
+        oauth=oauth or FakeOAuth(),
+        states=states or FakeStates(),
+        links=links or FakeLinks(),
+        admins=admins or FakeAdmins(),
+        reads=reads or FakeReads(),
+        audio=audio
+        or AudioDelivery(
+            tracks=FakeTracks(),
+            keys=FakeKeys(),
+            source=FakeAudioSource(),
+        ),
+        sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
+        now=now or now_at(),
+        schema_ready=lambda: schema_ready,
+        console_origin="https://sturnus.example",
+    )

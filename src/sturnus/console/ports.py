@@ -15,11 +15,12 @@ invitation for the next handler to reach for something it should not have.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from typing import Protocol
 
+from sturnus.console.statistics import AttendedSession
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 
@@ -58,6 +59,40 @@ class AdminDirectory(Protocol):
     """Whether somebody administers any guild the bot serves."""
 
     async def is_admin_anywhere(self, discord_user_id: int) -> bool: ...
+
+
+class SessionReads(Protocol):
+    """Everything the console reads, already narrowed to one Discord user.
+
+    Every method takes `discord_user_id` first, and that is the whole
+    point of the shape: there is no method here that can be called
+    without naming whose data is being asked for, so a handler cannot
+    accidentally ask a wider question than it is entitled to. The
+    narrowing is done by the statement itself in
+    `sturnus.console.queries` -- not by a filter afterwards, which is a
+    filter somebody can forget.
+    """
+
+    async def sessions_for(self, discord_user_id: int) -> Sequence[AttendedSession]: ...
+
+    #: `None` for a session that does not exist *and* for one this person
+    #: was not in. The handler answers 404 to both, deliberately.
+    async def session_for(
+        self, discord_user_id: int, session_id: int
+    ) -> AttendedSession | None: ...
+
+    async def sessions_in_year(
+        self, discord_user_id: int, year: int
+    ) -> Sequence[AttendedSession]: ...
+
+    async def sessions_on_day(
+        self, discord_user_id: int, day: date
+    ) -> Sequence[AttendedSession]: ...
+
+    #: This person's own transcripts, encoded as the column stores them.
+    #: Their own and never the session's: the dashboard's word count says
+    #: how much *they* said, and the transcript is the protected content.
+    async def transcripts_of(self, discord_user_id: int) -> Sequence[str]: ...
 
 
 @dataclass(frozen=True)
