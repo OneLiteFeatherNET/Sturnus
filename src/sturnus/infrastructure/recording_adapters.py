@@ -31,9 +31,18 @@ class FileAudioWriter:
     def __init__(self, path: Path, epoch: datetime) -> None:
         self.path = path
         self._writer = SpeakerWriter(path, epoch)
+        # The previous frame, kept so the resampling filter has signal on
+        # both sides of what it is producing. One writer exists per
+        # speaker, which is exactly the scope this history belongs to:
+        # two speakers share no filter state, and neither should they.
+        self._history = b""
 
     def write(self, at: datetime, pcm: bytes) -> None:
-        self._writer.write(at, to_mono_16k(pcm))
+        self._writer.write(at, to_mono_16k(pcm, self._history))
+        # Kept whatever the frame was: a silent frame is still the signal
+        # the next frame's filter has to start from, and dropping it would
+        # put a boundary artefact after every pause.
+        self._history = pcm
 
     def close(self) -> None:
         self._writer.close()
