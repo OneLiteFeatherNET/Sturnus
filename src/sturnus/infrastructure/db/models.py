@@ -65,6 +65,31 @@ class OAuthState(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
+class ConsoleState(Base):
+    """A single-use OAuth state for a console sign-in.
+
+    A table of its own rather than a row in `oauth_state`, for a reason
+    that is about identity rather than tidiness: `/link` knows who is
+    linking before the browser ever leaves -- a slash command was run by
+    somebody -- so its state carries a `discord_user_id`. A console
+    sign-in does not. Who this is only becomes known when the provider
+    answers, which is after the round trip.
+
+    Squeezing that into `oauth_state` would have meant either a nullable
+    owner or a placeholder id, and both make "a pending account link" and
+    "a pending console sign-in" the same row shape. The link callback's
+    consumer does not filter by provider, so it would then consume a
+    console state and mint an account link for a user id that does not
+    exist.
+    """
+
+    __tablename__ = "console_state"
+
+    state: Mapped[str] = mapped_column(Text, primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class Session(Base):
     __tablename__ = "session"
 
