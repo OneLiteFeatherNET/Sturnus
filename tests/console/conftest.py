@@ -29,6 +29,7 @@ from sturnus.console.ports import (
     QueueControl,
     QueueSnapshot,
     RequeueOutcome,
+    RevocationOutcome,
     SessionReads,
     SettingsStore,
     StateStore,
