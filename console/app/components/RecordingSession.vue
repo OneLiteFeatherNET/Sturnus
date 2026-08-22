@@ -52,7 +52,7 @@ const others = computed(() =>
           <span
             v-if="isInProgress(session)"
             class="rounded-full px-2 py-0.5 text-xs font-medium"
-            :style="{ background: 'var(--color-brand-green)', color: 'var(--surface)' }"
+            :style="{ background: 'var(--positive)', color: 'var(--positive-contrast)' }"
           >
             Recording now
           </span>
@@ -78,7 +78,7 @@ const others = computed(() =>
           target="_blank"
           rel="noreferrer"
           class="flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-          :style="{ color: 'var(--color-brand-cyan)' }"
+          :style="{ color: 'var(--action)' }"
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
             <path
@@ -114,7 +114,7 @@ const others = computed(() =>
         <NuxtLink
           :to="recordingPath(session.id)"
           class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-          :style="{ color: 'var(--color-brand-cyan)' }"
+          :style="{ color: 'var(--action)' }"
         >
           Open
         </NuxtLink>

@@ -33,7 +33,7 @@ const visible = computed(() => visibleEntries(session.value))
       :title="entry.label"
       :aria-label="entry.label"
       class="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-      active-class="bg-[var(--surface-raised)] text-[var(--color-brand-cyan)]"
+      active-class="bg-[var(--surface-raised)] text-[var(--action)]"
     >
       <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" class="shrink-0">
         <path :d="entry.icon" />

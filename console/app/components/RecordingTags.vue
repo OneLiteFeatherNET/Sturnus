@@ -160,7 +160,7 @@ async function remove(tag: string) {
           placeholder="retro, kunde onelitefeather"
           class="w-full rounded-lg border px-3 py-1.5 text-sm"
           :style="{
-            borderColor: 'var(--border)',
+            borderColor: 'var(--control-border)',
             background: 'var(--surface-raised)',
             color: 'var(--text)',
           }"
@@ -176,7 +176,7 @@ async function remove(tag: string) {
       <button
         type="submit"
         class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-60"
-        :style="{ color: 'var(--color-brand-cyan)' }"
+        :style="{ color: 'var(--action)' }"
         :disabled="saving || typed.trim().length === 0"
       >
         {{ saving ? 'Saving…' : 'Add' }}

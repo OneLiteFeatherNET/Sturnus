@@ -211,8 +211,8 @@ async function commit(view: SettingView, action: 'save' | 'clear') {
  *  restart rendered in the same green as one already in force is the lie
  *  this page exists to avoid. */
 const TONE_COLOUR: Record<string, string> = {
-  live: 'var(--color-brand-green)',
-  soon: 'var(--color-brand-cyan)',
+  live: 'var(--positive)',
+  soon: 'var(--action)',
   restart: 'var(--color-brand-yellow)',
   unknown: 'var(--color-brand-magenta)',
 }
@@ -229,7 +229,7 @@ const TONE_COLOUR: Record<string, string> = {
     <p
       v-if="guildError"
       class="rounded-xl border p-4 text-sm"
-      :style="{ borderColor: 'var(--color-brand-red)', background: 'var(--surface)' }"
+      :style="{ borderColor: 'var(--danger)', background: 'var(--surface)' }"
     >
       {{ describeError(guildError) }}
     </p>
@@ -302,7 +302,7 @@ const TONE_COLOUR: Record<string, string> = {
       <p
         v-if="settingError"
         class="mb-6 rounded-xl border p-4 text-sm"
-        :style="{ borderColor: 'var(--color-brand-red)', background: 'var(--surface)' }"
+        :style="{ borderColor: 'var(--danger)', background: 'var(--surface)' }"
       >
         {{ describeError(settingError) }}
       </p>
@@ -459,7 +459,7 @@ const TONE_COLOUR: Record<string, string> = {
           <div
             v-if="confirming && confirming.key === view.key"
             class="mt-3 rounded-lg border p-3"
-            :style="{ borderColor: 'var(--color-brand-red)', background: 'var(--surface-raised)' }"
+            :style="{ borderColor: 'var(--danger)', background: 'var(--surface-raised)' }"
           >
             <p class="mb-1 text-sm font-semibold">{{ confirmation(view)?.title }}</p>
             <p class="mb-3 text-sm" :style="{ color: 'var(--text-muted)' }">
@@ -469,7 +469,7 @@ const TONE_COLOUR: Record<string, string> = {
               <button
                 type="button"
                 class="rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
-                :style="{ background: 'var(--color-brand-red)' }"
+                :style="{ background: 'var(--danger)' }"
                 @click="commit(view, confirming.action)"
               >
                 {{ confirmation(view)?.confirmLabel }}
@@ -502,7 +502,7 @@ const TONE_COLOUR: Record<string, string> = {
           <p
             v-if="failures[view.key]"
             class="mt-3 rounded-lg border p-3 text-sm"
-            :style="{ borderColor: 'var(--color-brand-red)' }"
+            :style="{ borderColor: 'var(--danger)' }"
           >
             {{ failures[view.key] }}
           </p>

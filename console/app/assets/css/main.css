@@ -20,7 +20,24 @@
 
 /* Dark and light both, following the viewer's system preference. The
    console is read at a desk in the afternoon and at midnight after a
-   meeting, and neither reading deserves to be the compromised one. */
+   meeting, and neither reading deserves to be the compromised one.
+
+   The brand palette above is the *identity*: the mark, the calendar heat
+   scale, the gradient on the dashboard. The four pairs below are the
+   *roles* -- what a control is, what a failure is, what a good state is,
+   what the edge of a control is -- and they exist because the identity
+   colours cannot carry those roles in both themes.
+
+   Measured, not guessed. `--color-brand-cyan` on white is 2.07:1, and it
+   was the colour of nearly every link and every primary button in this
+   console; the WCAG AA floor for text is 4.5:1. In dark it is 9.39:1 and
+   perfectly fine, which is exactly why the problem survived so long --
+   whoever looked at it last was looking at the theme where it works.
+
+   So `--action` is the brand cyan in dark and a darkened cousin of it in
+   light (6.23:1 on the page, 5.39:1 on the sunken surface). The same
+   applies to red, which fails in the *other* direction: 3.87:1 on the
+   dark background, where every error string in the queue panel is set. */
 :root {
   --surface: #ffffff;
   --surface-raised: #f6f7fb;
@@ -28,6 +45,22 @@
   --border: #d9dcec;
   --text: #16172b;
   --text-muted: #5b5d78;
+
+  /* A link, a primary button, a scrubber, a playhead. */
+  --action: #0a6a7d;
+  /* What is legible *on* an `--action` fill. */
+  --action-contrast: #ffffff;
+  /* A failure, an error string, the outline of a card that failed. */
+  --danger: #a81f19;
+  --danger-contrast: #ffffff;
+  /* A finished job, a session being recorded right now. */
+  --positive: #0f7a34;
+  --positive-contrast: #ffffff;
+  /* The edge of a control, as opposed to the edge of a card. WCAG asks
+     3:1 of anything that is the only affordance of a control, and
+     `--border` is 1.36:1 in both themes -- fine for a divider, not for
+     the dashed outline that is the entire "Show spectrogram" button. */
+  --control-border: #7c8099;
 }
 
 @media (prefers-color-scheme: dark) {
@@ -38,6 +71,15 @@
     --border: #262845;
     --text: #eceefa;
     --text-muted: #9a9cba;
+
+    /* The brand cyan itself, which is 9.39:1 here and needs no help. */
+    --action: #06c5e8;
+    --action-contrast: #0b0b1f;
+    --danger: #ff8a82;
+    --danger-contrast: #0b0b1f;
+    --positive: #1bc755;
+    --positive-contrast: #0b0b1f;
+    --control-border: #63678f;
   }
 }
 

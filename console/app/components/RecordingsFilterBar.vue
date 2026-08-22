@@ -107,7 +107,7 @@ function clear() {
             placeholder="channel, who was there, or one of your tags"
             class="mt-1 w-full rounded-lg border px-3 py-1.5 text-sm"
             :style="{
-              borderColor: 'var(--border)',
+              borderColor: 'var(--control-border)',
               background: 'var(--surface-raised)',
               color: 'var(--text)',
             }"
@@ -122,7 +122,7 @@ function clear() {
             type="date"
             class="mt-1 rounded-lg border px-3 py-1.5 text-sm"
             :style="{
-              borderColor: 'var(--border)',
+              borderColor: 'var(--control-border)',
               background: 'var(--surface-raised)',
               color: 'var(--text)',
             }"
@@ -137,7 +137,7 @@ function clear() {
             type="date"
             class="mt-1 rounded-lg border px-3 py-1.5 text-sm"
             :style="{
-              borderColor: 'var(--border)',
+              borderColor: 'var(--control-border)',
               background: 'var(--surface-raised)',
               color: 'var(--text)',
             }"
@@ -151,7 +151,7 @@ function clear() {
             v-model="draft.protocol"
             class="mt-1 rounded-lg border px-3 py-1.5 text-sm"
             :style="{
-              borderColor: 'var(--border)',
+              borderColor: 'var(--control-border)',
               background: 'var(--surface-raised)',
               color: 'var(--text)',
             }"
@@ -167,7 +167,7 @@ function clear() {
         <button
           type="submit"
           class="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-          :style="{ borderColor: 'var(--border)', color: 'var(--text)' }"
+          :style="{ borderColor: 'var(--control-border)', color: 'var(--text)' }"
         >
           Search
         </button>
@@ -189,7 +189,7 @@ function clear() {
             type="button"
             class="rounded-full border px-2.5 py-0.5 text-xs tabular-nums transition-colors hover:bg-[var(--surface-raised)]"
             :style="{
-              borderColor: filters.tags.includes(use.tag) ? 'var(--text)' : 'var(--border)',
+              borderColor: filters.tags.includes(use.tag) ? 'var(--text)' : 'var(--control-border)',
               color: 'var(--text)',
             }"
             :aria-pressed="filters.tags.includes(use.tag)"
