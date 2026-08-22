@@ -57,6 +57,7 @@ from discord.ext import voice_recv
 
 from sturnus.application.ports import Clock
 from sturnus.infrastructure.discord.capture_diagnostics import CaptureDiagnostics
+from sturnus.infrastructure.discord.dave import DaveDecryptor
 from sturnus.infrastructure.telemetry import VOICE_PACKETS, record
 
 log = logging.getLogger(__name__)
@@ -148,6 +149,7 @@ class RecordingSink(voice_recv.AudioSink):
         emit: Callable[[CaptureMessage], None],
         guild_id: int | None = None,
         diagnostics: CaptureDiagnostics | None = None,
+        dave: DaveDecryptor | None = None,
     ) -> None:
         # No destination: this sink is an endpoint, not a link in a
         # transformer chain, so it registers no child.
@@ -168,6 +170,14 @@ class RecordingSink(voice_recv.AudioSink):
         # handed bytes and nothing else -- so the arithmetic that cut those
         # bytes out of the packet can only be checked from this side.
         self._diagnostics = diagnostics
+        # Discord encrypts voice end-to-end underneath the transport, and
+        # `discord-ext-voice-recv` never implemented the receiving half --
+        # so what arrives here is ciphertext. Injected rather than built
+        # here because it needs the voice client, which the library only
+        # attaches after construction; `voice.py` wires it in `listen()`.
+        # `None` means "not wired yet", and a frame then passes through
+        # exactly as it did before this existed.
+        self._dave = dave
         self._unattributed: set[int] = set()
         self._sink_errors = 0
         self._cleaned_up = False
@@ -285,7 +295,22 @@ class RecordingSink(voice_recv.AudioSink):
         if self._diagnostics is not None:
             self._note_packet_shape(ssrc, data)
 
-        pcm = self._decoder.decode(ssrc, data.opus)
+        # Before the decoder, and this order is the whole fix: the Opus
+        # decoder must never see the end-to-end layer. `frame` is `None`
+        # for a frame that could not be decrypted, which the decoder
+        # already treats as "write nothing".
+        frame = data.opus
+        if self._dave is not None:
+            frame = self._dave.decrypt(user.id, frame)
+            if frame is None:
+                # Counted apart from `undecodable`: a frame that will not
+                # decrypt and a frame that will not decode have different
+                # causes and different fixes, and one label for both is
+                # how this defect stayed invisible for as long as it did.
+                record(VOICE_PACKETS, 1, outcome="undecryptable", guild_id=self._guild_id)
+                return
+
+        pcm = self._decoder.decode(ssrc, frame)
         if pcm is None:
             # The frame is gone. `SpeakerWriter` places audio by
             # RTP-derived absolute time, so this becomes exactly one

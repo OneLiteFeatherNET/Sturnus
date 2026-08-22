@@ -60,6 +60,7 @@ from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.repositories import ConsentRepository
 from sturnus.infrastructure.discord.capture_diagnostics import CaptureDiagnostics
 from sturnus.infrastructure.discord.consent_cache import ConsentCache
+from sturnus.infrastructure.discord.dave import DaveDecryptor, session_source_for
 from sturnus.infrastructure.discord.decoding import (
     DecoderFactory,
     ResilientOpusDecoder,
@@ -273,6 +274,10 @@ class VoiceReceiveAdapter:
             on_decode_failure=self._on_decode_failure,
             diagnostics=diagnostics,
         )
+        # The decryptor is built from the *client*, not from its session:
+        # DAVE is MLS and the group key changes whenever somebody joins or
+        # leaves, so the session is re-read on every frame. See
+        # `sturnus.infrastructure.discord.dave`.
         sink = RecordingSink(
             consent_role_id=consent_role_id,
             decoder=decoder,
@@ -280,6 +285,7 @@ class VoiceReceiveAdapter:
             emit=self._emit,
             guild_id=self._guild_id,
             diagnostics=diagnostics,
+            dave=DaveDecryptor(session_source_for(self._voice_client)),
         )
         self._voice_client.listen(sink, after=self._on_listen_stopped)
 
