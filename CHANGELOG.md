@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.10.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.9.0...v0.10.0) (2026-08-22)
+
+
+### Features
+
+* **bot:** measure a live capture, to find where the noise comes from ([#87](https://github.com/OneLiteFeatherNET/Sturnus/issues/87)) ([0e574dc](https://github.com/OneLiteFeatherNET/Sturnus/commit/0e574dcb766ccfc8785924a865ba88dfcbf78a08))
+
+
+### Bug Fixes
+
+* **console:** make the recording page reachable, and stop logging hangups ([#86](https://github.com/OneLiteFeatherNET/Sturnus/issues/86)) ([1660a15](https://github.com/OneLiteFeatherNET/Sturnus/commit/1660a15ec9173c973f811e886642418f593be1ec))
+
 ## [0.9.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.8.1...v0.9.0) (2026-08-22)
 
 
