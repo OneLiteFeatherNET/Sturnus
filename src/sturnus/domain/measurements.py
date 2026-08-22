@@ -29,11 +29,26 @@ class JobMeasurements:
     removing that silence. `segment_count` is how many segments came back,
     which is what separates "said nothing" from "was never transcribed":
     both leave an empty transcript, and only this number tells them apart.
+
+    `model` is what produced all three. It is optional only because rows
+    written before it existed cannot be backfilled -- there is nothing to
+    read it from, and guessing the current default would turn an absence
+    into a claim.
     """
 
     audio_seconds: float
     speech_seconds: float
     segment_count: int
+    #: The model that produced them, or `None` for a job finished before
+    #: this was recorded.
+    #:
+    #: Not a measurement itself, and kept here anyway, because none of the
+    #: three above means anything without it. `sturnus.infrastructure.
+    #: whisper` already says so about the metric -- "a real-time factor
+    #: that mixes `large-v3` with `tiny` says nothing" -- and the same is
+    #: true of a segment count. Two runs over one recording are only
+    #: comparable if each says what produced it.
+    model: str | None = None
 
     def __post_init__(self) -> None:
         if self.audio_seconds < 0:

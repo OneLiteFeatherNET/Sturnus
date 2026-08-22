@@ -206,12 +206,15 @@ def _engine_with(model: _RecordingModel, default_language: str = "de") -> Whispe
     `tests/infrastructure/discord/test_config_commands.py`.
     """
     engine = object.__new__(WhisperEngine)
-    engine._model = model
     engine._default_language = default_language
-    # `__init__` keeps the name it was given so that the metrics can be
-    # labelled by model without any call site passing it in again. Bypassing
-    # `__init__` means setting it here too.
-    engine._model_name = "tiny"
+    # `__init__` loads one model eagerly and keeps it in a cache keyed by
+    # name, so that a job can ask for a different one. Bypassing `__init__`
+    # means seeding that cache by hand -- and naming the default, which is
+    # what every measurement is labelled with when a job asks for nothing.
+    engine._models = {"tiny": model}
+    engine._default_model = "tiny"
+    engine._device = "cpu"
+    engine._compute_type = "int8"
     return engine
 
 
@@ -1624,3 +1627,72 @@ async def test_the_transcribed_text_is_never_logged(
     assert caplog.records, "the debug trace exists at all, so this is not vacuous"
     assert "Vertrag" not in caplog.text
     assert "Beispiel" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Running one recording through a model other than the default
+# ---------------------------------------------------------------------------
+
+
+def _wav_with_speech(tmp_path: Path) -> Path:
+    """A file the gate finds something in, so the model is actually called."""
+    recording = tmp_path / "model-choice.wav"
+    _write_wav(recording, np.concatenate([np.zeros(16_000, dtype=np.float32), _tone(2.0)]))
+    return recording
+
+
+async def test_a_job_runs_on_the_default_when_it_asks_for_nothing(tmp_path: Path) -> None:
+    """Which is every job nobody is asking a question about."""
+    model = _RecordingModel()
+    engine = _engine_with(model)
+    await engine.transcribe(_wav_with_speech(tmp_path), "de", None)
+
+    assert model.calls, "the default model was not the one that ran"
+    assert engine._models.keys() == {"tiny"}, "asking for nothing loaded something"
+
+
+async def test_the_measurements_name_the_model_that_produced_them(tmp_path: Path) -> None:
+    """The reason the model is stored beside the numbers at all.
+
+    A segment count and a real-time factor are only comparable between two
+    runs if each says what produced it -- this module already refuses to
+    label its metrics any other way.
+    """
+    engine = _engine_with(_RecordingModel())
+    result = await engine.transcribe(_wav_with_speech(tmp_path), "de", None)
+    assert result.measurements is not None
+    assert result.measurements.model == "tiny"
+
+
+async def test_an_unknown_model_fails_the_job_rather_than_falling_back(
+    tmp_path: Path,
+) -> None:
+    """The decision this feature turns on.
+
+    Falling back to the default would still produce a transcript, still
+    record measurements, and look exactly like a result -- so a comparison
+    run could report that a smaller model did fine when the smaller model
+    never ran. This project has already lost days to a failure that
+    reported success.
+    """
+    engine = _engine_with(_RecordingModel())
+    # Whatever the loader raises for a name it cannot resolve -- the point
+    # is that it propagates and fails the job, not which type it is.
+    with pytest.raises((OSError, ValueError, RuntimeError)):
+        await engine.transcribe(_wav_with_speech(tmp_path), "de", None, "no-such-model")
+    assert "no-such-model" not in engine._models
+
+
+async def test_a_second_model_is_loaded_once_and_kept(tmp_path: Path) -> None:
+    """A comparison means running the same file twice; loading `large-v3`
+    twice would dominate the measurement it exists to produce."""
+    engine = _engine_with(_RecordingModel())
+    other = _RecordingModel()
+    engine._models["other"] = other
+
+    path = _wav_with_speech(tmp_path)
+    await engine.transcribe(path, "de", None, "other")
+    await engine.transcribe(path, "de", None, "other")
+
+    assert engine._models["other"] is other, "the cached model was replaced"
+    assert len(other.calls) == 2

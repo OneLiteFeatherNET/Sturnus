@@ -282,6 +282,9 @@ class _ClaimedJobShape(Protocol):
     s3_key: str
     encryption_key_id: str
     wrapped_data_key: bytes
+    #: `None` for every job nobody asked a question about, which is
+    #: almost all of them.
+    requested_model: str | None
 
 
 def _configured_language(configured: str | None) -> str | None:
@@ -559,7 +562,9 @@ async def process_one(
             # whatever the config store was doing is not comparable.
             started = time.monotonic()
             try:
-                result = await engine.transcribe(wav_path, pinned_language, prompt)
+                result = await engine.transcribe(
+                    wav_path, pinned_language, prompt, job.requested_model
+                )
             except Exception as exc:
                 log_exception(
                     log,

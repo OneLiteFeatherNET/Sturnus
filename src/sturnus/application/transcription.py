@@ -45,9 +45,19 @@ class TranscriptionResult:
 
 class TranscriptionEngine(Protocol):
     async def transcribe(
-        self, path: Path, language: str | None, initial_prompt: str | None
+        self,
+        path: Path,
+        language: str | None,
+        initial_prompt: str | None,
+        model: str | None = None,
     ) -> TranscriptionResult:
         """Transcribe one speaker's recording.
+
+        `model` names the engine to use, or `None` for whatever the worker
+        was configured with. It exists so the same recording can be run
+        through two models and the results compared -- the only way to
+        answer "is a smaller one good enough" for this deployment's own
+        audio and language.
 
         `language` pins the language; `None` asks the engine to detect it and
         report what it found.
