@@ -15,6 +15,12 @@ const PUBLIC_ROUTES = new Set(['/sign-in'])
 export default defineNuxtRouteMiddleware(async (to) => {
   if (PUBLIC_ROUTES.has(to.path)) return
 
+  // Only a 401 sends somebody to the sign-in page. An API that is down or
+  // erroring is a different failure with a different remedy, and dressing
+  // it up as "you are signed out" would send the person to log in again,
+  // where it would work, and leave them with no idea what happened.
+  // `loadSession` rethrows those, and Nuxt renders them as the error they
+  // are.
   const user = await loadSession()
   if (!user) {
     return navigateTo('/sign-in')

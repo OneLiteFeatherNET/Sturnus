@@ -46,6 +46,12 @@ jobs:
 
       - run: npm run test
 
+      # Typecheck, which was silently a no-op until `console/tsconfig.json`
+      # existed: Nuxt writes the real configuration into the generated
+      # `.nuxt`, so the script had nothing to extend and failed before it
+      # checked anything.
+      - run: npm run typecheck
+
       # The build is the real check. Every one of the above passes on a
       # component that a template error would stop dead, and the browser is
       # where that would otherwise be discovered.
