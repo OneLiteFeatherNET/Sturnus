@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.publishing import DOCUMENTED_STATUS
@@ -245,6 +245,117 @@ async def load_status(
         oldest_pending_session_ended_at=oldest,
         closed_undocumented=int(stuck or 0),
     )
+
+
+#: How many unfinished sessions a queue overview reports before it stops.
+#: A guild that has been broken for a month has hundreds, and a page of
+#: hundreds is a page nobody reads -- while the twenty newest are where
+#: whatever is wrong right now actually shows. The reader is told when the
+#: list was cut, so "twenty" never reads as "twenty exist".
+ACTIVE_SESSION_LIMIT = 20
+
+
+@dataclass(frozen=True)
+class ActiveSession:
+    """One session the pipeline has not finished with, and where its jobs are.
+
+    `channel_name` as well as `channel_id`, unlike `SessionSummary`: that
+    one is rendered into Discord, where `<#id>` resolves to the channel's
+    current name and stays a working link. A web page has no such
+    rendering, so it needs the name the session opened under -- the same
+    name every other console view shows.
+    """
+
+    id: int
+    channel_id: int
+    channel_name: str | None
+    started_at: datetime
+    ended_at: datetime | None
+    status: str
+    document_url: str | None
+    #: One entry per `REPORTED_STATUSES`, zero-filled, so a caller can
+    #: render the lifecycle in order without checking for absent keys.
+    counts: dict[str, int]
+
+
+async def load_active_sessions(
+    session_factory: async_sessionmaker[AsyncSession],
+    guild_id: int,
+    limit: int = ACTIVE_SESSION_LIMIT,
+) -> tuple[list[ActiveSession], bool]:
+    """This guild's unfinished sessions, newest first, and whether there are more.
+
+    **What counts as unfinished**, and why it is two conditions rather than
+    one. Anything that is not `documented` is obviously unfinished: it is
+    recording now, waiting for a worker, being transcribed, or stuck. But a
+    session can reach `documented` with a `dead` job in it -- the document
+    is written once every job is terminal, and `dead` is terminal -- so a
+    speaker whose transcription failed permanently would vanish from the
+    queue view at exactly the moment somebody needs to notice them. A dead
+    job keeps its session on this list however finished the session claims
+    to be.
+
+    An `open` session with no jobs at all is included on purpose: it is a
+    recording in progress, which is the one thing an administrator looking
+    at a queue most wants confirmed.
+
+    Guild-scoped in the statement rather than filtered afterwards, the same
+    rule the rest of this module follows: a `WHERE` that names the guild
+    cannot be forgotten, because without it the query returns nothing
+    rather than everything.
+    """
+    dead_jobs = select(TranscriptionJob.session_id).where(TranscriptionJob.status == "dead")
+    async with session_factory() as db:
+        rows = (
+            await db.execute(
+                select(Session)
+                .where(
+                    Session.guild_id == guild_id,
+                    or_(Session.status != DOCUMENTED_STATUS, Session.id.in_(dead_jobs)),
+                )
+                # By id as well as by time, so two sessions that opened in
+                # the same instant do not swap places between two refreshes.
+                .order_by(Session.started_at.desc(), Session.id.desc())
+                # One more than asked for, which is how "there are more"
+                # is learned without a second `COUNT(*)` over the same
+                # predicate -- a count that could disagree with the page it
+                # describes, having been taken a moment later.
+                .limit(limit + 1)
+            )
+        ).scalars()
+        found = list(rows)
+        truncated = len(found) > limit
+        found = found[:limit]
+        if not found:
+            return [], False
+
+        counted = await db.execute(
+            select(TranscriptionJob.session_id, TranscriptionJob.status, func.count())
+            .where(TranscriptionJob.session_id.in_([row.id for row in found]))
+            .group_by(TranscriptionJob.session_id, TranscriptionJob.status)
+        )
+        per_session: dict[int, dict[str, int]] = {
+            row.id: dict.fromkeys(REPORTED_STATUSES, 0) for row in found
+        }
+        for session_id, status, count in counted:
+            # `setdefault` rather than assignment: a status this build does
+            # not know about is still work somebody has to account for, and
+            # dropping it would make the counts silently fail to add up.
+            per_session[session_id][status] = per_session[session_id].get(status, 0) + int(count)
+
+    return [
+        ActiveSession(
+            id=row.id,
+            channel_id=row.channel_id,
+            channel_name=row.channel_name,
+            started_at=row.started_at,
+            ended_at=row.ended_at,
+            status=row.status,
+            document_url=row.document_url,
+            counts=per_session[row.id],
+        )
+        for row in found
+    ], truncated
 
 
 async def load_session(

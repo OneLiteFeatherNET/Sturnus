@@ -85,6 +85,17 @@ export const ADMIN_VIEW: NavSection = {
       icon: 'M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-8 0a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5Zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5Z',
       adminOnly: true,
     },
+    {
+      to: '/admin/queue',
+      label: 'Queue',
+      // A stack of layers waiting their turn, which is what a queue of
+      // transcription jobs is. Deliberately not a clock or an hourglass:
+      // both would say "this takes time", and the reason anybody opens
+      // this page is that something has stopped taking time and started
+      // taking none.
+      icon: 'M12 2 2 7l10 5 10-5-10-5Zm0 20 10-5-2.5-1.25L12 19.5 4.5 15.75 2 17l10 5Zm0-5.5 10-5-2.5-1.25L12 14 4.5 10.25 2 11.5l10 5Z',
+      adminOnly: true,
+    },
   ],
 }
 

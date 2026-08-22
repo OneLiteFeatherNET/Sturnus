@@ -1105,6 +1105,53 @@ nobody withdrew anything, the guild's policy moved on under them (§6).
 Restoring the old `policy_version` would bring every one of those back.
 Withdrawing through the console is what survives that.
 
+### 6.2.7 The queue overview
+
+**Admin View → Queue**, per guild: the same figures `/queue status` prints
+in Discord, plus the sessions they are made of. Both read `load_status`,
+so the two never disagree.
+
+A session is listed while it is **unfinished**, which is two conditions
+rather than one:
+
+- its status is not `documented` — it is recording now, waiting for a
+  worker, being transcribed, or stuck; **or**
+- it has a `dead` job. A session reaches `documented` once every job is
+  terminal, and `dead` is terminal, so a speaker whose transcription
+  failed permanently would otherwise disappear from this view at exactly
+  the moment somebody needs to notice them.
+
+A session with status `open` and no jobs at all is a recording happening
+right now. It is listed on purpose.
+
+Three numbers need reading with their caveats, and the page prints them:
+
+- **`running` past its lease** — a job whose worker died holding it. No
+  amount of waiting fixes one; it needs `/queue requeue` or the re-queue
+  control on the recording page. The count is computed against an
+  *assumed* lease, because `api` cannot see the worker's
+  `job_lease_seconds`; the lease it used is shown beside the number. If
+  the worker's setting differs, the count is wrong in the direction the
+  difference points.
+- **Closed and undocumented** — nothing is queued for these and nothing
+  will happen on its own. The worker's `retry_pending_documents` sweep is
+  what normally clears them; a count that stays put across several
+  refreshes means the document write is failing, and §5 is where to look.
+- **Oldest pending** — dated by the *session's end*, not by the job.
+  `transcription_job` has no enqueue timestamp at all. A session's end is
+  within seconds of when its jobs were created, which answers "has this
+  been sitting here for hours?" and nothing more precise. A re-queued job
+  keeps its session's original end, so a redo makes this read older than
+  the job actually is.
+
+The list is cut at twenty sessions, newest first, and says so when it was
+cut. The totals above it are the guild's and are never cut.
+
+There is no re-queue control on this page. Each row links to
+`/recordings/{id}`, which carries the per-session panel — and the decision
+of whether a re-queue is safe stays in one place (`plan_requeue`) rather
+than being made twice.
+
 ### 6.3 Listening to a recording by hand
 
 Every automated check this system has can describe a track — its level,

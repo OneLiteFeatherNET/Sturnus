@@ -42,6 +42,7 @@ from sturnus.console.adapters import (
     ConsoleConsentDirectory,
     ConsoleLinkDirectory,
     ConsoleQueueControl,
+    ConsoleQueueOverview,
     ConsoleStateStore,
     ConsoleTagWriter,
     ConsoleTrackDirectory,
@@ -215,6 +216,7 @@ async def _run() -> None:
         audio=audio,
         queue=ConsoleQueueControl(session_factory, admins),
         tags=ConsoleTagWriter(session_factory),
+        queues=ConsoleQueueOverview(session_factory, admins, now),
         consents=ConsoleConsentDirectory(session_factory, admins, config, now),
     )
 

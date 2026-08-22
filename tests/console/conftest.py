@@ -24,9 +24,11 @@ from sturnus.console.ports import (
     AdminDirectory,
     ConsentDirectory,
     ConsentHolder,
+    GuildQueue,
     LinkDirectory,
     OAuthClient,
     QueueControl,
+    QueueOverview,
     QueueSnapshot,
     RequeueOutcome,
     RevocationOutcome,
@@ -471,6 +473,26 @@ class FakeTags:
         return self.stored[(session_id, owner)]
 
 
+class FakeQueueOverview:
+    """A guild queue nobody administers, until a test says otherwise.
+
+    Defaults to `None`, which is what the real overview answers for "no
+    such guild or not yours" -- so a test with no interest in the queue
+    gets 404s rather than a fake that quietly authorises everything.
+    """
+
+    def __init__(self, queue: GuildQueue | None = None) -> None:
+        self.queue = queue
+        #: Every guild this was asked about, with who asked. The route
+        #: tests assert on it: "the handler passed the signed-in id, not
+        #: one from the URL" cannot be seen in a response body.
+        self.asked: list[tuple[int, int]] = []
+
+    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildQueue | None:
+        self.asked.append((guild_id, requested_by))
+        return self.queue
+
+
 class FakeConsents:
     """A consent directory nobody administers, until a test says otherwise.
 
@@ -512,12 +534,13 @@ def build_test_api(
     states: StateStore | None = None,
     links: LinkDirectory | None = None,
     admins: AdminDirectory | None = None,
-    consents: ConsentDirectory | None = None,
     reads: SessionReads | None = None,
     config: SettingsStore | None = None,
     audio: AudioDelivery | None = None,
     queue: QueueControl | None = None,
     tags: TagWriter | None = None,
+    queues: QueueOverview | None = None,
+    consents: ConsentDirectory | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -554,6 +577,7 @@ def build_test_api(
         ),
         queue=queue or FakeQueue(),
         tags=tags or FakeTags(),
+        queues=queues or FakeQueueOverview(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,

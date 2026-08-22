@@ -68,11 +68,29 @@ describe('who is offered the Admin View', () => {
     expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('User Settings')
   })
 
-  it('lists what the bot does before what the members have agreed to', () => {
+  it('offers the queue to an administrator', () => {
+    expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('Queue')
+  })
+
+  it('hides the queue from somebody who administers nothing', () => {
+    // The queue endpoint answers 404 to a non-administrator -- the same
+    // answer it gives for a guild that does not exist -- so an entry left
+    // visible would offer a page that can only ever refuse them.
+    expect(visibleEntries(PARTICIPANT).map((e) => e.label)).not.toContain('Queue')
+    expect(visibleEntries(null).map((e) => e.label)).not.toContain('Queue')
+  })
+
+  it('lists the daily work first and the thing gone wrong last', () => {
     // The configuration is what an administrator comes to the Admin View
     // for daily; a member's consent is looked at when somebody asks about
-    // that one member, which is rarer and always deliberate.
-    expect(ADMIN_VIEW.entries.map((e) => e.label)).toEqual(['Bot Settings', 'User Settings'])
+    // that one member, which is rarer and always deliberate. The queue is
+    // rarer still and is never scanned -- it is opened because a protocol
+    // did not appear, which is a question somebody arrives holding.
+    expect(ADMIN_VIEW.entries.map((e) => e.label)).toEqual([
+      'Bot Settings',
+      'User Settings',
+      'Queue',
+    ])
   })
 
   it('hides it from somebody who administers nothing', () => {

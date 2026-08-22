@@ -31,6 +31,8 @@ from sturnus.application.linking import new_state
 from sturnus.console.ports import (
     AdminDirectory,
     ConsentHolder,
+    GuildQueue,
+    QueuedSession,
     QueueSnapshot,
     QueueSpeaker,
     RequeueOutcome,
@@ -49,12 +51,16 @@ from sturnus.infrastructure.db.models import (
     TranscriptionJob,
 )
 from sturnus.infrastructure.db.models import Session as SessionRow
+from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS
 from sturnus.infrastructure.db.repositories import ConsentRepository
 from sturnus.infrastructure.db.requeue import (
+    ActiveSession,
     SessionView,
     apply_requeue,
+    load_active_sessions,
     load_requeue_view,
     load_session,
+    load_status,
 )
 
 #: How long a sign-in may take. Ten minutes is a browser round trip
@@ -674,3 +680,74 @@ class ConsoleConsentDirectory:
                 )
             ).all()
         return {discord_user_id: held for discord_user_id, held in rows}
+
+
+class ConsoleQueueOverview:
+    """A guild's transcription queue, for an administrator of that guild.
+
+    The guild-wide companion to `ConsoleQueueControl`, and built the same
+    way: the administrator check is part of the one call, and everything
+    below it is `sturnus.infrastructure.db.requeue` unchanged -- the same
+    `load_status` the `/queue status` command reads. A console that
+    counted the jobs itself would be a second definition of "how much work
+    is outstanding", and the two would agree until one of them changed.
+
+    `load_active_sessions` is new machinery rather than reused, because
+    Discord never needed it: a slash command answers in one message and
+    reports totals, while a page has room to say *which* sessions the
+    totals are made of. It lives beside the other reads for the same
+    reason they do -- so both callers ask the same questions.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        admins: AdminDirectory,
+        now: Callable[[], datetime],
+        lease_seconds: float = DEFAULT_LEASE_SECONDS,
+    ) -> None:
+        self._session_factory = session_factory
+        self._admins = admins
+        self._now = now
+        #: The lease this process *assumes*. The one that actually applies
+        #: is `job_lease_seconds` in the worker's settings, which this
+        #: process cannot see -- so the number travels out with the answer
+        #: and the console names it rather than presenting a count derived
+        #: from a guess as a fact. The same caveat `/queue status` prints.
+        self._lease_seconds = lease_seconds
+
+    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildQueue | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+
+        now = self._now()
+        status = await load_status(self._session_factory, guild_id, now, self._lease_seconds)
+        sessions, truncated = await load_active_sessions(self._session_factory, guild_id)
+        return GuildQueue(
+            pending=status.counts.get("pending", 0),
+            running=status.counts.get("running", 0),
+            done=status.counts.get("done", 0),
+            dead=status.counts.get("dead", 0),
+            running_past_lease=status.running_past_lease,
+            oldest_pending_session_ended_at=status.oldest_pending_session_ended_at,
+            closed_undocumented=status.closed_undocumented,
+            lease_seconds=self._lease_seconds,
+            sessions=tuple(_queued(session) for session in sessions),
+            truncated=truncated,
+        )
+
+
+def _queued(session: ActiveSession) -> QueuedSession:
+    return QueuedSession(
+        id=session.id,
+        channel_id=session.channel_id,
+        channel_name=session.channel_name,
+        started_at=session.started_at,
+        ended_at=session.ended_at,
+        status=session.status,
+        document_url=session.document_url,
+        pending=session.counts.get("pending", 0),
+        running=session.counts.get("running", 0),
+        done=session.counts.get("done", 0),
+        dead=session.counts.get("dead", 0),
+    )
