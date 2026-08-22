@@ -21,16 +21,19 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import Row, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.linking import new_state
+from sturnus.application.publishing import DOCUMENTED_STATUS
 from sturnus.console.ports import (
     AdminDirectory,
     ConsentHolder,
     GuildQueue,
+    GuildRecording,
     QueuedSession,
     QueueSnapshot,
     QueueSpeaker,
@@ -39,6 +42,7 @@ from sturnus.console.ports import (
     SettingsStore,
     Track,
 )
+from sturnus.console.reporting import RecordedSession
 from sturnus.domain import settings
 from sturnus.domain.consent import ConsentRecord, is_consent_active
 from sturnus.infrastructure.db.models import (
@@ -653,3 +657,143 @@ def _queued(session: ActiveSession) -> QueuedSession:
         done=session.counts.get("done", 0),
         dead=session.counts.get("dead", 0),
     )
+
+
+class ConsoleGuildReports:
+    """A guild's recorded sessions, counted rather than listed.
+
+    The authorisation is here, as it is in every other directory in this
+    module: one `is_admin(guild_id, ...)` at the top of the one method,
+    and `None` for both of the reasons somebody might not get an answer.
+
+    **What the statements deliberately do not select.** Nothing here reads
+    `session_participant.discord_user_id` into a value that leaves this
+    class. The participant rows are counted -- per session, and distinctly
+    across the guild -- and the identities stay in the database. That is
+    what keeps `sturnus.console.reporting` able to say it is about a guild
+    rather than about its people: a report module handed a list of who
+    attended is one edit away from ranking them, and a ranking of
+    colleagues by meeting attendance is a works-council decision rather
+    than a console feature.
+
+    Three statements rather than one join, the same trade
+    `ConsoleQueries` makes: a join across participants and jobs multiplies
+    rows, and a session with five speakers and five tracks comes back
+    twenty-five times.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        admins: AdminDirectory,
+        config: SettingsStore,
+    ) -> None:
+        self._session_factory = session_factory
+        self._admins = admins
+        self._config = config
+
+    async def recording_of(self, guild_id: int, *, requested_by: int) -> GuildRecording | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+
+        zone, zone_name = _zone(
+            (await self._config.snapshot(guild_id)).get(settings.TIMEZONE) or "UTC"
+        )
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(
+                        SessionRow.id,
+                        SessionRow.started_at,
+                        SessionRow.ended_at,
+                        SessionRow.status,
+                    )
+                    .where(SessionRow.guild_id == guild_id)
+                    .order_by(SessionRow.started_at, SessionRow.id)
+                )
+            ).all()
+            if not rows:
+                return GuildRecording((), 0, zone, zone_name)
+
+            found = [row.id for row in rows]
+            people = (
+                await db.execute(
+                    select(SessionParticipant.session_id, func.count())
+                    .where(SessionParticipant.session_id.in_(found))
+                    .group_by(SessionParticipant.session_id)
+                )
+            ).all()
+            # Counted in the statement rather than by collecting ids and
+            # taking a set: `COUNT(DISTINCT ...)` answers the question
+            # without any identity crossing into Python.
+            distinct = await db.scalar(
+                select(func.count(func.distinct(SessionParticipant.discord_user_id))).where(
+                    SessionParticipant.session_id.in_(found)
+                )
+            )
+            tracks = (
+                await db.execute(
+                    select(
+                        TranscriptionJob.session_id,
+                        func.count(),
+                        func.sum(TranscriptionJob.audio_seconds),
+                        func.sum(TranscriptionJob.speech_seconds),
+                        # Null is not zero. `SUM` skips nulls silently, so
+                        # the number of rows it skipped is counted beside
+                        # it -- otherwise "we never measured this" and
+                        # "they said nothing" arrive as the same total.
+                        func.count().filter(TranscriptionJob.speech_seconds.is_(None)),
+                    )
+                    .where(TranscriptionJob.session_id.in_(found))
+                    .group_by(TranscriptionJob.session_id)
+                )
+            ).all()
+
+        attendance = {session_id: int(count) for session_id, count in people}
+        measured = {
+            session_id: (int(count), audio, speech, int(unmeasured))
+            for session_id, count, audio, speech, unmeasured in tracks
+        }
+        return GuildRecording(
+            sessions=tuple(
+                _recorded(row, attendance.get(row.id, 0), measured.get(row.id)) for row in rows
+            ),
+            distinct_participants=int(distinct or 0),
+            zone=zone,
+            zone_name=zone_name,
+        )
+
+
+def _recorded(
+    row: Row[tuple[int, datetime, datetime | None, str]],
+    participants: int,
+    measured: tuple[int, float | None, float | None, int] | None,
+) -> RecordedSession:
+    tracks, audio_seconds, speech_seconds, unmeasured = measured or (0, None, None, 0)
+    return RecordedSession(
+        id=row.id,
+        started_at=row.started_at,
+        ended_at=row.ended_at,
+        documented=row.status == DOCUMENTED_STATUS,
+        participants=participants,
+        tracks=tracks,
+        audio_seconds=audio_seconds,
+        speech_seconds=speech_seconds,
+        unmeasured_tracks=unmeasured,
+    )
+
+
+def _zone(name: str) -> tuple[tzinfo, str]:
+    """The guild's timezone, falling back to UTC on an unusable value.
+
+    The same fallback the worker applies when writing a protocol, and for
+    the same reason: a report with the wrong month boundary is a smaller
+    loss than no report, and the value that caused it is a `/config` away
+    from being fixed. The name travels with the zone so the page can say
+    which calendar it cut the months in rather than leaving the reader to
+    assume theirs.
+    """
+    try:
+        return ZoneInfo(name), name
+    except (ZoneInfoNotFoundError, ValueError):
+        return UTC, "UTC"

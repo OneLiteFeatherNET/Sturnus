@@ -17,9 +17,10 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, tzinfo
 from typing import Protocol
 
+from sturnus.console.reporting import RecordedSession
 from sturnus.console.statistics import AttendedSession
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
@@ -439,3 +440,35 @@ class QueueOverview(Protocol):
     """
 
     async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildQueue | None: ...
+
+
+@dataclass(frozen=True)
+class GuildRecording:
+    """A guild's recorded sessions, and how many distinct people were in them.
+
+    The two are read together and returned as one value because the second
+    cannot be derived from the first: `sessions` carries per-session
+    participant *counts*, never identities, so "how many different people
+    has this guild recorded" has to be counted in the statement. Keeping
+    the identities out of the value is the point -- see
+    `sturnus.console.reporting` on why this feature stops at aggregates.
+    """
+
+    sessions: tuple[RecordedSession, ...]
+    distinct_participants: int
+    #: The guild's `timezone` setting, or `UTC` when it is unset or
+    #: unusable. Months are cut in it, the same calendar the protocols are
+    #: written in.
+    zone: tzinfo
+    zone_name: str
+
+
+class GuildReports(Protocol):
+    """What a guild's recording adds up to, if the person asking administers it.
+
+    `requested_by` is not optional and there is no method here without it,
+    for the reason the other three directories have none. `None` covers
+    "no such guild" and "you do not administer it" alike.
+    """
+
+    async def recording_of(self, guild_id: int, *, requested_by: int) -> GuildRecording | None: ...
