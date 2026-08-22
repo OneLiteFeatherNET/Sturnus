@@ -64,10 +64,12 @@ jobs:
           STURNUS_OUTLINE_CLIENT_SECRET=not-a-real-secret
           STURNUS_OUTLINE_REDIRECT_URI=https://sturnus.invalid/oauth/callback
           STURNUS_OUTLINE_SERVICE_KEY=not-a-real-key
+          STURNUS_CONSOLE_REDIRECT_URI=https://sturnus.invalid/api/auth/callback
+          STURNUS_SESSION_SECRET=not-a-real-session-secret-of-at-least-32-bytes
           EOF
 
           failed=0
-          for entrypoint in sturnus-bot sturnus-worker sturnus-link; do
+          for entrypoint in sturnus-bot sturnus-worker sturnus-link sturnus-api; do
             echo "::group::$entrypoint"
             out=$(docker run --rm --env-file /tmp/env --entrypoint sh sturnus:ci \
                     -c "timeout 25 $entrypoint 2>&1" || true)

@@ -33,12 +33,17 @@ from __future__ import annotations
 
 from typing import Final
 
-#: The three processes built from the one image. The same literal names
+#: The Python processes built from the one image. The same literal names
 #: `sturnus.infrastructure.observability.init_sentry` takes as its
 #: `component` tag and `[project.scripts]` uses, so an operator reading a
 #: Sentry issue, a Loki stream and a Tempo service graph sees one word for
-#: one process rather than three near-synonyms.
-COMPONENTS: Final = ("bot", "worker", "link")
+#: one process rather than four near-synonyms.
+#:
+#: `api` arrived without being added here, which is exactly what the note
+#: on `service_name` below warned about -- nothing enforces this tuple, so
+#: it drifted silently for the length of one change. The console is
+#: deliberately absent: it is a Node process that calls none of this.
+COMPONENTS: Final = ("bot", "worker", "link", "api")
 
 
 #: OpenTelemetry `service.name` per component. Derived, not tabulated, so a
