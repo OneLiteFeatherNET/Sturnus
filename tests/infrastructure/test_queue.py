@@ -5,7 +5,8 @@ from typing import Any
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from sturnus.infrastructure.db.models import Base
+from sturnus.domain.measurements import JobMeasurements
+from sturnus.infrastructure.db.models import Base, TranscriptionJob
 from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import JobRepository, SessionRepository
 from sturnus.infrastructure.telemetry import JOB_OUTCOME, record
@@ -385,3 +386,107 @@ async def test_the_outcome_counter_never_reports_a_failure_as_a_success(
         await queue.fail(job.id, "broken", 3)
 
     assert _job_outcomes(outcomes) == ["failed", "failed", "dead"]
+
+
+async def _claim_one(factory: async_sessionmaker[AsyncSession], queue: JobQueue) -> Any:
+    """Seeds one speaker's job and claims it, which is the state every
+    measurement test below starts from."""
+    await seed(factory, [ANNA])
+    job = await queue.claim()
+    assert job is not None
+    return job
+
+
+# ---------------------------------------------------------------------------
+# What a finished job measured. The console's dashboard is built from these
+# three numbers, and until now the worker computed all of them and kept
+# none -- they went into a log line and a metric, both retained for weeks,
+# while the job row lives as long as the guild does.
+# ---------------------------------------------------------------------------
+
+
+async def test_completing_a_job_stores_what_it_measured(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    queue = JobQueue(factory)
+    job = await _claim_one(factory, queue)
+
+    await queue.complete(
+        job.id,
+        "the transcript",
+        JobMeasurements(audio_seconds=521.0, speech_seconds=88.5, segment_count=42),
+    )
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, job.id)
+        assert stored is not None
+        assert stored.audio_seconds == 521.0
+        assert stored.speech_seconds == 88.5
+        assert stored.segment_count == 42
+
+
+async def test_a_job_completed_without_measurements_stores_null_not_zero(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Null means "never measured"; zero would mean "said nothing".
+
+    They are different facts about a recording, and the console renders
+    them differently -- one as an absence, the other as a silent
+    participant. Collapsing them here would make that distinction
+    unrecoverable.
+    """
+    queue = JobQueue(factory)
+    job = await _claim_one(factory, queue)
+
+    await queue.complete(job.id, "the transcript")
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, job.id)
+        assert stored is not None
+        assert stored.audio_seconds is None
+        assert stored.segment_count is None
+
+
+async def test_a_track_that_produced_nothing_still_records_its_length(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The case the whole column set exists for.
+
+    A recording of real length whose decoder returned no segments is the
+    signature of the defect that cost this project two days. Storing the
+    length beside a segment count of zero is what makes it visible
+    afterwards, rather than indistinguishable from a participant who
+    never spoke.
+    """
+    queue = JobQueue(factory)
+    job = await _claim_one(factory, queue)
+
+    await queue.complete(
+        job.id, "", JobMeasurements(audio_seconds=6000.0, speech_seconds=0.9, segment_count=0)
+    )
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, job.id)
+        assert stored is not None
+        assert stored.audio_seconds == 6000.0
+        assert stored.segment_count == 0
+
+
+async def test_measurements_do_not_change_whether_a_job_was_the_last(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`complete` answers one question -- was this the session's last job,
+    which is what triggers document creation -- and adding a second
+    responsibility to it must not disturb the first. Two speakers, so both
+    answers are exercised rather than only the one a single job can give.
+    """
+    await seed(factory, [ANNA, BEN])
+    queue = JobQueue(factory)
+
+    first = await queue.claim()
+    assert first is not None
+    assert await queue.complete(first.id, "a", JobMeasurements(10.0, 5.0, 1)) is False
+
+    second = await queue.claim()
+    assert second is not None
+    assert await queue.complete(second.id, "b", JobMeasurements(20.0, 6.0, 2)) is True

@@ -24,6 +24,7 @@ EXPECTED_TABLES = {
     "session",
     "session_participant",
     "transcription_job",
+    "admin_member",
 }
 
 

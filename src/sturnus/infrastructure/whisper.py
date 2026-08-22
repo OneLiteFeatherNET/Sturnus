@@ -95,6 +95,7 @@ from sturnus.application.transcription import (
     TranscribedSegment,
     TranscriptionResult,
 )
+from sturnus.domain.measurements import JobMeasurements
 from sturnus.infrastructure.speech_gate import speech_clips
 from sturnus.infrastructure.telemetry import TRANSCRIPTION_PROGRESS, set_current_span_fields
 from sturnus.observability.events import Event, log_event
@@ -629,4 +630,17 @@ class WhisperEngine:
         # two: it sees a `TranscriptionResult`, and the gate's numbers are
         # not in it.
         set_current_span_fields(speech_seconds=speech_seconds, clips=len(clips))
-        return TranscriptionResult(segments=tuple(collected), language=detected)
+        return TranscriptionResult(
+            segments=tuple(collected),
+            language=detected,
+            # This is the only place all three exist together. `audio_seconds`
+            # is the file as written, `speech_seconds` what the gate passed on,
+            # and the segment count what came back -- the caller can derive
+            # none of them, which is why they travel on the result rather than
+            # being recomputed downstream.
+            measurements=JobMeasurements(
+                audio_seconds=audio_seconds,
+                speech_seconds=speech_seconds,
+                segment_count=len(collected),
+            ),
+        )

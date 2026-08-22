@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
+from sturnus.domain.measurements import JobMeasurements
 from sturnus.domain.transcript import Segment, SpeakerIdentity
 
 
@@ -27,6 +28,19 @@ class TranscribedSegment:
 class TranscriptionResult:
     segments: tuple[TranscribedSegment, ...]
     language: str
+    #: What the engine measured about the recording it was handed, when it
+    #: is in a position to know. `None` for an engine that only decodes --
+    #: a test double, or a future backend that is handed audio rather than
+    #: a file and so never sees its length.
+    #:
+    #: It rides on the result rather than being recomputed by the caller
+    #: because the caller *cannot* recompute it: the gate's figures are not
+    #: derivable from the segments. `max(segment.end)` is the end of the
+    #: last thing said, which on a track whose speaker fell silent halfway
+    #: through is nowhere near the length of the recording -- and a track
+    #: that decoded to nothing has no segments to take a maximum of at all,
+    #: which is precisely the case worth measuring.
+    measurements: JobMeasurements | None = None
 
 
 class TranscriptionEngine(Protocol):

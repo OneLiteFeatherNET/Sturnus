@@ -50,6 +50,7 @@ from sturnus.application.ports import AudioStore, Encryptor, SessionKey
 from sturnus.application.recording import JobQueue
 from sturnus.application.transcription import TranscriptionEngine, TranscriptionResult
 from sturnus.application.worker import AudioDownloader, Decryptor, Queue
+from sturnus.domain.measurements import JobMeasurements
 from sturnus.infrastructure.telemetry import (
     DOCUMENT_CREATE_DURATION,
     JOB_STAGE_DURATION,
@@ -110,12 +111,25 @@ class TracedQueue:
             )
         return claimed
 
-    async def complete(self, job_id: int, transcript: str) -> bool:
+    async def complete(
+        self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+    ) -> bool:
         # `transcript` is passed straight through and never observed: it is
         # the protected content itself, and the only thing worth recording
         # about it -- its length -- is already on the `job.transcribe` span.
+        #
+        # `measurements` is durations and a count, so unlike the transcript
+        # it is safe to put on a span -- and worth putting there, since a
+        # trace of a job that decoded nothing is otherwise a trace with no
+        # sign of what went wrong.
         with span("job.complete", job_id=job_id), _StageTimer("complete"):
-            is_last = await self._inner.complete(job_id, transcript)
+            if measurements is not None:
+                set_current_span_fields(
+                    audio_seconds=round(measurements.audio_seconds, 3),
+                    speech_seconds=round(measurements.speech_seconds, 3),
+                    segment_count=measurements.segment_count,
+                )
+            is_last = await self._inner.complete(job_id, transcript, measurements)
         # `outcome` lands on the enclosing `job.process` span, the same
         # place and for the same reason as `claim`'s ids: the root span is
         # opened before anything is known and cannot label itself

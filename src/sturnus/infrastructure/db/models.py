@@ -7,6 +7,7 @@ from datetime import datetime
 from sqlalchemy import (
     BigInteger,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -122,6 +123,28 @@ class SessionParticipant(Base):
     )
 
 
+class AdminMember(Base):
+    """One Discord administrator of one guild, mirrored for `api` to read.
+
+    `admin_role_id` is a Discord role, and the console's API process has no
+    gateway to ask about role membership -- deliberately: a process that
+    can decrypt every recording in the system is not one to also hand the
+    ability to act as the bot (Spec 13.2). `bot`, which does hold the
+    members intent, writes this table; `api` only ever reads it.
+
+    Rows are replaced per guild rather than merged, because a revoked role
+    that leaves a stale row behind is a privilege outliving its grant --
+    and nothing downstream would ever show it, since every caller asks
+    "is this person an admin" and never "why".
+    """
+
+    __tablename__ = "admin_member"
+
+    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    discord_user_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class TranscriptionJob(Base):
     __tablename__ = "transcription_job"
 
@@ -145,6 +168,15 @@ class TranscriptionJob(Base):
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error: Mapped[str | None] = mapped_column(Text)
     transcript: Mapped[str | None] = mapped_column(Text)
+    # What the job measured about its recording, written on completion.
+    # Nullable because every row that predates the column has audio that
+    # may already be deleted -- there is nothing to backfill from, and a
+    # zero would be a claim rather than an absence. See
+    # `sturnus.domain.measurements.JobMeasurements` for why the three
+    # belong together.
+    audio_seconds: Mapped[float | None] = mapped_column(Float)
+    speech_seconds: Mapped[float | None] = mapped_column(Float)
+    segment_count: Mapped[int | None] = mapped_column(Integer)
 
     __table_args__ = (
         UniqueConstraint("session_id", "discord_user_id", name="uq_job_per_speaker"),

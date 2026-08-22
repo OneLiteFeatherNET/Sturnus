@@ -62,6 +62,7 @@ from datetime import UTC, datetime, timedelta
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sturnus.domain.measurements import JobMeasurements
 from sturnus.infrastructure.db.models import Session, TranscriptionJob
 from sturnus.infrastructure.telemetry import JOB_OUTCOME, record
 from sturnus.observability.events import Event, log_event
@@ -141,7 +142,9 @@ class JobQueue:
                 wrapped_data_key=job.wrapped_data_key,
             )
 
-    async def complete(self, job_id: int, transcript: str) -> bool:
+    async def complete(
+        self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+    ) -> bool:
         """Stores the transcript, marks the job done, and reports whether it
         was the session's last job.
 
@@ -192,6 +195,20 @@ class JobQueue:
 
             job.transcript = transcript
             job.status = "done"
+            # Written in the same transaction as the transcript, because
+            # they describe the same act of decoding: a row carrying one
+            # without the other would be a job whose transcript cannot be
+            # interpreted -- an empty one means "said nothing" or "nothing
+            # decoded" depending entirely on these three numbers.
+            #
+            # Left null when absent rather than defaulted to zero. Null is
+            # "never measured", zero is "measured, and it was nothing", and
+            # only one of those is a claim about the recording. An engine
+            # that cannot measure says so by passing nothing.
+            if measurements is not None:
+                job.audio_seconds = measurements.audio_seconds
+                job.speech_seconds = measurements.speech_seconds
+                job.segment_count = measurements.segment_count
             await session.flush()
             remaining = await session.scalar(
                 select(func.count())

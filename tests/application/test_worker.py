@@ -19,6 +19,7 @@ from sturnus.application.documents import CreatedDocument
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
 from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.domain import settings as domain_settings
+from sturnus.domain.measurements import JobMeasurements
 from sturnus.infrastructure.db.queue import ClaimedJob
 from sturnus.infrastructure.documents.outline import PermanentDocumentError
 
@@ -37,12 +38,19 @@ class FakeQueue:
         self.completed: list[tuple[int, str]] = []
         self.failed: list[tuple[int, str]] = []
         self.last_is_final = False
+        self.measured: list[JobMeasurements | None] = []
 
     async def claim(self) -> object | None:
         return self.jobs.pop(0) if self.jobs else None
 
-    async def complete(self, job_id: int, transcript: str) -> bool:
+    async def complete(
+        self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+    ) -> bool:
         self.completed.append((job_id, transcript))
+        # Kept separately from `completed` so a test can assert on what was
+        # measured without every existing assertion on that list having to
+        # grow a third element it does not care about.
+        self.measured.append(measurements)
         return self.last_is_final
 
     async def fail(self, job_id: int, error: str, _max_attempts: int) -> bool:
@@ -62,11 +70,19 @@ class FakeEngine:
     """
 
     def __init__(
-        self, text: str = "spoken words", fail: bool = False, detected: str = "de"
+        self,
+        text: str = "spoken words",
+        fail: bool = False,
+        detected: str = "de",
+        measurements: JobMeasurements | None = None,
     ) -> None:
         self.text = text
         self.fail = fail
         self.detected = detected
+        #: Defaults to `None`, which is the honest default for a double
+        #: that decodes nothing: an engine reports what it measured, and
+        #: this one measured nothing. Tests that care pass a value.
+        self.measurements = measurements
         self.calls: list[tuple[Path, str | None]] = []
         #: `initial_prompt` from every call, recorded separately from
         #: `calls` so the existing `calls[i][1]` language assertions stay
@@ -81,7 +97,9 @@ class FakeEngine:
         if self.fail:
             raise RuntimeError("model exploded")
         return TranscriptionResult(
-            segments=(TranscribedSegment(0.0, 1.0, self.text),), language=self.detected
+            segments=(TranscribedSegment(0.0, 1.0, self.text),),
+            language=self.detected,
+            measurements=self.measurements,
         )
 
 
@@ -826,3 +844,37 @@ async def test_an_unusable_timezone_falls_back_to_utc_rather_than_failing(
 
     assert documents.created, "an unusable timezone must not prevent the document"
     assert "20:00" in documents.created[0][0]
+
+
+async def test_the_worker_persists_what_the_engine_measured(tmp_path: Path) -> None:
+    """The numbers reach the queue exactly as the engine reported them.
+
+    The worker neither recomputes nor sanity-checks them, and that is the
+    design: the gate's figures are not derivable from the segments, and a
+    worker that tried would arrive at `max(segment.end)` -- the end of the
+    last thing said, which on a track whose speaker fell silent halfway
+    through is nowhere near the length of the recording.
+    """
+    queue = FakeQueue([job()])
+    measured = JobMeasurements(audio_seconds=521.0, speech_seconds=88.5, segment_count=2)
+
+    await process_one(**run(tmp_path, queue=queue, engine=FakeEngine(measurements=measured)))
+
+    assert queue.measured == [measured]
+
+
+async def test_an_engine_that_measured_nothing_completes_the_job_anyway(
+    tmp_path: Path,
+) -> None:
+    """Measurement is not a precondition for a transcript.
+
+    A backend handed audio rather than a file never sees the recording's
+    length, and refusing to store its transcript over that would trade a
+    working transcription for a missing statistic.
+    """
+    queue = FakeQueue([job()])
+
+    await process_one(**run(tmp_path, queue=queue, engine=FakeEngine()))
+
+    assert queue.measured == [None]
+    assert len(queue.completed) == 1
