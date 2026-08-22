@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, tzinfo
 from typing import Protocol
 
+from sturnus.console.participation import Attendance
 from sturnus.console.reporting import RecordedSession
 from sturnus.console.statistics import AttendedSession
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
@@ -472,3 +473,40 @@ class GuildReports(Protocol):
     """
 
     async def recording_of(self, guild_id: int, *, requested_by: int) -> GuildRecording | None: ...
+
+
+@dataclass(frozen=True)
+class GuildParticipation:
+    """Who took part in a guild's meetings, and how many there were.
+
+    The session count travels with the people because a rank means
+    nothing without it: "in eleven meetings" is one claim out of twelve
+    and quite another out of four hundred.
+
+    Read `sturnus.console.participation` before touching anything that
+    reaches this. It is the one thing the console reports that is about
+    other people, named and ranked, and it is a separate port for a
+    separate endpoint precisely so that not having it stays one revert.
+    """
+
+    people: tuple[Attendance, ...]
+    sessions: int
+
+
+class ParticipationReports(Protocol):
+    """A guild's attendance ranking, if the person asking administers it.
+
+    Deliberately not a method on `GuildReports`. That protocol answers
+    about a guild in aggregate and says in its own docstring that it names
+    nobody; adding a ranking to it would make that sentence false and
+    would put the two behind one authorisation call, one endpoint and one
+    decision. They are different decisions.
+
+    `requested_by` is not optional, for the reason no directory here takes
+    an optional one, and `None` covers "no such guild" and "you do not
+    administer it" alike.
+    """
+
+    async def attendance_in(
+        self, guild_id: int, *, requested_by: int
+    ) -> GuildParticipation | None: ...

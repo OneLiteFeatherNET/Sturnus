@@ -42,6 +42,7 @@ from sturnus.console.adapters import (
     ConsoleConsentDirectory,
     ConsoleGuildReports,
     ConsoleLinkDirectory,
+    ConsoleParticipationReports,
     ConsoleQueueControl,
     ConsoleQueueOverview,
     ConsoleStateStore,
@@ -218,6 +219,7 @@ async def _run() -> None:
         queues=ConsoleQueueOverview(session_factory, admins, now),
         consents=ConsoleConsentDirectory(session_factory, admins, config, now),
         reports=ConsoleGuildReports(session_factory, admins, config),
+        participation=ConsoleParticipationReports(session_factory, admins),
     )
 
     runner = web.AppRunner(app)

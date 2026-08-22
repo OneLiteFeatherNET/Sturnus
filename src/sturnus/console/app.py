@@ -40,6 +40,7 @@ from sturnus.console.ports import (
     GuildReports,
     LinkDirectory,
     OAuthClient,
+    ParticipationReports,
     QueueControl,
     QueueOverview,
     SessionReads,
@@ -52,7 +53,7 @@ from sturnus.console.routes_consent import CONSENT_DIRECTORY
 from sturnus.console.routes_consent import register as register_consent
 from sturnus.console.routes_queue import QUEUE_CONTROL, QUEUE_OVERVIEW
 from sturnus.console.routes_queue import register as register_queue
-from sturnus.console.routes_report import GUILD_REPORTS
+from sturnus.console.routes_report import GUILD_REPORTS, PARTICIPATION_REPORTS
 from sturnus.console.routes_report import register as register_report
 from sturnus.console.session import (
     ExpiredSession,
@@ -278,6 +279,7 @@ def build_api(
     queues: QueueOverview,
     consents: ConsentDirectory,
     reports: GuildReports,
+    participation: ParticipationReports,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
 
@@ -306,6 +308,7 @@ def build_api(
     app[QUEUE_OVERVIEW] = queues
     app[CONSENT_DIRECTORY] = consents
     app[GUILD_REPORTS] = reports
+    app[PARTICIPATION_REPORTS] = participation
     app.add_routes(
         [
             web.get("/healthz", healthz),
