@@ -21,6 +21,8 @@ jobs:
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
+  # The Python image: bot, worker, link and api, one image and four entry
+  # points (Spec 13.2).
   publish:
     needs: release-please
     if: needs.release-please.outputs.release_created == 'true'
@@ -32,4 +34,33 @@ jobs:
       image-name: "onelitefeather/sturnus"
       version: ${{ needs.release-please.outputs.version }}
       context: "."
+    secrets: inherit
+
+  # The console: a Node process, and therefore an image of its own. A
+  # crashed renderer is an outage of the page and a crashed API is an
+  # outage of the data -- they fail differently -- and one image for both
+  # would put a Node runtime in the Python image, which is the larger of
+  # the two by a wide margin.
+  #
+  # Same version tag, deliberately: the chart defaults the console's tag to
+  # the app version, and a console a release behind its API is a console
+  # whose pages call endpoints that may not exist yet. Nothing enforces
+  # that they are published together beyond this job sitting next to the
+  # one above, which is why they share a `needs` and a version expression
+  # rather than being triggered separately.
+  publish-console:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    permissions:
+      contents: read
+      id-token: write   # keyless signing
+    uses: OneLiteFeatherNET/workflows/.github/workflows/docker-publish.yml@v2.8.1
+    with:
+      image-name: "onelitefeather/sturnus-console"
+      version: ${{ needs.release-please.outputs.version }}
+      # The build context is the repository root, not `console/`: the
+      # Dockerfile copies `console/package.json` and `console/` by those
+      # paths so that a context of `console/` alone would break both.
+      context: "."
+      dockerfile: "console/Dockerfile"
     secrets: inherit
