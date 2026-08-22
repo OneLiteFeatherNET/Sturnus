@@ -1,0 +1,200 @@
+"""Process entrypoint for the `api` deployment: the console's back end.
+
+Serves the JSON API at `sturnus.onelitefeather.dev/api/*` behind an OAuth
+session. See `docs/superpowers/specs/2026-08-21-sturnus-console-design.md`.
+
+**What this process holds, and what it must never hold.** It has the
+database, the OAuth client secret, and -- from the next change onwards --
+S3 and the master key, because it decrypts audio on the way to the
+browser. It has no Discord token, and must not be given one: a process
+that can read every recording ever made is not one to also hand the
+ability to act as the bot (Spec 13.2). Whether somebody administers a
+guild is therefore read from `admin_member`, which the bot mirrors, rather
+than asked of Discord here.
+
+Like `link`, this starts listening *before* waiting for the worker's
+migrations. Waiting first leaves the health port closed for as long as the
+wait takes, and the liveness probe kills the pod while it is doing exactly
+what it should.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import signal
+from datetime import UTC, datetime, timedelta
+
+from aiohttp import web
+from pydantic import SecretStr
+from sqlalchemy import inspect
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+
+from sturnus.config import StrictSettings
+from sturnus.console.adapters import ConsoleLinkDirectory, ConsoleStateStore
+from sturnus.console.app import build_api
+from sturnus.console.session import SessionCookie
+from sturnus.infrastructure.db.admin_members import AdminMemberStore
+from sturnus.infrastructure.db.models import AccountLink, AdminMember, ConsoleState
+from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
+from sturnus.infrastructure.observability import init_sentry
+from sturnus.infrastructure.telemetry import init_telemetry, shutdown_telemetry
+from sturnus.observability.events import Event, log_event
+from sturnus.observability.setup import (
+    asyncio_exception_handler,
+    configure_logging,
+    install_excepthooks,
+)
+
+log = logging.getLogger(__name__)
+
+_SCHEMA_WAIT_INTERVAL_SECONDS = 2.0
+
+#: How long a console session lasts. Long enough for a working day, short
+#: enough that a tab left open overnight is not a standing grant.
+_SESSION_LIFETIME = timedelta(hours=12)
+
+#: The tables this process reads. Narrower than the whole schema on
+#: purpose: waiting for tables it never touches would tie its readiness to
+#: migrations that have nothing to do with it.
+_REQUIRED_TABLES = frozenset(
+    {
+        AccountLink.__tablename__,
+        AdminMember.__tablename__,
+        ConsoleState.__tablename__,
+        "session",
+        "session_participant",
+        "transcription_job",
+    }
+)
+
+
+class ApiSettings(StrictSettings):
+    """Everything this process needs, and nothing it does not.
+
+    No `discord_token`: see the module docstring. `session_secret` signs
+    the console's session cookies and is refused below thirty-two bytes by
+    `SessionCookie` itself, so a placeholder fails at startup rather than
+    serving forgeable sessions.
+    """
+
+    database_url: str
+    outline_base_url: str
+    outline_client_id: str
+    outline_client_secret: SecretStr
+    #: The console's own callback, which is *not* the account-link one --
+    #: they are different flows on different paths, and registering the
+    #: same URI for both would send an account link to the console.
+    console_redirect_uri: str
+    session_secret: SecretStr
+    health_port: int = 8080
+    console_origin: str = "https://sturnus.onelitefeather.dev"
+
+
+async def _wait_for_schema(engine: AsyncEngine) -> None:
+    """Polls until every table this process reads exists.
+
+    Unbounded, unlike the bot's equivalent: this process serves a web
+    console, and a console that is 503 while the schema catches up is a
+    better outcome than a pod that gives up and crash-loops. `/readyz`
+    reports the wait, so Kubernetes holds traffic back rather than
+    restarting anything.
+    """
+    while True:
+        async with engine.connect() as conn:
+            existing: set[str] = await conn.run_sync(
+                lambda sync_conn: set(inspect(sync_conn).get_table_names())
+            )
+        missing = _REQUIRED_TABLES - existing
+        if not missing:
+            return
+        log_event(
+            log,
+            logging.WARNING,
+            Event.SCHEMA_WAITING,
+            "Waiting for the worker to migrate the database schema",
+            missing=sorted(missing),
+        )
+        await asyncio.sleep(_SCHEMA_WAIT_INTERVAL_SECONDS)
+
+
+async def _run() -> None:
+    settings = ApiSettings()
+
+    engine = create_async_engine(settings.database_url)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    oauth = OutlineOAuth(
+        base_url=settings.outline_base_url,
+        client_id=settings.outline_client_id,
+        client_secret=settings.outline_client_secret.get_secret_value(),
+        redirect_uri=settings.console_redirect_uri,
+    )
+
+    schema_ready = False
+    app = build_api(
+        oauth=oauth,
+        states=ConsoleStateStore(session_factory),
+        links=ConsoleLinkDirectory(session_factory),
+        admins=AdminMemberStore(session_factory),
+        sessions=SessionCookie(settings.session_secret.get_secret_value(), _SESSION_LIFETIME),
+        now=lambda: datetime.now(UTC),
+        schema_ready=lambda: schema_ready,
+        console_origin=settings.console_origin,
+    )
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    # Bound to `0.0.0.0`: reached through a Kubernetes Service and the
+    # Cloudflare Tunnel in front of it, never directly (Spec 13.5).
+    site = web.TCPSite(runner, "0.0.0.0", settings.health_port)
+    await site.start()
+    log_event(
+        log,
+        logging.INFO,
+        Event.CONSOLE_STARTED,
+        "Console API listening",
+        count=settings.health_port,
+    )
+
+    await _wait_for_schema(engine)
+    schema_ready = True
+    log.info("Database schema is present; ready to serve the console")
+
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.set_exception_handler(asyncio_exception_handler)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+
+    try:
+        await stop.wait()
+    finally:
+        log_event(
+            log,
+            logging.INFO,
+            Event.SHUTDOWN_BEGIN,
+            "Shutdown requested: stopping the console API",
+        )
+        await runner.cleanup()
+        await engine.dispose()
+        shutdown_telemetry()
+        log_event(log, logging.INFO, Event.SHUTDOWN_COMPLETE, "Console API stopped")
+
+
+def main() -> None:
+    # The same four, in the same order and for the same reasons as every
+    # other entrypoint: `configure_logging` installs the handler that
+    # redacts what the others report, and `install_excepthooks` is what
+    # stops a settings `ValidationError` -- whose pydantic message embeds
+    # the raw environment dict, secret prefixes and all -- reaching stderr
+    # unredacted.
+    configure_logging("api")
+    install_excepthooks()
+    init_sentry("api")
+    init_telemetry("api")
+    asyncio.run(_run())
+
+
+if __name__ == "__main__":
+    main()

@@ -120,6 +120,12 @@ class Event(StrEnum):
     LINK_ESTABLISHED = "link.established"
     LINK_STATES_PURGED = "link.states_purged"
 
+    # -- console ------------------------------------------------------------
+    CONSOLE_STARTED = "console.started"
+    CONSOLE_SIGNED_IN = "console.signed_in"
+    CONSOLE_SIGN_IN_REJECTED = "console.sign_in_rejected"
+    CONSOLE_STATES_PURGED = "console.states_purged"
+
     # -- cross-cutting ------------------------------------------------------
     PROCESS_STARTING = "process.starting"
     SHUTDOWN_BEGIN = "shutdown.begin"
