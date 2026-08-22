@@ -340,3 +340,82 @@ class QueueControl(Protocol):
     async def status_for(self, session_id: int, *, requested_by: int) -> QueueSnapshot | None: ...
 
     async def requeue(self, session_id: int, *, requested_by: int) -> RequeueOutcome | None: ...
+
+
+@dataclass(frozen=True)
+class ConsentHolder:
+    """One person's standing consent in one guild, as an administrator sees it.
+
+    The newest `consent` row for that person in that guild, which is the
+    same selection `ConsentRepository.current` makes and the same one the
+    recorder acts on -- showing an administrator an older row would show
+    them a decision nothing enforces.
+
+    `active` is not `revoked_at is None`. Consent also expires when the
+    guild's `policy_version` moves on, because a grant names the version
+    it was given under (`sturnus.domain.consent.is_consent_active`). Both
+    states are reported separately rather than folded into one flag: "they
+    withdrew it" and "we changed the policy under them" are different
+    facts about a person and lead to different conversations.
+
+    `recordings_with_audio` is here for one purpose, and it is not a link
+    to a delete button. Withdrawing consent stops future recording; it
+    does not erase what is already stored. An administrator who is not
+    shown that number would reasonably assume it does.
+    """
+
+    discord_user_id: int
+    #: From `session_participant`, which is the only place a name is
+    #: stored -- `consent` has none. `None` for somebody who consented and
+    #: has not yet been in a recorded session, which is exactly the state
+    #: a well-run guild onboards people into.
+    display_name: str | None
+    policy_version: str
+    granted_at: datetime
+    revoked_at: datetime | None
+    active: bool
+    recordings_with_audio: int
+
+
+@dataclass(frozen=True)
+class RevocationOutcome:
+    """What a revocation did, or why it did nothing."""
+
+    revoked: bool
+    #: Why nothing happened, as one of a fixed set of reasons. `None` when
+    #: something did.
+    refusal: str | None
+
+
+class ConsentDirectory(Protocol):
+    """Who has consented in a guild, and the power to withdraw it for them.
+
+    `requested_by` is not optional and there is no method here without it,
+    for the reason `TrackDirectory` and `QueueControl` have none: the
+    authorisation rule lives inside the call rather than in a handler that
+    could forget to apply it. Both methods answer `None` for "no such
+    guild" and for "you do not administer it" alike.
+
+    **What a revocation from here can and cannot do.** Consent is two
+    layers (Spec 3.1): a Discord role, checked synchronously on every
+    frame, and a stored record, checked on every frame through a five
+    second cache. This process holds no Discord token and never will
+    (Spec 13.2) -- it can decrypt every recording ever made, and a process
+    with that reach is not one to also give the ability to act as the bot.
+    So it writes the record and cannot touch the role.
+
+    That is enough to stop the recording: the stored record is the layer
+    that exists precisely because the role can be bypassed, and a
+    revocation takes effect within the cache's five seconds, mid-session.
+    What it leaves behind is a role the person still holds, which is
+    visible in Discord and misleading if nobody says so. The console says
+    so, in the interface, next to the button.
+    """
+
+    async def holders(
+        self, guild_id: int, *, requested_by: int
+    ) -> Sequence[ConsentHolder] | None: ...
+
+    async def revoke(
+        self, guild_id: int, discord_user_id: int, *, requested_by: int
+    ) -> RevocationOutcome | None: ...

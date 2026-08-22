@@ -1036,6 +1036,75 @@ cannot be without giving `api` a Discord token.
   a recording. The console shows the track and omits the speaker rather
   than dropping a recording that exists.
 
+### 6.2.6 Withdrawing somebody else's consent
+
+An administrator can end a member's consent from the console's **Admin
+View → User Settings**, per guild. This is the third way a consent can
+end, and the three are not interchangeable:
+
+| Way | Scope | Removes the role? | Effect on recording |
+|---|---|---|---|
+| `/consent revoke` in Discord | The person themselves | **Yes** | Immediate (role check is per frame, uncached) |
+| Bumping `policy_version` | Everybody in the guild at once | No | Within the consent cache's 5 s TTL |
+| Console → User Settings | One named person | **No** | Within the consent cache's 5 s TTL |
+
+**The console cannot remove the Discord role, and this is deliberate.**
+`api` holds no Discord token (§6.2.2), so it writes `consent.revoked_at`
+and nothing else. That is enough to stop the recording: the packet filter
+checks *both* layers on every frame, and the stored record is the layer
+that exists precisely because somebody with Discord's `administrator`
+permission bypasses channel permissions and could speak without the role.
+Recording of that person stops mid-session, within five seconds.
+
+What it leaves is a member who still holds the consent role. Nothing
+records them, but Discord looks as though something might, and `/consent
+status` will report "role assigned: yes, consent active: no". **If the
+role should go too, remove it in Discord** — either by hand or by asking
+the person to run `/consent revoke`, which does both.
+
+Note the asymmetry with removing the role *only*, which is what an
+administrator would otherwise do by hand: that stops the recording and
+leaves `revoked_at` NULL, so the record still reads as consent given, and
+re-adding the role at any point silently resumes recording somebody who
+never re-consented. Withdrawing through the console is the half that
+lasts.
+
+**It does not delete anything already recorded.** Withdrawing consent is a
+decision about the future. Erasing what was recorded under the consent
+that existed at the time is `/audio purge <user>` in Discord (§12.3), and
+it is deliberately a separate act with a separate command. The User
+Settings page shows, per person, how many recordings the guild still holds
+for them, so the distinction is on the screen rather than in this
+document.
+
+**A consent record is never deleted.** `revoked_at` is stamped on the
+newest grant; earlier grants keep their history. The row *is* the evidence
+that consent was once given, which is what Art. 7(1) requires be
+demonstrable, so a revocation modifies the grant it revokes rather than
+removing it.
+
+**Who did it is only in the log.** `consent` has no column naming the
+person who performed a revocation — `/consent revoke` never needed one,
+because the only person who could run it was the subject. So the audit
+trail for a third-party revocation is the log line and nothing else:
+
+```logql
+{namespace="sturnus"} | json | sturnus_event="console.consent_revoked"
+```
+
+It is emitted at **WARNING** with `guild_id`, `discord_user_id` (whose
+consent) and `requested_by` (who withdrew it). Retention of that line is
+therefore the retention of the audit trail; if a longer one is needed, it
+has to become a column, which is a migration and a change to the shared
+`ConsentRepository.record_revocation`.
+
+**A consent that is inactive is not the same as one that was withdrawn.**
+The page distinguishes them, and so should anybody reading it. A grant
+naming a superseded `policy_version` has no force and a NULL `revoked_at`:
+nobody withdrew anything, the guild's policy moved on under them (§6).
+Restoring the old `policy_version` would bring every one of those back.
+Withdrawing through the console is what survives that.
+
 ### 6.3 Listening to a recording by hand
 
 Every automated check this system has can describe a track — its level,

@@ -22,11 +22,14 @@ from sturnus.console.audio import AudioDelivery
 from sturnus.console.filters import SessionFilter
 from sturnus.console.ports import (
     AdminDirectory,
+    ConsentDirectory,
+    ConsentHolder,
     LinkDirectory,
     OAuthClient,
     QueueControl,
     QueueSnapshot,
     RequeueOutcome,
+    RevocationOutcome,
     SessionReads,
     SettingsStore,
     StateStore,
@@ -468,12 +471,48 @@ class FakeTags:
         return self.stored[(session_id, owner)]
 
 
+class FakeConsents:
+    """A consent directory nobody administers, until a test says otherwise.
+
+    Defaults to answering `None` everywhere, which is what the real
+    directory answers for "no such guild or not yours" -- so a test with no
+    interest in consent gets 404s rather than a fake that quietly
+    authorises everything.
+    """
+
+    def __init__(
+        self,
+        holders: Sequence[ConsentHolder] | None = None,
+        outcome: RevocationOutcome | None = None,
+    ) -> None:
+        self.holders_by_guild = None if holders is None else tuple(holders)
+        self.outcome = outcome
+        #: Every revocation this was asked for, as (guild, subject, actor).
+        #: Recorded rather than merely counted: "the administrator's own id
+        #: reached the write, not one taken from the URL" is the property
+        #: the authorisation tests assert on, and it cannot be seen in a
+        #: response body.
+        self.revoked: list[tuple[int, int, int]] = []
+        self.listed: list[tuple[int, int]] = []
+
+    async def holders(self, guild_id: int, *, requested_by: int) -> Sequence[ConsentHolder] | None:
+        self.listed.append((guild_id, requested_by))
+        return self.holders_by_guild
+
+    async def revoke(
+        self, guild_id: int, discord_user_id: int, *, requested_by: int
+    ) -> RevocationOutcome | None:
+        self.revoked.append((guild_id, discord_user_id, requested_by))
+        return self.outcome
+
+
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
     states: StateStore | None = None,
     links: LinkDirectory | None = None,
     admins: AdminDirectory | None = None,
+    consents: ConsentDirectory | None = None,
     reads: SessionReads | None = None,
     config: SettingsStore | None = None,
     audio: AudioDelivery | None = None,
@@ -504,6 +543,7 @@ def build_test_api(
         states=states or FakeStates(),
         links=links or FakeLinks(),
         admins=admins or FakeAdmins(),
+        consents=consents or FakeConsents(),
         reads=reads or FakeReads(),
         config=config or FakeConfig(),
         audio=audio

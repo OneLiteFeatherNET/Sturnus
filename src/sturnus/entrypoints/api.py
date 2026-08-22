@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 
 from sturnus.config import StrictSettings
 from sturnus.console.adapters import (
+    ConsoleConsentDirectory,
     ConsoleLinkDirectory,
     ConsoleQueueControl,
     ConsoleStateStore,
@@ -188,21 +189,33 @@ async def _run() -> None:
     )
 
     admins = AdminMemberStore(session_factory)
+    config = ConfigStore(session_factory)
+
+    def now() -> datetime:
+        """The one clock this process reads.
+
+        Named rather than repeated as a lambda at each call site: two
+        collaborators that each build their own would be two clocks a test
+        has to pin separately, and one of them would be missed.
+        """
+        return datetime.now(UTC)
+
     schema_ready = False
     app = build_api(
         oauth=oauth,
         states=ConsoleStateStore(session_factory),
         links=ConsoleLinkDirectory(session_factory),
         admins=admins,
-        config=ConfigStore(session_factory),
+        config=config,
         reads=ConsoleQueries(session_factory),
         sessions=SessionCookie(settings.session_secret.get_secret_value(), _SESSION_LIFETIME),
-        now=lambda: datetime.now(UTC),
+        now=now,
         schema_ready=lambda: schema_ready,
         console_origin=settings.console_origin,
         audio=audio,
         queue=ConsoleQueueControl(session_factory, admins),
         tags=ConsoleTagWriter(session_factory),
+        consents=ConsoleConsentDirectory(session_factory, admins, config, now),
     )
 
     runner = web.AppRunner(app)
