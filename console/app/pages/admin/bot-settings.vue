@@ -40,7 +40,7 @@ import {
   writeSelectedGuild,
 } from '~/utils/settings'
 
-useHead({ title: 'Settings' })
+useHead({ title: 'Bot Settings' })
 
 const api = useApi()
 

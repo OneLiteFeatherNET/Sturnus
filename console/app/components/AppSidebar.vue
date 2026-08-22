@@ -7,8 +7,15 @@
  * name through `aria-label` and its `title`, so a screen reader and a
  * hover both still say what the icon means. An icon rail whose entries
  * announce nothing is a rail only its author can navigate.
+ *
+ * The same rule governs the two groups. Expanded, "User View" and "Admin
+ * View" are visible headings; collapsed, they are a rule between two runs
+ * of icons -- but each group carries its name on the group element itself
+ * in both modes, so the boundary is announced rather than merely drawn.
+ * Somebody who cannot see the rule is exactly the person who most needs to
+ * be told that the next icon acts on the whole guild.
  */
-import { visibleEntries } from '~/utils/navigation'
+import { visibleSections } from '~/utils/navigation'
 
 const { collapsed } = useSidebar()
 const session = useSession()
@@ -16,7 +23,7 @@ const session = useSession()
 // The list and the filter both live in `~/utils/navigation`, where they
 // can be tested without rendering anything -- and where the note that
 // hiding is a courtesy rather than a control is written down.
-const visible = computed(() => visibleEntries(session.value))
+const visible = computed(() => visibleSections(session.value))
 </script>
 
 <template>
@@ -26,19 +33,43 @@ const visible = computed(() => visibleEntries(session.value))
     :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
     aria-label="Sections"
   >
-    <NuxtLink
-      v-for="entry in visible"
-      :key="entry.to"
-      :to="entry.to"
-      :title="entry.label"
-      :aria-label="entry.label"
-      class="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-      active-class="bg-[var(--surface-raised)] text-[var(--color-brand-cyan)]"
+    <div
+      v-for="(section, index) in visible"
+      :key="section.label"
+      role="group"
+      :aria-label="section.label"
+      class="flex flex-col gap-1"
     >
-      <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" class="shrink-0">
-        <path :d="entry.icon" />
-      </svg>
-      <span v-if="!collapsed" class="truncate">{{ entry.label }}</span>
-    </NuxtLink>
+      <!-- A rule instead of a heading when collapsed. The heading text
+           would not fit the rail, and shrinking it to an abbreviation
+           would be a second label to keep in step with the first. -->
+      <hr
+        v-if="collapsed && index > 0"
+        class="my-2"
+        :style="{ borderColor: 'var(--border)' }"
+      >
+      <h2
+        v-if="!collapsed"
+        class="px-3 pt-3 pb-1 text-xs font-semibold uppercase tracking-wider"
+        :style="{ color: 'var(--text-muted)' }"
+      >
+        {{ section.label }}
+      </h2>
+
+      <NuxtLink
+        v-for="entry in section.entries"
+        :key="entry.to"
+        :to="entry.to"
+        :title="entry.label"
+        :aria-label="entry.label"
+        class="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+        active-class="bg-[var(--surface-raised)] text-[var(--color-brand-cyan)]"
+      >
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" class="shrink-0">
+          <path :d="entry.icon" />
+        </svg>
+        <span v-if="!collapsed" class="truncate">{{ entry.label }}</span>
+      </NuxtLink>
+    </div>
   </nav>
 </template>
