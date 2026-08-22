@@ -12,11 +12,14 @@ A credential is a `SecretStr` field -- including an optional one, typed
 takes a string, but it embeds the database password, so it is stored and
 handled like the rest.
 
-`SentrySettings` is folded into every component. It is a class of its own
-because all three read it (see its docstring), so unlike the other three it
-is not "one component's settings"; but the DSN still has to reach each
-container through the Secret, and this list is what the chart is checked
-against.
+`SentrySettings` is folded into every component that has a settings class.
+It is a class of its own because they all read it (see its docstring), so
+unlike the others it is not "one component's settings"; but the DSN still
+has to reach each container through the Secret, and this list is what the
+chart is checked against.
+
+The console has no settings class and no credentials, and is listed anyway
+with an empty list -- see `CREDENTIAL_FREE`.
 """
 
 import json
@@ -27,6 +30,7 @@ from pydantic import SecretStr
 from pydantic_settings import BaseSettings
 
 from sturnus.config import SentrySettings, Settings
+from sturnus.entrypoints.api import ApiSettings
 from sturnus.entrypoints.link import LinkSettings
 from sturnus.entrypoints.worker import WorkerSettings
 
@@ -37,7 +41,16 @@ COMPONENTS: dict[str, type[BaseSettings]] = {
     "sturnus-bot": Settings,
     "sturnus-worker": WorkerSettings,
     "sturnus-link": LinkSettings,
+    "sturnus-api": ApiSettings,
 }
+
+#: Components with no settings class of their own, and no credentials at
+#: all. Listed rather than omitted: a component missing from this file
+#: would fail the chart job as "rendered but not expected", which reads as
+#: an oversight. Naming it with an empty list says the emptiness is the
+#: design -- the console renders pages and calls the API, and every
+#: credential lives on the other side of that boundary.
+CREDENTIAL_FREE = ("sturnus-console",)
 
 #: Not a SecretStr, but a credential all the same -- see the module docstring.
 ALSO_SECRET = {"database_url"}
@@ -73,6 +86,8 @@ def credentials() -> dict[str, list[str]]:
             if _is_credential(name, field.annotation)
         ]
         out[deployment] = sorted(names + shared)
+    for deployment in CREDENTIAL_FREE:
+        out[deployment] = []
     return out
 
 

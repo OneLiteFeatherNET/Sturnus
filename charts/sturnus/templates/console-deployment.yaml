@@ -1,0 +1,106 @@
+{{- /*
+  The console: a Nuxt server that renders pages and calls the API.
+
+  It is the only component with no `sturnus.secretEnv` block, and that is
+  the design rather than an omission -- see `_helpers.tpl`, which refuses
+  outright to render one for it. Every credential and every authorisation
+  decision lives on the other side of the API boundary. A `secretKeyRef`
+  here could only ever be a mistake, so the chart makes it unrepresentable.
+
+  It also runs a different image from every other component. The two fail
+  differently -- a rendering process that has crashed is an outage of the
+  page, an API process that has crashed is an outage of the data -- and
+  keeping them apart keeps a Node runtime out of the Python image.
+*/ -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "sturnus.fullname" . }}-console
+  labels:
+    {{- include "sturnus.componentLabels" (dict "root" . "component" "console") | nindent 4 }}
+spec:
+  replicas: {{ .Values.console.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "sturnus.componentSelectorLabels" (dict "root" . "component" "console") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "sturnus.componentLabels" (dict "root" . "component" "console") | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "sturnus.serviceAccountName" . }}
+      # Never calls the Kubernetes API, and is reachable from the internet.
+      automountServiceAccountToken: false
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: console
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          image: {{ include "sturnus.consoleImage" . }}
+          imagePullPolicy: {{ .Values.consoleImage.pullPolicy }}
+          # No `sturnus.secretEnv`, deliberately -- see the note at the top
+          # of this file. `commonEnv` is not applied either: it carries the
+          # settings the Python components share, none of which this one
+          # reads, and applying it would put an S3 endpoint and an Outline
+          # URL on a process with no use for either.
+          env:
+            # Where the server-side render reaches the API. The in-cluster
+            # Service, not the public hostname: routing a server-side call
+            # back out through Cloudflare and in again would double the
+            # latency and fail entirely when the tunnel is the thing that
+            # is down.
+            - name: NUXT_API_INTERNAL_BASE
+              value: http://{{ include "sturnus.fullname" . }}-api:{{ .Values.api.service.port }}
+            {{- range $k, $v := .Values.console.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.console.containerPort }}
+              protocol: TCP
+          {{- with .Values.console.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.console.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.console.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.console.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            # readOnlyRootFilesystem: true. Nitro writes nothing of its own;
+            # only the runtime's scratch needs /tmp.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.console.tmpSizeLimit }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

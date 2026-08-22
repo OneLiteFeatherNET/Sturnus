@@ -8,7 +8,7 @@ the chart -- silently, because nothing fails.
 
 from pydantic import SecretStr
 
-from scripts.component_credentials import _is_credential, credentials
+from scripts.component_credentials import CREDENTIAL_FREE, _is_credential, credentials
 
 
 def test_an_optional_secret_is_still_a_secret() -> None:
@@ -42,12 +42,25 @@ def test_database_url_is_a_credential_despite_being_a_plain_string() -> None:
     assert _is_credential("database_url", str)
 
 
-def test_every_component_receives_the_sentry_dsn() -> None:
-    """All three call `init_sentry` before reading their own settings, so all
-    three need the key -- and the GitOps repository that supplies it is
+def test_every_python_component_receives_the_sentry_dsn() -> None:
+    """Each of them calls `init_sentry` before reading its own settings, so
+    each needs the key -- and the GitOps repository that supplies it is
     public, which is why it travels through the `Secret` rather than
-    `commonEnv`. See docs/operations.md section 1.4."""
-    for keys in credentials().values():
+    `commonEnv`. See docs/operations.md section 1.4.
+
+    The console is excluded, and the exclusion is derived from
+    `CREDENTIAL_FREE` rather than named here: it is a Node process that
+    calls none of this, and a component listed there is one the chart is
+    asserted to give nothing at all. Spelling "console" in this test as
+    well would mean two places to update when a second such component
+    arrives.
+    """
+    for component, keys in credentials().items():
+        if component in CREDENTIAL_FREE:
+            assert keys == [], (
+                f"{component} is listed as credential-free but was derived credentials: {keys}"
+            )
+            continue
         assert "STURNUS_SENTRY_DSN" in keys
 
 
