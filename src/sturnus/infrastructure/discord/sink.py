@@ -56,6 +56,7 @@ import discord
 from discord.ext import voice_recv
 
 from sturnus.application.ports import Clock
+from sturnus.infrastructure.discord.capture_diagnostics import CaptureDiagnostics
 from sturnus.infrastructure.telemetry import VOICE_PACKETS, record
 
 log = logging.getLogger(__name__)
@@ -146,6 +147,7 @@ class RecordingSink(voice_recv.AudioSink):
         clock: Clock,
         emit: Callable[[CaptureMessage], None],
         guild_id: int | None = None,
+        diagnostics: CaptureDiagnostics | None = None,
     ) -> None:
         # No destination: this sink is an endpoint, not a link in a
         # transformer chain, so it registers no child.
@@ -162,6 +164,10 @@ class RecordingSink(voice_recv.AudioSink):
         self._decoder = decoder
         self._clock = clock
         self._emit = emit
+        # The RTP packet is only visible here -- `ResilientOpusDecoder` is
+        # handed bytes and nothing else -- so the arithmetic that cut those
+        # bytes out of the packet can only be checked from this side.
+        self._diagnostics = diagnostics
         self._unattributed: set[int] = set()
         self._sink_errors = 0
         self._cleaned_up = False
@@ -276,6 +282,9 @@ class RecordingSink(voice_recv.AudioSink):
         # three-byte OPUS_SILENCE frame and is decoded normally, because
         # skipping it would desynchronise the decoder's last-packet
         # duration, which packet-loss concealment depends on.
+        if self._diagnostics is not None:
+            self._note_packet_shape(ssrc, data)
+
         pcm = self._decoder.decode(ssrc, data.opus)
         if pcm is None:
             # The frame is gone. `SpeakerWriter` places audio by
@@ -300,6 +309,36 @@ class RecordingSink(voice_recv.AudioSink):
                 captured_at=self._clock.now(),
             )
         )
+
+    def _note_packet_shape(self, ssrc: int, data: voice_recv.VoiceData) -> None:
+        """Reports how the payload was cut out of the packet around it.
+
+        Reads only the documented attributes of `RTPPacket`, and tolerates
+        every one of them being absent: a `FakePacket` and a
+        `SilencePacket` carry neither an extension nor a body, and a
+        diagnostic that raised on one would stop the capture it exists to
+        explain.
+        """
+        assert self._diagnostics is not None
+        packet = data.packet
+        extension = getattr(packet, "extension", None)
+        body = getattr(packet, "data", b"") or b""
+        payload = getattr(packet, "decrypted_data", b"") or b""
+        if not body or not payload:
+            return
+        try:
+            self._diagnostics.observe_rtp(
+                ssrc,
+                extended=bool(getattr(packet, "extended", False)),
+                csrc_count=int(getattr(packet, "cc", 0) or 0),
+                extension_words=int(getattr(extension, "length", 0) or 0),
+                body_bytes=len(body),
+                payload_bytes=len(payload),
+            )
+        except Exception:
+            # Never from here: `write()` already guards the frame path, and
+            # a measurement is not worth the capture it would take down.
+            log.debug("Could not measure the RTP shape for ssrc=%s", ssrc, exc_info=True)
 
     def _note_unattributed(self, ssrc: int) -> None:
         """Reports unattributed audio once per SSRC, and never more than that.
