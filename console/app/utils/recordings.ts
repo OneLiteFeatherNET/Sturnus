@@ -1,0 +1,214 @@
+/**
+ * A session, its tracks, and how each of them is put into words.
+ *
+ * Separate from the components for the same reason the transport is: the
+ * distinction this module exists to keep -- a measurement of zero against a
+ * measurement that was never taken -- is a decision about honesty, and a
+ * decision embedded in a template can only be checked by rendering one.
+ */
+
+/** Every id here is a string. A Discord snowflake exceeds JavaScript's safe
+ *  integer range, where a JSON number silently loses its last digits and
+ *  produces an id that looks right and names nobody. */
+export interface SessionTrack {
+  discord_user_id: string
+  display_name: string | null
+  /** Seconds of audio written for this speaker. `null` means never measured. */
+  audio_seconds: number | null
+  /** Seconds of it that were speech. `null` means never measured; `0` means
+   *  measured, and this person did not say anything. */
+  speech_seconds: number | null
+  segment_count: number | null
+}
+
+export interface SessionParticipant {
+  discord_user_id: string
+  display_name: string
+}
+
+export interface RecordedSession {
+  id: string
+  started_at: string
+  ended_at: string | null
+  duration_seconds: number | null
+  channel_id: string
+  channel_name: string | null
+  /** The Outline protocol, when one was written. */
+  document_url: string | null
+  /** Everybody else who was in the channel -- including the people who did
+   *  not consent, who are therefore in this list and not in `tracks`. */
+  other_participants: SessionParticipant[]
+  tracks: SessionTrack[]
+}
+
+export interface SessionsResponse {
+  sessions: RecordedSession[]
+}
+
+/**
+ * What is shown where there is no answer.
+ *
+ * An em dash rather than "0", "n/a" or an empty cell: it reads as an
+ * absence at a glance, lines up in a column of numbers, and cannot be
+ * mistaken for a measurement.
+ */
+export const NOT_MEASURED = '—'
+
+/** A length as a clock, with an hours field only when there are hours. */
+export function formatSeconds(total: number): string {
+  // Down, never to the nearest: a track of 59.9 seconds has not reached a
+  // minute, and saying it has makes two numbers that should agree differ.
+  const whole = Math.max(0, Math.floor(total))
+  const hours = Math.floor(whole / 3600)
+  const minutes = Math.floor((whole % 3600) / 60)
+  const seconds = whole % 60
+  const padded = `${String(seconds).padStart(2, '0')}`
+  if (hours > 0) return `${hours}:${String(minutes).padStart(2, '0')}:${padded}`
+  return `${minutes}:${padded}`
+}
+
+/** A measurement, or the fact that none was taken. */
+export function formatMeasurement(seconds: number | null | undefined): string {
+  if (seconds === null || seconds === undefined) return NOT_MEASURED
+  return formatSeconds(seconds)
+}
+
+/** A count, or the fact that none was taken. */
+export function formatCount(count: number | null | undefined): string {
+  if (count === null || count === undefined) return NOT_MEASURED
+  return String(count)
+}
+
+/**
+ * How much of a track was speech, between 0 and 1, or `null` for unknown.
+ *
+ * Unknown covers three cases that all mean the same thing to a reader:
+ * either measurement missing, and a track with no audio at all -- a share
+ * of nothing is not a small share, it is no answer.
+ */
+export function speechShare(track: SessionTrack): number | null {
+  const { audio_seconds: audio, speech_seconds: speech } = track
+  if (audio === null || speech === null) return null
+  if (audio <= 0) return null
+  // The two numbers come from different stages of the pipeline -- one from
+  // the padded track, one from what was actually transcribed -- so a bug
+  // upstream could put speech above audio. A bar drawn past its own end is
+  // a worse way to find that out than a bar at its end.
+  return Math.min(1, Math.max(0, speech / audio))
+}
+
+export function formatShare(share: number | null): string {
+  if (share === null) return NOT_MEASURED
+  return `${Math.round(share * 100)}%`
+}
+
+/**
+ * What to call a speaker.
+ *
+ * Somebody who has left the guild has no display name left to look up, and
+ * a row with an empty name is a track nobody can attribute -- so the id,
+ * which is ugly but true.
+ */
+export function trackLabel(track: SessionTrack): string {
+  const name = track.display_name?.trim()
+  return name ? name : track.discord_user_id
+}
+
+/** What to call the channel it happened in. */
+export function channelLabel(session: RecordedSession): string {
+  const name = session.channel_name?.trim()
+  return name ? `#${name}` : `Channel ${session.channel_id}`
+}
+
+function instantOf(value: string | null): number | null {
+  if (!value) return null
+  const parsed = Date.parse(value)
+  return Number.isNaN(parsed) ? null : parsed
+}
+
+/**
+ * How long the session ran, in seconds, or `null` while that is unknown.
+ *
+ * The API's own measurement first; the two timestamps as a fallback, since
+ * an older row may predate the column. Written as an explicit null check
+ * rather than `||`, because a meeting that ended the second it started has
+ * a duration of zero and deserves to keep it.
+ */
+export function sessionLength(session: RecordedSession): number | null {
+  if (session.duration_seconds !== null && session.duration_seconds !== undefined) {
+    return session.duration_seconds
+  }
+  const started = instantOf(session.started_at)
+  const ended = instantOf(session.ended_at)
+  if (started === null || ended === null) return null
+  return Math.max(0, Math.floor((ended - started) / 1000))
+}
+
+/** A session with no end is one that is still being recorded. */
+export function isInProgress(session: RecordedSession): boolean {
+  return session.ended_at === null
+}
+
+/** Whether a protocol was written. An empty link is not a document. */
+export function hasProtocol(session: RecordedSession): boolean {
+  return Boolean(session.document_url?.trim())
+}
+
+/**
+ * An instant, written in a named zone.
+ *
+ * The zone is a parameter and not an ambient default on purpose. The
+ * console renders on the server, where the process's zone has nothing to
+ * do with the reader's; formatting with whatever `Intl` happens to resolve
+ * would put one time in the server-rendered HTML and a different one in
+ * the hydrated page, which Vue reports as a mismatch and a reader reports
+ * as the console being wrong about when their meeting was. So the page
+ * renders UTC first and switches to the viewer's zone after mounting.
+ *
+ * The shape is `YYYY-MM-DD HH:MM`, assembled from parts rather than taken
+ * from a locale format: unambiguous in every country, sorts the way it
+ * reads, and does not change with the ICU data the container happens to
+ * ship.
+ */
+export function formatTimestamp(iso: string, timeZone: string): string {
+  const instant = instantOf(iso)
+  if (instant === null) return NOT_MEASURED
+  const date = new Date(instant)
+  try {
+    return assemble(date, timeZone)
+  } catch {
+    // A zone the runtime will not accept. `resolvedOptions().timeZone` has
+    // returned surprises before, and a page that throws while formatting a
+    // date shows nothing at all.
+    return assemble(date, 'UTC')
+  }
+}
+
+function assemble(date: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date)
+  const at = (type: Intl.DateTimeFormatPartTypes) => parts.find((p) => p.type === type)?.value ?? ''
+  return `${at('year')}-${at('month')}-${at('day')} ${at('hour')}:${at('minute')}`
+}
+
+/**
+ * Where one speaker's track is streamed from.
+ *
+ * The base is passed in rather than read from the runtime config here, and
+ * it must be the *public* one: an `<audio>` element loads in a browser, so
+ * the internal cluster address a server-side render would use addresses
+ * nothing the listener can reach. Both ids are escaped -- they are strings
+ * from an API, and a string allowed to contain a slash is a string allowed
+ * to address a different endpoint.
+ */
+export function audioUrl(base: string, sessionId: string, discordUserId: string): string {
+  const root = base.replace(/\/+$/, '')
+  return `${root}/sessions/${encodeURIComponent(sessionId)}/tracks/${encodeURIComponent(discordUserId)}/audio`
+}
