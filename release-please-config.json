@@ -9,8 +9,14 @@
       "package-name": "sturnus",
       "changelog-path": "CHANGELOG.md",
       "extra-files": [
-        { "type": "generic", "path": "pyproject.toml" },
-        { "type": "generic", "path": "charts/sturnus/Chart.yaml" },
+        {
+          "type": "generic",
+          "path": "pyproject.toml"
+        },
+        {
+          "type": "generic",
+          "path": "charts/sturnus/Chart.yaml"
+        },
         {
           "type": "toml",
           "path": "uv.lock",
@@ -18,5 +24,6 @@
         }
       ]
     }
-  }
+  },
+  "bootstrap-sha": "906c6d661be1e22435fc66c7baac92e13cddf535"
 }
