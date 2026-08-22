@@ -30,6 +30,7 @@ from datetime import date
 from aiohttp import web
 
 from sturnus.console.app import current_user, require_session
+from sturnus.console.filters import InvalidFilter, session_filter
 from sturnus.console.paging import InvalidPage, page_request
 from sturnus.console.ports import SessionReads
 from sturnus.console.statistics import (
@@ -99,11 +100,24 @@ async def sessions_view(request: web.Request) -> web.Response:
     viewer = current_user(request).discord_user_id
     try:
         window = page_request(request.query.get("limit"), request.query.get("offset"))
-    except InvalidPage as refusal:
+        # `getall` rather than `get`: `?tag=retro&tag=kunde` is how a set
+        # of chips is written, and reading only the first would silently
+        # answer a narrower question than the one on the screen.
+        matching = session_filter(
+            text=request.query.get("q"),
+            tags=request.query.getall("tag", []),
+            since=request.query.get("from"),
+            until=request.query.get("to"),
+            protocol=request.query.get("protocol"),
+        )
+    except (InvalidPage, InvalidFilter) as refusal:
         # `str(refusal)` is a fixed sentence from `sturnus.console.paging`
-        # and never the value that broke the rule.
+        # or `sturnus.console.filters` and never the value that broke the
+        # rule.
         return _malformed(str(refusal))
-    page = await request.app[READS].sessions_page(viewer, limit=window.limit, offset=window.offset)
+    page = await request.app[READS].sessions_page(
+        viewer, limit=window.limit, offset=window.offset, matching=matching
+    )
     return web.json_response(session_page_json(page, viewer))
 
 

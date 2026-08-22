@@ -26,9 +26,10 @@ from __future__ import annotations
 from collections import defaultdict
 from datetime import date
 
-from sqlalchemy import ColumnElement, Select, func, select
+from sqlalchemy import ColumnElement, Select, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sturnus.console.filters import LIKE_ESCAPE, NO_FILTER, SessionFilter, like_pattern
 from sturnus.console.statistics import (
     AttendedSession,
     Participant,
@@ -70,7 +71,14 @@ class ConsoleQueries:
         """
         return await self._sessions(discord_user_id)
 
-    async def sessions_page(self, discord_user_id: int, *, limit: int, offset: int) -> SessionPage:
+    async def sessions_page(
+        self,
+        discord_user_id: int,
+        *,
+        limit: int,
+        offset: int,
+        matching: SessionFilter = NO_FILTER,
+    ) -> SessionPage:
         """One window of this person's sessions, and how many there are.
 
         Two statements rather than a `count(*) OVER ()` on the first.
@@ -85,11 +93,12 @@ class ConsoleQueries:
         more" is easier to recover from than one that reads as "there is
         less than you can already see".
         """
-        total = await self._count(discord_user_id)
-        found = await self._sessions(discord_user_id, limit=limit, offset=offset)
+        narrowing = self._narrowing(discord_user_id, matching)
+        total = await self._count(discord_user_id, *narrowing)
+        found = await self._sessions(discord_user_id, *narrowing, limit=limit, offset=offset)
         return SessionPage(sessions=found, total=total, limit=limit, offset=offset)
 
-    async def _count(self, discord_user_id: int) -> int:
+    async def _count(self, discord_user_id: int, *conditions: ColumnElement[bool]) -> int:
         """How many sessions this person was in.
 
         Scoped by the same subquery as everything else. A count is a
@@ -101,7 +110,11 @@ class ConsoleQueries:
             counted = await db.scalar(
                 select(func.count())
                 .select_from(Session)
-                .where(Session.id.in_(self._attended_by(discord_user_id)))
+                # The same conditions the page itself is selected
+                # with, passed in rather than re-derived: a total counted
+                # under a different filter than the rows is a list saying
+                # "1-20 of 47" over twelve results.
+                .where(Session.id.in_(self._attended_by(discord_user_id)), *conditions)
             )
             return counted or 0
 
@@ -175,6 +188,95 @@ class ConsoleQueries:
             ).all()
         counted = tag_counts([(row[0], row[1]) for row in rows])
         return tuple(TagUse(tag=tag, sessions=sessions) for tag, sessions in counted)
+
+    def _narrowing(
+        self, discord_user_id: int, matching: SessionFilter
+    ) -> tuple[ColumnElement[bool], ...]:
+        """A filter, as conditions on the session statement.
+
+        In the statement and not applied to its results, for the same
+        reason the scope is: a filter in Python is a filter that has
+        already fetched what it is about to discard, and on this endpoint
+        that means fetching a whole history to show twelve rows of it.
+
+        Nothing here searches a transcript. See the module docstring of
+        `sturnus.console.filters` for why that is a decision rather than
+        an omission.
+        """
+        conditions: list[ColumnElement[bool]] = []
+
+        if matching.since is not None:
+            conditions.append(Session.started_at >= day_bounds(matching.since)[0])
+        if matching.until is not None:
+            # The end of the named day, not its start. Somebody who picks
+            # "to 21 August" means the whole of the 21st, and a bound at
+            # midnight silently drops the day they named.
+            conditions.append(Session.started_at <= day_bounds(matching.until)[1])
+
+        if matching.protocol is True:
+            conditions.append(Session.document_url.is_not(None))
+        elif matching.protocol is False:
+            conditions.append(Session.document_url.is_(None))
+
+        # One `EXISTS` per tag, so they combine with AND: a second chip is
+        # somebody narrowing a list, and getting more rows from it than
+        # from the first alone is the opposite of what pressing it looks
+        # like. Each names `discord_user_id`, so the filter can only ever
+        # be over labels this reader wrote.
+        for tag in matching.tags:
+            conditions.append(
+                select(SessionTag.tag)
+                .where(
+                    SessionTag.session_id == Session.id,
+                    SessionTag.discord_user_id == discord_user_id,
+                    SessionTag.tag == tag,
+                )
+                .exists()
+            )
+
+        if matching.text is not None:
+            conditions.append(self._matching_text(discord_user_id, matching.text))
+
+        return tuple(conditions)
+
+    def _matching_text(self, discord_user_id: int, text: str) -> ColumnElement[bool]:
+        """Search text, against the three things a recording is known by.
+
+        The channel it happened in, the people who were in it, and the
+        labels this reader put on it -- and nothing else. All three are
+        already in the response this same person gets from
+        `/api/sessions`, so searching them narrows what they can see
+        rather than widening it. A transcript is not among them, and that
+        is the whole point of `sturnus.console.filters`.
+
+        Case-insensitive because nobody types a channel name the way it
+        was written, and matched anywhere in the value because "retro" has
+        to find "weekly retro".
+        """
+        pattern = like_pattern(text)
+        scope = self._attended_by(discord_user_id)
+        return or_(
+            Session.channel_name.ilike(pattern, escape=LIKE_ESCAPE),
+            select(SessionParticipant.id)
+            .where(
+                SessionParticipant.session_id == Session.id,
+                # Redundant with the outer statement, which already
+                # restricts `Session.id` to this person's sessions -- and
+                # kept anyway, so that a later edit loosening the outer
+                # `WHERE` cannot quietly turn this into a search across
+                # other people's meetings.
+                SessionParticipant.session_id.in_(scope),
+                SessionParticipant.discord_display_name.ilike(pattern, escape=LIKE_ESCAPE),
+            )
+            .exists(),
+            select(SessionTag.tag)
+            .where(
+                SessionTag.session_id == Session.id,
+                SessionTag.discord_user_id == discord_user_id,
+                SessionTag.tag.ilike(pattern, escape=LIKE_ESCAPE),
+            )
+            .exists(),
+        )
 
     def _attended_by(self, discord_user_id: int) -> Select[tuple[int]]:
         """The scope, as a subquery: the ids of sessions this person was in.

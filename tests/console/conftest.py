@@ -19,6 +19,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from sturnus.console.app import build_api
 from sturnus.console.audio import AudioDelivery
+from sturnus.console.filters import SessionFilter
 from sturnus.console.ports import (
     AdminDirectory,
     LinkDirectory,
@@ -196,18 +197,34 @@ class FakeReads:
         #: window the query string named" cannot be seen in a body that
         #: happens to be short.
         self.windows: list[tuple[int, int]] = []
+        #: Every filter this was asked to apply, in order.
+        self.filters: list[SessionFilter] = []
 
     async def sessions_for(self, discord_user_id: int) -> Sequence[AttendedSession]:
         self.asked_for.append(discord_user_id)
         return self.sessions
 
-    async def sessions_page(self, discord_user_id: int, *, limit: int, offset: int) -> SessionPage:
+    async def sessions_page(
+        self,
+        discord_user_id: int,
+        *,
+        limit: int,
+        offset: int,
+        matching: SessionFilter,
+    ) -> SessionPage:
         # Windowed in Python, which a double may do and the real query may
         # not: what the route tests need from this is that the handler
         # passed the window it parsed, and `self.windows` is where they
         # read that off.
         self.asked_for.append(discord_user_id)
         self.windows.append((limit, offset))
+        # Recorded and never applied. Narrowing is a property of the SQL
+        # and is tested against the real database in
+        # `tests/console/test_queries.py`; a double that filtered in
+        # Python would only ever prove that the double filters. What the
+        # route tests need from this is that the handler read the query
+        # string into the filter it passed on.
+        self.filters.append(matching)
         return SessionPage(
             sessions=self.sessions[offset : offset + limit],
             total=len(self.sessions),
