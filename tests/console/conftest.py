@@ -9,14 +9,20 @@ need on pytest-asyncio's loop instead.
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from datetime import UTC, date, datetime
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from sturnus.console.app import build_api
+from sturnus.console.audio import AudioDelivery
+from sturnus.console.ports import Track
+from sturnus.console.session import SessionCookie
 from sturnus.console.statistics import AttendedSession
+from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
 
 AiohttpClientFactory = Callable[
@@ -153,3 +159,162 @@ class FakeReads:
     async def transcripts_of(self, discord_user_id: int) -> Sequence[str]:
         self.asked_for.append(discord_user_id)
         return self.transcripts
+
+
+# ---------------------------------------------------------------------------
+# Audio delivery
+# ---------------------------------------------------------------------------
+
+SESSION = 4711
+S3_KEY = "sessions/4711/speakers/100.enc"
+KEY_ID = "test-key-1"
+DATA_KEY = bytes(range(32))
+
+#: Small enough that a whole test stays fast, large enough that a stream of
+#: it crosses several chunk boundaries and several read boundaries at once.
+TRACK_BYTES = CHUNK_SIZE * 2 + 5_000
+
+
+def sealed(plaintext: bytes, tmp_path: Path, data_key: bytes = DATA_KEY) -> bytes:
+    """One recording in the real on-disk format, as bytes.
+
+    Goes through `encrypt_file` rather than assembling the framing by hand:
+    a fixture that reimplements the format would agree with itself and with
+    nothing else, and the whole point of the reader under test is that it
+    understands what the writer actually wrote.
+    """
+    source = tmp_path / "plain.pcm"
+    source.write_bytes(plaintext)
+    target = tmp_path / "sealed.enc"
+    encrypt_file(source, target, data_key)
+    return target.read_bytes()
+
+
+class FakeAudioSource:
+    """The object store, in memory, with every read it served recorded.
+
+    The recording is what the range tests assert on: "a listener who wants
+    minute 30 must not download minutes 0 to 29" is a statement about which
+    bytes were fetched, not about which bytes came back.
+    """
+
+    #: Deliberately not a round number and deliberately smaller than a
+    #: chunk, so every frame the reader assembles spans several pieces and
+    #: no boundary lines up with anything.
+    PIECE = 7_919
+
+    def __init__(self, objects: dict[str, bytes] | None = None) -> None:
+        self.objects = objects if objects is not None else {}
+        self.reads: list[tuple[int, int]] = []
+        self.streamed_from: list[int] = []
+        self.streamed_bytes = 0
+
+    async def size(self, key: str) -> int:
+        if key not in self.objects:
+            raise KeyError(key)
+        return len(self.objects[key])
+
+    async def read(self, key: str, start: int, length: int) -> bytes:
+        if key not in self.objects:
+            raise KeyError(key)
+        self.reads.append((start, length))
+        return self.objects[key][start : start + length]
+
+    async def stream(self, key: str, start: int) -> AsyncGenerator[bytes, None]:
+        if key not in self.objects:
+            raise KeyError(key)
+        self.streamed_from.append(start)
+        body = self.objects[key][start:]
+        for offset in range(0, len(body), self.PIECE):
+            piece = body[offset : offset + self.PIECE]
+            self.streamed_bytes += len(piece)
+            yield piece
+
+
+class FakeKeys:
+    """The master key, without one. Records every unwrap it was asked for."""
+
+    def __init__(self, key_id: str = KEY_ID, data_key: bytes = DATA_KEY) -> None:
+        self.key_id = key_id
+        self._data_key = data_key
+        self.unwrapped: list[bytes] = []
+
+    def unwrap(self, wrapped: bytes) -> bytes:
+        self.unwrapped.append(wrapped)
+        return self._data_key
+
+
+class FakeTracks:
+    """`transcription_job` joined to `session_participant`, in memory.
+
+    Scoped by the asking user in `track_for` rather than by a filter the
+    caller applies afterwards -- the same shape the real adapter has, so a
+    handler that forgot to pass `requested_by` would fail here too.
+    """
+
+    def __init__(
+        self,
+        tracks: dict[tuple[int, int], Track] | None = None,
+        participants: dict[int, set[int]] | None = None,
+    ) -> None:
+        self.tracks = tracks if tracks is not None else {}
+        self.participants = participants if participants is not None else {}
+        self.asked: list[tuple[int, int, int]] = []
+
+    async def track_for(
+        self, session_id: int, speaker_id: int, *, requested_by: int
+    ) -> Track | None:
+        self.asked.append((session_id, speaker_id, requested_by))
+        if requested_by not in self.participants.get(session_id, set()):
+            return None
+        return self.tracks.get((session_id, speaker_id))
+
+
+async def collect(pieces: AsyncIterator[bytes]) -> bytes:
+    return b"".join([piece async for piece in pieces])
+
+
+# ---------------------------------------------------------------------------
+# The application under test
+# ---------------------------------------------------------------------------
+
+
+def build_test_api(
+    *,
+    oauth: FakeOAuth | None = None,
+    states: FakeStates | None = None,
+    links: FakeLinks | None = None,
+    admins: FakeAdmins | None = None,
+    reads: FakeReads | None = None,
+    audio: AudioDelivery | None = None,
+    sessions: SessionCookie | None = None,
+    now: Callable[[], datetime] | None = None,
+    schema_ready: bool = True,
+) -> web.Application:
+    """Builds the console API with every collaborator defaulted.
+
+    One factory rather than one per test module. Three modules each
+    constructing the application themselves meant that adding a
+    collaborator broke the two files that had no interest in it -- which is
+    precisely what happened when the audio and read changes met. Here a new
+    collaborator is one default in one place.
+
+    Every argument is an override, so a test names only what it is about.
+    """
+    return build_api(
+        oauth=oauth or FakeOAuth(),
+        states=states or FakeStates(),
+        links=links or FakeLinks(),
+        admins=admins or FakeAdmins(),
+        reads=reads or FakeReads(),
+        audio=audio
+        or AudioDelivery(
+            tracks=FakeTracks(),
+            keys=FakeKeys(),
+            source=FakeAudioSource(),
+        ),
+        sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
+        now=now or now_at(),
+        schema_ready=lambda: schema_ready,
+        console_origin="https://sturnus.example",
+    )

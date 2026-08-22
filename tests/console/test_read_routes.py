@@ -20,7 +20,6 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient
 
-from sturnus.console.app import build_api
 from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.console.statistics import AttendedSession, Participant, Track
 from tests.console.conftest import (
@@ -34,6 +33,7 @@ from tests.console.conftest import (
     FakeOAuth,
     FakeReads,
     FakeStates,
+    build_test_api,
     now_at,
 )
 
@@ -50,7 +50,7 @@ READ_PATHS = [
 
 
 def app(reads: FakeReads | None = None) -> web.Application:
-    return build_api(
+    return build_test_api(
         oauth=FakeOAuth(),
         states=FakeStates(),
         links=FakeLinks(),
@@ -58,8 +58,7 @@ def app(reads: FakeReads | None = None) -> web.Application:
         reads=reads or FakeReads(),
         sessions=SessionCookie(SECRET, timedelta(hours=12)),
         now=now_at(),
-        schema_ready=lambda: True,
-        console_origin="https://sturnus.example",
+        schema_ready=True,
     )
 
 
