@@ -41,13 +41,12 @@ import logging
 from aiohttp import web
 
 from sturnus.console.audio import (
-    WAV_HEADER_BYTES,
     AudioDelivery,
     ByteRange,
     CorruptRecording,
     UnsatisfiableRange,
     parse_range,
-    pcm_length,
+    stored_length,
     stream_wav,
 )
 from sturnus.observability.events import Event, log_event, log_exception
@@ -136,7 +135,7 @@ async def track_audio(request: web.Request) -> web.StreamResponse:
         return _no_such_recording()
 
     try:
-        pcm_bytes = pcm_length(ciphertext_bytes)
+        total = stored_length(ciphertext_bytes)
     except CorruptRecording as exc:
         log_exception(
             log,
@@ -150,7 +149,8 @@ async def track_audio(request: web.Request) -> web.StreamResponse:
         )
         return _unreadable()
 
-    total = WAV_HEADER_BYTES + pcm_bytes
+    # The stored object *is* the WAV file, header included, so the length of
+    # the resource is the length of the plaintext and nothing is added to it.
     try:
         requested = parse_range(request.headers.get("Range"), total)
     except UnsatisfiableRange:
@@ -188,7 +188,7 @@ async def track_audio(request: web.Request) -> web.StreamResponse:
 
     data_key = delivery.keys.unwrap(track.wrapped_data_key)
     try:
-        async for piece in stream_wav(delivery.source, track.s3_key, data_key, span, pcm_bytes):
+        async for piece in stream_wav(delivery.source, track.s3_key, data_key, span):
             await response.write(piece)
     except CorruptRecording as exc:
         # The status line left with the headers, so there is no status to
