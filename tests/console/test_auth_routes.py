@@ -16,6 +16,7 @@ import pytest
 from aiohttp import web
 
 from sturnus.console.app import build_api
+from sturnus.console.audio import AudioDelivery
 from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 from tests.console.conftest import (
@@ -25,9 +26,12 @@ from tests.console.conftest import (
     T0,
     AiohttpClientFactory,
     FakeAdmins,
+    FakeAudioSource,
+    FakeKeys,
     FakeLinks,
     FakeOAuth,
     FakeStates,
+    FakeTracks,
     now_at,
 )
 
@@ -50,6 +54,11 @@ def app(
         now=now_at(),
         schema_ready=lambda: schema_ready,
         console_origin="https://sturnus.example",
+        # Present but empty: nothing in this file plays a track, and
+        # `build_api` requires the collaborator rather than defaulting it
+        # so that a deployment which forgot to wire S3 fails at startup
+        # instead of at the first person who tries to listen.
+        audio=AudioDelivery(tracks=FakeTracks(), source=FakeAudioSource(), keys=FakeKeys()),
     )
 
 

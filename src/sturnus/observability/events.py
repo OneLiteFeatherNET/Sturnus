@@ -125,6 +125,21 @@ class Event(StrEnum):
     CONSOLE_SIGNED_IN = "console.signed_in"
     CONSOLE_SIGN_IN_REJECTED = "console.sign_in_rejected"
     CONSOLE_STATES_PURGED = "console.states_purged"
+    #: The access log for the most consequential thing the console does:
+    #: one person played another person's voice back. `session_id`,
+    #: `discord_user_id` (whose voice) and `requested_by` (who listened)
+    #: are the three that make the line answer the question anyone would
+    #: ask of it afterwards.
+    CONSOLE_TRACK_SERVED = "console.track_served"
+    #: A recording that was asked for and not handed over -- because the
+    #: asker was not in the session, or because the retention sweep has
+    #: already erased the audio. `reason` says which.
+    CONSOLE_TRACK_REFUSED = "console.track_refused"
+    #: A stored recording that this reader cannot make sense of. **A human
+    #: must act:** the object is there, the person is entitled to it, and
+    #: it will not decrypt -- which is either a truncated upload or a
+    #: format that has drifted from its reader.
+    CONSOLE_TRACK_UNREADABLE = "console.track_unreadable"
 
     # -- cross-cutting ------------------------------------------------------
     PROCESS_STARTING = "process.starting"

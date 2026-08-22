@@ -26,6 +26,7 @@ from datetime import datetime
 
 from aiohttp import web
 
+from sturnus.console.audio import AudioDelivery
 from sturnus.console.auth import (
     ConsoleAuth,
     ExchangeRefused,
@@ -33,6 +34,8 @@ from sturnus.console.auth import (
     UnknownState,
 )
 from sturnus.console.ports import AdminDirectory, LinkDirectory, OAuthClient, StateStore
+from sturnus.console.routes_audio import AUDIO_DELIVERY
+from sturnus.console.routes_audio import register as register_audio
 from sturnus.console.session import (
     ExpiredSession,
     InvalidSession,
@@ -250,6 +253,7 @@ def build_api(
     now: Clock,
     schema_ready: ReadinessCheck,
     console_origin: str,
+    audio: AudioDelivery,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
 
@@ -266,6 +270,7 @@ def build_api(
     app[_NOW] = now
     app[_SCHEMA_READY] = schema_ready
     app[_CONSOLE_ORIGIN] = console_origin
+    app[AUDIO_DELIVERY] = audio
     app.add_routes(
         [
             web.get("/healthz", healthz),
@@ -276,4 +281,5 @@ def build_api(
             web.get("/api/me", me),
         ]
     )
+    register_audio(app)
     return app

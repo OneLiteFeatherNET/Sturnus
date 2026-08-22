@@ -4,13 +4,19 @@ Serves the JSON API at `sturnus.onelitefeather.dev/api/*` behind an OAuth
 session. See `docs/superpowers/specs/2026-08-21-sturnus-console-design.md`.
 
 **What this process holds, and what it must never hold.** It has the
-database, the OAuth client secret, and -- from the next change onwards --
-S3 and the master key, because it decrypts audio on the way to the
-browser. It has no Discord token, and must not be given one: a process
-that can read every recording ever made is not one to also hand the
-ability to act as the bot (Spec 13.2). Whether somebody administers a
-guild is therefore read from `admin_member`, which the bot mirrors, rather
-than asked of Discord here.
+database, the OAuth client secret, S3 and the master key -- the last two
+because it decrypts audio on the way to the browser
+(`sturnus.console.routes_audio`). It has no Discord token, and must not be
+given one: a process that can read every recording ever made is not one to
+also hand the ability to act as the bot (Spec 13.2). Whether somebody
+administers a guild is therefore read from `admin_member`, which the bot
+mirrors, rather than asked of Discord here.
+
+That makes this the second process holding the master key, and the first
+one reachable through a browser. What keeps that defensible is not the key
+handling -- it is that the key never unwraps anything the requester was not
+in the room for, which is decided one layer up, per request, against
+`session_participant`.
 
 Like `link`, this starts listening *before* waiting for the worker's
 migrations. Waiting first leaves the health port closed for as long as the
@@ -21,6 +27,7 @@ what it should.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import signal
 from datetime import UTC, datetime, timedelta
@@ -31,12 +38,19 @@ from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from sturnus.config import StrictSettings
-from sturnus.console.adapters import ConsoleLinkDirectory, ConsoleStateStore
+from sturnus.console.adapters import (
+    ConsoleLinkDirectory,
+    ConsoleStateStore,
+    ConsoleTrackDirectory,
+)
 from sturnus.console.app import build_api
+from sturnus.console.audio import AudioDelivery
 from sturnus.console.session import SessionCookie
+from sturnus.infrastructure.crypto import KeyWrapper
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.models import AccountLink, AdminMember, ConsoleState
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
+from sturnus.infrastructure.objectstore import S3AudioStore
 from sturnus.infrastructure.observability import init_sentry
 from sturnus.infrastructure.telemetry import init_telemetry, shutdown_telemetry
 from sturnus.observability.events import Event, log_event
@@ -76,6 +90,12 @@ class ApiSettings(StrictSettings):
     the console's session cookies and is refused below thirty-two bytes by
     `SessionCookie` itself, so a placeholder fails at startup rather than
     serving forgeable sessions.
+
+    The S3 credentials and the master key are here because audio playback
+    decrypts in this process. They are required rather than optional, so a
+    deployment missing them fails while an operator is still looking at it
+    -- the alternative is a console that signs people in, shows them their
+    sessions, and answers every play button with a 500.
     """
 
     database_url: str
@@ -87,6 +107,16 @@ class ApiSettings(StrictSettings):
     #: same URI for both would send an account link to the console.
     console_redirect_uri: str
     session_secret: SecretStr
+    s3_endpoint: str
+    s3_bucket: str
+    s3_access_key: SecretStr
+    s3_secret_key: SecretStr
+    #: Base64-encoded 32 bytes, and the id of the key it is. A recording
+    #: names the master key that wrapped its data key, so the id is what
+    #: lets a mismatch be reported as the configuration error it is rather
+    #: than as an authentication-tag failure mid-response.
+    master_key: SecretStr
+    master_key_id: str
     health_port: int = 8080
     console_origin: str = "https://sturnus.onelitefeather.dev"
 
@@ -131,6 +161,20 @@ async def _run() -> None:
         redirect_uri=settings.console_redirect_uri,
     )
 
+    audio = AudioDelivery(
+        tracks=ConsoleTrackDirectory(session_factory),
+        source=S3AudioStore(
+            endpoint=settings.s3_endpoint,
+            bucket=settings.s3_bucket,
+            access_key=settings.s3_access_key.get_secret_value(),
+            secret_key=settings.s3_secret_key.get_secret_value(),
+        ),
+        keys=KeyWrapper(
+            base64.b64decode(settings.master_key.get_secret_value()),
+            settings.master_key_id,
+        ),
+    )
+
     schema_ready = False
     app = build_api(
         oauth=oauth,
@@ -141,6 +185,7 @@ async def _run() -> None:
         now=lambda: datetime.now(UTC),
         schema_ready=lambda: schema_ready,
         console_origin=settings.console_origin,
+        audio=audio,
     )
 
     runner = web.AppRunner(app)
