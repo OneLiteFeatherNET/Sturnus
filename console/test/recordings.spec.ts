@@ -19,13 +19,20 @@ import {
   formatTimestamp,
   hasProtocol,
   isInProgress,
+  isQueueBusy,
+  queueProgress,
+  queueSpeakerLabel,
+  queueStatusPath,
   recordingPath,
+  requeuePath,
   sessionLength,
   spectrogramUrl,
   speechShare,
   trackCoverage,
   trackLabel,
   type RecordedSession,
+  type QueueSnapshot,
+  type QueueSpeaker,
   type SessionTrack,
   type SpectrogramResponse,
 } from '../app/utils/recordings'
@@ -338,5 +345,65 @@ describe('how much of a session a track covers', () => {
   it('has no answer when the session has no length to measure against', () => {
     const open = { ...session(null), ended_at: null }
     expect(trackCoverage(open, track(300))).toBeNull()
+  })
+})
+
+describe('the transcription queue', () => {
+  const speaker = (status: string, over: Partial<QueueSpeaker> = {}): QueueSpeaker => ({
+    discord_user_id: '2',
+    display_name: 'Anna',
+    status,
+    attempts: 1,
+    error: null,
+    ...over,
+  })
+  const snapshot = (speakers: QueueSpeaker[]): QueueSnapshot => ({
+    session_status: 'documented',
+    document_url: null,
+    speakers,
+    can_requeue: true,
+    refusal: null,
+  })
+
+  it('addresses the queue of one session', () => {
+    expect(queueStatusPath('7')).toBe('/sessions/7/queue')
+    expect(requeuePath('7')).toBe('/sessions/7/queue/requeue')
+  })
+
+  it('escapes the id, like every other path built from one', () => {
+    expect(requeuePath('a/b')).toBe('/sessions/a%2Fb/queue/requeue')
+  })
+
+  it('is busy while any job is pending or running', () => {
+    expect(isQueueBusy(snapshot([speaker('done'), speaker('running')]))).toBe(true)
+    expect(isQueueBusy(snapshot([speaker('pending')]))).toBe(true)
+  })
+
+  it('is not busy once every job has settled, however it settled', () => {
+    // `dead` is settled: it means "gave up", and a worker will not touch
+    // it again. Polling on would never stop.
+    expect(isQueueBusy(snapshot([speaker('done'), speaker('dead')]))).toBe(false)
+  })
+
+  it('reads busyness from the jobs, not from the session status', () => {
+    // The session flips to `documented` only after the document is
+    // written, so a poll that watched the status would stop one step
+    // early and never show the finished protocol.
+    const midway = { ...snapshot([speaker('running')]), session_status: 'documented' }
+    expect(isQueueBusy(midway)).toBe(true)
+  })
+
+  it('reports how far a redo has got', () => {
+    expect(queueProgress(snapshot([speaker('done'), speaker('running')]))).toBe(0.5)
+    expect(queueProgress(snapshot([speaker('done'), speaker('dead')]))).toBe(1)
+  })
+
+  it('has no progress to report for a session with no jobs', () => {
+    expect(queueProgress(snapshot([]))).toBeNull()
+  })
+
+  it('falls back to the id for a speaker who has left the guild', () => {
+    expect(queueSpeakerLabel(speaker('done', { display_name: null }))).toBe('2')
+    expect(queueSpeakerLabel(speaker('done', { display_name: '  ' }))).toBe('2')
   })
 })

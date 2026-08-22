@@ -288,3 +288,81 @@ export function trackCoverage(
   if (track.audio_seconds === null) return null
   return { share: Math.min(1, Math.max(0, track.audio_seconds / total)) }
 }
+
+/**
+ * Where a session's transcription has got to, and whether it may be redone.
+ *
+ * Only an administrator of the session's guild ever sees this: re-running
+ * a transcription spends worker time, clears transcripts and replaces a
+ * document a team has already read. Everyone else's request answers 404,
+ * which is also what "no such session" answers — the console does not
+ * confirm the existence of meetings somebody has no business knowing
+ * about.
+ */
+export interface QueueSpeaker {
+  discord_user_id: string
+  display_name: string | null
+  /** `pending`, `running`, `done` or `dead`. */
+  status: string
+  attempts: number
+  /** The last failure, already shortened, or `null` if nothing failed. */
+  error: string | null
+}
+
+export interface QueueSnapshot {
+  session_status: string
+  document_url: string | null
+  speakers: QueueSpeaker[]
+  can_requeue: boolean
+  /** Why not, when `can_requeue` is false. A button that greys out without
+   *  saying why is a bug report waiting to be filed. */
+  refusal: string | null
+}
+
+export interface RequeueOutcome {
+  accepted: boolean
+  requeued: string[]
+  /** Speakers left alone because their audio is erased. Never folded into
+   *  `requeued`: their old transcript is carried into the new document
+   *  unchanged, and somebody told only the first number would reasonably
+   *  assume the whole document had been regenerated. */
+  skipped_erased: string[]
+  refusal: string | null
+}
+
+export function queueStatusPath(sessionId: string): string {
+  return `/sessions/${encodeURIComponent(sessionId)}/queue`
+}
+
+export function requeuePath(sessionId: string): string {
+  return `/sessions/${encodeURIComponent(sessionId)}/queue/requeue`
+}
+
+/** Job statuses that mean a worker may still act on this session. */
+const IN_FLIGHT = new Set(['pending', 'running'])
+
+/**
+ * Whether the queue is still moving, which is what decides whether the
+ * progress view keeps polling.
+ *
+ * Read from the jobs rather than from `session_status`, because the
+ * session flips to `documented` only after the document is written — so
+ * polling that stopped at the last `done` would stop one step early and
+ * never show the finished document.
+ */
+export function isQueueBusy(snapshot: QueueSnapshot): boolean {
+  return snapshot.speakers.some((speaker) => IN_FLIGHT.has(speaker.status))
+}
+
+/** How far a re-queue has got, between 0 and 1. `null` with no jobs. */
+export function queueProgress(snapshot: QueueSnapshot): number | null {
+  if (snapshot.speakers.length === 0) return null
+  const finished = snapshot.speakers.filter((speaker) => !IN_FLIGHT.has(speaker.status)).length
+  return finished / snapshot.speakers.length
+}
+
+/** What to call a speaker in the queue view. */
+export function queueSpeakerLabel(speaker: QueueSpeaker): string {
+  const name = speaker.display_name?.trim()
+  return name ? name : speaker.discord_user_id
+}

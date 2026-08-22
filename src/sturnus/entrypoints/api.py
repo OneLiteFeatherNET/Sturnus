@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sturnus.config import StrictSettings
 from sturnus.console.adapters import (
     ConsoleLinkDirectory,
+    ConsoleQueueControl,
     ConsoleStateStore,
     ConsoleTrackDirectory,
 )
@@ -185,12 +186,13 @@ async def _run() -> None:
         ),
     )
 
+    admins = AdminMemberStore(session_factory)
     schema_ready = False
     app = build_api(
         oauth=oauth,
         states=ConsoleStateStore(session_factory),
         links=ConsoleLinkDirectory(session_factory),
-        admins=AdminMemberStore(session_factory),
+        admins=admins,
         config=ConfigStore(session_factory),
         reads=ConsoleQueries(session_factory),
         sessions=SessionCookie(settings.session_secret.get_secret_value(), _SESSION_LIFETIME),
@@ -198,6 +200,7 @@ async def _run() -> None:
         schema_ready=lambda: schema_ready,
         console_origin=settings.console_origin,
         audio=audio,
+        queue=ConsoleQueueControl(session_factory, admins),
     )
 
     runner = web.AppRunner(app)

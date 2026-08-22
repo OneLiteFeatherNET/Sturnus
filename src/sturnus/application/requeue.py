@@ -81,6 +81,13 @@ class RequeuePlan:
 
     #: Jobs to reset to `pending`, ascending by id.
     resettable_job_ids: tuple[int, ...]
+    #: The speakers those jobs belong to, in the same order. Kept beside
+    #: the job ids rather than derived later from `session_participant`:
+    #: a job whose participant row is gone still has a job, so the two
+    #: lists are not interchangeable and reconstructing one from the other
+    #: would quietly drop exactly the speaker a re-queue is most likely to
+    #: be about.
+    resettable_user_ids: tuple[int, ...]
     #: Speakers left untouched because their audio no longer exists. Their
     #: old transcript is carried into the new document unchanged.
     erased_user_ids: tuple[int, ...]
@@ -122,6 +129,7 @@ def plan_requeue(jobs: list[dict[str, object]]) -> RequeuePlan:
     which is the exact case the refusal exists for.
     """
     resettable: list[int] = []
+    resettable_users: list[int] = []
     erased: list[int] = []
     active: list[int] = []
     for candidate in sorted(jobs, key=lambda row: cast(int, row["id"])):
@@ -135,8 +143,10 @@ def plan_requeue(jobs: list[dict[str, object]]) -> RequeuePlan:
             erased.append(user_id)
         else:
             resettable.append(job_id)
+            resettable_users.append(user_id)
     return RequeuePlan(
         resettable_job_ids=tuple(resettable),
+        resettable_user_ids=tuple(resettable_users),
         erased_user_ids=tuple(erased),
         active_user_ids=tuple(active),
     )
