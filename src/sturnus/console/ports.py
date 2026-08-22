@@ -15,9 +15,12 @@ invitation for the next handler to reach for something it should not have.
 
 from __future__ import annotations
 
-from datetime import datetime
+from collections.abc import AsyncGenerator, Sequence
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Protocol
 
+from sturnus.console.statistics import AttendedSession
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 
@@ -53,6 +56,158 @@ class LinkDirectory(Protocol):
 
 
 class AdminDirectory(Protocol):
-    """Whether somebody administers any guild the bot serves."""
+    """Who administers what, as far as the console is allowed to know.
+
+    Three questions rather than one, because the console asks three
+    genuinely different ones and answering the narrow one with the wide
+    one is the failure this protocol exists to make hard to write:
+
+    * `is_admin_anywhere` decides whether the settings section is offered
+      at all. It is a rendering hint and never a control.
+    * `administered_guilds` is what the guild picker lists.
+    * `is_admin` is the only one that authorises anything. Every settings
+      read and every settings write goes through it, per guild, because
+      an administrator of one guild is nobody in another.
+
+    Read from `admin_member`, which `bot` mirrors on its sweep. The API
+    process has no gateway to ask Discord directly, deliberately: a
+    process that can decrypt every recording ever made is not one to also
+    hand the ability to act as the bot (Spec 13.2).
+    """
 
     async def is_admin_anywhere(self, discord_user_id: int) -> bool: ...
+
+    async def administered_guilds(self, discord_user_id: int) -> Sequence[int]: ...
+
+    async def is_admin(self, guild_id: int, discord_user_id: int) -> bool: ...
+
+
+class SessionReads(Protocol):
+    """Everything the console reads, already narrowed to one Discord user.
+
+    Every method takes `discord_user_id` first, and that is the whole
+    point of the shape: there is no method here that can be called
+    without naming whose data is being asked for, so a handler cannot
+    accidentally ask a wider question than it is entitled to. The
+    narrowing is done by the statement itself in
+    `sturnus.console.queries` -- not by a filter afterwards, which is a
+    filter somebody can forget.
+    """
+
+    async def sessions_for(self, discord_user_id: int) -> Sequence[AttendedSession]: ...
+
+    #: `None` for a session that does not exist *and* for one this person
+    #: was not in. The handler answers 404 to both, deliberately.
+    async def session_for(
+        self, discord_user_id: int, session_id: int
+    ) -> AttendedSession | None: ...
+
+    async def sessions_in_year(
+        self, discord_user_id: int, year: int
+    ) -> Sequence[AttendedSession]: ...
+
+    async def sessions_on_day(
+        self, discord_user_id: int, day: date
+    ) -> Sequence[AttendedSession]: ...
+
+    #: This person's own transcripts, encoded as the column stores them.
+    #: Their own and never the session's: the dashboard's word count says
+    #: how much *they* said, and the transcript is the protected content.
+    async def transcripts_of(self, discord_user_id: int) -> Sequence[str]: ...
+
+
+@dataclass(frozen=True)
+class Track:
+    """Where one speaker's recording is, and what unlocks it.
+
+    Deliberately not the whole `transcription_job` row. What the audio
+    endpoint needs is the object key and the wrapped key; the transcript,
+    the status and the attempt count are somebody else's business, and a
+    value that carried them would put a transcript one attribute access
+    away from a response body.
+    """
+
+    s3_key: str
+    encryption_key_id: str
+    wrapped_data_key: bytes
+
+
+class TrackDirectory(Protocol):
+    """One speaker's recording, if the person asking is allowed to hear it.
+
+    `requested_by` is not an afterthought and not optional: the whole
+    authorisation rule for audio lives inside this one call. An
+    implementation answers `None` both for "there is no such track" and for
+    "you were not in that session", because from outside they must look the
+    same -- the existence of a session somebody was not in is not
+    information they are owed.
+
+    Consequently there is no `track` method without a `requested_by`, and
+    no way to filter afterwards in a handler. A filter that can be
+    forgotten is a filter that will be.
+    """
+
+    async def track_for(
+        self, session_id: int, speaker_id: int, *, requested_by: int
+    ) -> Track | None: ...
+
+
+class KeyUnwrapper(Protocol):
+    """Unwraps a recording's data key with the process's master key.
+
+    `sturnus.infrastructure.crypto.KeyWrapper` satisfies this. `key_id`
+    is here because a recording names the master key that wrapped it, and
+    a mismatch is a configuration error worth reporting as one rather than
+    an authentication-tag failure three layers down.
+    """
+
+    key_id: str
+
+    def unwrap(self, wrapped: bytes) -> bytes: ...
+
+
+class EncryptedAudioSource(Protocol):
+    """The object store, read by byte range.
+
+    Three methods because the audio endpoint makes three different kinds of
+    request and no more: how big the object is (to declare the track's
+    length), the fixed-size file header (to get the nonce prefix), and the
+    body from a chosen chunk boundary onwards.
+
+    `stream` is an async *generator* rather than a plain iterator so the
+    handler can close it: a listener who stops playing halfway through
+    should stop the transfer from S3 in the same breath, and a suspended
+    generator nobody closed holds the connection until the loop gets round
+    to finalising it.
+
+    A key that is not in the store raises `KeyError` -- the ordinary case
+    is a recording the retention sweep already erased while its row lives
+    on, which is a 404 and not an error.
+    """
+
+    async def size(self, key: str) -> int: ...
+
+    async def read(self, key: str, start: int, length: int) -> bytes: ...
+
+    def stream(self, key: str, start: int) -> AsyncGenerator[bytes, None]: ...
+
+
+class SettingsStore(Protocol):
+    """Per-guild runtime configuration, read whole and written one key at a time.
+
+    Narrow to two methods on purpose. In particular there is no
+    `get`/`get_stored` here: the listing endpoint reads a guild's whole
+    configuration in one query rather than one per key, and a protocol
+    that offered the per-key read would be an invitation for the next
+    handler to loop over `KNOWN_KEYS` doing seventeen round trips.
+
+    **`set` is where value validation lives, and it must stay there.** It
+    refuses an unknown key and refuses a non-positive-integer for an
+    integer key, and the API's job is to turn that `ValueError` into a
+    400 -- never to check the same thing first. Two copies of a
+    validation rule is how the two drift.
+    """
+
+    async def snapshot(self, guild_id: int) -> dict[str, str]: ...
+
+    async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None: ...
