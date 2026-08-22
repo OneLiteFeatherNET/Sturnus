@@ -15,10 +15,15 @@
  *
  * - **This report is about a server, never about the people in it.** The
  *   payload carries no ids and no names, and nothing here invents a
- *   per-person figure or hints that one is coming. How long one named
- *   person sat in meetings, or spoke in them, is a measure of that
- *   person's conduct at work -- a matter for a works council, not a
- *   console feature. Counts of people are counts and stop there.
+ *   per-person figure. How long one named person sat in meetings, or spoke
+ *   in them, is a measure of that person's conduct at work -- a works-
+ *   council matter -- and none of it is in this module. The Reporting page
+ *   does carry an attendance ranking, and it is deliberately a separate
+ *   module (`~/utils/participation`) with its own framing, its own
+ *   endpoint, and a reveal the reader has to press: mixing it in here would
+ *   have put every one of these figures behind the same audit line.
+ *   `REPORT_SCOPE_NOTE` names that boundary on the page. Counts of people
+ *   are counts and stop there.
  * - **Null is not zero.** `average_duration_seconds`, `longest_duration_
  *   seconds`, `average_participants` and `largest_meeting` are null for a
  *   server whose meetings have not finished. Printing `0` would state that
@@ -924,20 +929,24 @@ export const REPORT_EMPTY_NOTE =
 /**
  * What this report is about, and what it is deliberately not about.
  *
- * On the page rather than only in this file. The payload holds no names
- * and no ids, and that is a decision rather than an oversight: a
- * per-person readout of who attended which meetings and who spoke for how
- * long is a means of monitoring conduct and performance at work, which is
- * a matter for a works council and not a console feature. Saying so is
- * also the honest answer to the reader who was about to ask where the
- * breakdown is.
+ * On the page rather than only in this file. Nothing this module produces
+ * carries a name or an id, and that is a decision rather than an oversight:
+ * how long one named person sat in meetings, or spoke in them, is a measure
+ * of that person rather than of this server.
+ *
+ * The last sentence exists because the page below now has an attendance
+ * ranking on it, and a scope note that claimed no per-person readout exists
+ * anywhere would be false the moment somebody scrolled. It is named here,
+ * and named as the separate thing it is -- loaded only when asked for, and
+ * logged when it is -- rather than left for the reader to discover under a
+ * note telling them it could not be there.
  */
 export const REPORT_SCOPE_NOTE =
   'Every figure here is about the server as a whole and never about the people in it. Sturnus '
-  + 'sends this page no names and no ids, and there is no per-person breakdown behind it — how '
-  + 'long one named person sat in meetings, or spoke in them, is a measure of that person rather '
-  + 'than of this server, and that is not something a console should hand out. Counts of people '
-  + 'are counts, and stop there.'
+  + 'sends this page no names and no ids for any of them, and none of these figures can be traced '
+  + 'back to one person. Counts of people are counts, and stop there. The attendance ranking at '
+  + 'the foot of this page is the one exception and is kept apart on purpose: it names people, it '
+  + 'is fetched only when somebody asks for it, and asking for it is written to the audit log.'
 
 /* -------------------------------------------------------------------- */
 /* When the API says no                                                  */
