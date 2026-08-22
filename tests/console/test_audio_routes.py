@@ -24,7 +24,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 from moto import mock_aws
 
-from sturnus.console.audio import WAV_HEADER_BYTES, AudioDelivery, wav_header
+from sturnus.console.audio import AudioDelivery
 from sturnus.console.ports import (
     EncryptedAudioSource,
     KeyUnwrapper,
@@ -124,7 +124,7 @@ async def test_a_participant_hears_the_track_they_asked_for(
     client = await signed_in(aiohttp_client, build(tracks, source))
     response = await client.get(url())
     assert response.status == 200
-    assert await response.read() == wav_header(len(TRACK)) + TRACK
+    assert await response.read() == TRACK
 
 
 async def test_someone_who_was_not_in_the_session_is_told_it_does_not_exist(
@@ -236,7 +236,7 @@ async def test_the_response_is_a_wav_a_browser_will_play(
     response = await client.get(url())
     assert response.headers["Content-Type"] == "audio/wav"
     assert response.headers["Accept-Ranges"] == "bytes"
-    assert int(response.headers["Content-Length"]) == WAV_HEADER_BYTES + len(TRACK)
+    assert int(response.headers["Content-Length"]) == len(TRACK)
 
 
 async def test_nothing_in_between_is_allowed_to_keep_a_copy(
@@ -260,13 +260,15 @@ async def test_nothing_in_between_is_allowed_to_keep_a_copy(
 async def test_a_range_is_answered_with_partial_content(
     aiohttp_client: AiohttpClientFactory, tracks: FakeTracks, source: FakeAudioSource
 ) -> None:
-    total = WAV_HEADER_BYTES + len(TRACK)
+    total = len(TRACK)
     client = await signed_in(aiohttp_client, build(tracks, source))
-    response = await client.get(url(), headers={"Range": "bytes=44-1043"})
+    response = await client.get(url(), headers={"Range": "bytes=1000-1999"})
     assert response.status == 206
-    assert response.headers["Content-Range"] == f"bytes 44-1043/{total}"
+    assert response.headers["Content-Range"] == f"bytes 1000-1999/{total}"
     assert int(response.headers["Content-Length"]) == 1_000
-    assert await response.read() == TRACK[:1_000]
+    # An offset into the stored file, with nothing subtracted from it: the
+    # resource and the plaintext are the same bytes.
+    assert await response.read() == TRACK[1_000:2_000]
 
 
 async def test_a_suffix_range_returns_the_end_of_the_track(
@@ -283,7 +285,7 @@ async def test_a_range_starting_late_does_not_download_what_came_before(
 ) -> None:
     """The reason `Range` is implemented at all: a listener who wants
     minute 30 must not pay for minutes 0 to 29."""
-    first = WAV_HEADER_BYTES + len(TRACK) - 4_000
+    first = len(TRACK) - 4_000
     client = await signed_in(aiohttp_client, build(tracks, source))
     response = await client.get(url(), headers={"Range": f"bytes={first}-"})
     assert await response.read() == TRACK[-4_000:]
@@ -295,7 +297,7 @@ async def test_an_unsatisfiable_range_is_refused_with_the_real_length(
 ) -> None:
     """416 carries the length so the client can ask again correctly rather
     than guess a second time."""
-    total = WAV_HEADER_BYTES + len(TRACK)
+    total = len(TRACK)
     client = await signed_in(aiohttp_client, build(tracks, source))
     response = await client.get(url(), headers={"Range": f"bytes={total}-"})
     assert response.status == 416
@@ -308,7 +310,7 @@ async def test_a_range_this_server_cannot_parse_yields_the_whole_track(
     client = await signed_in(aiohttp_client, build(tracks, source))
     response = await client.get(url(), headers={"Range": "kilobytes=0-1"})
     assert response.status == 200
-    assert await response.read() == wav_header(len(TRACK)) + TRACK
+    assert await response.read() == TRACK
 
 
 async def test_a_stranger_asking_for_a_range_still_learns_nothing(
@@ -360,9 +362,9 @@ async def test_a_real_recording_survives_the_whole_round_trip(
         client = await signed_in(aiohttp_client, build(tracks, store, keys=wrapper))
 
         whole = await client.get(url())
-        assert await whole.read() == wav_header(len(TRACK)) + TRACK
+        assert await whole.read() == TRACK
 
-        first = WAV_HEADER_BYTES + CHUNK_SIZE - 1_000
+        first = CHUNK_SIZE - 1_000
         partial = await client.get(url(), headers={"Range": f"bytes={first}-"})
         assert partial.status == 206
         assert await partial.read() == TRACK[CHUNK_SIZE - 1_000 :]
@@ -377,6 +379,6 @@ async def test_a_player_can_ask_for_the_length_without_the_audio(
     client = await signed_in(aiohttp_client, build(tracks, source))
     response = await client.head(url())
     assert response.status == 200
-    assert int(response.headers["Content-Length"]) == WAV_HEADER_BYTES + len(TRACK)
+    assert int(response.headers["Content-Length"]) == len(TRACK)
     assert response.headers["Accept-Ranges"] == "bytes"
     assert await response.read() == b""

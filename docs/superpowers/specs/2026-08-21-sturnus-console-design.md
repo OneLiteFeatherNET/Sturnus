@@ -209,8 +209,14 @@ surprise worth discovering in production.
 `GET /api/sessions/{id}/tracks/{discord_user_id}/audio`
 
 - Authorises against `session_participant` for the signed-in user.
-- Streams from S3, decrypting chunk by chunk, converting the raw 48 kHz
-  stereo PCM into a WAV stream with a header written up front.
+- Streams from S3, decrypting chunk by chunk and serving the plaintext
+  unchanged. What the bot stores is already a complete RIFF/WAVE file --
+  `SpeakerWriter` writes 16 kHz mono, converted from Discord's 48 kHz
+  stereo on arrival -- so there is no PCM to convert and no header to
+  write. This paragraph previously said the opposite, and the endpoint was
+  built to match: it declared 48 kHz stereo and prepended a header of its
+  own, which played the stored header as samples and the audio at six
+  times speed.
 - Supports `Range`, because a browser audio element will ask for one and
   because a listener who wants minute 30 should not have to download
   minutes 0 to 29. The chunked AES-GCM format allows starting at a chunk

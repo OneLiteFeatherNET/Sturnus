@@ -24,10 +24,18 @@ playback; the alternative is a decode pipeline in the request path.
 
 Three facts hold this file together:
 
-1. What the bot writes is raw interleaved PCM straight off Discord's
-   decoder -- 48 kHz, stereo, signed 16-bit little-endian, no container.
-   Nothing in the encrypted file records that; it is a convention between
-   `FileAudioWriterFactory`, `scripts/audio_sample.py` and this module.
+1. **What the bot stores is already a complete RIFF/WAVE file**, written by
+   `SpeakerWriter` at 16 kHz mono -- Whisper's own format, converted from
+   Discord's 48 kHz stereo on arrival so nothing downstream has to
+   resample. So this module transcodes nothing *and describes nothing*: it
+   decrypts the object and hands the bytes over exactly as they are, and
+   the header a player reads is the one the writer wrote.
+
+   This used to be a convention instead -- "48 kHz, stereo, no container",
+   restated here, in `scripts/audio_sample.py` and in a test, and true in
+   none of them. A convention is what the file format was; the file
+   describing itself is what it is now, and that is the difference between
+   a reader that can drift and one that cannot.
 2. The ciphertext is framed: `MAGIC`, an 8-byte per-file nonce prefix, then
    repeated `[4-byte big-endian length][sealed chunk]`, every chunk full
    except the last. So chunk `n` starts at a computable offset, and the
@@ -61,22 +69,6 @@ from sturnus.infrastructure.crypto import (
     TAG_BYTES,
     nonce,
 )
-
-#: What `FileAudioWriterFactory` writes. See fact (1) in the docstring.
-SAMPLE_RATE = 48_000
-CHANNELS = 2
-SAMPLE_WIDTH = 2
-BYTES_PER_SECOND = SAMPLE_RATE * CHANNELS * SAMPLE_WIDTH
-
-#: The canonical RIFF/WAVE header: `RIFF`, `fmt ` and `data` and nothing
-#: else. Canonical rather than merely valid, because the offset of the
-#: first sample has to be a constant this server can add to a byte range,
-#: and an optional `LIST` or `fact` chunk would move it.
-WAV_HEADER_BYTES = 44
-
-#: RIFF sizes are unsigned 32-bit. At 192000 bytes a second that runs out
-#: after about six hours and twelve minutes of meeting.
-_RIFF_MAX = 0xFFFFFFFF
 
 #: `bytes=<first>-<last>`, `bytes=<first>-`, `bytes=-<suffix>`. One range
 #: only: a multi-range request is answered with the whole resource, which
@@ -167,44 +159,19 @@ def parse_range(header: str | None, total: int) -> ByteRange | None:
     return ByteRange(first, min(last, total - 1))
 
 
-def wav_header(pcm_bytes: int) -> bytes:
-    """The 44-byte header for a track of `pcm_bytes` of audio.
+def stored_length(ciphertext_bytes: int) -> int:
+    """How many bytes of WAV file an encrypted object of this size holds.
 
-    The length declared here is the *whole* track's, never the slice a
-    `Range` asked for: a browser draws its seek bar from this number, and a
-    header that describes the slice gives a player that cannot seek.
+    Named for the file rather than for its samples, because `pcm_length`
+    was how the mistake this module carried stayed sayable: the plaintext
+    is a *container*, header included, and a name promising raw PCM invited
+    exactly the arithmetic that reported every track at a sixth of its
+    length.
 
-    Clamped at `_RIFF_MAX` rather than allowed to overflow. A track past
-    six hours cannot be described honestly in this format, and the choice
-    is between a header that understates the length and a `struct.error`
-    at the moment somebody finally records a long meeting.
-    """
-    data = min(pcm_bytes, _RIFF_MAX)
-    return struct.pack(
-        "<4sI4s4sIHHIIHH4sI",
-        b"RIFF",
-        min(data + 36, _RIFF_MAX),
-        b"WAVE",
-        b"fmt ",
-        16,  # the size of the fmt chunk that follows
-        1,  # WAVE_FORMAT_PCM
-        CHANNELS,
-        SAMPLE_RATE,
-        BYTES_PER_SECOND,
-        CHANNELS * SAMPLE_WIDTH,
-        SAMPLE_WIDTH * 8,
-        b"data",
-        data,
-    )
-
-
-def pcm_length(ciphertext_bytes: int) -> int:
-    """How much audio an encrypted object of this size holds.
-
-    Derived rather than measured, which is the point: the WAV header has to
-    declare the track's length before the first byte of audio is sent, and
-    the alternative is downloading and decrypting the whole recording to
-    find out how long it is.
+    Derived rather than measured, which is the point: the response has to
+    declare its length before the first byte is sent, and the alternative
+    is downloading and decrypting the whole recording to find out how long
+    it is.
 
     The arithmetic is exact because the framing is: every chunk but the
     last is exactly `FRAME_BYTES` on disk, and every sealed chunk is
@@ -229,13 +196,15 @@ async def stream_wav(
     key: str,
     data_key: bytes,
     span: ByteRange,
-    pcm_bytes: int,
 ) -> AsyncGenerator[bytes, None]:
-    """Yields `span` of the WAV representation of one encrypted recording.
+    """Yields `span` of one encrypted recording, decrypted and otherwise untouched.
 
-    `span` is over the served resource -- header included -- because that
-    is the thing the client is addressing. Byte 44 of the response is
-    sample zero of the track.
+    `span` is an offset into the stored WAV file itself, which is both the
+    plaintext and the served resource: there is no header to add and
+    therefore no offset to carry. That equality is the fix -- the version
+    before this one prepended 44 bytes describing 48 kHz stereo in front of
+    a 16 kHz mono file, so a player read the stored header as samples and
+    the audio at six times speed.
 
     The seek is what makes `Range` worth having. A request whose first
     audio byte falls in chunk `n` fetches ciphertext from chunk `n`'s
@@ -245,21 +214,15 @@ async def stream_wav(
     finest seek this format allows, and that is the price of authenticating
     what is served.
     """
-    if span.first < WAV_HEADER_BYTES:
-        header = wav_header(pcm_bytes)
-        yield header[span.first : min(span.last + 1, WAV_HEADER_BYTES)]
-        if span.last < WAV_HEADER_BYTES:
-            return
-
-    first_sample = max(0, span.first - WAV_HEADER_BYTES)
-    remaining = span.last - WAV_HEADER_BYTES - first_sample + 1
+    remaining = span.length
     if remaining <= 0:
         return
+    first_byte = span.first
 
     prefix = await _file_prefix(source, key)
     aead = AESGCM(data_key)
-    counter = first_sample // CHUNK_SIZE
-    discard = first_sample % CHUNK_SIZE
+    counter = first_byte // CHUNK_SIZE
+    discard = first_byte % CHUNK_SIZE
 
     # A bytearray rather than repeated concatenation: a 4 MiB frame arrives
     # in pieces, and rebuilding the buffer for each one is quadratic in the
