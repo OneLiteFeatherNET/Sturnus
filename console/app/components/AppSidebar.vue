@@ -21,8 +21,8 @@ const visible = computed(() => visibleEntries(session.value))
 
 <template>
   <nav
-    class="flex flex-col gap-1 border-r p-3 transition-[width] duration-200"
-    :class="collapsed ? 'w-16' : 'w-56'"
+    class="flex shrink-0 flex-col gap-1 border-r p-3 transition-[width] duration-200"
+    :class="collapsed ? 'w-16' : 'w-16 sm:w-56'"
     :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
     aria-label="Sections"
   >
@@ -38,7 +38,13 @@ const visible = computed(() => visibleEntries(session.value))
       <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" class="shrink-0">
         <path :d="entry.icon" />
       </svg>
-      <span v-if="!collapsed" class="truncate">{{ entry.label }}</span>
+      <!-- Below `sm` the rail is icons only whatever the stored
+           preference says: 224 px of navigation out of a 375 px screen
+           leaves 103 px for the page, which is narrower than a scrubber.
+           The entries keep their `aria-label` and `title`, so this is the
+           same mode the burger already produces rather than a rail that
+           announces nothing. -->
+      <span v-if="!collapsed" class="hidden truncate sm:inline">{{ entry.label }}</span>
     </NuxtLink>
   </nav>
 </template>

@@ -29,15 +29,11 @@
 import {
   audioUrl,
   channelLabel,
-  formatCount,
-  formatMeasurement,
   formatSeconds,
-  formatShare,
   formatTimestamp,
   hasProtocol,
   isInProgress,
   sessionLength,
-  speechShare,
   trackLabel,
   type RecordedSession,
 } from '~/utils/recordings'
@@ -81,14 +77,35 @@ const base = useRuntimeConfig().public.apiBase
 const positions = ref<Record<string, number>>({})
 const players = new Map<string, HTMLAudioElement>()
 
+/**
+ * A ref callback per track, cached so its identity is stable.
+ *
+ * This used to return a fresh closure on every call, and the template
+ * calls it on every render. Vue treats a new ref function as a new
+ * binding, so a `timeupdate` — four a second, per playing track — tore
+ * down and re-seated *every* track's ref, rebuilt every `<li>`, every
+ * four-entry `<dl>` and every `<audio>` vnode on the page. The sibling
+ * component (`MultiTrackPlayer`) already cached its binders for exactly
+ * this reason and says so; the rule was written down and then not
+ * applied one file over.
+ */
+const binders = new Map<string, (el: unknown) => void>()
+
 function bindPlayer(trackId: string) {
-  return (el: unknown) => {
-    if (el && typeof (el as HTMLAudioElement).play === 'function') {
-      players.set(trackId, el as HTMLAudioElement)
-    } else {
-      players.delete(trackId)
+  let existing = binders.get(trackId)
+  if (!existing) {
+    existing = (el: unknown) => {
+      // Duck-typed rather than `instanceof HTMLAudioElement`, so the
+      // check holds wherever this runs.
+      if (el && typeof (el as HTMLAudioElement).play === 'function') {
+        players.set(trackId, el as HTMLAudioElement)
+      } else {
+        players.delete(trackId)
+      }
     }
+    binders.set(trackId, existing)
   }
+  return existing
 }
 
 function onTime(trackId: string, event: Event) {
@@ -120,7 +137,7 @@ const others = computed(() => session.value?.other_participants ?? [])
     </NuxtLink>
 
     <p
-      v-if="status === 'pending'"
+      v-if="status === 'pending' && !error"
       class="rounded-2xl border p-6 text-sm"
       :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
     >
@@ -149,13 +166,18 @@ const others = computed(() => session.value?.other_participants ?? [])
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
         Nothing was lost; the recording is on the server either way.
       </p>
+      <!-- Disabled rather than replaced while the retry runs: the button
+           that started it is the one that would vanish, and a control
+           that unmounts itself when pressed drops the keyboard to the top
+           of the document. -->
       <button
         type="button"
-        class="mt-3 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+        class="mt-3 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-60"
         :style="{ color: 'var(--color-brand-cyan)' }"
+        :disabled="status === 'pending'"
         @click="refresh()"
       >
-        Try again
+        {{ status === 'pending' ? 'Trying again…' : 'Try again' }}
       </button>
     </div>
 
@@ -276,37 +298,24 @@ const others = computed(() => session.value?.other_participants ?? [])
             class="rounded-xl p-4"
             :style="{ background: 'var(--surface-raised)' }"
           >
-            <div class="flex flex-wrap items-baseline justify-between gap-2">
-              <h3 class="text-sm font-medium">{{ trackLabel(track) }}</h3>
-              <dl
-                class="flex flex-wrap gap-x-5 gap-y-1 text-xs"
-                :style="{ color: 'var(--text-muted)' }"
-              >
-                <div class="flex gap-1">
-                  <dt>Audio</dt>
-                  <dd class="tabular-nums">{{ formatMeasurement(track.audio_seconds) }}</dd>
-                </div>
-                <div class="flex gap-1">
-                  <dt>Speech</dt>
-                  <dd class="tabular-nums">{{ formatMeasurement(track.speech_seconds) }}</dd>
-                </div>
-                <div class="flex gap-1">
-                  <dt>Segments</dt>
-                  <dd class="tabular-nums">{{ formatCount(track.segment_count) }}</dd>
-                </div>
-                <div class="flex gap-1">
-                  <dt>Share</dt>
-                  <dd class="tabular-nums">{{ formatShare(speechShare(track)) }}</dd>
-                </div>
-              </dl>
-            </div>
+            <!-- The four measurements are not repeated here. The
+                 transport directly above already shows them per speaker,
+                 and rendering them twice was around a hundred redundant
+                 nodes on an eight-speaker page and every speaker's
+                 numbers read out twice in a row by a screen reader. -->
+            <h3 class="text-sm font-medium">{{ trackLabel(track) }}</h3>
 
+            <!-- Named, because eight identical "audio" controls in a row
+                 tell a screen-reader user nothing about which speaker
+                 they are on. `preload="none"`: nothing is fetched until
+                 somebody presses play on this particular speaker. -->
             <audio
               :ref="bindPlayer(track.discord_user_id)"
               :src="audioUrl(base, session.id, track.discord_user_id)"
               class="mt-3 w-full"
               controls
               preload="none"
+              :aria-label="`${trackLabel(track)} on their own`"
               @timeupdate="onTime(track.discord_user_id, $event)"
             />
 

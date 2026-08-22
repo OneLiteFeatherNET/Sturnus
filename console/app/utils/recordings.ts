@@ -387,3 +387,60 @@ export function queueSpeakerLabel(speaker: QueueSpeaker): string {
   const name = speaker.display_name?.trim()
   return name ? name : speaker.discord_user_id
 }
+
+
+/**
+ * A job status in words rather than as the enum the table stores.
+ *
+ * A speaker's row reading "dead" is a database value shown to a human. It
+ * means the job gave up after exhausting its retries, which is a sentence
+ * somebody can act on; the enum is one they have to be told the meaning
+ * of. Unknown values pass through unchanged rather than becoming
+ * "unknown": a status this console has not been taught yet is still more
+ * use to whoever is debugging than a word that hides it.
+ */
+const QUEUE_STATUS_WORDS: Record<string, string> = {
+  pending: 'waiting',
+  running: 'transcribing',
+  done: 'finished',
+  dead: 'gave up',
+}
+
+export function queueStatusWords(status: string): string {
+  return QUEUE_STATUS_WORDS[status] ?? status
+}
+
+/** How far the arrow keys move a track's playhead, and how far the page
+ *  keys move it. Five seconds is about one sentence, which is the unit
+ *  somebody scrubbing a meeting is looking for; thirty is about one
+ *  exchange. */
+export const SEEK_NUDGE_SECONDS = 5
+export const SEEK_STRIDE_SECONDS = 30
+
+/**
+ * Where a key press moves the playhead, or `null` for a key this is not
+ * about.
+ *
+ * `null` rather than the unchanged position, because the caller has to
+ * know whether to call `preventDefault` — swallowing Tab or a browser
+ * shortcut to save writing out the list of handled keys is how a control
+ * becomes a trap.
+ *
+ * The five keys every slider on the web answers to, so that nobody has to
+ * discover this one. Clamped at both ends: a seek past the end of a track
+ * is a player that stops, and a negative one throws in some browsers.
+ */
+export function seekTarget(key: string, at: number, duration: number): number | null {
+  if (duration <= 0) return null
+  if (key === 'Home') return 0
+  if (key === 'End') return duration
+  const moves: Record<string, number> = {
+    ArrowLeft: -SEEK_NUDGE_SECONDS,
+    ArrowRight: SEEK_NUDGE_SECONDS,
+    PageDown: -SEEK_STRIDE_SECONDS,
+    PageUp: SEEK_STRIDE_SECONDS,
+  }
+  const step = moves[key]
+  if (step === undefined) return null
+  return Math.min(duration, Math.max(0, at + step))
+}

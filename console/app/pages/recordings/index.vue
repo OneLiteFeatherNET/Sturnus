@@ -149,16 +149,12 @@ onMounted(() => {
 
     <RecordingsFilterBar :filters="filters" :total="total" @apply="apply" />
 
-    <p
-      v-if="loadingFirst"
-      class="rounded-2xl border p-6 text-sm"
-      :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
-    >
-      Loading your sessions…
-    </p>
-
+    <!-- The failure is checked before the loading state, so that pressing
+         "Try again" keeps the card — and the button — on screen while the
+         retry runs. Checked the other way round, the control that started
+         the retry unmounts itself and the keyboard lands on the body. -->
     <div
-      v-else-if="error"
+      v-if="error"
       class="rounded-2xl border p-6"
       :style="{ borderColor: 'var(--color-brand-red)' }"
     >
@@ -168,13 +164,22 @@ onMounted(() => {
       </p>
       <button
         type="button"
-        class="mt-3 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+        class="mt-3 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-60"
         :style="{ color: 'var(--color-brand-cyan)' }"
+        :disabled="refreshing"
         @click="refresh()"
       >
-        Try again
+        {{ refreshing ? 'Trying again…' : 'Try again' }}
       </button>
     </div>
+
+    <p
+      v-else-if="loadingFirst"
+      class="rounded-2xl border p-6 text-sm"
+      :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+    >
+      Loading your sessions…
+    </p>
 
     <!-- A page past the end, which is what a bookmark becomes once enough
          recordings have been erased. Distinguished from "no recordings"

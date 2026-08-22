@@ -22,12 +22,23 @@
  *
  * **Fetched only when asked for.** A session with eight speakers is eight
  * of these, and each one costs the server a full pass over an encrypted
- * track. So nothing loads until the component is on screen and the viewer
- * has opened it.
+ * track. So nothing loads until the viewer asks for it by pressing the
+ * control below. (An earlier version of this note claimed the loading was
+ * also gated on the component being on screen. There is no observer here
+ * and there never was; it is gated on the press alone.)
+ *
+ * **Seeking works from the keyboard.** The picture answers "where is the
+ * speech", and clicking it moves the player to that moment — which for a
+ * long time was the only way to do so, anywhere in the console, and left
+ * the accessible name of the element instructing a screen-reader user to
+ * click something they could not reach. It is now a slider: focusable,
+ * driven by the arrow keys, and announcing where it is rather than how to
+ * operate a mouse.
  */
 import {
   decodeMagnitudes,
   formatSeconds,
+  seekTarget,
   spectrogramUrl,
   type SpectrogramResponse,
 } from '~/utils/recordings'
@@ -63,6 +74,14 @@ async function load() {
     // empty box that does not.
     status.value = 'failed'
   }
+}
+
+/** Asking again after a failure. The failed state used to carry no
+ *  control at all, so one transient 500 put that track's picture out of
+ *  reach for the life of the page. */
+async function retry() {
+  status.value = 'idle'
+  await load()
 }
 
 /**
@@ -155,45 +174,97 @@ function onClick(event: MouseEvent) {
   const fraction = Math.min(1, Math.max(0, (event.clientX - box.left) / box.width))
   emit('seek', fraction * data.duration_seconds)
 }
+
+/** Where the slider says it is: the player's position, or the start. */
+const at = computed(() => {
+  const data = picture.value
+  if (!data) return 0
+  const here = props.position ?? 0
+  return Math.min(Math.max(0, here), data.duration_seconds)
+})
+
+/**
+ * Seeking with the keyboard.
+ *
+ * Where each key lands is `seekTarget`, tested without rendering
+ * anything. What is left here is the one thing that needs an event:
+ * `preventDefault` for the keys that were handled and for no others —
+ * swallowing Tab or a browser shortcut to save writing out the list is
+ * how a control becomes a trap.
+ */
+function onKey(event: KeyboardEvent) {
+  const data = picture.value
+  if (!data) return
+  const target = seekTarget(event.key, at.value, data.duration_seconds)
+  if (target === null) return
+  event.preventDefault()
+  emit('seek', target)
+}
 </script>
 
 <template>
   <div class="mt-3">
+    <!-- One control that stays mounted through both of its states rather
+         than two that replace each other. The button used to disappear
+         the moment it was pressed, which dropped the keyboard to the top
+         of the document — eight tracks down a page, that is the whole
+         page traversed again to get back. -->
     <button
-      v-if="status === 'idle'"
+      v-if="status === 'idle' || status === 'loading'"
       type="button"
-      class="w-full rounded-lg border border-dashed px-3 py-4 text-xs transition-colors hover:bg-[var(--surface-raised)]"
+      class="w-full rounded-lg border border-dashed px-3 py-4 text-xs transition-colors hover:bg-[var(--surface-raised)] disabled:cursor-progress"
       :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+      :disabled="status === 'loading'"
       @click="load()"
     >
-      Show spectrogram — see where the speech is without listening
+      {{
+        status === 'loading'
+          ? 'Drawing this track…'
+          : 'Show spectrogram — see where the speech is without listening'
+      }}
     </button>
 
-    <p
-      v-else-if="status === 'loading'"
-      class="rounded-lg border border-dashed px-3 py-4 text-center text-xs"
-      :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
-    >
-      Drawing this track…
-    </p>
-
-    <p
+    <div
       v-else-if="status === 'failed'"
-      class="rounded-lg border border-dashed px-3 py-4 text-center text-xs"
+      class="rounded-lg border border-dashed px-3 py-3 text-center text-xs"
       :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
     >
-      This track could not be drawn. The audio above is unaffected.
-    </p>
+      <p>This track could not be drawn. The audio above is unaffected.</p>
+      <button
+        type="button"
+        class="mt-1 rounded-lg px-2 py-1 font-medium underline transition-colors hover:bg-[var(--surface-raised)]"
+        :style="{ color: 'var(--color-brand-cyan)' }"
+        @click="retry()"
+      >
+        Try again
+      </button>
+    </div>
 
     <template v-else>
+      <!-- A slider, because that is what it is: it reports where playback
+           is and it moves it. `role="img"` here used to declare the whole
+           thing a static picture while a click handler contradicted it,
+           and the accessible name told a screen-reader user to click
+           something that was not in the tab order at all. -->
       <div
-        class="relative cursor-pointer overflow-hidden rounded-lg"
-        :style="{ background: 'var(--surface-sunken)' }"
-        role="img"
-        :aria-label="`Spectrogram of this track, ${formatSeconds(picture?.duration_seconds ?? 0)} long. Click to jump to a moment.`"
+        class="relative cursor-pointer overflow-hidden rounded-lg focus-visible:outline focus-visible:outline-2"
+        :style="{ background: 'var(--surface-sunken)', outlineColor: 'var(--color-brand-cyan)' }"
+        role="slider"
+        tabindex="0"
+        aria-label="Position in this track"
+        aria-orientation="horizontal"
+        aria-valuemin="0"
+        :aria-valuemax="Math.round(picture?.duration_seconds ?? 0)"
+        :aria-valuenow="Math.round(at)"
+        :aria-valuetext="`${formatSeconds(at)} of ${formatSeconds(picture?.duration_seconds ?? 0)}`"
         @click="onClick"
+        @keydown="onKey"
       >
-        <canvas ref="canvas" class="block h-28 w-full" />
+        <!-- Hidden from assistive technology: it is a grid of pixels, and
+             what it means is the sentence underneath it, which is
+             readable. Announcing "image" here would add a name to the
+             slider and no information. -->
+        <canvas ref="canvas" class="block h-28 w-full" aria-hidden="true" />
         <div
           v-if="playheadPercent !== null"
           class="pointer-events-none absolute inset-y-0 w-px"

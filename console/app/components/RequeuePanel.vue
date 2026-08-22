@@ -22,12 +22,21 @@
  * a session flips to `documented` only after the document is written, so
  * stopping at the last `done` would stop one step early and never show the
  * finished document.
+ *
+ * **And it stops on the way out, including mid-request.** `clearTimeout`
+ * alone was not enough: a timer that had already fired was past clearing,
+ * and its continuation — which runs after an `await` — installed a fresh
+ * one that nothing was left to cancel. Navigating away during any of the
+ * three seconds a poll is in flight left a loop making twenty database
+ * reads a minute for the life of the tab, per panel, invisibly. So every
+ * continuation asks `mounted` before it acts.
  */
 import {
   isQueueBusy,
   queueProgress,
   queueSpeakerLabel,
   queueStatusPath,
+  queueStatusWords,
   requeuePath,
   type QueueSnapshot,
   type RequeueOutcome,
@@ -49,18 +58,9 @@ const failure = ref<string | null>(null)
  *  load-generator. */
 const POLL_MS = 3000
 let timer: ReturnType<typeof setTimeout> | null = null
-
-/**
- * Whether this panel is still on the page.
- *
- * Checked after every `await`, because that is where an unmount happens
- * without the code resuming afterwards knowing about it. `clearTimeout`
- * alone was not enough: a timer that had already fired was past clearing,
- * and its continuation installed a fresh one that nothing was left to
- * cancel. Navigating away during any of the three seconds a poll is in
- * flight left a loop making twenty database reads a minute for the life
- * of the tab, per panel, invisibly.
- */
+/** Whether this panel is still on the page. Checked after every `await`,
+ *  because that is where an unmount can happen without the code that
+ *  resumes afterwards knowing about it. */
 let mounted = true
 
 async function readStatus(): Promise<void> {
@@ -68,6 +68,7 @@ async function readStatus(): Promise<void> {
     const fresh = await api<QueueSnapshot>(queueStatusPath(props.sessionId))
     if (!mounted) return
     snapshot.value = fresh
+    failure.value = null
     // A 200 is the only proof that this person administers this guild,
     // and it is what makes the panel appear.
     visible.value = true
@@ -81,11 +82,11 @@ async function readStatus(): Promise<void> {
       return
     }
     // Any other failure leaves `visible` exactly as it was, and that is
-    // the whole point. Setting it to `true` here -- which this used to
-    // do -- meant one 500 revealed the Transcription section, its
-    // explanatory text and all, to somebody who should never learn the
-    // endpoint exists. A transient fault must not become a way to ask
-    // "am I looking at a real session in a guild with a queue".
+    // the whole point. Setting it to `true` here — which this used to do
+    // — meant one 500 revealed the Transcription section, explanatory
+    // text and all, to somebody who should never learn the endpoint
+    // exists. A transient fault must not be a way to ask "am I looking
+    // at a real session in a guild with a queue".
     failure.value = 'The transcription queue could not be read.'
   }
 }
@@ -97,11 +98,11 @@ function scheduleIfBusy() {
   }
   if (snapshot.value && isQueueBusy(snapshot.value)) {
     timer = setTimeout(async () => {
+      await readStatus()
       // The timer that started this has already fired, so `clearTimeout`
       // in `onBeforeUnmount` could not have stopped what runs here.
       if (!mounted) return
-      await readStatus()
-      if (mounted) scheduleIfBusy()
+      scheduleIfBusy()
     }, POLL_MS)
   }
 }
@@ -124,14 +125,20 @@ async function requeue() {
       failure.value = 'The re-queue could not be started.'
     }
   } finally {
-    // Every branch below can resume after the component is gone: the
-    // request above is awaited, and so is the status read.
     if (mounted) {
       working.value = false
       await readStatus()
       if (mounted) scheduleIfBusy()
     }
   }
+}
+
+/** Reading the queue again after a failure, without reloading the page.
+ *  The failed state used to carry no control at all: one transient fault
+ *  and the panel was a sentence saying so until somebody pressed F5. */
+async function retry() {
+  await readStatus()
+  if (mounted) scheduleIfBusy()
 }
 
 onMounted(async () => {
@@ -197,13 +204,21 @@ function statusColour(status: string): string {
       {{ snapshot.refusal }}
     </p>
 
-    <p
+    <div
       v-if="failure"
       class="mt-3 rounded-lg p-3 text-sm"
-      :style="{ background: 'var(--surface-raised)', color: 'var(--color-brand-red)' }"
+      :style="{ background: 'var(--surface-raised)' }"
     >
-      {{ failure }}
-    </p>
+      <p :style="{ color: 'var(--color-brand-red)' }">{{ failure }}</p>
+      <button
+        type="button"
+        class="mt-2 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-sunken)]"
+        :style="{ color: 'var(--color-brand-cyan)' }"
+        @click="retry()"
+      >
+        Try again
+      </button>
+    </div>
 
     <!-- What the last press actually did. The skipped speakers are named
          separately and never folded into the count above them. -->
@@ -228,7 +243,9 @@ function statusColour(status: string): string {
         class="mt-4 h-1.5 overflow-hidden rounded-full"
         :style="{ background: 'var(--surface-sunken)' }"
         role="progressbar"
+        aria-label="Transcription progress"
         :aria-valuenow="Math.round(progress * 100)"
+        :aria-valuetext="`${Math.round(progress * 100)}% of speakers finished`"
         aria-valuemin="0"
         aria-valuemax="100"
       >
@@ -246,7 +263,7 @@ function statusColour(status: string): string {
         >
           <span class="min-w-32 flex-1 truncate">{{ queueSpeakerLabel(speaker) }}</span>
           <span class="text-xs font-medium" :style="{ color: statusColour(speaker.status) }">
-            {{ speaker.status }}
+            {{ queueStatusWords(speaker.status) }}
           </span>
           <span
             v-if="speaker.attempts > 1"
@@ -269,7 +286,12 @@ function statusColour(status: string): string {
         </li>
       </ul>
 
-      <p class="mt-3 text-xs" :style="{ color: 'var(--text-muted)' }">
+      <!-- In a live region because pressing the button drops focus (the
+           button disables itself) and the only thing that changes
+           afterwards is this line and the bar above it. Without one, an
+           administrator using a screen reader presses "Transcribe again"
+           and is told nothing at all. -->
+      <p class="mt-3 text-xs" :style="{ color: 'var(--text-muted)' }" role="status" aria-live="polite">
         Session status: {{ snapshot.session_status }}<span v-if="busy"> · watching for changes</span>
       </p>
     </template>
