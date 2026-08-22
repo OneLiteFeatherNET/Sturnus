@@ -914,3 +914,115 @@ export function describeQueueError(error: unknown): string {
       return `Sturnus answered ${status} and could not report this server’s queue. Nothing is known about why.`
   }
 }
+
+/**
+ * A poll that cannot outlive the thing it is polling for.
+ *
+ * Extracted from the page rather than written inline, and not for tidiness:
+ * the property that matters here is one no build, type check or render can
+ * show, and one that a page component cannot be asked about without a Nuxt
+ * runtime around it. Here it is an ordinary function with fake timers
+ * pointed at it.
+ *
+ * The defect it exists to make unrepresentable is the one `RequeuePanel`
+ * shipped with. A chain of timeouts is the right shape -- an interval can
+ * queue a second request behind a slow first -- but `clearTimeout` cannot
+ * stop a timer that has **already fired**, and the continuation after the
+ * `await` inside it installs a fresh timer that nothing is left to cancel.
+ * Navigating away during the seconds a poll is in flight therefore leaves a
+ * loop reading the database for the life of the tab, per page, invisibly.
+ *
+ * So `alive` is checked *after every await*, which is exactly where an
+ * unmount happens without the resuming code being told, and `stop()` sets
+ * it false as well as clearing the pending timer. One of those two alone
+ * is the bug.
+ *
+ * `shouldContinue` is re-asked each round rather than captured once,
+ * because whether there is anything left to watch is a fact about the data
+ * that just came back.
+ */
+/** What a timer handle is, without committing to a runtime.
+ *
+ *  `setTimeout` returns a `Timeout` object under Node and a number in a
+ *  browser, and this module is compiled with both libraries in scope
+ *  because a page is rendered on the server and then polls in the client.
+ *  `ReturnType<typeof setTimeout>` resolves to whichever overload the
+ *  checker reaches first, which is not the same as what the call actually
+ *  returns -- so the union is written out rather than inferred. The loop
+ *  never inspects a handle; it stores what its own `setTimer` returned and
+ *  hands it back to its own `clearTimer`. */
+export type QueueTimer = ReturnType<typeof setTimeout> | number
+
+export interface QueuePoll {
+  /** Whether another round is worth making, asked afresh each time. */
+  shouldContinue: () => boolean
+  /** One re-read. Rejections are the caller's to handle; a rejected round
+   *  ends the loop rather than retrying blind, because a poll that keeps
+   *  hammering an endpoint that is failing is how a transient fault becomes
+   *  a sustained one. */
+  run: () => Promise<void>
+  delayMs: number
+  setTimer?: (callback: () => void, ms: number) => QueueTimer
+  clearTimer?: (handle: QueueTimer) => void
+}
+
+export interface QueuePollHandle {
+  /** Stops the loop for good. Safe to call more than once, and safe to
+   *  call from inside the loop's own continuation. */
+  stop: () => void
+  /** Whether the loop is still able to schedule another round. Exposed for
+   *  the tests, which is the whole reason this is a function and not four
+   *  lines in a component. */
+  readonly alive: boolean
+}
+
+export function startQueuePolling(poll: QueuePoll): QueuePollHandle {
+  const setTimer = poll.setTimer ?? setTimeout
+  const clearTimer = poll.clearTimer ?? clearTimeout
+
+  let alive = true
+  let timer: QueueTimer | null = null
+
+  function stop() {
+    alive = false
+    if (timer !== null) {
+      clearTimer(timer)
+      timer = null
+    }
+  }
+
+  function schedule() {
+    if (!alive || !poll.shouldContinue()) return
+    timer = setTimer(() => {
+      // Cleared first: this handle has fired and can no longer be
+      // cancelled, so leaving it in place would make `stop()` believe it
+      // had cancelled something.
+      timer = null
+      if (!alive) return
+      poll
+        .run()
+        .then(() => {
+          // The check that the extracted version exists for. Between the
+          // timer firing and this line the component may have gone, and
+          // nothing tells the resuming code so.
+          if (!alive) return
+          schedule()
+        })
+        .catch(() => {
+          // A failed round ends the loop. The page has an error to show
+          // and a refresh control to try again with; a loop that retried
+          // on its own would turn one bad second into a request every
+          // five for as long as the tab is open.
+          stop()
+        })
+    }, poll.delayMs)
+  }
+
+  schedule()
+  return {
+    stop,
+    get alive() {
+      return alive
+    },
+  }
+}

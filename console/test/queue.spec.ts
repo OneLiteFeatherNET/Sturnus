@@ -22,7 +22,7 @@
  * administrator who restarted a healthy worker because a console told them
  * it was dead.
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   CLEAR_QUEUE_NOTE,
@@ -50,6 +50,7 @@ import {
   type GuildQueue,
   type QueueCounts,
   type QueuedSession,
+  startQueuePolling,
 } from '../app/utils/queue'
 
 /** A session with everything harmless, so each test states only the one
@@ -772,5 +773,155 @@ describe('when the API says no', () => {
     // here may reintroduce one from a message field either.
     const leaky = { status: 500, message: 'http://sturnus-api:8080/api/guilds/4711/queue failed' }
     expect(describeQueueError(leaky)).not.toContain('sturnus-api')
+  })
+})
+
+describe('polling a queue that is still moving', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  /** A round that resolves only when the test says so, so an unmount can be
+   *  placed *during* a request rather than only between two of them. That
+   *  window is where the defect this loop exists for actually lives. */
+  function deferred() {
+    let release: () => void = () => {}
+    const promise = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    return { promise, release }
+  }
+
+  it('re-reads while there is work in flight', async () => {
+    let rounds = 0
+    startQueuePolling({
+      shouldContinue: () => true,
+      run: async () => {
+        rounds += 1
+      },
+      delayMs: 5000,
+    })
+
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(rounds).toBe(1)
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(rounds).toBe(2)
+  })
+
+  it('stops on its own once nothing is moving', async () => {
+    // Every poll is a database read across a whole guild. A page left open
+    // overnight on a server that finished at five o'clock must not keep
+    // making them.
+    let rounds = 0
+    let moving = true
+    startQueuePolling({
+      shouldContinue: () => moving,
+      run: async () => {
+        rounds += 1
+        moving = false
+      },
+      delayMs: 5000,
+    })
+
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(rounds).toBe(1)
+  })
+
+  it('makes no further request after being stopped between two rounds', async () => {
+    let rounds = 0
+    const handle = startQueuePolling({
+      shouldContinue: () => true,
+      run: async () => {
+        rounds += 1
+      },
+      delayMs: 5000,
+    })
+
+    handle.stop()
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(rounds).toBe(0)
+    expect(handle.alive).toBe(false)
+  })
+
+  it('makes no further request after being stopped in the middle of one', async () => {
+    /**
+     * The defect this loop was extracted to make unrepresentable.
+     *
+     * `clearTimeout` cannot stop a timer that has already fired, and the
+     * continuation after the `await` installs a fresh one that nothing is
+     * left to cancel. Navigating away during the seconds a request is in
+     * flight therefore left `RequeuePanel` reading the database for the
+     * life of the tab, invisibly. Nothing in a build, a type check or a
+     * render shows it.
+     */
+    const round = deferred()
+    let rounds = 0
+    const handle = startQueuePolling({
+      shouldContinue: () => true,
+      run: async () => {
+        rounds += 1
+        await round.promise
+      },
+      delayMs: 5000,
+    })
+
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(rounds).toBe(1)
+
+    // The unmount lands while the first read is still outstanding.
+    handle.stop()
+    round.release()
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(rounds).toBe(1)
+  })
+
+  it('ends the loop when a round fails rather than retrying blind', async () => {
+    // The page has an error to show and a refresh control to try again
+    // with. A loop that retried on its own would turn one bad second into
+    // a request every five for as long as the tab is open.
+    let rounds = 0
+    const handle = startQueuePolling({
+      shouldContinue: () => true,
+      run: async () => {
+        rounds += 1
+        throw new Error('the API had a bad second')
+      },
+      delayMs: 5000,
+    })
+
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(rounds).toBe(1)
+    expect(handle.alive).toBe(false)
+  })
+
+  it('schedules nothing at all when there was never anything to watch', async () => {
+    let rounds = 0
+    startQueuePolling({
+      shouldContinue: () => false,
+      run: async () => {
+        rounds += 1
+      },
+      delayMs: 5000,
+    })
+
+    await vi.advanceTimersByTimeAsync(60_000)
+
+    expect(rounds).toBe(0)
+  })
+
+  it('can be stopped twice without complaint', async () => {
+    // A page that stops the loop on unmount and again on a guild switch is
+    // an ordinary page, not a misuse.
+    const handle = startQueuePolling({
+      shouldContinue: () => true,
+      run: async () => {},
+      delayMs: 5000,
+    })
+
+    handle.stop()
+    expect(() => handle.stop()).not.toThrow()
   })
 })

@@ -471,6 +471,8 @@ class FakeTags:
             return None
         self.stored[(session_id, owner)] = tuple(sorted(tags))
         return self.stored[(session_id, owner)]
+
+
 class FakeQueueOverview:
     """A guild queue nobody administers, until a test says otherwise.
 
@@ -532,7 +534,6 @@ def build_test_api(
     states: StateStore | None = None,
     links: LinkDirectory | None = None,
     admins: AdminDirectory | None = None,
-    consents: ConsentDirectory | None = None,
     reads: SessionReads | None = None,
     config: SettingsStore | None = None,
     audio: AudioDelivery | None = None,
@@ -577,7 +578,6 @@ def build_test_api(
         queue=queue or FakeQueue(),
         tags=tags or FakeTags(),
         queues=queues or FakeQueueOverview(),
-        consents=consents or FakeConsents(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,
