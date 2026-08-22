@@ -23,11 +23,13 @@ from sturnus.console.ports import (
     AdminDirectory,
     ConsentDirectory,
     ConsentHolder,
+    GuildParticipation,
     GuildQueue,
     GuildRecording,
     GuildReports,
     LinkDirectory,
     OAuthClient,
+    ParticipationReports,
     QueueControl,
     QueueOverview,
     QueueSnapshot,
@@ -471,6 +473,24 @@ class FakeReports:
         return self.recording
 
 
+class FakeParticipation:
+    """An attendance ranking nobody administers, until a test says otherwise.
+
+    Its own double rather than a second method on `FakeReports`, mirroring
+    the production split: the aggregate report names nobody and this one is
+    the whole of what does, so a test that wires up one and not the other
+    is expressing something real.
+    """
+
+    def __init__(self, attendance: GuildParticipation | None = None) -> None:
+        self.attendance = attendance
+        self.asked: list[tuple[int, int]] = []
+
+    async def attendance_in(self, guild_id: int, *, requested_by: int) -> GuildParticipation | None:
+        self.asked.append((guild_id, requested_by))
+        return self.attendance
+
+
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
@@ -484,6 +504,7 @@ def build_test_api(
     queues: QueueOverview | None = None,
     consents: ConsentDirectory | None = None,
     reports: GuildReports | None = None,
+    participation: ParticipationReports | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -521,6 +542,7 @@ def build_test_api(
         queues=queues or FakeQueueOverview(),
         consents=consents or FakeConsents(),
         reports=reports or FakeReports(),
+        participation=participation or FakeParticipation(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,

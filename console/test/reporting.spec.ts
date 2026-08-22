@@ -25,9 +25,11 @@
  *   back.
  *
  * And one thing is asserted by its absence: nothing in this module names
- * or ranks a person, because this report is about a server and a
- * per-person readout of attendance and speaking time is a works-council
- * matter rather than a console feature.
+ * or ranks a person, because this report is about a server. The Reporting
+ * page does carry an attendance ranking, in `~/utils/participation` and
+ * behind a reveal of its own -- the boundary between the two is the point,
+ * and `REPORT_SCOPE_NOTE` is tested here for naming it rather than for
+ * denying that anything of the sort exists.
  */
 import { describe, expect, it } from 'vitest'
 
@@ -652,14 +654,24 @@ describe('a server with nothing to report', () => {
 })
 
 describe('what this report is not about', () => {
-  it('says outright that there is no per-person breakdown behind it', () => {
+  it('says outright that none of these figures is about a person', () => {
     // A per-person readout of meeting attendance and speaking time is a
     // means of monitoring conduct and performance at work, which is a
-    // works-council matter rather than a console feature. The payload
-    // carries no names and no ids; the framing has to match.
+    // works-council matter. This payload carries no names and no ids; the
+    // framing has to match.
     expect(REPORT_SCOPE_NOTE).toContain('about the server as a whole and never about the people in it')
-    expect(REPORT_SCOPE_NOTE).toContain('no per-person breakdown behind it')
+    expect(REPORT_SCOPE_NOTE).toContain('none of these figures can be traced back to one person')
     expect(REPORT_SCOPE_NOTE).toContain('Counts of people are counts, and stop there.')
+  })
+
+  it('names the one thing on the page that is about people, rather than denying it', () => {
+    // The page below carries an attendance ranking, in its own module and
+    // behind a reveal. A scope note claiming no per-person readout exists
+    // anywhere would be false the moment somebody scrolled, and a reader
+    // who caught it in one claim has no reason to believe the others.
+    expect(REPORT_SCOPE_NOTE).toContain('The attendance ranking at the foot of this page is the one exception')
+    expect(REPORT_SCOPE_NOTE).toContain('fetched only when somebody asks for it')
+    expect(REPORT_SCOPE_NOTE).toContain('written to the audit log')
   })
 
   it('describes the participant count as a count and nothing more', () => {
@@ -669,10 +681,12 @@ describe('what this report is not about', () => {
     expect(people.note).toContain('does not send this page their names')
   })
 
-  it('never hints that a per-person readout is on its way', () => {
-    // Every sentence this module can produce, checked at once: an
-    // interface that promises a breakdown is as much a promise as one that
-    // ships it.
+  it('never turns one of these figures into a readout about a person', () => {
+    // Every sentence this module can produce, checked at once. The page
+    // does carry an attendance ranking, and it is a separate module behind
+    // its own reveal; what must not happen is one of the figures *here*
+    // acquiring a per-person reading, which is how a server-level report
+    // becomes a per-person one without anybody deciding it should.
     const prose = everySentence(
       report({ months: [month({ month: '2026-01' }), month({ month: '2026-03' })], open_sessions: 1 }),
     )

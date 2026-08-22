@@ -29,9 +29,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.linking import new_state
 from sturnus.application.publishing import DOCUMENTED_STATUS
+from sturnus.console.participation import Attendance
 from sturnus.console.ports import (
     AdminDirectory,
     ConsentHolder,
+    GuildParticipation,
     GuildQueue,
     GuildRecording,
     QueuedSession,
@@ -797,3 +799,147 @@ def _zone(name: str) -> tuple[tzinfo, str]:
         return ZoneInfo(name), name
     except (ZoneInfoNotFoundError, ValueError):
         return UTC, "UTC"
+
+
+class ConsoleParticipationReports:
+    """Who took part in a guild's meetings, counted per person.
+
+    A class of its own rather than a method on `ConsoleGuildReports`, for
+    the reason `ParticipationReports` is a protocol of its own: that one
+    reads participant rows and never carries an identity out of the
+    statement, and this one exists to do exactly that. Keeping them apart
+    is what lets the aggregate report keep saying it names nobody, and
+    what makes not having this one a revert rather than an audit.
+
+    Read `sturnus.console.participation` before extending it. This is the
+    only place in the console where a list of colleagues is ranked, and
+    the reasons that is a decision rather than a feature are written down
+    there.
+
+    Two statements rather than a join, the same trade the rest of this
+    module makes: a join from participants to jobs multiplies rows, and a
+    person in twelve sessions with a track in each comes back a hundred
+    and forty-four times.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        admins: AdminDirectory,
+    ) -> None:
+        self._session_factory = session_factory
+        self._admins = admins
+
+    async def attendance_in(self, guild_id: int, *, requested_by: int) -> GuildParticipation | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+
+        async with self._session_factory() as db:
+            sessions = int(
+                await db.scalar(
+                    select(func.count())
+                    .select_from(SessionRow)
+                    .where(SessionRow.guild_id == guild_id)
+                )
+                or 0
+            )
+            in_guild = select(SessionRow.id).where(SessionRow.guild_id == guild_id)
+            attended = (
+                await db.execute(
+                    select(
+                        SessionParticipant.discord_user_id,
+                        # `DISTINCT` is redundant today and kept anyway:
+                        # `uq_participant_per_session` is what actually
+                        # guarantees one row per person per session, and a
+                        # plain `COUNT(*)` would be a ranking of colleagues
+                        # that silently becomes a ranking by how often
+                        # their connection dropped the day that constraint
+                        # is relaxed. Cheap insurance on a number nobody
+                        # would re-derive by hand.
+                        func.count(func.distinct(SessionParticipant.session_id)),
+                        func.min(SessionRow.started_at),
+                        func.max(SessionRow.started_at),
+                    )
+                    .join(SessionRow, SessionRow.id == SessionParticipant.session_id)
+                    .where(SessionRow.guild_id == guild_id)
+                    .group_by(SessionParticipant.discord_user_id)
+                )
+            ).all()
+            if not attended:
+                return GuildParticipation((), sessions)
+
+            people = [row[0] for row in attended]
+            spoken = {
+                discord_user_id: (speech, int(unmeasured))
+                for discord_user_id, speech, unmeasured in (
+                    await db.execute(
+                        select(
+                            TranscriptionJob.discord_user_id,
+                            func.sum(TranscriptionJob.speech_seconds),
+                            # Null is not zero: `SUM` skips nulls silently,
+                            # so the rows it skipped are counted beside it.
+                            # Without this a person whose recordings
+                            # predate the measurement columns reads as
+                            # having said nothing.
+                            func.count().filter(TranscriptionJob.speech_seconds.is_(None)),
+                        )
+                        .where(
+                            TranscriptionJob.session_id.in_(in_guild),
+                            TranscriptionJob.discord_user_id.in_(people),
+                        )
+                        .group_by(TranscriptionJob.discord_user_id)
+                    )
+                ).all()
+            }
+            names = await self._latest_display_names(guild_id, people)
+
+        return GuildParticipation(
+            people=tuple(
+                Attendance(
+                    discord_user_id=discord_user_id,
+                    display_name=names.get(discord_user_id),
+                    sessions=int(count),
+                    speech_seconds=spoken.get(discord_user_id, (None, 0))[0],
+                    unmeasured_tracks=spoken.get(discord_user_id, (None, 0))[1],
+                    first_seen_at=first_seen,
+                    last_seen_at=last_seen,
+                )
+                for discord_user_id, count, first_seen, last_seen in attended
+            ),
+            sessions=sessions,
+        )
+
+    async def _latest_display_names(self, guild_id: int, people: Sequence[int]) -> dict[int, str]:
+        """The name each person last appeared under in this guild.
+
+        The same read `ConsoleConsentDirectory` makes and for the same
+        reason -- a page of eighteen-digit numbers is not one anybody can
+        act on -- and scoped to this guild for the same reason too: a
+        display name is per-guild, and borrowing one from elsewhere would
+        put a nickname from another server next to a statement about this
+        one.
+        """
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(
+                        SessionParticipant.discord_user_id,
+                        SessionParticipant.discord_display_name,
+                        SessionRow.started_at,
+                    )
+                    .join(SessionRow, SessionRow.id == SessionParticipant.session_id)
+                    .where(
+                        SessionRow.guild_id == guild_id,
+                        SessionParticipant.discord_user_id.in_(people),
+                    )
+                    .order_by(
+                        SessionParticipant.discord_user_id,
+                        SessionRow.started_at.desc(),
+                    )
+                )
+            ).all()
+
+        names: dict[int, str] = {}
+        for discord_user_id, display_name, _started_at in rows:
+            names.setdefault(discord_user_id, display_name)
+        return names

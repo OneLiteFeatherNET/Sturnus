@@ -178,6 +178,15 @@ class Event(StrEnum):
     #: which of the two it was.
     CONSOLE_CONSENT_REVOKE_REFUSED = "console.consent_revoke_refused"
 
+    #: Somebody read a guild's attendance ranking -- the one thing the
+    #: console reports that names other people and orders them. Logged on
+    #: a *read*, which nothing else here is, because that is the point: a
+    #: ranking of colleagues by meeting attendance is subject to
+    #: co-determination (BetrVG §87(1)(6)), and "who looked at it, and
+    #: when" is the first question anybody reviewing the arrangement will
+    #: ask. `guild_id` and `requested_by`; never who was in the list.
+    CONSOLE_PARTICIPATION_READ = "console.participation_read"
+
     # -- cross-cutting ------------------------------------------------------
     PROCESS_STARTING = "process.starting"
     SHUTDOWN_BEGIN = "shutdown.begin"

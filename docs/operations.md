@@ -1193,6 +1193,59 @@ council (BetrVG §87(1)(6)) rather than something a console adds because
 the columns happen to be there. The rows exist and the ranking is
 buildable; building it is a separate, deliberate act.
 
+### 6.2.9 The attendance ranking, and why it is its own thing
+
+**Admin View → Reporting → attendance**, per guild: the people this guild
+has recorded, ordered by how many of its meetings they were in, with how
+long each of them spoke.
+
+**Read this before switching it on.** This is the only thing Sturnus
+produces that names other people and ranks them. Everything else in the
+console is either about the person reading it or about a guild in
+aggregate.
+
+An ordered list of colleagues by meeting attendance and speaking time is
+a `technische Einrichtung, die dazu bestimmt ist, das Verhalten oder die
+Leistung der Arbeitnehmer zu überwachen` — BetrVG §87(1)(6) — and is
+therefore subject to co-determination in a German workplace with a works
+council, regardless of what anybody intended it for. The GDPR half is the
+same point from the other side: the recordings were collected so a
+protocol could be written, and an attendance ranking serves a further
+purpose from the same data. Neither of those is a reason it cannot exist.
+Both are reasons the decision belongs to the people who run the guild
+rather than to whoever deploys the bot.
+
+Practically:
+
+- **It is a separate endpoint, port and module** (`/report/participation`,
+  `ParticipationReports`, `sturnus.console.participation`). Removing it is
+  a revert of one change, not an audit of a shared response shape. The
+  aggregate report at `/report` is untouched by that and continues to name
+  nobody.
+- **Every read is logged**, at INFO, which no other read in the console
+  is:
+
+  ```logql
+  {namespace="sturnus"} | json | sturnus_event="console.participation_read"
+  ```
+
+  The line carries `guild_id`, `requested_by` and how many people were in
+  the answer. It deliberately does *not* carry who they were — the list is
+  the thing under discussion, and copying it into a retained, searchable
+  log store would be making a second copy of it.
+- **It reports attendance and speaking time and nothing further.** No
+  words spoken, no punctuality, no share-of-talk, nothing per meeting.
+  Each of those would be another purpose and would need deciding again.
+- **It is ordered by meetings attended, never by speaking time.** "Was
+  present most often" and "talked the most" are different statements about
+  a colleague, and only one of them was asked for.
+- **`speech_seconds` is null-aware.** A person whose recordings predate
+  the measurement columns has no speaking total, and the page says so
+  rather than showing a zero that reads as silence.
+
+If this is not wanted in a deployment, do not merge or do revert the
+change that adds it; the rest of the reporting page works without it.
+
 ### 6.3 Listening to a recording by hand
 
 Every automated check this system has can describe a track — its level,

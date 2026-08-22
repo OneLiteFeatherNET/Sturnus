@@ -20,14 +20,17 @@
  *
  * Three things this page refuses to do, all three on purpose:
  *
- * - **It never names or ranks a person, and never hints that it might.**
- *   The payload carries no ids and no names, and that is a decision rather
- *   than an omission: a per-person readout of who attended which meetings
- *   and who spoke for how long is a means of monitoring conduct and
- *   performance at work, which is a works-council matter and not a console
- *   feature. `REPORT_SCOPE_NOTE` says so on the page, because the reader
- *   who was about to go looking for the breakdown deserves the answer
- *   rather than a dead end.
+ * - **None of the figures above the ranking is about a person.** The report
+ *   payload carries no ids and no names, and that is a decision rather than
+ *   an omission. The attendance ranking at the foot of the page is the one
+ *   thing here that names people, and everything about how it is built
+ *   keeps it apart from the rest: its own endpoint, its own module
+ *   (`~/utils/participation`), its own standing notes, and a request that
+ *   goes out only when somebody presses the control that says what it will
+ *   do. Reading it is written to the audit log, which is exactly why it is
+ *   not loaded alongside the figures — somebody checking whether
+ *   transcription is keeping up has not asked to look at a ranking of their
+ *   colleagues, and their name should not end up in a log saying they did.
  * - **It draws its own bars.** A chart library for one row of rectangles
  *   would be a dependency for four glyphs, and the Content-Security-Policy
  *   this console is served under would not load it anyway. The bars are
@@ -38,6 +41,25 @@
  *   seconds would be a cost with no reader. The Refresh button is the
  *   whole of the refresh policy.
  */
+import {
+  PARTICIPATION_EMPTY_HEADING,
+  PARTICIPATION_EMPTY_NOTE,
+  PARTICIPATION_HEADING,
+  PARTICIPATION_HIDE_LABEL,
+  PARTICIPATION_HIDE_NOTE,
+  PARTICIPATION_LOADING_NOTE,
+  PARTICIPATION_REVEAL_BUSY_LABEL,
+  PARTICIPATION_REVEAL_LABEL,
+  PARTICIPATION_REVEAL_NOTE,
+  type GuildParticipation,
+  describeParticipationError,
+  isParticipationEmpty,
+  parseGuildParticipation,
+  participationNotes,
+  participationPath,
+  participationRows,
+  participationScopeLine,
+} from '~/utils/participation'
 import {
   REPORT_EMPTY_HEADING,
   REPORT_EMPTY_NOTE,
@@ -144,6 +166,93 @@ async function refreshNow() {
     refreshing.value = false
   }
 }
+
+/* -------------------------------------------------------------------- */
+/* The attendance ranking, which is not fetched with anything else       */
+/* -------------------------------------------------------------------- */
+
+/**
+ * Whether the reader has asked for the ranking.
+ *
+ * The whole reason this is a separate request rather than another field on
+ * the report: reading the ranking is written to the audit log, and somebody
+ * who opened this page to check whether transcription is keeping up has not
+ * asked to look at a ranking of the people they work with. Loading it
+ * alongside the figures would have put every one of them in that log,
+ * without ever having been asked.
+ *
+ * `immediate: false` and no `watch`, deliberately. A watched fetcher would
+ * re-issue the request -- and write another audit line -- every time
+ * somebody flipped the guild picker, which is the opposite of asking.
+ */
+const revealed = ref(false)
+
+/** Whether the request is out. Its own ref rather than `useAsyncData`'s
+ *  status, for the same reason `refreshing` above is one: the status is
+ *  about the data, and this is about the button the reader is looking at
+ *  while they wait for an answer they deliberately asked for. */
+const asking = ref(false)
+
+const {
+  data: rankingData,
+  error: rankingError,
+  execute: loadRanking,
+  clear: clearRanking,
+} = await useAsyncData(
+  'guild-participation',
+  async () => {
+    const guildId = selected.value
+    if (!guildId) {
+      return { guildId: null as string | null, participation: null as GuildParticipation | null }
+    }
+    return { guildId, participation: parseGuildParticipation(await api(participationPath(guildId))) }
+  },
+  { immediate: false, default: () => null },
+)
+
+// The list appears only once the answer is in hand. The control stays put
+// and says it is reading, rather than being replaced by a spinner where it
+// stood: the reader pressed a button that named what it would do, and the
+// thing that reports back should be that button.
+async function revealRanking() {
+  asking.value = true
+  try {
+    await loadRanking()
+  }
+  finally {
+    asking.value = false
+    revealed.value = true
+  }
+}
+
+function hideRanking() {
+  revealed.value = false
+  clearRanking()
+}
+
+// Switching servers puts the ranking away rather than carrying it across.
+// A list of named people left standing under a different server's heading
+// is the worst version of the mistake the guild picker exists to prevent --
+// and re-fetching it for the new server on the reader's behalf would be
+// this page deciding to look at that server's people for them.
+watch(selected, () => {
+  revealed.value = false
+  clearRanking()
+})
+
+/** Nothing is shown while the answer on hand belongs to another guild, for
+ *  the same reason the report itself is guarded that way — with the
+ *  difference that a stale row here carries somebody's name. */
+const ranking = computed(() =>
+  rankingData.value && rankingData.value.guildId === selected.value
+    ? rankingData.value.participation
+    : null,
+)
+
+const rankingNotes = participationNotes()
+const rankingRows = computed(() => (ranking.value ? participationRows(ranking.value) : []))
+const rankingScope = computed(() => (ranking.value ? participationScopeLine(ranking.value) : ''))
+const rankingEmpty = computed(() => Boolean(ranking.value && isParticipationEmpty(ranking.value)))
 
 /** An absence is not a small number, and must not be coloured like one. A
  *  muted em dash reads as "there is nothing here"; the same dash in the
@@ -466,6 +575,173 @@ const TONE_COLOUR: Record<string, string> = {
                   </dd>
                 </div>
               </dl>
+            </section>
+
+            <!-- The one section on this page that names people and puts
+                 them in an order. Everything about how it is laid out is
+                 the same argument the module makes in words: the standing
+                 notes are above the control rather than above the list, so
+                 the reader has them before they decide; the rows are drawn
+                 identically, with no first-place styling, no bars and no
+                 medals; and speaking time is a sentence underneath the
+                 attendance rather than a column beside it, because a column
+                 of durations is ranked by the eye whether or not anybody
+                 sorted it. There is no sort control, and there is not going
+                 to be one. -->
+            <section class="mt-8">
+              <h2 class="mb-1 text-sm font-semibold">{{ PARTICIPATION_HEADING }}</h2>
+
+              <!-- Above the reveal, not above the list. A note that appears
+                   only once the ranking is on screen arrives after the
+                   decision it exists to inform. -->
+              <dl
+                class="mb-4 flex flex-col gap-4 rounded-xl border p-4"
+                :style="{ borderColor: 'var(--color-brand-yellow)', background: 'var(--surface)' }"
+              >
+                <div v-for="note in rankingNotes" :key="note.key">
+                  <dt class="text-sm font-medium">{{ note.label }}</dt>
+                  <dd class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
+                    {{ note.text }}
+                  </dd>
+                </div>
+              </dl>
+
+              <!-- Nothing has been fetched at this point, and the control
+                   says what pressing it will do rather than "show more". -->
+              <div
+                v-if="!revealed"
+                class="rounded-xl border p-4"
+                :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+              >
+                <p class="mb-3 text-xs" :style="{ color: 'var(--text-muted)' }">
+                  {{ asking ? PARTICIPATION_LOADING_NOTE : PARTICIPATION_REVEAL_NOTE }}
+                </p>
+                <button
+                  type="button"
+                  class="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-40"
+                  :style="{ borderColor: 'var(--border)' }"
+                  :disabled="asking"
+                  @click="revealRanking()"
+                >
+                  {{ asking ? PARTICIPATION_REVEAL_BUSY_LABEL : PARTICIPATION_REVEAL_LABEL }}
+                </button>
+              </div>
+
+              <template v-else>
+                <p
+                  v-if="rankingError"
+                  class="rounded-xl border p-4 text-sm"
+                  :style="{ borderColor: 'var(--color-brand-red)', background: 'var(--surface)' }"
+                >
+                  {{ describeParticipationError(rankingError) }}
+                </p>
+
+                <!-- No answer and no error: the guild changed under the
+                     request, or the fetcher never ran. Nothing is shown,
+                     because the only thing that could be shown here is
+                     another server's people. -->
+                <p v-else-if="!ranking" class="text-sm" :style="{ color: 'var(--text-muted)' }">
+                  {{ PARTICIPATION_LOADING_NOTE }}
+                </p>
+
+                <!-- Nobody to list is a sentence, not an empty table. An
+                     empty table reads as a section that failed to load, and
+                     the obvious response to that is to press the button
+                     again — which here costs another audit line. -->
+                <section
+                  v-else-if="rankingEmpty"
+                  class="rounded-2xl border p-8 text-center"
+                  :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+                >
+                  <h3 class="mb-2 text-base font-medium">{{ PARTICIPATION_EMPTY_HEADING }}</h3>
+                  <p class="mx-auto max-w-lg text-sm" :style="{ color: 'var(--text-muted)' }">
+                    {{ PARTICIPATION_EMPTY_NOTE }}
+                  </p>
+                </section>
+
+                <template v-else>
+                  <p class="mb-3 text-xs" :style="{ color: 'var(--text-muted)' }">
+                    {{ rankingScope }}
+                  </p>
+
+                  <!-- An ordered list, because that is what this is. Every
+                       row carries the same border, the same weight and the
+                       same colours: the difference between the first row
+                       and the last is the number in it, and the page adds
+                       nothing to that. -->
+                  <ol class="flex flex-col gap-3">
+                    <li
+                      v-for="row in rankingRows"
+                      :key="row.key"
+                      class="rounded-xl border p-4"
+                      :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+                    >
+                      <!-- The row said in full for a reader who is
+                           listening to the page, and hidden from the eye
+                           that is reading the lines below it. -->
+                      <span class="sr-only">{{ row.detail }}</span>
+
+                      <div aria-hidden="true">
+                        <div class="flex items-baseline gap-3">
+                          <span
+                            class="w-8 shrink-0 text-right text-sm tabular-nums"
+                            :style="{ color: 'var(--text-muted)' }"
+                          >{{ row.rank }}</span>
+                          <h3 class="text-sm font-medium break-all">{{ row.name }}</h3>
+                          <!-- A shared place is said rather than left to be
+                               inferred from two identical numbers. -->
+                          <span v-if="row.tied" class="text-xs" :style="{ color: 'var(--text-muted)' }">
+                            shared place
+                          </span>
+                        </div>
+
+                        <div class="mt-1 pl-11">
+                          <p class="text-sm">{{ row.attendance }}</p>
+                          <!-- Speaking time is a sentence in muted text,
+                               under the attendance and never beside it. An
+                               unmeasured one is coloured as the absence it
+                               is rather than as a small figure. -->
+                          <p
+                            class="mt-1 text-xs"
+                            :style="{
+                              color: 'var(--text-muted)',
+                              fontStyle: row.speechAbsent ? 'italic' : 'normal',
+                            }"
+                          >
+                            {{ row.speech }}
+                          </p>
+                          <p class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
+                            {{ row.seen }}
+                          </p>
+                          <p
+                            v-if="row.identity"
+                            class="mt-1 text-xs"
+                            :style="{ color: 'var(--text-muted)' }"
+                          >
+                            {{ row.identity }}
+                          </p>
+                        </div>
+                      </div>
+                    </li>
+                  </ol>
+
+                  <!-- Putting it away does not unsay it, and the note
+                       beside the button says so. -->
+                  <div class="mt-4 flex flex-wrap items-baseline gap-3">
+                    <button
+                      type="button"
+                      class="shrink-0 rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+                      :style="{ borderColor: 'var(--border)' }"
+                      @click="hideRanking()"
+                    >
+                      {{ PARTICIPATION_HIDE_LABEL }}
+                    </button>
+                    <p class="text-xs" :style="{ color: 'var(--text-muted)' }">
+                      {{ PARTICIPATION_HIDE_NOTE }}
+                    </p>
+                  </div>
+                </template>
+              </template>
             </section>
           </template>
         </template>
