@@ -50,11 +50,29 @@ const failure = ref<string | null>(null)
 const POLL_MS = 3000
 let timer: ReturnType<typeof setTimeout> | null = null
 
+/**
+ * Whether this panel is still on the page.
+ *
+ * Checked after every `await`, because that is where an unmount happens
+ * without the code resuming afterwards knowing about it. `clearTimeout`
+ * alone was not enough: a timer that had already fired was past clearing,
+ * and its continuation installed a fresh one that nothing was left to
+ * cancel. Navigating away during any of the three seconds a poll is in
+ * flight left a loop making twenty database reads a minute for the life
+ * of the tab, per panel, invisibly.
+ */
+let mounted = true
+
 async function readStatus(): Promise<void> {
   try {
-    snapshot.value = await api<QueueSnapshot>(queueStatusPath(props.sessionId))
+    const fresh = await api<QueueSnapshot>(queueStatusPath(props.sessionId))
+    if (!mounted) return
+    snapshot.value = fresh
+    // A 200 is the only proof that this person administers this guild,
+    // and it is what makes the panel appear.
     visible.value = true
   } catch (error) {
+    if (!mounted) return
     // 404 is the ordinary answer for "you do not administer this guild".
     // It is not a failure to report; it is the reason this panel is not
     // for this person.
@@ -62,7 +80,12 @@ async function readStatus(): Promise<void> {
       visible.value = false
       return
     }
-    visible.value = true
+    // Any other failure leaves `visible` exactly as it was, and that is
+    // the whole point. Setting it to `true` here -- which this used to
+    // do -- meant one 500 revealed the Transcription section, its
+    // explanatory text and all, to somebody who should never learn the
+    // endpoint exists. A transient fault must not become a way to ask
+    // "am I looking at a real session in a guild with a queue".
     failure.value = 'The transcription queue could not be read.'
   }
 }
@@ -74,8 +97,11 @@ function scheduleIfBusy() {
   }
   if (snapshot.value && isQueueBusy(snapshot.value)) {
     timer = setTimeout(async () => {
+      // The timer that started this has already fired, so `clearTimeout`
+      // in `onBeforeUnmount` could not have stopped what runs here.
+      if (!mounted) return
       await readStatus()
-      scheduleIfBusy()
+      if (mounted) scheduleIfBusy()
     }, POLL_MS)
   }
 }
@@ -98,9 +124,13 @@ async function requeue() {
       failure.value = 'The re-queue could not be started.'
     }
   } finally {
-    working.value = false
-    await readStatus()
-    scheduleIfBusy()
+    // Every branch below can resume after the component is gone: the
+    // request above is awaited, and so is the status read.
+    if (mounted) {
+      working.value = false
+      await readStatus()
+      if (mounted) scheduleIfBusy()
+    }
   }
 }
 
@@ -110,6 +140,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  mounted = false
   if (timer !== null) clearTimeout(timer)
 })
 
