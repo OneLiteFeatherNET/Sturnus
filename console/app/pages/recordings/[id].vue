@@ -225,6 +225,12 @@ const others = computed(() => session.value?.other_participants ?? [])
         </p>
       </header>
 
+      <!-- The reader's own labels on this recording. Placed above the
+           audio because it is the half of the page somebody returns to a
+           recording to *write*, and below the metadata because it is not
+           what the recording is. -->
+      <RecordingTags :session-id="session.id" :tags="session.tags" />
+
       <!-- The meeting, on one clock. -->
       <section
         class="rounded-2xl border p-5"

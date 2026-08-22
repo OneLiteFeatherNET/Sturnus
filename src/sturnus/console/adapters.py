@@ -19,9 +19,11 @@ own makes that unrepresentable rather than merely unlikely.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 
 from sqlalchemy import delete, select
+from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.linking import new_state
@@ -36,6 +38,7 @@ from sturnus.infrastructure.db.models import (
     AccountLink,
     ConsoleState,
     SessionParticipant,
+    SessionTag,
     TranscriptionJob,
 )
 from sturnus.infrastructure.db.models import Session as SessionRow
@@ -184,6 +187,102 @@ class ConsoleTrackDirectory:
                 encryption_key_id=row.encryption_key_id,
                 wrapped_data_key=row.wrapped_data_key,
             )
+
+
+class ConsoleTagWriter:
+    """Replaces one person's labels on one session, if it was their session.
+
+    The authorisation is the first statement and there is no path past
+    it: a tag may only be written by somebody `session_participant` says
+    was in the meeting, and a session that does not exist and one this
+    person was not in both answer `None` -- the same 404, for the same
+    reason the audio endpoint gives it. A 403 would confirm that a
+    meeting exists to somebody just established as having no part in it.
+
+    Whose labels these are is not a filter either: `discord_user_id` is
+    in the primary key, so the delete below cannot remove anybody else's
+    row even if it were written wrongly, and the insert cannot create a
+    row that belongs to somebody else.
+
+    What is stored is exactly what it is handed. Normalisation is
+    `sturnus.console.tags`, applied once at the edge, because a second
+    copy of "when are two labels the same label" is a second copy that
+    will disagree.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def replace(
+        self, session_id: int, *, owner: int, tags: Sequence[str], now: datetime
+    ) -> tuple[str, ...] | None:
+        """The stored labels afterwards, or `None` for a session not theirs."""
+        wanted = set(tags)
+        async with self._session_factory() as db:
+            was_there = await db.scalar(
+                select(SessionParticipant.id)
+                .where(
+                    SessionParticipant.session_id == session_id,
+                    SessionParticipant.discord_user_id == owner,
+                )
+                .limit(1)
+            )
+            if was_there is None:
+                return None
+
+            held = set(
+                (
+                    await db.execute(
+                        select(SessionTag.tag).where(
+                            SessionTag.session_id == session_id,
+                            SessionTag.discord_user_id == owner,
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+            # A difference rather than "delete everything, insert the new
+            # set". A label that survives an edit keeps the `created_at`
+            # it was first written with, which is what makes that column
+            # mean anything at all -- rewriting it on every edit would
+            # record when somebody last added a *different* tag.
+            removed = held - wanted
+            if removed:
+                await db.execute(
+                    delete(SessionTag).where(
+                        SessionTag.session_id == session_id,
+                        SessionTag.discord_user_id == owner,
+                        SessionTag.tag.in_(removed),
+                    )
+                )
+            added = wanted - held
+            if added:
+                await db.execute(
+                    insert(SessionTag)
+                    .values(
+                        [
+                            {
+                                "session_id": session_id,
+                                "discord_user_id": owner,
+                                "tag": tag,
+                                "created_at": now,
+                            }
+                            for tag in sorted(added)
+                        ]
+                    )
+                    # Two tabs saving the same tag at the same moment is
+                    # not an error worth a 500: the row they both want
+                    # exists either way, which is the whole of what either
+                    # of them asked for.
+                    .on_conflict_do_nothing(index_elements=["session_id", "discord_user_id", "tag"])
+                )
+            await db.commit()
+        # Sorted, because that is the order every read returns them in and
+        # a caller that rendered this answer in another order would show
+        # chips that rearrange themselves on the next page load.
+        return tuple(sorted(wanted))
 
 
 class ConsoleQueueControl:

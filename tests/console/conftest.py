@@ -29,10 +29,11 @@ from sturnus.console.ports import (
     SessionReads,
     SettingsStore,
     StateStore,
+    TagWriter,
     Track,
 )
 from sturnus.console.session import SessionCookie
-from sturnus.console.statistics import AttendedSession
+from sturnus.console.statistics import AttendedSession, TagUse
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
 
@@ -178,9 +179,11 @@ class FakeReads:
         self,
         sessions: Sequence[AttendedSession] = (),
         transcripts: Sequence[str] = (),
+        tags: Sequence[TagUse] = (),
     ) -> None:
         self.sessions = tuple(sessions)
         self.transcripts = tuple(transcripts)
+        self.tags = tuple(tags)
         #: Every Discord id this was asked about, in order. The route
         #: tests assert on it, because "the handler passed the session's
         #: own user id through" is the thing that cannot be checked from
@@ -210,6 +213,10 @@ class FakeReads:
     async def transcripts_of(self, discord_user_id: int) -> Sequence[str]:
         self.asked_for.append(discord_user_id)
         return self.transcripts
+
+    async def tags_of(self, discord_user_id: int) -> Sequence[TagUse]:
+        self.asked_for.append(discord_user_id)
+        return self.tags
 
 
 # ---------------------------------------------------------------------------
@@ -389,6 +396,42 @@ class FakeQueue:
         return self.outcome
 
 
+class FakeTags:
+    """The tag write path, in memory, scoped by the asking user.
+
+    Answers `None` for a session nobody says this person was in, which is
+    what the real writer answers for both "no such session" and "not
+    yours" -- so a route test that forgot to pass the signed-in user gets
+    a 404 here too rather than a fake that writes for anybody.
+
+    Whether the *statement* scopes is a property of SQL and is tested
+    against the real database in `tests/console/test_adapters.py`.
+    """
+
+    def __init__(
+        self,
+        participants: dict[int, set[int]] | None = None,
+        stored: dict[tuple[int, int], tuple[str, ...]] | None = None,
+    ) -> None:
+        self.participants = participants if participants is not None else {}
+        self.stored = stored if stored is not None else {}
+        #: Every write this was asked to make, in order. The route tests
+        #: assert on it, because "the handler wrote for the signed-in
+        #: person and not for anybody the request could name" cannot be
+        #: seen in a response body.
+        self.written: list[tuple[int, int, tuple[str, ...]]] = []
+
+    async def replace(
+        self, session_id: int, *, owner: int, tags: Sequence[str], now: datetime
+    ) -> tuple[str, ...] | None:
+        del now
+        self.written.append((session_id, owner, tuple(tags)))
+        if owner not in self.participants.get(session_id, set()):
+            return None
+        self.stored[(session_id, owner)] = tuple(sorted(tags))
+        return self.stored[(session_id, owner)]
+
+
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
@@ -399,6 +442,7 @@ def build_test_api(
     config: SettingsStore | None = None,
     audio: AudioDelivery | None = None,
     queue: QueueControl | None = None,
+    tags: TagWriter | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -433,6 +477,7 @@ def build_test_api(
             source=FakeAudioSource(),
         ),
         queue=queue or FakeQueue(),
+        tags=tags or FakeTags(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,

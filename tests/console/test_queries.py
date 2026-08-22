@@ -22,6 +22,7 @@ from sturnus.infrastructure.db.models import (
     Base,
     Session,
     SessionParticipant,
+    SessionTag,
     TranscriptionJob,
 )
 
@@ -104,6 +105,25 @@ async def a_track(
                 audio_seconds=audio_seconds,
                 speech_seconds=speech_seconds,
                 segment_count=segment_count,
+            )
+        )
+        await db.commit()
+
+
+async def a_tag(
+    factory: async_sessionmaker[AsyncSession],
+    session_id: int,
+    discord_user_id: int,
+    tag: str,
+) -> None:
+    """One person's label on one session, written straight to the table."""
+    async with factory() as db:
+        db.add(
+            SessionTag(
+                session_id=session_id,
+                discord_user_id=discord_user_id,
+                tag=tag,
+                created_at=T0,
             )
         )
         await db.commit()
@@ -380,3 +400,94 @@ async def test_transcripts_span_every_session_you_were_in(
         words("eins"),
         words("zwei"),
     }
+
+
+# ---------------------------------------------------------------------------
+# Tags, which are only ever your own
+# ---------------------------------------------------------------------------
+
+
+async def test_a_session_carries_the_labels_you_put_on_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    mine = await a_session(factory)
+    await a_tag(factory, mine, ANNA, "retro")
+    found = await ConsoleQueries(factory).session_for(ANNA, mine)
+    assert found is not None
+    assert found.tags == ("retro",)
+
+
+async def test_somebody_elses_label_on_your_own_meeting_is_not_yours_to_read(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The whole privacy decision, in one query.
+
+    Ben was in the same meeting and called it something. That is a remark
+    about a conversation Anna was also in, and she does not get to read
+    it -- `session_tag` is keyed by its owner and the statement names
+    her, so there is no version of this read that returns his word.
+    """
+    ours = await a_session(factory, people={ANNA: "anna", BEN: "ben"})
+    await a_tag(factory, ours, BEN, "zeitverschwendung")
+    found = await ConsoleQueries(factory).session_for(ANNA, ours)
+    assert found is not None
+    assert found.tags == ()
+
+
+async def test_two_people_may_label_the_same_meeting_differently(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Neither overwrites the other, because the owner is in the key."""
+    ours = await a_session(factory, people={ANNA: "anna", BEN: "ben"})
+    await a_tag(factory, ours, ANNA, "retro")
+    await a_tag(factory, ours, BEN, "planung")
+    hers = await ConsoleQueries(factory).session_for(ANNA, ours)
+    his = await ConsoleQueries(factory).session_for(BEN, ours)
+    assert hers is not None and his is not None
+    assert (hers.tags, his.tags) == (("retro",), ("planung",))
+
+
+async def test_a_sessions_labels_come_back_alphabetical(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """So a recording's chips do not rearrange themselves between two
+    page loads, which is what an unordered read would do the moment the
+    planner chose a different join."""
+    mine = await a_session(factory)
+    await a_tag(factory, mine, ANNA, "retro")
+    await a_tag(factory, mine, ANNA, "abschluss")
+    found = await ConsoleQueries(factory).session_for(ANNA, mine)
+    assert found is not None
+    assert found.tags == ("abschluss", "retro")
+
+
+async def test_your_own_labels_are_counted_across_your_meetings(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    first = await a_session(factory, started_at=datetime(2026, 1, 1, 9, 0, tzinfo=UTC))
+    second = await a_session(factory, started_at=datetime(2026, 2, 1, 9, 0, tzinfo=UTC))
+    await a_tag(factory, first, ANNA, "retro")
+    await a_tag(factory, second, ANNA, "retro")
+    await a_tag(factory, second, ANNA, "kunde")
+    used = await ConsoleQueries(factory).tags_of(ANNA)
+    assert [(use.tag, use.sessions) for use in used] == [("retro", 2), ("kunde", 1)]
+
+
+async def test_the_labels_you_are_offered_are_not_anybody_elses(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    ours = await a_session(factory, people={ANNA: "anna", BEN: "ben"})
+    await a_tag(factory, ours, BEN, "planung")
+    assert await ConsoleQueries(factory).tags_of(ANNA) == ()
+
+
+async def test_a_label_on_a_meeting_you_are_no_longer_in_is_not_counted(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A tag outliving the participation that justified it would put a
+    chip in the filter bar counting a meeting the person can no longer
+    open -- and the count is itself a statement about a session they are
+    no longer entitled to see."""
+    theirs = await a_session(factory, people={BEN: "ben"})
+    await a_tag(factory, theirs, ANNA, "retro")
+    assert await ConsoleQueries(factory).tags_of(ANNA) == ()

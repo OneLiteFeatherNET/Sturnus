@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 from sturnus.console.statistics import (
     AttendedSession,
     Participant,
+    TagUse,
     Track,
     calendar_year,
     count_words,
@@ -21,6 +22,7 @@ from sturnus.console.statistics import (
     day_bounds,
     day_timeline,
     session_json,
+    tags_json,
     year_bounds,
 )
 
@@ -59,6 +61,7 @@ def attended(
         Participant(BEN, "ben"),
     ),
     tracks: tuple[Track, ...] = (),
+    tags: tuple[str, ...] = (),
 ) -> AttendedSession:
     return AttendedSession(
         id=session_id,
@@ -69,6 +72,7 @@ def attended(
         document_url=document_url,
         participants=participants,
         tracks=tracks,
+        tags=tags,
     )
 
 
@@ -437,3 +441,28 @@ def test_a_day_runs_from_midnight_to_the_last_instant_before_the_next() -> None:
     first, last = day_bounds(datetime(2026, 8, 21, tzinfo=UTC).date())
     assert first == datetime(2026, 8, 21, 0, 0, 0, tzinfo=UTC)
     assert last == datetime(2026, 8, 21, 23, 59, 59, 999999, tzinfo=UTC)
+
+
+# ---------------------------------------------------------------------------
+# Tags, which belong to whoever wrote them
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_carries_the_labels_it_was_read_with() -> None:
+    assert session_json(attended(tags=("kunde", "retro")), ANNA)["tags"] == ["kunde", "retro"]
+
+
+def test_a_session_nobody_labelled_carries_an_empty_list() -> None:
+    """An empty list rather than a missing key: a client that has to ask
+    whether the field is there is a client that will forget once."""
+    assert session_json(attended(), ANNA)["tags"] == []
+
+
+def test_the_labels_somebody_uses_are_a_list_and_not_an_object() -> None:
+    """A tag is text somebody typed, and text somebody typed makes a poor
+    JSON key -- `constructor` and `__proto__` are valid tags and neither
+    behaves like a key in every client that will ever read this."""
+    assert tags_json((TagUse("retro", 2), TagUse("kunde", 1))) == [
+        {"tag": "retro", "sessions": 2},
+        {"tag": "kunde", "sessions": 1},
+    ]
