@@ -298,3 +298,78 @@ def test_only_a_few_leading_bytes_of_a_broken_packet_are_recorded(
     recorded = text.split("first bytes: ")[1].split(" | ")[0].split()
     assert len(recorded) <= 8, "recorded more packets than the cap allows"
     assert all(len(sample) == 8 for sample in recorded), "recorded more than four bytes each"
+
+
+# ---------------------------------------------------------------------------
+# The arithmetic that cut the payload out of the packet
+# ---------------------------------------------------------------------------
+
+
+def _rtp(diagnostics: CaptureDiagnostics, **over: object) -> None:
+    """One RTP observation, with a healthy packet as the default."""
+    call: dict[str, object] = {
+        "extended": True,
+        "csrc_count": 0,
+        "extension_words": 1,
+        # 200 bytes of Opus, a 16-byte AEAD tag and one 4-word... one
+        # 4-byte extension word inside the ciphertext.
+        "body_bytes": 200 + 16 + 4,
+        "payload_bytes": 200,
+    }
+    call.update(over)
+    diagnostics.observe_rtp(1, **call)  # type: ignore[arg-type]
+
+
+def test_a_trim_the_header_explains_is_not_flagged(caplog: pytest.LogCaptureFixture) -> None:
+    """Tag plus extension words is the whole of it.
+
+    With a 16-byte AEAD tag and an `n`-word extension whose data sits
+    inside the ciphertext, body minus payload must be exactly `16 + 4n`.
+    """
+    diagnostics = CaptureDiagnostics(packet_reader=FakeReader())
+    for _ in range(5):
+        _rtp(diagnostics)
+    with caplog.at_level(logging.WARNING):
+        diagnostics.report()
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "trims the header cannot explain: 0" in text
+    assert "payload trimmed by: 20B x5" in text
+
+
+def test_a_trim_the_header_cannot_explain_is_counted(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The finding this measurement exists for.
+
+    Removing the wrong number of bytes leaves the remainder starting in
+    the middle of the packet -- which is read as a random TOC byte, decodes
+    without error, and comes out as noise. Exactly the production symptom.
+    """
+    diagnostics = CaptureDiagnostics(packet_reader=FakeReader())
+    for _ in range(4):
+        _rtp(diagnostics, payload_bytes=196)  # four bytes too few
+    with caplog.at_level(logging.WARNING):
+        diagnostics.report()
+    assert "trims the header cannot explain: 4" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_a_packet_with_no_extension_is_trimmed_by_the_tag_alone(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    diagnostics = CaptureDiagnostics(packet_reader=FakeReader())
+    for _ in range(3):
+        _rtp(diagnostics, extended=False, extension_words=0, body_bytes=216, payload_bytes=200)
+    with caplog.at_level(logging.WARNING):
+        diagnostics.report()
+    assert "trims the header cannot explain: 0" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_the_rtp_shape_is_reported(caplog: pytest.LogCaptureFixture) -> None:
+    """A CSRC count above zero would move where the payload begins, so it
+    is reported rather than assumed away."""
+    diagnostics = CaptureDiagnostics(packet_reader=FakeReader())
+    for _ in range(6):
+        _rtp(diagnostics, csrc_count=2)
+    with caplog.at_level(logging.WARNING):
+        diagnostics.report()
+    assert "ext=y/cc=2/words=1 x6" in "\n".join(r.getMessage() for r in caplog.records)

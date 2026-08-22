@@ -264,10 +264,14 @@ class VoiceReceiveAdapter:
         leave its decoders unreleased.
         """
         assert self._voice_client is not None
+        # One collector for both: the sink sees the RTP packet and the
+        # decoder sees the bytes cut out of it, and the whole question is
+        # whether those two agree.
+        diagnostics = CaptureDiagnostics() if self._capture_diagnostics else None
         decoder = ResilientOpusDecoder(
             factory=self._decoder_factory,
             on_decode_failure=self._on_decode_failure,
-            diagnostics=CaptureDiagnostics() if self._capture_diagnostics else None,
+            diagnostics=diagnostics,
         )
         sink = RecordingSink(
             consent_role_id=consent_role_id,
@@ -275,6 +279,7 @@ class VoiceReceiveAdapter:
             clock=self._clock,
             emit=self._emit,
             guild_id=self._guild_id,
+            diagnostics=diagnostics,
         )
         self._voice_client.listen(sink, after=self._on_listen_stopped)
 

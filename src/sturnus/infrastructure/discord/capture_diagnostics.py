@@ -99,6 +99,10 @@ OFFSET_SCAN = range(0, 17)
 LEADING_BYTES = 4
 LEADING_SAMPLES = 8
 
+#: What an AEAD cipher appends to every sealed body. Both modes Discord
+#: offers use 16, and it is the constant term in the trim arithmetic below.
+AEAD_TAG_BYTES = 16
+
 
 @dataclass
 class StreamDiagnostics:
@@ -125,6 +129,19 @@ class StreamDiagnostics:
     #: exactly enough to see whether an RTP extension is still sitting in
     #: front of the Opus packet.
     leading_bytes: list[str] = field(default_factory=list)
+
+    # -- the RTP packet the payload was cut out of --
+    #: `(extended, csrc_count, extension_words)` as the packet header
+    #: declares them, counted.
+    rtp_shapes: Counter[tuple[bool, int, int]] = field(default_factory=Counter)
+    #: How many bytes the library removed between the encrypted body and
+    #: the payload it handed over, counted. With AES-GCM's 16-byte tag and
+    #: an `n`-word extension this must be exactly `16 + 4n` -- any other
+    #: value is the arithmetic being wrong, and the wrong number of bytes
+    #: removed is precisely what makes the rest read as random.
+    trim_sizes: Counter[int] = field(default_factory=Counter)
+    #: Trims that do not match what the header implies.
+    unexplained_trims: int = 0
 
     # -- signal shape, over sampled frames only --
     sampled: int = 0
@@ -207,6 +224,37 @@ class CaptureDiagnostics:
             due = stream.frames % self._report_every == 0
         if due:
             self.report(ssrc)
+
+    def observe_rtp(
+        self,
+        ssrc: int,
+        *,
+        extended: bool,
+        csrc_count: int,
+        extension_words: int,
+        body_bytes: int,
+        payload_bytes: int,
+    ) -> None:
+        """Records how the payload was cut out of the packet around it.
+
+        This is the arithmetic, not the audio. `body_bytes` is the
+        encrypted region the library decrypted; `payload_bytes` is what it
+        handed over as the Opus packet. With an AEAD tag of `TAG_BYTES`
+        and an `n`-word RTP extension whose data sits inside the
+        ciphertext, the difference must be exactly `TAG_BYTES + 4n`.
+
+        Any other difference means the wrong number of bytes was removed,
+        and the remainder is then read starting from the wrong place --
+        which is exactly what a stream of random-looking TOC bytes looks
+        like from above.
+        """
+        with self._lock:
+            stream = self._stream(ssrc)
+            stream.rtp_shapes[(extended, csrc_count, extension_words)] += 1
+            trim = body_bytes - payload_bytes
+            stream.trim_sizes[trim] += 1
+            if trim != AEAD_TAG_BYTES + 4 * (extension_words if extended else 0):
+                stream.unexplained_trims += 1
 
     def observe_pcm(self, ssrc: int, pcm: bytes) -> None:
         """Measures the decoder's own output, before anything else sees it.
@@ -353,6 +401,12 @@ def _log_stream(stream: StreamDiagnostics, *, final: bool = False) -> None:
     )
     sizes = ", ".join(f"{band}:{count}" for band, count in sorted(stream.size_buckets.items()))
 
+    rtp = ", ".join(
+        f"ext={'y' if ext else 'n'}/cc={cc}/words={words} x{count}"
+        for (ext, cc, words), count in stream.rtp_shapes.most_common(3)
+    )
+    trims = ", ".join(f"{trim}B x{count}" for trim, count in stream.trim_sizes.most_common(4))
+
     rms = math.sqrt(stream.sum_squares / stream.samples) if stream.samples else 0.0
     mean_step = stream.step_sum / stream.step_count if stream.step_count else 0.0
     zcr = stream.crossings / stream.samples if stream.samples else 0.0
@@ -361,6 +415,7 @@ def _log_stream(stream: StreamDiagnostics, *, final: bool = False) -> None:
     log.warning(
         "capture diagnostics%s ssrc=%s: %d packets | shapes: %s | unexpected shape: %d | "
         "unreadable: %d | reads correctly at offset: %s | first bytes: %s | sizes: %s || "
+        "rtp: %s | payload trimmed by: %s | trims the header cannot explain: %d || "
         "decoder output over %d sampled frames "
         "(%d silent): peak=%d rms=%.0f mean_step=%.0f step/rms=%.2f zcr=%.3f autocorr=%.3f "
         "|| clean speech reads autocorr>0.4, step/rms<0.3; the four degraded production "
@@ -374,6 +429,9 @@ def _log_stream(stream: StreamDiagnostics, *, final: bool = False) -> None:
         offsets,
         " ".join(stream.leading_bytes) or "none",
         sizes or "none",
+        rtp or "none",
+        trims or "none",
+        stream.unexplained_trims,
         stream.sampled,
         stream.silent_frames,
         stream.peak,
