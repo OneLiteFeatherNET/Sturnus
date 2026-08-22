@@ -218,3 +218,83 @@ def test_a_departing_speaker_is_reported_once_and_forgotten(
 )
 def test_packet_sizes_are_reported_as_bands(size: int, band: str) -> None:
     assert size_bucket(size) == band
+
+
+# ---------------------------------------------------------------------------
+# Finding where the real packet starts
+# ---------------------------------------------------------------------------
+
+
+class ShiftedReader(PacketReader):
+    """A stream whose packets are preceded by `pad` bytes of something else.
+
+    Reads as the expected shape only when those bytes are skipped, which is
+    exactly what a capture reading `1f/480spf/1ch` one packet and
+    `2f/960spf/2ch` the next looks like: not a damaged Opus stream, but
+    bytes that are not an Opus packet being parsed as one.
+    """
+
+    def __init__(self, pad: int) -> None:
+        self.pad = pad
+
+    def shape(self, frame: bytes) -> tuple[int, int, int] | None:
+        if not frame:
+            return None
+        if frame[:1] == b"\xff" * min(1, self.pad) and self.pad:
+            # Still standing on the padding.
+            return (2, 480, 1)
+        return HEALTHY_SHAPE
+
+
+def test_the_offset_that_reads_correctly_is_reported(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The measurement that turns "the packets are wrong" into a fix.
+
+    Reading the TOC at each small offset and counting which one yields the
+    shape Discord actually sends names the number of bytes standing in
+    front of the real packet -- and that number is the bug.
+    """
+    pad = 4
+    diagnostics = CaptureDiagnostics(
+        sample_every=1, report_every=10_000, packet_reader=ShiftedReader(pad)
+    )
+    for _ in range(6):
+        diagnostics.observe_packet(1, b"\xff" * pad + b"\xfc" + b"\x11" * 40)
+    with caplog.at_level(logging.WARNING):
+        diagnostics.report()
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert f"reads correctly at offset: +{pad}:6" in text, text
+
+
+def test_a_healthy_stream_costs_no_offset_scan(caplog: pytest.LogCaptureFixture) -> None:
+    """17 extra parses per packet for an answer nobody needs would be a
+    real cost on the capture thread, so the scan runs only once something
+    is already wrong."""
+    with caplog.at_level(logging.WARNING):
+        _run(_voiced(), frames=5).report()
+    assert "reads correctly at offset: none" in "\n".join(r.getMessage() for r in caplog.records)
+
+
+def test_only_a_few_leading_bytes_of_a_broken_packet_are_recorded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Structure, never content.
+
+    Four bytes is a TOC byte and the start of a compressed payload -- far
+    too little to reconstruct anything audible, and exactly enough to see
+    whether an RTP extension is still sitting in front of the packet.
+    """
+    diagnostics = CaptureDiagnostics(
+        sample_every=1, report_every=10_000, packet_reader=ShiftedReader(2)
+    )
+    for _ in range(40):
+        diagnostics.observe_packet(1, b"\xff\xff" + bytes(range(64)))
+    with caplog.at_level(logging.WARNING):
+        diagnostics.report()
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    recorded = text.split("first bytes: ")[1].split(" | ")[0].split()
+    assert len(recorded) <= 8, "recorded more packets than the cap allows"
+    assert all(len(sample) == 8 for sample in recorded), "recorded more than four bytes each"

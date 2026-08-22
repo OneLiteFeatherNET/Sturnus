@@ -60,6 +60,11 @@ log = logging.getLogger(__name__)
 EXPECTED_FRAMES_PER_PACKET = 1
 EXPECTED_SAMPLES_PER_FRAME = 960
 EXPECTED_CHANNELS = 2
+_EXPECTED_SHAPE = (
+    EXPECTED_FRAMES_PER_PACKET,
+    EXPECTED_SAMPLES_PER_FRAME,
+    EXPECTED_CHANNELS,
+)
 
 #: One frame in this many is measured for signal shape. 50 is one a second
 #: per speaker, which is plenty to characterise a stream and keeps the
@@ -73,6 +78,26 @@ REPORT_EVERY = 300
 
 #: Samples that count as silence, matching `sturnus.domain.silence`.
 _SILENCE_FLOOR = 32
+
+#: Leading-byte offsets tried when a stream's packet shapes come out wrong.
+#:
+#: A packet whose shapes are scattered across `1f/480spf/1ch`,
+#: `2f/960spf/2ch` and so on is not a damaged Opus stream -- it is bytes
+#: that are not an Opus packet being read as one. Almost every byte value
+#: is a formally valid TOC, which is why libopus reports no error and the
+#: decoder returns noise instead of failing.
+#:
+#: So the useful question is not "is this packet valid" but "where does the
+#: real packet start". Reading the TOC at each small offset and counting
+#: which one yields the expected shape answers it directly, and the answer
+#: is the number of bytes that need stripping.
+OFFSET_SCAN = range(0, 17)
+
+#: How many leading bytes of a malformed packet to record, and from how
+#: many packets. Four bytes cannot carry recognisable audio; eight packets
+#: is enough to see whether the same prefix repeats.
+LEADING_BYTES = 4
+LEADING_SAMPLES = 8
 
 
 @dataclass
@@ -89,6 +114,17 @@ class StreamDiagnostics:
     size_buckets: Counter[str] = field(default_factory=Counter)
     #: Packets libopus refused to parse at all.
     unreadable_packets: int = 0
+    #: For each leading-byte offset tried, how many packets read as the
+    #: shape Discord actually sends when the packet is taken to start
+    #: there. The offset that dominates is the number of bytes standing in
+    #: front of the real Opus packet.
+    healthy_at_offset: Counter[int] = field(default_factory=Counter)
+    #: The leading bytes of a handful of packets, as hex. Structure, not
+    #: content: four bytes is a TOC byte and the first of the compressed
+    #: payload, which is far too little to reconstruct anything audible and
+    #: exactly enough to see whether an RTP extension is still sitting in
+    #: front of the Opus packet.
+    leading_bytes: list[str] = field(default_factory=list)
 
     # -- signal shape, over sampled frames only --
     sampled: int = 0
@@ -159,6 +195,15 @@ class CaptureDiagnostics:
                 stream.unreadable_packets += 1
             else:
                 stream.packet_shapes[shape] += 1
+            if shape != _EXPECTED_SHAPE and len(stream.leading_bytes) < LEADING_SAMPLES:
+                stream.leading_bytes.append(frame[:LEADING_BYTES].hex())
+            if shape != _EXPECTED_SHAPE:
+                # Only when something is already wrong: on a healthy stream
+                # this is 17 extra parses per packet for an answer nobody
+                # needs.
+                for offset in OFFSET_SCAN:
+                    if self._reader.shape(frame[offset:]) == _EXPECTED_SHAPE:
+                        stream.healthy_at_offset[offset] += 1
             due = stream.frames % self._report_every == 0
         if due:
             self.report(ssrc)
@@ -301,8 +346,11 @@ def _log_stream(stream: StreamDiagnostics, *, final: bool = False) -> None:
         f"{frames}f/{spf}spf/{ch}ch x{count}"
         for (frames, spf, ch), count in stream.packet_shapes.most_common(4)
     )
-    expected = (EXPECTED_FRAMES_PER_PACKET, EXPECTED_SAMPLES_PER_FRAME, EXPECTED_CHANNELS)
-    unexpected = sum(c for shape, c in stream.packet_shapes.items() if shape != expected)
+    unexpected = sum(c for shape, c in stream.packet_shapes.items() if shape != _EXPECTED_SHAPE)
+    offsets = (
+        ", ".join(f"+{offset}:{count}" for offset, count in stream.healthy_at_offset.most_common(4))
+        or "none"
+    )
     sizes = ", ".join(f"{band}:{count}" for band, count in sorted(stream.size_buckets.items()))
 
     rms = math.sqrt(stream.sum_squares / stream.samples) if stream.samples else 0.0
@@ -312,7 +360,8 @@ def _log_stream(stream: StreamDiagnostics, *, final: bool = False) -> None:
 
     log.warning(
         "capture diagnostics%s ssrc=%s: %d packets | shapes: %s | unexpected shape: %d | "
-        "unreadable: %d | sizes: %s || decoder output over %d sampled frames "
+        "unreadable: %d | reads correctly at offset: %s | first bytes: %s | sizes: %s || "
+        "decoder output over %d sampled frames "
         "(%d silent): peak=%d rms=%.0f mean_step=%.0f step/rms=%.2f zcr=%.3f autocorr=%.3f "
         "|| clean speech reads autocorr>0.4, step/rms<0.3; the four degraded production "
         "tracks read autocorr 0.21-0.26, step/rms about 0.44",
@@ -322,6 +371,8 @@ def _log_stream(stream: StreamDiagnostics, *, final: bool = False) -> None:
         shapes or "none",
         unexpected,
         stream.unreadable_packets,
+        offsets,
+        " ".join(stream.leading_bytes) or "none",
         sizes or "none",
         stream.sampled,
         stream.silent_frames,
