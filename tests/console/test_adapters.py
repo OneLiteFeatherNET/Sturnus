@@ -12,8 +12,17 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from sturnus.console.adapters import ConsoleLinkDirectory, ConsoleStateStore
-from sturnus.infrastructure.db.models import Base
+from sturnus.console.adapters import (
+    ConsoleLinkDirectory,
+    ConsoleStateStore,
+    ConsoleTrackDirectory,
+)
+from sturnus.infrastructure.db.models import (
+    Base,
+    Session,
+    SessionParticipant,
+    TranscriptionJob,
+)
 from sturnus.infrastructure.db.repositories import AccountLinkRepository
 
 T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
@@ -127,3 +136,105 @@ async def test_the_most_recent_link_wins_when_an_account_is_relinked(
     await links.save(ANNA, "outline", ANNA_OUTLINE, "Anna")
     await links.save(BEN, "outline", ANNA_OUTLINE, "Anna")
     assert await ConsoleLinkDirectory(factory).discord_user_for("outline", ANNA_OUTLINE) == BEN
+
+
+# ---------------------------------------------------------------------------
+# The track directory: the authorisation rule for audio, as one query
+# ---------------------------------------------------------------------------
+
+
+async def seed_session(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    participants: tuple[int, ...],
+    speaker: int | None = None,
+    erased: bool = False,
+) -> int:
+    """One closed session, its participants, and optionally one recording."""
+    async with factory() as db:
+        session = Session(guild_id=1, channel_id=2, started_at=T0, status="closed")
+        db.add(session)
+        await db.flush()
+        for user in participants:
+            db.add(
+                SessionParticipant(
+                    session_id=session.id,
+                    discord_user_id=user,
+                    discord_display_name=f"user-{user}",
+                    first_seen_at=T0,
+                )
+            )
+        if speaker is not None:
+            db.add(
+                TranscriptionJob(
+                    session_id=session.id,
+                    discord_user_id=speaker,
+                    s3_key=f"sessions/{session.id}/speakers/{speaker}.enc",
+                    encryption_key_id="key-1",
+                    wrapped_data_key=b"wrapped",
+                    retention_until=T0 + timedelta(days=30),
+                    audio_deleted_at=T0 if erased else None,
+                    status="done",
+                )
+            )
+        await db.commit()
+        return session.id
+
+
+async def test_a_participant_finds_the_recording_of_someone_in_the_room(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA, BEN), speaker=ANNA)
+
+    track = await ConsoleTrackDirectory(factory).track_for(session_id, ANNA, requested_by=BEN)
+
+    assert track is not None
+    assert track.s3_key == f"sessions/{session_id}/speakers/{ANNA}.enc"
+    assert track.wrapped_data_key == b"wrapped"
+    assert track.encryption_key_id == "key-1"
+
+
+async def test_somebody_who_was_not_in_the_session_finds_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The whole authorisation rule for audio, in one assertion.
+
+    The recording exists, the query names it exactly, and the answer is
+    still nothing -- because the scoping is inside the statement rather
+    than applied by whoever remembers to apply it.
+    """
+    session_id = await seed_session(factory, participants=(ANNA,), speaker=ANNA)
+
+    assert (
+        await ConsoleTrackDirectory(factory).track_for(session_id, ANNA, requested_by=BEN) is None
+    )
+
+
+async def test_a_speaker_with_no_recording_in_that_session_yields_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA, BEN), speaker=ANNA)
+
+    assert (
+        await ConsoleTrackDirectory(factory).track_for(session_id, BEN, requested_by=ANNA) is None
+    )
+
+
+async def test_a_recording_the_retention_sweep_erased_is_not_offered(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`audio_deleted_at` is the record that the object is gone. Offering
+    the row anyway would send a participant to S3 for a key that was
+    deleted on purpose, and answer them with a 404 from two layers deeper.
+    """
+    session_id = await seed_session(factory, participants=(ANNA,), speaker=ANNA, erased=True)
+
+    assert (
+        await ConsoleTrackDirectory(factory).track_for(session_id, ANNA, requested_by=ANNA) is None
+    )
+
+
+async def test_a_session_that_does_not_exist_yields_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    assert await ConsoleTrackDirectory(factory).track_for(9_999, ANNA, requested_by=ANNA) is None

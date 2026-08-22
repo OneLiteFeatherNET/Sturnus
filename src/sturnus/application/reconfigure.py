@@ -53,6 +53,21 @@ TUNABLE_KEYS: tuple[str, ...] = (
     settings.AUDIO_RETENTION_DAYS,
 )
 
+#: The keys a reconcile can never help with, because the process reads them
+#: exactly once at start. Today that is only `publish_poll_seconds`: the
+#: publish sweep runs on one process-wide interval taken from the setting's
+#: default rather than per-guild scheduling -- a deliberate simplification,
+#: see the comment above `_PUBLISH_POLL_SECONDS` in `sturnus.entrypoints.bot`.
+#:
+#: It lives here rather than beside the `/config` replies that first needed
+#: it because it is a fact about how the bot *reads* a key, exactly like the
+#: two tuples above -- and because it now has a second reader. The console's
+#: API process cannot reconcile at all (no gateway, Spec 13.2), so it has to
+#: tell an operator which of these three classes their write falls into, and
+#: a second hand-maintained list of restart-only keys would be a list that
+#: disagrees with this one the day a fourth class appears.
+RESTART_REQUIRED_KEYS: frozenset[str] = frozenset({settings.PUBLISH_POLL_SECONDS})
+
 
 @dataclass(frozen=True)
 class GuildRuntimeConfig:
