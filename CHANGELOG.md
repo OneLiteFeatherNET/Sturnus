@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.10.0...v0.11.0) (2026-08-22)
+
+
+### Features
+
+* **bot:** find where the real Opus packet starts ([#89](https://github.com/OneLiteFeatherNET/Sturnus/issues/89)) ([1712941](https://github.com/OneLiteFeatherNET/Sturnus/commit/1712941c6cc0f90912472451fbf7858863b645e6))
+
 ## [0.10.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.9.0...v0.10.0) (2026-08-22)
 
 
