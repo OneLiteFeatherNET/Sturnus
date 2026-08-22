@@ -239,6 +239,11 @@ const others = computed(() => session.value?.other_participants ?? [])
         <MultiTrackPlayer :session="session" />
       </section>
 
+      <!-- Second wave: only an administrator of this guild sees anything
+           here, and for everybody else the component renders nothing at
+           all rather than a disabled control that confirms it exists. -->
+      <RequeuePanel :session-id="session.id" />
+
       <!-- One speaker at a time. -->
       <section
         class="rounded-2xl border p-5"

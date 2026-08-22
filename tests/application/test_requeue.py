@@ -118,7 +118,12 @@ def test_a_session_with_no_jobs_at_all_is_empty() -> None:
     """Nobody ever spoke, so there is no recording to transcribe again."""
     plan = plan_requeue([])
 
-    assert plan == RequeuePlan(resettable_job_ids=(), erased_user_ids=(), active_user_ids=())
+    assert plan == RequeuePlan(
+        resettable_job_ids=(),
+        resettable_user_ids=(),
+        erased_user_ids=(),
+        active_user_ids=(),
+    )
     assert plan.is_empty is True
     assert plan.is_blocked is False
 

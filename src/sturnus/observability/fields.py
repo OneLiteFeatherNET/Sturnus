@@ -145,6 +145,7 @@ _MEASUREMENTS = frozenset(
         "deleted",
         "failed",
         "speakers",
+        "skipped",
         "participants",
         "blocks",
         "packets",

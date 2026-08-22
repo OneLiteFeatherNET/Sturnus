@@ -135,6 +135,16 @@ class Event(StrEnum):
     #: asker was not in the session, or because the retention sweep has
     #: already erased the audio. `reason` says which.
     CONSOLE_TRACK_REFUSED = "console.track_refused"
+    #: An administrator asked, from the console, for a session to be
+    #: transcribed again. **WARNING, and deliberately so:** it clears
+    #: transcripts and will replace a document a team has already read, so
+    #: the line that says who asked is the only record of why that
+    #: document changed under them.
+    CONSOLE_REQUEUE_APPLIED = "console.requeue_applied"
+    #: A re-queue that was asked for and refused, because the session was
+    #: not in a state a redo is safe from. INFO: this is the feature
+    #: working, not failing.
+    CONSOLE_REQUEUE_REFUSED = "console.requeue_refused"
     #: A stored recording that this reader cannot make sense of. **A human
     #: must act:** the object is there, the person is entitled to it, and
     #: it will not decrypt -- which is either a truncated upload or a

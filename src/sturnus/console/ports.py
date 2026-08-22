@@ -211,3 +211,79 @@ class SettingsStore(Protocol):
     async def snapshot(self, guild_id: int) -> dict[str, str]: ...
 
     async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None: ...
+
+
+@dataclass(frozen=True)
+class QueueSpeaker:
+    """One speaker's transcription job, as the console reports it."""
+
+    discord_user_id: int
+    display_name: str | None
+    status: str
+    attempts: int
+    #: `str(exc)` from the last failed attempt, already shortened. `None`
+    #: while nothing has failed.
+    error: str | None
+
+
+@dataclass(frozen=True)
+class QueueSnapshot:
+    """Where a session's transcription has got to, right now.
+
+    This is the progress view. It exists because a re-queue is not
+    instantaneous and a button that reports nothing after being pressed is
+    a button people press twice: what an administrator needs after asking
+    for a redo is to watch `pending` become `running` become `done`.
+
+    `session_status` is the row's own status, which moves in step: a
+    re-queue resets it to `closed`, and it becomes `documented` again only
+    once every job has finished and the document has been written. So
+    "the redo is complete" is a fact about this value, not a guess from
+    counting jobs.
+    """
+
+    session_status: str
+    document_url: str | None
+    speakers: tuple[QueueSpeaker, ...]
+    #: Whether a re-queue would be accepted right now, and if not, why.
+    #: Derived from the same `plan_requeue` the write itself re-derives
+    #: under a lock, so the button is disabled for the same reasons the
+    #: write would refuse -- rather than for a second, drifting set.
+    can_requeue: bool
+    refusal: str | None
+
+
+@dataclass(frozen=True)
+class RequeueOutcome:
+    """What a re-queue did, or why it did nothing."""
+
+    accepted: bool
+    #: Speakers whose job was reset to `pending`.
+    requeued_user_ids: tuple[int, ...]
+    #: Speakers skipped because their audio is erased. Their old
+    #: transcript is carried into the new document unchanged, and saying
+    #: so is not optional: an administrator told "3 speakers re-queued"
+    #: and not told this would reasonably assume the whole document had
+    #: been regenerated.
+    erased_user_ids: tuple[int, ...]
+    refusal: str | None
+
+
+class QueueControl(Protocol):
+    """A session's transcription queue, if the person asking administers it.
+
+    `requested_by` is not optional and there is no method here without
+    it, for exactly the reason `TrackDirectory` has none: the authorisation
+    rule lives inside the call rather than in a handler that could forget
+    to apply it.
+
+    Both methods answer `None` for "no such session" *and* for "you do not
+    administer that guild", because from outside those must look the same.
+    Unlike audio, the rule here is administrator-of-the-guild rather than
+    participant-of-the-session: re-running a transcription is an operation
+    on the system, not a use of one's own recording.
+    """
+
+    async def status_for(self, session_id: int, *, requested_by: int) -> QueueSnapshot | None: ...
+
+    async def requeue(self, session_id: int, *, requested_by: int) -> RequeueOutcome | None: ...
