@@ -33,12 +33,17 @@ from __future__ import annotations
 
 from typing import Final
 
-#: The three processes built from the one image. The same literal names
+#: The Python processes built from the one image. The same literal names
 #: `sturnus.infrastructure.observability.init_sentry` takes as its
 #: `component` tag and `[project.scripts]` uses, so an operator reading a
 #: Sentry issue, a Loki stream and a Tempo service graph sees one word for
-#: one process rather than three near-synonyms.
-COMPONENTS: Final = ("bot", "worker", "link")
+#: one process rather than four near-synonyms.
+#:
+#: `api` arrived without being added here, which is exactly what the note
+#: on `service_name` below warned about -- nothing enforces this tuple, so
+#: it drifted silently for the length of one change. The console is
+#: deliberately absent: it is a Node process that calls none of this.
+COMPONENTS: Final = ("bot", "worker", "link", "api")
 
 
 #: OpenTelemetry `service.name` per component. Derived, not tabulated, so a
@@ -79,7 +84,12 @@ _IDENTIFIERS = frozenset(
 #: already logs the Discord one.
 #:
 #: They are nonetheless **log-only**: see `LOG_ONLY_FIELDS`.
-_SUBJECT_IDENTIFIERS = frozenset({"discord_user_id", "external_user_id"})
+#:
+#: `requested_by` is the second person in a line that has two: the console
+#: serves one participant's voice to another, and an access log for that
+#: which records only whose voice it was answers half the question anyone
+#: would ever ask of it.
+_SUBJECT_IDENTIFIERS = frozenset({"discord_user_id", "external_user_id", "requested_by"})
 
 #: Fixed literals from this repository's own source: enum members, stage
 #: names, outcome words. Bounded by construction, which is what makes them
@@ -115,6 +125,12 @@ _LITERALS = frozenset(
         "is_last",
         "listening",
         "missing",
+        #: A key of `sturnus.domain.settings` -- one of seventeen literals
+        #: from this repository's own source, and checked against the
+        #: registry before anything logs it. The *value* is not here and
+        #: must not be: `transcription_prompt` is free text an
+        #: administrator typed, and `policy_url` is a URL.
+        "config_key",
     }
 )
 
