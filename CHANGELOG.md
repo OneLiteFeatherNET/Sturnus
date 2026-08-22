@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.8.0...v0.8.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* **console:** serve recordings in the format the bot actually writes ([#77](https://github.com/OneLiteFeatherNET/Sturnus/issues/77)) ([eb95cf2](https://github.com/OneLiteFeatherNET/Sturnus/commit/eb95cf2901b8a572d4d0fbfec17037e4fb4d17b0))
+
 ## [0.8.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.7.0...v0.8.0) (2026-08-22)
 
 

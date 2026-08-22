@@ -1,6 +1,6 @@
 [project]
 name = "sturnus"
-version = "0.8.0" # x-release-please-version
+version = "0.8.1" # x-release-please-version
 description = "Discord voice transcription with Outline document output"
 readme = "README.md"
 requires-python = ">=3.12"
