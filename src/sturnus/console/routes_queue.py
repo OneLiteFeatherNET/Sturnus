@@ -1,7 +1,15 @@
-"""Re-running a session's transcription from the console, and watching it.
+"""A guild's transcription queue, and re-running one session's part of it.
 
+- `GET  /api/guilds/{guild_id}/queue`
 - `GET  /api/sessions/{session_id}/queue`
 - `POST /api/sessions/{session_id}/queue/requeue`
+
+**Why the guild-wide view is here rather than in a module of its own.**
+It is the same subject asked at a different scale: the per-session
+endpoints answer "where has this one got to", and the guild one answers
+"what is outstanding, and which sessions is it outstanding in". Splitting
+them across two files would have put one authorisation rule in two places
+and invited them to drift.
 
 **Why this exists at all.** The first pass over a recording can be wrong —
 a model that hallucinated, a worker that died, a bug since fixed — and
@@ -42,7 +50,14 @@ import logging
 
 from aiohttp import web
 
-from sturnus.console.ports import QueueControl, QueueSnapshot, RequeueOutcome
+from sturnus.console.ports import (
+    GuildQueue,
+    QueueControl,
+    QueuedSession,
+    QueueOverview,
+    QueueSnapshot,
+    RequeueOutcome,
+)
 from sturnus.observability.events import Event, log_event
 
 log = logging.getLogger(__name__)
@@ -51,8 +66,45 @@ log = logging.getLogger(__name__)
 #: because it belongs to these routes and nothing else reads it.
 QUEUE_CONTROL = web.AppKey("queue_control", QueueControl)
 
+#: The guild-wide overview's collaborator. A second key rather than one
+#: object with both shapes, because the two answer different questions at
+#: different scales and a protocol that offered both would let a handler
+#: reach for the wide one where the narrow one was meant.
+QUEUE_OVERVIEW: web.AppKey[QueueOverview] = web.AppKey("queue_overview")
+
 _STATUS_PATH = "/api/sessions/{session_id}/queue"
 _REQUEUE_PATH = "/api/sessions/{session_id}/queue/requeue"
+_GUILD_PATH = "/api/guilds/{guild_id}/queue"
+
+
+async def guild_queue(request: web.Request) -> web.Response:
+    """What this guild's transcription pipeline still owes, and where.
+
+    404 for a guild this person does not administer, and the same 404 for
+    one that does not exist. The list names when a guild met, in which
+    channel, and how many people spoke; a 403 would confirm that such a
+    list exists here to somebody just established as having no business
+    with it.
+    """
+    from sturnus.console.app import current_user
+
+    viewer = current_user(request).discord_user_id
+    try:
+        guild_id = int(request.match_info["guild_id"])
+    except ValueError:
+        # A path segment that is not a number names no guild, which is the
+        # same answer as naming one that does not exist.
+        return _no_such_guild()
+
+    queue = await request.app[QUEUE_OVERVIEW].for_guild(guild_id, requested_by=viewer)
+    if queue is None:
+        return _no_such_guild()
+    return web.json_response(
+        _guild_queue_json(guild_id, queue),
+        # It names when a guild met and in which channel, and it is stale
+        # the moment a worker claims a job.
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 async def queue_status(request: web.Request) -> web.Response:
@@ -169,6 +221,67 @@ def _outcome_json(outcome: RequeueOutcome) -> dict[str, object]:
     }
 
 
+def _guild_queue_json(guild_id: int, queue: GuildQueue) -> dict[str, object]:
+    return {
+        "guild_id": str(guild_id),
+        # The lifecycle in its own order rather than four sibling fields:
+        # `pending -> running -> done | dead` is how a reader finds where
+        # work is piling up, and a shape that spelled it out flat would
+        # leave that ordering to whichever client rendered it.
+        "counts": {
+            "pending": queue.pending,
+            "running": queue.running,
+            "done": queue.done,
+            "dead": queue.dead,
+        },
+        "running_past_lease": queue.running_past_lease,
+        "oldest_pending_session_ended_at": (
+            None
+            if queue.oldest_pending_session_ended_at is None
+            else queue.oldest_pending_session_ended_at.isoformat()
+        ),
+        "closed_undocumented": queue.closed_undocumented,
+        # Sent with the count it produced. `running_past_lease` is derived
+        # from an assumed lease and the one that applies is the worker's,
+        # which this process cannot see -- so the console names the number
+        # it used instead of presenting the count as a fact.
+        "lease_seconds": queue.lease_seconds,
+        "truncated": queue.truncated,
+        "sessions": [_queued_session_json(session) for session in queue.sessions],
+    }
+
+
+def _queued_session_json(session: QueuedSession) -> dict[str, object]:
+    return {
+        # A string like every other id in this API. Session ids do not
+        # need it and follow anyway: two id shapes in one payload is how
+        # the one that matters gets parsed with the wrong one.
+        "id": str(session.id),
+        "channel_id": str(session.channel_id),
+        "channel_name": session.channel_name,
+        "started_at": session.started_at.isoformat(),
+        "ended_at": None if session.ended_at is None else session.ended_at.isoformat(),
+        "status": session.status,
+        "document_url": session.document_url,
+        "counts": {
+            "pending": session.pending,
+            "running": session.running,
+            "done": session.done,
+            "dead": session.dead,
+        },
+    }
+
+
+def _no_such_guild() -> web.Response:
+    """One refusal for every reason there is to refuse.
+
+    "No such guild" and "you do not administer that guild" are
+    deliberately indistinguishable, for the reason `_no_such_session`
+    gives about sessions.
+    """
+    return web.json_response({"error": "no such guild"}, status=404)
+
+
 def _no_such_session() -> web.Response:
     """One refusal for every reason there is to refuse.
 
@@ -179,11 +292,12 @@ def _no_such_session() -> web.Response:
 
 
 def register(app: web.Application) -> None:
-    """Adds the queue routes to an application that already has its control."""
+    """Adds the queue routes to an application that already has its collaborators."""
     from sturnus.console.app import require_session
 
     app.add_routes(
         [
+            web.get(_GUILD_PATH, require_session(guild_queue)),
             web.get(_STATUS_PATH, require_session(queue_status)),
             web.post(_REQUEUE_PATH, require_session(requeue_session)),
         ]

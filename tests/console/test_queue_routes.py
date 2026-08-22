@@ -23,16 +23,24 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 
 from sturnus.console.app import SESSION_COOKIE
-from sturnus.console.ports import QueueSnapshot, QueueSpeaker, RequeueOutcome
+from sturnus.console.ports import (
+    GuildQueue,
+    QueuedSession,
+    QueueSnapshot,
+    QueueSpeaker,
+    RequeueOutcome,
+)
 from sturnus.console.session import SessionCookie, SignedSession
 from tests.console.conftest import (
     ANNA,
     BEN,
+    GUILD,
     SECRET,
     SESSION,
     T0,
     AiohttpClientFactory,
     FakeQueue,
+    FakeQueueOverview,
     build_test_api,
 )
 
@@ -237,4 +245,182 @@ async def test_nothing_in_between_may_cache_a_queue_snapshot(
     worker picks a job up."""
     client = await signed_in(aiohttp_client, build_test_api(queue=FakeQueue(snapshot=snapshot())))
     response = await client.get(status_url())
+    assert response.headers["Cache-Control"] == "private, no-store"
+
+
+# ---------------------------------------------------------------------------
+# The guild-wide view: what is outstanding, and where
+# ---------------------------------------------------------------------------
+
+
+def queued(**over: object) -> QueuedSession:
+    base: dict[str, object] = {
+        "id": SESSION,
+        "channel_id": 555,
+        "channel_name": "meeting",
+        "started_at": T0,
+        "ended_at": None,
+        "status": "closed",
+        "document_url": None,
+        "pending": 2,
+        "running": 1,
+        "done": 0,
+        "dead": 0,
+    }
+    base.update(over)
+    return QueuedSession(**base)  # type: ignore[arg-type]
+
+
+def guild_queue(**over: object) -> GuildQueue:
+    base: dict[str, object] = {
+        "pending": 2,
+        "running": 1,
+        "done": 40,
+        "dead": 1,
+        "running_past_lease": 0,
+        "oldest_pending_session_ended_at": T0,
+        "closed_undocumented": 0,
+        "lease_seconds": 1800.0,
+        "sessions": (queued(),),
+        "truncated": False,
+    }
+    base.update(over)
+    return GuildQueue(**base)  # type: ignore[arg-type]
+
+
+def guild_url(guild_id: int | str = GUILD) -> str:
+    return f"/api/guilds/{guild_id}/queue"
+
+
+async def test_an_administrator_sees_what_their_guild_still_owes(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    overview = FakeQueueOverview(queue=guild_queue())
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    response = await client.get(guild_url())
+
+    assert response.status == 200
+    body = await response.json()
+    assert body["counts"] == {"pending": 2, "running": 1, "done": 40, "dead": 1}
+    assert body["sessions"][0]["counts"]["pending"] == 2
+
+
+async def test_the_overview_asks_on_behalf_of_the_signed_in_person(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    # The whole authorisation model is that the id reaching the overview
+    # comes out of the signed cookie. A handler passing anything else would
+    # look identical from outside.
+    overview = FakeQueueOverview(queue=guild_queue())
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview), as_user=BEN)
+
+    await client.get(guild_url())
+
+    assert overview.asked == [(GUILD, BEN)]
+
+
+async def test_a_guild_this_person_does_not_administer_does_not_exist(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    # 404 and not 403, for the reason the session endpoints answer 404: the
+    # list names when a guild met and in which channel, and a 403 confirms
+    # such a list exists to somebody just established as having no business
+    # with it.
+    client = await signed_in(aiohttp_client, build_test_api(queues=FakeQueueOverview()))
+
+    response = await client.get(guild_url())
+
+    assert response.status == 404
+    assert (await response.json())["error"] == "no such guild"
+
+
+async def test_a_guild_id_that_is_not_a_number_gets_the_same_refusal(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    overview = FakeQueueOverview(queue=guild_queue())
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    assert (await client.get(guild_url("nope"))).status == 404
+    # And never reached the overview, so a malformed path cannot be used to
+    # find out which guild ids are well formed.
+    assert overview.asked == []
+
+
+async def test_the_overview_needs_a_session_like_every_other_endpoint(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    client = await aiohttp_client(build_test_api(queues=FakeQueueOverview(queue=guild_queue())))
+    assert (await client.get(guild_url())).status == 401
+
+
+async def test_the_lease_travels_with_the_count_it_produced(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """`running_past_lease` is derived from an assumed lease.
+
+    The lease that actually applies is the worker's `job_lease_seconds`,
+    which this process cannot see. Sending the number it used is what lets
+    the console name it rather than presenting a derived count as a fact --
+    the same caveat `/queue status` prints in Discord.
+    """
+    overview = FakeQueueOverview(queue=guild_queue(running_past_lease=3, lease_seconds=600.0))
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    body = await (await client.get(guild_url())).json()
+
+    assert body["running_past_lease"] == 3
+    assert body["lease_seconds"] == 600.0
+
+
+async def test_a_cut_list_says_that_it_was_cut(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    # Otherwise a page showing twenty sessions reads as "there are twenty",
+    # which for a guild that has been broken for a month is the opposite of
+    # the truth.
+    overview = FakeQueueOverview(queue=guild_queue(truncated=True))
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    assert (await (await client.get(guild_url())).json())["truncated"] is True
+
+
+async def test_a_guild_with_nothing_outstanding_is_an_empty_list(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    # Empty and not 404: "everything here is finished" and "this is not
+    # your guild" are different answers and must look different.
+    overview = FakeQueueOverview(
+        queue=guild_queue(pending=0, running=1, sessions=(), oldest_pending_session_ended_at=None)
+    )
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    body = await (await client.get(guild_url())).json()
+
+    assert body["sessions"] == []
+    assert body["oldest_pending_session_ended_at"] is None
+
+
+async def test_every_id_in_the_overview_travels_as_a_string(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    big = 308_000_000_000_000_001
+    overview = FakeQueueOverview(queue=guild_queue(sessions=(queued(channel_id=big),)))
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    body = await (await client.get(guild_url())).json()
+
+    assert body["guild_id"] == str(GUILD)
+    assert body["sessions"][0]["channel_id"] == str(big)
+    assert body["sessions"][0]["id"] == str(SESSION)
+
+
+async def test_nothing_in_between_may_cache_the_overview(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    overview = FakeQueueOverview(queue=guild_queue())
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    response = await client.get(guild_url())
+
     assert response.headers["Cache-Control"] == "private, no-store"

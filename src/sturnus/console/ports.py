@@ -366,3 +366,76 @@ class ConsentDirectory(Protocol):
     async def revoke(
         self, guild_id: int, discord_user_id: int, *, requested_by: int
     ) -> RevocationOutcome | None: ...
+
+
+@dataclass(frozen=True)
+class QueuedSession:
+    """One session the transcription pipeline has not finished with."""
+
+    id: int
+    channel_id: int
+    channel_name: str | None
+    started_at: datetime
+    ended_at: datetime | None
+    status: str
+    document_url: str | None
+    pending: int
+    running: int
+    done: int
+    dead: int
+
+
+@dataclass(frozen=True)
+class GuildQueue:
+    """Where a guild's transcription work stands, right now.
+
+    The guild-wide counts and the unfinished sessions in one value, read
+    together, because a page that showed "3 pending" beside a list read a
+    moment later would occasionally show three pending jobs and no session
+    they could belong to.
+
+    `running_past_lease` is the number worth reading first: a `running`
+    job whose lease expired is one whose worker died holding it, which no
+    amount of waiting fixes.
+
+    `lease_seconds` travels with it because that count is derived from an
+    assumed lease, and the lease that actually applies is the *worker's*
+    `job_lease_seconds`. The console says which number it used rather than
+    presenting a derived count as a fact -- the same caveat `/queue
+    status` prints, for the same reason.
+    """
+
+    pending: int
+    running: int
+    done: int
+    dead: int
+    running_past_lease: int
+    #: When the session owning the oldest `pending` job ended.
+    #: `transcription_job` has no enqueue timestamp at all, and a session's
+    #: end is within seconds of when its jobs were created -- close enough
+    #: to answer "has something been sitting here for hours?". It is *not*
+    #: the age of a re-queued job, which keeps its session's original end,
+    #: and the console says so rather than calling it a job age.
+    oldest_pending_session_ended_at: datetime | None
+    #: Sessions that are closed, have no unfinished jobs, and still have no
+    #: document. Nothing is queued for them and nothing will happen on its
+    #: own.
+    closed_undocumented: int
+    lease_seconds: float
+    sessions: tuple[QueuedSession, ...]
+    #: Whether the list above was cut short. Sent so that a page showing
+    #: twenty sessions never reads as "there are twenty".
+    truncated: bool
+
+
+class QueueOverview(Protocol):
+    """A guild's transcription queue, if the person asking administers it.
+
+    The guild-wide companion to `QueueControl`, which answers about one
+    session. Same rule, same shape: `requested_by` is not optional, there
+    is no method here without it, and `None` covers "no such guild" and
+    "you do not administer it" alike -- because from outside those must
+    look the same.
+    """
+
+    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildQueue | None: ...
