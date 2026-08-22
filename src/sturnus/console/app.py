@@ -40,6 +40,7 @@ from sturnus.console.ports import (
     LinkDirectory,
     OAuthClient,
     QueueControl,
+    QueueOverview,
     SessionReads,
     SettingsStore,
     StateStore,
@@ -49,7 +50,7 @@ from sturnus.console.routes_audio import AUDIO_DELIVERY
 from sturnus.console.routes_audio import register as register_audio
 from sturnus.console.routes_consent import CONSENT_DIRECTORY
 from sturnus.console.routes_consent import register as register_consent
-from sturnus.console.routes_queue import QUEUE_CONTROL
+from sturnus.console.routes_queue import QUEUE_CONTROL, QUEUE_OVERVIEW
 from sturnus.console.routes_queue import register as register_queue
 from sturnus.console.session import (
     ExpiredSession,
@@ -273,6 +274,7 @@ def build_api(
     audio: AudioDelivery,
     queue: QueueControl,
     tags: TagWriter,
+    queues: QueueOverview,
     consents: ConsentDirectory,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
@@ -300,6 +302,7 @@ def build_api(
     app[AUDIO_DELIVERY] = audio
     app[QUEUE_CONTROL] = queue
     app[routes_tags.TAG_WRITER] = tags
+    app[QUEUE_OVERVIEW] = queues
     app[CONSENT_DIRECTORY] = consents
     app.add_routes(
         [
