@@ -1,0 +1,132 @@
+<script setup lang="ts">
+/**
+ * One meeting: when it was, who was in it, what was measured, and where
+ * its protocol lives.
+ *
+ * The player is mounted only while the session is open. That is not a
+ * visual nicety -- it is the difference between a page that costs a few
+ * kilobytes of JSON and one that pulls every track of every session on
+ * first paint.
+ */
+import {
+  channelLabel,
+  formatSeconds,
+  formatTimestamp,
+  hasProtocol,
+  isInProgress,
+  sessionLength,
+  trackLabel,
+  type RecordedSession,
+} from '~/utils/recordings'
+
+const props = defineProps<{
+  session: RecordedSession
+  open: boolean
+  timeZone: string
+}>()
+
+defineEmits<{ toggle: [] }>()
+
+const length = computed(() => sessionLength(props.session))
+const panelId = computed(() => `session-${props.session.id}`)
+const speakers = computed(() => props.session.tracks.map(trackLabel))
+// Read here rather than asserted in the template: a template expression is
+// compiled as JavaScript, and a `!` that survives type-checking would not
+// survive the build.
+const protocolUrl = computed(() => props.session.document_url ?? '')
+const others = computed(() =>
+  props.session.other_participants.map((person) => person.display_name).join(', '),
+)
+</script>
+
+<template>
+  <article
+    class="rounded-2xl border"
+    :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+  >
+    <div class="flex flex-wrap items-start gap-4 p-4">
+      <div class="min-w-56 flex-1">
+        <h2 class="flex flex-wrap items-center gap-2 text-base font-semibold">
+          <span>{{ channelLabel(session) }}</span>
+          <span
+            v-if="isInProgress(session)"
+            class="rounded-full px-2 py-0.5 text-xs font-medium"
+            :style="{ background: 'var(--color-brand-green)', color: 'var(--surface)' }"
+          >
+            Recording now
+          </span>
+        </h2>
+        <p class="mt-1 text-sm tabular-nums" :style="{ color: 'var(--text-muted)' }">
+          {{ formatTimestamp(session.started_at, timeZone) }}
+          <span v-if="length !== null"> · {{ formatSeconds(length) }}</span>
+          <span v-else> · length unknown</span>
+        </p>
+      </div>
+
+      <!-- The protocol, or the fact that there is none. A session without
+           one is hidden nowhere: "no protocol" is usually the answer
+           somebody came looking for, and a row that quietly omitted the
+           link would send them to look for a bug instead. -->
+      <div class="flex shrink-0 items-center gap-2">
+        <a
+          v-if="hasProtocol(session)"
+          :href="protocolUrl"
+          target="_blank"
+          rel="noreferrer"
+          class="flex items-center gap-2 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+          :style="{ color: 'var(--color-brand-cyan)' }"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path
+              d="M14 3h7v7h-2V6.4l-8.3 8.3-1.4-1.4L17.6 5H14V3ZM5 5h5v2H6v11h11v-4h2v6H5V5Z"
+            />
+          </svg>
+          Protocol
+        </a>
+        <span
+          v-else
+          class="rounded-lg px-3 py-1.5 text-sm"
+          :style="{ color: 'var(--text-muted)' }"
+        >
+          No protocol
+        </span>
+
+        <button
+          type="button"
+          class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+          :style="{ color: 'var(--text-muted)' }"
+          :aria-expanded="open"
+          :aria-controls="panelId"
+          @click="$emit('toggle')"
+        >
+          {{ open ? 'Close' : 'Listen' }}
+        </button>
+      </div>
+    </div>
+
+    <div class="border-t px-4 py-3 text-sm" :style="{ borderColor: 'var(--border)' }">
+      <p v-if="speakers.length > 0">
+        <span :style="{ color: 'var(--text-muted)' }">Recorded:</span>
+        {{ speakers.join(', ') }}
+      </p>
+      <p v-else :style="{ color: 'var(--text-muted)' }">
+        Nobody in this session consented to being recorded, so it has no tracks.
+      </p>
+      <p v-if="session.other_participants.length > 0" class="mt-1">
+        <span :style="{ color: 'var(--text-muted)' }">Also in the channel, not recorded:</span>
+        {{ others }}
+      </p>
+    </div>
+
+    <div :id="panelId" class="px-4 pb-4">
+      <MultiTrackPlayer v-if="open && session.tracks.length > 0" :session="session" />
+      <p
+        v-else-if="open"
+        class="mt-4 rounded-xl border p-4 text-sm"
+        :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+      >
+        There is nothing to play: no track was written for this session.
+      </p>
+    </div>
+  </article>
+</template>
