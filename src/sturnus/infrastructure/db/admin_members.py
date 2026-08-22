@@ -122,3 +122,23 @@ class AdminMemberStore:
                 .order_by(AdminMember.discord_user_id)
             )
             return tuple(rows.scalars())
+
+    async def administered_guilds(self, discord_user_id: int) -> Sequence[int]:
+        """The guilds this person administers, ordered so two reads agree.
+
+        The reverse of `administrators`, and the console's guild picker:
+        an OAuth identity names no guild, so without this a signed-in
+        administrator would have to be told which guild ids are theirs by
+        some other route.
+
+        Ordered by id for the same reason `administrators` is -- arbitrary
+        but stable, so the picker does not shuffle itself between page
+        loads.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(AdminMember.guild_id)
+                .where(AdminMember.discord_user_id == discord_user_id)
+                .order_by(AdminMember.guild_id)
+            )
+            return tuple(rows.scalars())
