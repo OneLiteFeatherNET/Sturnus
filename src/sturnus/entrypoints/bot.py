@@ -282,6 +282,7 @@ async def _run() -> None:
         outline_oauth=outline_oauth,
         link_states=link_states,
         account_links=account_links,
+        capture_diagnostics=settings.capture_diagnostics,
     )
 
     stop = asyncio.Event()
