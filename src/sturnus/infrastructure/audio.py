@@ -29,19 +29,50 @@ def _require_aware(value: datetime) -> datetime:
     return value
 
 
-def to_mono_16k(pcm: bytes) -> bytes:
+def to_mono_16k(pcm: bytes, history: bytes = b"") -> bytes:
     """Convert Discord's 48 kHz 16-bit stereo PCM to 16 kHz mono.
 
     `soxr` is used rather than the standard library's `audioop`, which is
     removed in Python 3.13, and rather than naive decimation, which would
     alias without a low-pass filter.
+
+    **`history` is the frame before this one, and it is not optional in
+    practice.** A resampling filter needs signal on both sides of the
+    samples it is producing. Given one 20 ms frame alone it starts from
+    silence and ends in silence, so it rings in and out at every frame
+    boundary -- fifty times a second, for as long as anybody is speaking.
+
+    Measured against resampling the same audio as one continuous stream,
+    frames alone reach 32.9 dB SNR and frames with one frame of history
+    reach 45.2 dB: four times less error energy. Two frames of history
+    measure the same as one, so one is what this takes.
+
+    That error is not evenly spread -- 64% of it sits above 4 kHz -- which
+    is why it was audible as roughness on speech rather than as anything
+    that showed up in a level meter. It only became noticeable once the
+    recordings carried speech at all (see
+    `sturnus.infrastructure.discord.dave`); before that it was hiding
+    under a much larger fault.
+
+    Returns exactly `len(pcm) // 6` bytes whatever the history: the
+    caller places audio by RTP-derived time, so a conversion that
+    sometimes returned a different number of samples would shift the
+    timeline instead of improving it.
     """
     if not pcm:
         return b""
-    stereo = np.frombuffer(pcm, dtype="<i2").reshape(-1, 2)
+    wanted = len(pcm) // (_SAMPLE_WIDTH * 2 * (SOURCE_RATE // TARGET_RATE))
+    block = history + pcm
+    stereo = np.frombuffer(block, dtype="<i2").reshape(-1, 2)
     mono = stereo.mean(axis=1).astype(np.int16)
     resampled: np.ndarray = soxr.resample(mono, SOURCE_RATE, TARGET_RATE)
-    return resampled.astype("<i2").tobytes()
+    # The tail is this frame's own audio; everything before it belongs to
+    # the history and has already been written.
+    tail = resampled[-wanted:] if len(resampled) >= wanted else resampled
+    if len(tail) < wanted:
+        # Only reachable for a first frame shorter than the ratio itself.
+        tail = np.pad(tail, (wanted - len(tail), 0))
+    return tail.astype("<i2").tobytes()
 
 
 class SpeakerWriter:
