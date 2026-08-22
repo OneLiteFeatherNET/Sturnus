@@ -126,9 +126,13 @@ async def test_a_failing_job_logs_no_payload(tmp_path: Path, captured: io.String
         # plants would never be in the message it checks -- the test would
         # go on passing while measuring nothing.
         async def transcribe(
-            self, path: Path, language: str | None, initial_prompt: str | None
+            self,
+            path: Path,
+            language: str | None,
+            initial_prompt: str | None,
+            model: str | None = None,
         ) -> object:
-            del path, language, initial_prompt
+            del path, language, initial_prompt, model
             raise RuntimeError(f"decode failed on {TRANSCRIPT_CANARY}")
 
     queue = FakeQueue([job()])

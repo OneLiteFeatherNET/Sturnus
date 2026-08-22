@@ -88,12 +88,20 @@ class FakeEngine:
         #: `calls` so the existing `calls[i][1]` language assertions stay
         #: as they are.
         self.prompts: list[str | None] = []
+        #: What each call was asked to run with. `None` is the worker's
+        #: own default, which is every job nobody asked a question about.
+        self.models: list[str | None] = []
 
     async def transcribe(
-        self, path: Path, language: str | None, initial_prompt: str | None
+        self,
+        path: Path,
+        language: str | None,
+        initial_prompt: str | None,
+        model: str | None = None,
     ) -> TranscriptionResult:
         self.calls.append((path, language))
         self.prompts.append(initial_prompt)
+        self.models.append(model)
         if self.fail:
             raise RuntimeError("model exploded")
         return TranscriptionResult(

@@ -196,28 +196,81 @@ class WhisperEngine:
         compute_type: str,
         default_language: str,
     ) -> None:
-        self._model = WhisperModel(model_size, device=device, compute_type=compute_type)
-        # Kept so every measurement below can be labelled by model without a
-        # call site passing it in again. It is the only label these metrics
-        # carry: a real-time factor that mixes `large-v3` with `tiny` says
-        # nothing, and no id may become a metric label (see
-        # `observability.fields.METRIC_LABEL_FIELDS`).
-        self._model_name = model_size
+        self._device = device
+        self._compute_type = compute_type
+        # One model is loaded eagerly -- the default -- because the first
+        # load is slow enough that discovering it lazily would make the
+        # first job of every deployment look like a hang. Others join it
+        # only if a job asks by name.
+        self._models: dict[str, WhisperModel] = {
+            model_size: WhisperModel(model_size, device=device, compute_type=compute_type)
+        }
+        self._default_model = model_size
+        # Every measurement below is labelled with the model that produced
+        # it, resolved per job rather than fixed at construction. It is the
+        # only label these metrics carry: a real-time factor that mixes
+        # `large-v3` with `tiny` says nothing, and no id may become a
+        # metric label (see `observability.fields.METRIC_LABEL_FIELDS`).
         self._default_language = default_language
 
     async def transcribe(
-        self, path: Path, language: str | None, initial_prompt: str | None
+        self,
+        path: Path,
+        language: str | None,
+        initial_prompt: str | None,
+        model: str | None = None,
     ) -> TranscriptionResult:
-        return await asyncio.to_thread(self._transcribe, path, language, initial_prompt)
+        """Transcribes one file, optionally with a model other than the default.
+
+        `model` exists so that two runs over the *same* recording can be
+        compared -- which is the only way to answer "is a smaller model
+        good enough here" for this deployment's own audio, in its own
+        language. Every earlier comparison in this project was made
+        against recordings that turned out to be noise (see
+        `sturnus.infrastructure.discord.dave`), so none of them said
+        anything about a model.
+        """
+        return await asyncio.to_thread(self._transcribe, path, language, initial_prompt, model)
+
+    def _model_for(self, name: str | None) -> tuple[str, WhisperModel]:
+        """The model a job asked for, loading it once if it is new.
+
+        **An unknown name fails the job rather than falling back.** A
+        comparison run that silently used the old model would still
+        produce a transcript, still record measurements, and look exactly
+        like a result -- and this project has already lost days to a
+        failure that reported success.
+
+        Cached because loading `large-v3` takes long enough to dominate a
+        short job, and a comparison means running the same file twice.
+        Unbounded on purpose: the names come from an administrator's
+        re-queue, not from user input, and a worker that has loaded three
+        models has been asked for three.
+        """
+        wanted = name or self._default_model
+        existing = self._models.get(wanted)
+        if existing is not None:
+            return wanted, existing
+        log.info("Loading transcription model %s, which this worker has not used before", wanted)
+        loaded = WhisperModel(wanted, device=self._device, compute_type=self._compute_type)
+        self._models[wanted] = loaded
+        return wanted, loaded
 
     def _transcribe(
-        self, path: Path, language: str | None, initial_prompt: str | None
+        self,
+        path: Path,
+        language: str | None,
+        initial_prompt: str | None,
+        model: str | None = None,
     ) -> TranscriptionResult:
         # Decoded here rather than inside `transcribe()` so the gate and the
         # model measure and seek through the *same* array. Handing the model
         # the path instead would decode a 100-minute file a second time, and
         # clip offsets computed on a different copy of the samples could be
         # misaligned against the one being transcribed.
+        # Resolved before anything is decoded: an unknown model must fail
+        # the job before it costs a hundred minutes of audio processing.
+        model_name, engine = self._model_for(model)
         audio = decode_audio(str(path), sampling_rate=_SAMPLE_RATE)
         audio_seconds = audio.shape[0] / _SAMPLE_RATE
         clips = speech_clips(audio, sample_rate=_SAMPLE_RATE)
@@ -257,7 +310,7 @@ class WhisperEngine:
                 Event.TRANSCRIPTION_SKIPPED,
                 "The speech gate found nothing above the silence floor; the model was "
                 "not called and this speaker produced no segments.",
-                model=self._model_name,
+                model=model_name,
                 audio_seconds=round(audio_seconds, 3),
                 speech_seconds=0.0,
                 clips=0,
@@ -330,16 +383,18 @@ class WhisperEngine:
         # reproduced here (`_on_the_frame_grid`). Asked for before the call
         # rather than while collecting: a library that stopped publishing
         # `frames_per_second` should fail now, not after a 100-minute decode.
-        clip_starts_in_frames = _on_the_frame_grid(concat_starts, self._model.frames_per_second)
+        clip_starts_in_frames = _on_the_frame_grid(concat_starts, engine.frames_per_second)
 
         started = time.monotonic()
         # Before the call, not after it: `transcribe()` extracts features and
         # detects a language before it yields anything, and a job that wedges
         # in there has to be distinguishable from one that has merely just
         # started. See `TranscriptionProgress.begin`.
-        TRANSCRIPTION_PROGRESS.begin(self._model_name)
+        TRANSCRIPTION_PROGRESS.begin(model_name)
         try:
             return self._decode(
+                engine,
+                model_name,
                 speech,
                 language,
                 initial_prompt,
@@ -362,6 +417,8 @@ class WhisperEngine:
 
     def _decode(
         self,
+        engine: WhisperModel,
+        model_name: str,
         speech: np.ndarray[Any, Any],
         language: str | None,
         initial_prompt: str | None,
@@ -384,7 +441,7 @@ class WhisperEngine:
         and a second derivation of `offsets` from the same clips is a second
         place for the two to drift apart.
         """
-        segments, info = self._model.transcribe(
+        segments, info = engine.transcribe(
             speech,
             language=language,
             # Biases the decoder towards the vocabulary and the style of
@@ -597,7 +654,7 @@ class WhisperEngine:
                 logging.INFO,
                 Event.TRANSCRIPTION_DECODED,
                 "Decoded one speaker's recording",
-                model=self._model_name,
+                model=model_name,
                 language=detected,
                 audio_seconds=round(audio_seconds, 3),
                 speech_seconds=round(speech_seconds, 3),
@@ -614,7 +671,7 @@ class WhisperEngine:
                 "The gate passed audio above the silence floor but the decoder judged "
                 "every window to be silence; this speaker contributes nothing to the "
                 "protocol",
-                model=self._model_name,
+                model=model_name,
                 language=detected,
                 audio_seconds=round(audio_seconds, 3),
                 speech_seconds=round(speech_seconds, 3),
@@ -639,6 +696,7 @@ class WhisperEngine:
             # none of them, which is why they travel on the result rather than
             # being recomputed downstream.
             measurements=JobMeasurements(
+                model=model_name,
                 audio_seconds=audio_seconds,
                 speech_seconds=speech_seconds,
                 segment_count=len(collected),

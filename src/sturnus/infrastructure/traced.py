@@ -210,7 +210,11 @@ class TracedTranscriptionEngine:
         self._inner = inner
 
     async def transcribe(
-        self, path: Path, language: str | None, initial_prompt: str | None
+        self,
+        path: Path,
+        language: str | None,
+        initial_prompt: str | None,
+        model: str | None = None,
     ) -> TranscriptionResult:
         """Forwards every argument, and puts `initial_prompt` on no span.
 
@@ -227,7 +231,7 @@ class TracedTranscriptionEngine:
         `fields.ALLOWED_FIELDS` and must not be added to it.
         """
         with span("job.transcribe") as active, _StageTimer("transcribe"):
-            result = await self._inner.transcribe(path, language, initial_prompt)
+            result = await self._inner.transcribe(path, language, initial_prompt, model)
             audio_seconds = max((segment.end for segment in result.segments), default=0.0)
             set_span_fields(
                 active,

@@ -239,6 +239,18 @@ class TranscriptionJob(Base):
     audio_seconds: Mapped[float | None] = mapped_column(Float)
     speech_seconds: Mapped[float | None] = mapped_column(Float)
     segment_count: Mapped[int | None] = mapped_column(Integer)
+    #: What produced the three above. Null for a job finished before this
+    #: column existed -- there is nothing to backfill it from, and naming
+    #: the current default would turn an absence into a claim.
+    model: Mapped[str | None] = mapped_column(Text)
+
+    #: What a re-queue asked this job to run with, or null for the
+    #: worker's own default. Kept apart from `model` because the two
+    #: answer different questions -- "what was asked for" survives a
+    #: failure, "what ran" does not exist until one succeeds, and a
+    #: comparison is only worth as much as the certainty about which
+    #: engine produced each side of it.
+    requested_model: Mapped[str | None] = mapped_column(Text)
 
     __table_args__ = (
         UniqueConstraint("session_id", "discord_user_id", name="uq_job_per_speaker"),

@@ -445,7 +445,10 @@ async def _job_dicts(db: AsyncSession, session_id: int) -> list[dict[str, object
 
 
 async def apply_requeue(
-    session_factory: async_sessionmaker[AsyncSession], guild_id: int, session_id: int
+    session_factory: async_sessionmaker[AsyncSession],
+    guild_id: int,
+    session_id: int,
+    model: str | None = None,
 ) -> SessionView | None:
     """Resets a session's recoverable jobs, in one transaction and one commit.
 
@@ -522,6 +525,16 @@ async def apply_requeue(
                 attempts=0,
                 # The old error described the old run.
                 error=None,
+                # What to transcribe with this time. `None` leaves the
+                # worker's own default, which is every re-queue nobody
+                # asked a question about.
+                #
+                # It is stored rather than passed, because the worker that
+                # eventually claims this job is not the process handling
+                # this request -- there may be none running right now. A
+                # question about a model has to survive in the row until
+                # somebody picks the job up.
+                requested_model=model,
                 # `assemble` reads every job of the session, not only the
                 # one that finished last, so a reset job that kept its old
                 # text would put the very hallucinations this command

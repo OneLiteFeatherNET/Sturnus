@@ -86,6 +86,9 @@ class ClaimedJob:
     s3_key: str
     encryption_key_id: str
     wrapped_data_key: bytes
+    #: The model this job was re-queued with, or `None` for the worker's
+    #: own default -- which is every job nobody asked a question about.
+    requested_model: str | None = None
 
 
 class JobQueue:
@@ -140,6 +143,7 @@ class JobQueue:
                 s3_key=job.s3_key,
                 encryption_key_id=job.encryption_key_id,
                 wrapped_data_key=job.wrapped_data_key,
+                requested_model=job.requested_model,
             )
 
     async def complete(
@@ -209,6 +213,11 @@ class JobQueue:
                 job.audio_seconds = measurements.audio_seconds
                 job.speech_seconds = measurements.speech_seconds
                 job.segment_count = measurements.segment_count
+                # What actually ran, which is not always what was asked
+                # for: a job re-queued with no model runs on the worker's
+                # default, and the three numbers above mean nothing
+                # without knowing which.
+                job.model = measurements.model
             await session.flush()
             remaining = await session.scalar(
                 select(func.count())
