@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.12.0...v0.12.1) (2026-08-22)
+
+
+### Bug Fixes
+
+* **bot:** decrypt Discord's end-to-end layer before decoding Opus ([#93](https://github.com/OneLiteFeatherNET/Sturnus/issues/93)) ([ce43ad3](https://github.com/OneLiteFeatherNET/Sturnus/commit/ce43ad39fc599367da93b692157de412a8498cf1))
+
 ## [0.12.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.11.0...v0.12.0) (2026-08-22)
 
 
