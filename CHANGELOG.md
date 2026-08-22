@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.8.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.7.0...v0.8.0) (2026-08-22)
+
+
+### Features
+
+* **chart:** deploy the console and its API ([#73](https://github.com/OneLiteFeatherNET/Sturnus/issues/73)) ([7a8e197](https://github.com/OneLiteFeatherNET/Sturnus/commit/7a8e1973eeba367ce1fcdf3ac9f02a33a18e9c80))
+* **console:** read and write the bot's runtime settings from the console ([#67](https://github.com/OneLiteFeatherNET/Sturnus/issues/67)) ([fb91dd2](https://github.com/OneLiteFeatherNET/Sturnus/commit/fb91dd2df5ffcb296f04136e8bb9f134f774ef03))
+* **console:** read endpoints for the dashboard, sessions and calendar ([#65](https://github.com/OneLiteFeatherNET/Sturnus/issues/65)) ([0d9dd0b](https://github.com/OneLiteFeatherNET/Sturnus/commit/0d9dd0bb1a1077b0cbab716d5bf611295011cedd))
+* **console:** stream a session's audio, decrypting on the way out ([#66](https://github.com/OneLiteFeatherNET/Sturnus/issues/66)) ([cd005eb](https://github.com/OneLiteFeatherNET/Sturnus/commit/cd005eb3b68e62bf61eaae3ee785a2f5f55e3969))
+* **console:** the API process, its session, and signing in ([#62](https://github.com/OneLiteFeatherNET/Sturnus/issues/62)) ([32ff035](https://github.com/OneLiteFeatherNET/Sturnus/commit/32ff035c451f1cb68983fdf9123d5dfa10312127))
+* **console:** the calendar heatmap and day timeline ([#70](https://github.com/OneLiteFeatherNET/Sturnus/issues/70)) ([d5ebeb9](https://github.com/OneLiteFeatherNET/Sturnus/commit/d5ebeb9c508d8d8da93782d7545be37789fe6941))
+* **console:** the dashboard ([#68](https://github.com/OneLiteFeatherNET/Sturnus/issues/68)) ([a6f9188](https://github.com/OneLiteFeatherNET/Sturnus/commit/a6f91881c3999ec449aae3554e1e497622af223c))
+* **console:** the Nuxt application, its layout and its front door ([#63](https://github.com/OneLiteFeatherNET/Sturnus/issues/63)) ([b1e3b65](https://github.com/OneLiteFeatherNET/Sturnus/commit/b1e3b651fd83e9a53a9165b690ff88145e280ccc))
+* **console:** the recordings page and its multi-track player ([#69](https://github.com/OneLiteFeatherNET/Sturnus/issues/69)) ([399f163](https://github.com/OneLiteFeatherNET/Sturnus/commit/399f163bca7c425b0b42614750bf48488c339d97))
+* **console:** the settings page, and what it says about taking effect ([#71](https://github.com/OneLiteFeatherNET/Sturnus/issues/71)) ([55461ef](https://github.com/OneLiteFeatherNET/Sturnus/commit/55461ef41982932b9d275e30d47d1252749e33f8))
+* **db:** persist what a job measured, and mirror who administers the bot ([#61](https://github.com/OneLiteFeatherNET/Sturnus/issues/61)) ([3ff2c01](https://github.com/OneLiteFeatherNET/Sturnus/commit/3ff2c0135c63600b1d290785172ee1ec3b22e235))
+
+
+### Bug Fixes
+
+* **console:** show a page when a page cannot be rendered ([#75](https://github.com/OneLiteFeatherNET/Sturnus/issues/75)) ([210ffe4](https://github.com/OneLiteFeatherNET/Sturnus/commit/210ffe4f9fccdcd8f91e9b0ffa7db51d2bb973d8))
+
 ## [0.7.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.6.0...v0.7.0) (2026-08-21)
 
 
