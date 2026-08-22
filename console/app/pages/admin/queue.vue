@@ -52,6 +52,7 @@ import {
   sessionCounts,
   sessionStartLine,
   sessionsSummaryLine,
+  startQueuePolling,
   truncationNotice,
 } from '~/utils/queue'
 import { recordingPath } from '~/utils/recordings'
@@ -145,30 +146,34 @@ const moving = computed(() => Boolean(queue.value && isQueueMoving(queue.value))
  *  who has just pressed a button and is waiting for it, this page is a
  *  guild-wide read that somebody leaves open. */
 const POLL_MS = 5000
-let timer: ReturnType<typeof setTimeout> | null = null
+
+/** The running loop, or `null` when nothing is scheduled.
+ *
+ *  The loop itself lives in `~/utils/queue`, where it can be tested with
+ *  fake timers -- see `startQueuePolling` on the defect that makes an
+ *  inline chain of timeouts the wrong shape. What is left here is when to
+ *  start one and when to let it go. */
+let poll: ReturnType<typeof startQueuePolling> | null = null
 
 function stopPolling() {
-  if (timer !== null) {
-    clearTimeout(timer)
-    timer = null
-  }
+  poll?.stop()
+  poll = null
 }
 
-/** Re-reads once, and only if the work has not finished in the meantime.
- *  Same shape as `RequeuePanel`'s loop -- a chain of timeouts rather than
- *  an interval -- so a slow response can never queue a second request
- *  behind the first. */
+/** Re-reads while there is work in flight, and stops when there is not. */
 function scheduleIfMoving() {
   stopPolling()
-  // Never during a server render: there is no `clearTimeout` on the way
-  // out of one, so a timer started there would keep the render alive and
-  // would fetch for a reader who has already been sent their HTML.
+  // Never during a server render: a timer started there would keep the
+  // render alive and would fetch for a reader who already has their HTML.
   if (!import.meta.client) return
-  if (!moving.value) return
-  timer = setTimeout(async () => {
-    await reload()
-    scheduleIfMoving()
-  }, POLL_MS)
+  poll = startQueuePolling({
+    // Re-asked each round rather than captured now, because whether there
+    // is anything left to watch is a fact about the data that just came
+    // back.
+    shouldContinue: () => moving.value,
+    run: reload,
+    delayMs: POLL_MS,
+  })
 }
 
 /** Whether a re-read is in flight. `useAsyncData`'s own status settles
