@@ -27,6 +27,7 @@ from sturnus.application.publishing import SessionReader, announce_ready_session
 from sturnus.application.recovery import recover_orphans
 from sturnus.config import get_settings
 from sturnus.domain import settings as domain_settings
+from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.models import Base
@@ -183,6 +184,10 @@ async def _run() -> None:
     session_repo = SessionRepository(session_factory)
     job_repo = JobRepository(session_factory)
     link_states = LinkStateStore(session_factory)
+    # Written here, read by the console's API process -- which has no
+    # gateway to ask Discord who holds `admin_role_id`, and must not be
+    # given one (Spec 13.2): it already holds S3 and the master key.
+    admin_mirror = AdminMemberStore(session_factory)
     # `provider` fixed at construction: the bot only ever reads its own
     # Outline mapping back (`/link status`), never another provider's --
     # see `AccountLinkRepository`'s class docstring for why the read and
@@ -264,6 +269,7 @@ async def _run() -> None:
     client = SturnusClient(
         clock=clock,
         config_store=config_store,
+        admin_mirror=admin_mirror,
         consent_repo=consent_repo,
         session_repo=session_repo,
         job_repo=traced_job_repo,

@@ -107,6 +107,7 @@ from sturnus.application.documents import (
 )
 from sturnus.application.transcription import TranscriptionEngine
 from sturnus.domain import settings as domain_settings
+from sturnus.domain.measurements import JobMeasurements
 from sturnus.domain.transcript import DEFAULT_MERGE_GAP
 from sturnus.observability.events import Event, log_event, log_exception
 
@@ -138,7 +139,9 @@ class Queue(Protocol):
 
     async def claim(self) -> object | None: ...
 
-    async def complete(self, job_id: int, transcript: str) -> bool: ...
+    async def complete(
+        self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+    ) -> bool: ...
 
     #: Returns whether the job is now **dead** -- out of attempts, so this
     #: recording will never be transcribed -- rather than queued for another
@@ -603,7 +606,16 @@ async def process_one(
                     job.session_id, job.discord_user_id, result.language
                 )
 
-            is_last = await queue.complete(job.id, serialize_transcript(result))
+            # The engine's own measurements, straight through: the worker
+            # neither recomputes nor second-guesses them. `audio_seconds`
+            # above is the end of the last segment, which answers "how long
+            # did this take per minute of speech" for the log line and is
+            # the wrong number for the database -- on a track whose speaker
+            # fell silent halfway through it is nowhere near the length of
+            # the recording.
+            is_last = await queue.complete(
+                job.id, serialize_transcript(result), result.measurements
+            )
         except Exception as exc:
             # Everything other than the transcription failure already
             # handled above: a failed download, a decrypt error, a

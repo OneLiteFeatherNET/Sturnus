@@ -53,6 +53,7 @@ from sturnus.application.reconfigure import (
 from sturnus.application.recording import JobQueue, RecordingService
 from sturnus.domain import settings
 from sturnus.domain.session import EndReason, SessionTimeouts
+from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import (
@@ -61,6 +62,7 @@ from sturnus.infrastructure.db.repositories import (
     SessionRepository,
 )
 from sturnus.infrastructure.discord.about_cog import AboutCog
+from sturnus.infrastructure.discord.admin_sync import sync_administrators
 from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
 from sturnus.infrastructure.discord.audio_cog import AudioCog
 from sturnus.infrastructure.discord.config_cog import ConfigCog
@@ -165,6 +167,7 @@ class SturnusClient(commands.Bot):
         *,
         clock: Clock,
         config_store: ConfigStore,
+        admin_mirror: AdminMemberStore | None = None,
         consent_repo: ConsentRepository,
         session_repo: SessionRepository,
         # Typed against the narrow `JobQueue` port rather than the concrete
@@ -202,6 +205,10 @@ class SturnusClient(commands.Bot):
 
         self._clock = clock
         self._config_store = config_store
+        #: Optional: a client built without one does not mirror, which is
+        #: what every test that has no interest in administrators gets.
+        #: In production `sturnus.entrypoints.bot` always supplies it.
+        self._admin_mirror = admin_mirror
         self._consent_repo = consent_repo
         self._session_repo = session_repo
         self._job_repo = job_repo
@@ -1121,6 +1128,7 @@ class SturnusClient(commands.Bot):
             if recording is not None:
                 await self._sweep_due_session(guild_id, recording, now)
             await self._reconcile(guild_id)
+            await self._mirror_administrators(guild_id, now)
             recording = self._guilds.get(guild_id)
             if (
                 recording is not None
@@ -1128,6 +1136,38 @@ class SturnusClient(commands.Bot):
                 and now >= recording.blocked_until
             ):
                 await self._end_capture_cooldown(guild_id, recording)
+
+    async def _mirror_administrators(self, guild_id: int, now: datetime) -> None:
+        """Writes this guild's administrators where the console's API can read them.
+
+        On the ordinary tick rather than a sweep of its own: the gateway
+        read behind it is a cache lookup, not an API call, so it costs
+        nothing to run every ten seconds and needs no rate-limit budget.
+        The mirror is therefore never more than one tick stale, which is
+        the whole reason it is acceptable for the API to trust it.
+
+        Failures are logged and swallowed. A guild whose administrator
+        list could not be refreshed keeps the membership it had, and the
+        alternative -- letting this raise -- would take the session
+        timeout enforcement in the same tick down with it.
+        """
+        if self._admin_mirror is None:
+            return
+        guild = self.get_guild(guild_id)
+        if guild is None:
+            return
+        try:
+            await sync_administrators(guild, self._config_store, self._admin_mirror, now)
+        except Exception as exc:
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.GUILD_TICK_FAILED,
+                "Could not mirror this guild's administrators; the console keeps "
+                "the membership it already had",
+                exc,
+                guild_id=guild_id,
+            )
 
     async def _sweep_due_session(
         self, guild_id: int, recording: _GuildRecording, now: datetime
