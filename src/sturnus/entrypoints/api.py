@@ -40,6 +40,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sturnus.config import StrictSettings
 from sturnus.console.adapters import (
     ConsoleConsentDirectory,
+    ConsoleGuildReports,
     ConsoleLinkDirectory,
     ConsoleQueueControl,
     ConsoleQueueOverview,
@@ -218,6 +219,7 @@ async def _run() -> None:
         tags=ConsoleTagWriter(session_factory),
         queues=ConsoleQueueOverview(session_factory, admins, now),
         consents=ConsoleConsentDirectory(session_factory, admins, config, now),
+        reports=ConsoleGuildReports(session_factory, admins, config),
     )
 
     runner = web.AppRunner(app)

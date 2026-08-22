@@ -1152,6 +1152,47 @@ There is no re-queue control on this page. Each row links to
 of whether a re-queue is safe stays in one place (`plan_requeue`) rather
 than being made twice.
 
+### 6.2.8 The report
+
+**Admin View → Reporting**, per guild: how often this guild meets, how
+long its meetings run, how many of them produced a protocol, how big they
+get, and the same broken down by month.
+
+It answers the question an administrator configuring Sturnus otherwise
+cannot: is this working out. Every figure comes from rows the system
+already writes.
+
+Two properties are worth knowing before reading a number off it.
+
+**Months are cut in the guild's `timezone`**, the same calendar the
+protocols are written in (§Spec 11), and the payload names which zone was
+used. A meeting that opened at 00:30 Berlin time belongs to the month the
+people in it think it does; bucketing by UTC would file it under the
+previous one and disagree with the timestamps printed in the protocol of
+that very meeting. An unusable `timezone` value falls back to UTC — the
+same fallback the worker applies — and the named zone in the report is how
+you find out that happened. Note this is a *different* choice from the
+per-person calendar view (§6.2.5), which groups by UTC day because one
+person's sessions can span guilds and no guild's zone is right for them.
+
+**"Unmeasured tracks" is not zero speech.** `speech_seconds` is nullable
+and null means nobody ever measured, while zero means somebody did and it
+was nothing. Recordings from before the measurement columns existed have
+null, and `SUM` skips them silently. The count of skipped tracks is
+therefore printed beside the total: a large one means the speech figure
+describes only part of what was recorded, not that the guild was quiet.
+
+**What the report is not.** It is about a guild and never about a named
+person. It says how big meetings get and how many distinct people the
+guild has recorded; it does not say who they were or rank them.
+
+That boundary is a decision rather than an omission. A per-person readout
+of meeting attendance and speaking time is a means of monitoring
+performance and conduct — in Germany and the EU a matter for a works
+council (BetrVG §87(1)(6)) rather than something a console adds because
+the columns happen to be there. The rows exist and the ranking is
+buildable; building it is a separate, deliberate act.
+
 ### 6.3 Listening to a recording by hand
 
 Every automated check this system has can describe a track — its level,

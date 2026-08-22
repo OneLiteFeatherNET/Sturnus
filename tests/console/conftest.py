@@ -25,6 +25,8 @@ from sturnus.console.ports import (
     ConsentDirectory,
     ConsentHolder,
     GuildQueue,
+    GuildRecording,
+    GuildReports,
     LinkDirectory,
     OAuthClient,
     QueueControl,
@@ -528,6 +530,26 @@ class FakeConsents:
         return self.outcome
 
 
+class FakeReports:
+    """A guild nobody administers, until a test says otherwise.
+
+    Defaults to `None`, which is what the real reports answer for "no such
+    guild or not yours" -- so a test with no interest in reporting gets
+    404s rather than a fake that quietly authorises everything.
+    """
+
+    def __init__(self, recording: GuildRecording | None = None) -> None:
+        self.recording = recording
+        #: Every guild this was asked about, with who asked. The route
+        #: tests assert on it: "the handler passed the signed-in id, not
+        #: one from the URL" cannot be seen in a response body.
+        self.asked: list[tuple[int, int]] = []
+
+    async def recording_of(self, guild_id: int, *, requested_by: int) -> GuildRecording | None:
+        self.asked.append((guild_id, requested_by))
+        return self.recording
+
+
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
@@ -541,6 +563,7 @@ def build_test_api(
     tags: TagWriter | None = None,
     queues: QueueOverview | None = None,
     consents: ConsentDirectory | None = None,
+    reports: GuildReports | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -578,6 +601,7 @@ def build_test_api(
         queue=queue or FakeQueue(),
         tags=tags or FakeTags(),
         queues=queues or FakeQueueOverview(),
+        reports=reports or FakeReports(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,
