@@ -60,6 +60,7 @@ dependencies = [
 ]
 
 [project.scripts]
+sturnus-api = "sturnus.entrypoints.api:main"
 sturnus-bot = "sturnus.entrypoints.bot:main"
 sturnus-link = "sturnus.entrypoints.link:main"
 sturnus-worker = "sturnus.entrypoints.worker:main"
