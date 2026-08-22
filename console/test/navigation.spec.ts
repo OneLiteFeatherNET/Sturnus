@@ -64,6 +64,17 @@ describe('who is offered the Admin View', () => {
     expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('Bot Settings')
   })
 
+  it('offers the user settings to an administrator', () => {
+    expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('User Settings')
+  })
+
+  it('lists what the bot does before what the members have agreed to', () => {
+    // The configuration is what an administrator comes to the Admin View
+    // for daily; a member's consent is looked at when somebody asks about
+    // that one member, which is rarer and always deliberate.
+    expect(ADMIN_VIEW.entries.map((e) => e.label)).toEqual(['Bot Settings', 'User Settings'])
+  })
+
   it('hides it from somebody who administers nothing', () => {
     expect(visibleSections(PARTICIPANT).map((s) => s.label)).toEqual(['User View'])
   })
