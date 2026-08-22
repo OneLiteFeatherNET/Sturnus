@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.14.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.13.0...v0.14.0) (2026-08-22)
+
+
+### Features
+
+* **bot:** ask Discord for video, since nothing in the stack ever does ([#98](https://github.com/OneLiteFeatherNET/Sturnus/issues/98)) ([e40643c](https://github.com/OneLiteFeatherNET/Sturnus/commit/e40643c28bcb6d3478ffbcf5a1d4117098fb0182))
+* **console:** a guild-wide view of what the transcription queue still owes ([#106](https://github.com/OneLiteFeatherNET/Sturnus/issues/106)) ([8d71b7d](https://github.com/OneLiteFeatherNET/Sturnus/commit/8d71b7d7ad70f42c8c8ae647436be53b64fb94bd))
+* **console:** let a participant find one recording among hundreds ([#101](https://github.com/OneLiteFeatherNET/Sturnus/issues/101)) ([f1542ac](https://github.com/OneLiteFeatherNET/Sturnus/commit/f1542ac2ce10bc69bf49c86126df97623bbb6c69))
+* **console:** let a participant label their own recordings ([#99](https://github.com/OneLiteFeatherNET/Sturnus/issues/99)) ([f6518f2](https://github.com/OneLiteFeatherNET/Sturnus/commit/f6518f2ef1c2f0db4b1683b38ed9b451c3dac634))
+* **console:** let an administrator withdraw a person's recording consent ([#105](https://github.com/OneLiteFeatherNET/Sturnus/issues/105)) ([8615772](https://github.com/OneLiteFeatherNET/Sturnus/commit/861577262143acc8cb20ad7a5e344dfc1af45787))
+* **console:** report what a guild's recording adds up to ([#107](https://github.com/OneLiteFeatherNET/Sturnus/issues/107)) ([1d0fe78](https://github.com/OneLiteFeatherNET/Sturnus/commit/1d0fe781d2c862222f34584ea55f68cfd596ad7b))
+* **console:** serve the recordings list one page at a time ([#111](https://github.com/OneLiteFeatherNET/Sturnus/issues/111)) ([e8693ff](https://github.com/OneLiteFeatherNET/Sturnus/commit/e8693ff296f0144d8d4cc8cdda5a7616d13180ef))
+* **console:** split the navigation into a User View and an Admin View ([#104](https://github.com/OneLiteFeatherNET/Sturnus/issues/104)) ([036b216](https://github.com/OneLiteFeatherNET/Sturnus/commit/036b216b27839217e511c2f3081164e892d8fb69))
+* **worker:** let a re-queue name the model, and record what actually ran ([#112](https://github.com/OneLiteFeatherNET/Sturnus/issues/112)) ([f1b8a8c](https://github.com/OneLiteFeatherNET/Sturnus/commit/f1b8a8c943cff7d41b18b535ac39d2e30063ff72))
+
+
+### Bug Fixes
+
+* **console:** make the colours of every control readable in both themes ([#103](https://github.com/OneLiteFeatherNET/Sturnus/issues/103)) ([6486859](https://github.com/OneLiteFeatherNET/Sturnus/commit/6486859244aa9db6c6317363d51a65d1dad91278))
+* **console:** repair the recording flow's leaks, traps and dead ends ([#102](https://github.com/OneLiteFeatherNET/Sturnus/issues/102)) ([ea20bbf](https://github.com/OneLiteFeatherNET/Sturnus/commit/ea20bbfbad046fefca988548af8efe8f4f5e57cb))
+* **console:** stop a failed queue read from revealing the admin panel ([#108](https://github.com/OneLiteFeatherNET/Sturnus/issues/108)) ([dea1f8b](https://github.com/OneLiteFeatherNET/Sturnus/commit/dea1f8bf1a8cebec254de721acfbc3df4af032e9))
+
 ## [0.13.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.12.1...v0.13.0) (2026-08-22)
 
 
