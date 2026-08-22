@@ -50,6 +50,29 @@ ANNA_ID, ANNA_SSRC = 100, 111
 VOICE_LOGGER = "sturnus.infrastructure.discord.voice"
 
 
+def voice_record(caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
+    """The first record this adapter logged, ignoring anybody else's.
+
+    `caplog.at_level(level, logger=...)` sets a level; it does not filter.
+    Every record that passes any logger lands in `caplog.records`, so
+    `records[0]` is "the first thing anything logged" -- which is this
+    adapter only as long as nothing else in the process happens to log at
+    the same moment. A task left running by an earlier test is enough to
+    make that false occasionally, and it did: one parametrisation of
+    `test_capture_dropped_from_voice_reports_the_close_code` failed in a
+    full run and passed on its own.
+
+    A flaky assertion is worse than a missing one, because it teaches
+    people to re-run the suite instead of reading it.
+    """
+    for record in caplog.records:
+        if record.name == VOICE_LOGGER:
+            return record
+    raise AssertionError(
+        f"nothing was logged by {VOICE_LOGGER}; got {[record.name for record in caplog.records]}"
+    )
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.value = T0
@@ -213,9 +236,9 @@ async def test_capture_stopping_on_its_own_is_logged_at_error(
     # `getattr`, because `sturnus_fields` is an `extra=` key rather than a
     # declared `LogRecord` attribute -- which is exactly what makes it a
     # field the registry governs rather than part of the message.
-    fields = getattr(caplog.records[0], "sturnus_fields", {})
+    fields = getattr(voice_record(caplog), "sturnus_fields", {})
     assert fields["error_type"] == "RuntimeError"
-    assert caplog.records[0].exc_info is not None, "the cause is carried, not summarised away"
+    assert voice_record(caplog).exc_info is not None, "the cause is carried, not summarised away"
 
 
 async def test_a_stop_we_asked_for_is_not_reported_as_a_failure() -> None:
@@ -345,7 +368,7 @@ async def test_the_drain_survives_a_handler_that_raises(
     # (`_MESSAGE_ERROR_LOG_EVERY`); rate and severity are separate
     # decisions, and lowering the severity to buy quiet costs the one
     # signal that says a human should look.
-    assert caplog.records[0].levelno == logging.ERROR
+    assert voice_record(caplog).levelno == logging.ERROR
 
 
 async def test_emit_before_join_is_a_no_op_rather_than_a_crash() -> None:
@@ -569,7 +592,7 @@ async def test_capture_dropped_from_voice_reports_the_close_code(
     with caplog.at_level(logging.ERROR, logger=VOICE_LOGGER):
         await voice._handle(CaptureStopped(_connection_closed(code)))
 
-    fields = getattr(caplog.records[0], "sturnus_fields", {})
+    fields = getattr(voice_record(caplog), "sturnus_fields", {})
     assert fields["close_code"] == code, what_it_means
     assert fields["error_type"] == "ConnectionClosed"
 
@@ -588,4 +611,4 @@ async def test_a_stop_with_no_close_code_reports_none_rather_than_inventing_one(
     with caplog.at_level(logging.ERROR, logger=VOICE_LOGGER):
         await voice._handle(CaptureStopped(OpusNotLoaded()))
 
-    assert getattr(caplog.records[0], "sturnus_fields", {})["close_code"] is None
+    assert getattr(voice_record(caplog), "sturnus_fields", {})["close_code"] is None
