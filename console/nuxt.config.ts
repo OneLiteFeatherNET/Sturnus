@@ -46,6 +46,15 @@ export default defineNuxtConfig({
     },
   },
 
+  routeRules: {
+    // The bot's configuration used to live at `/settings`, before there
+    // was an Admin View for it to sit inside. The old address is kept as a
+    // permanent redirect rather than deleted: it is in browser histories
+    // and in whatever anybody pasted into a chat, and a 404 there teaches
+    // people the console loses pages.
+    '/settings': { redirect: { to: '/admin/bot-settings', statusCode: 301 } },
+  },
+
   nitro: {
     // The container runs this as a plain Node server behind a Service.
     preset: 'node-server',
