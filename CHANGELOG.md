@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.15.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.14.0...v0.15.0) (2026-08-23)
+
+
+### Features
+
+* **api:** let a person tell the console who they are and how they want it ([#120](https://github.com/OneLiteFeatherNET/Sturnus/issues/120)) ([d5772fd](https://github.com/OneLiteFeatherNET/Sturnus/commit/d5772fd48e06814351a1d2b2a4c2967b3cea2602))
+* **api:** let somebody consent to audio without consenting to video ([#123](https://github.com/OneLiteFeatherNET/Sturnus/issues/123)) ([12b5c3d](https://github.com/OneLiteFeatherNET/Sturnus/commit/12b5c3d79cf143ba04ef2788c10e19f418527d02))
+* **api:** let the queue tell the console when it moves, instead of being asked ([#117](https://github.com/OneLiteFeatherNET/Sturnus/issues/117)) ([2a5cde6](https://github.com/OneLiteFeatherNET/Sturnus/commit/2a5cde6d526cfff4c659e28dfe2092fb5f92b254))
+* **api:** mirror the names behind the ids the console makes people type ([#116](https://github.com/OneLiteFeatherNET/Sturnus/issues/116)) ([4f711f0](https://github.com/OneLiteFeatherNET/Sturnus/commit/4f711f0c31869e5c8a50debadda15963840a5a37))
+* **bot:** let a guild name every channel the bot may record in, not just one ([#118](https://github.com/OneLiteFeatherNET/Sturnus/issues/118)) ([0109c44](https://github.com/OneLiteFeatherNET/Sturnus/commit/0109c44d451c4cfb4e21c6e9e8e43cb46f8d6140))
+* **bot:** make a recording a property of a room rather than of a server ([#126](https://github.com/OneLiteFeatherNET/Sturnus/issues/126)) ([38c3173](https://github.com/OneLiteFeatherNET/Sturnus/commit/38c3173d2008288158ce90c6888aa5de795078ec))
+* **console:** give a person a menu of their own, and a theme they chose ([#121](https://github.com/OneLiteFeatherNET/Sturnus/issues/121)) ([cc24930](https://github.com/OneLiteFeatherNET/Sturnus/commit/cc24930b265d2cc9ac7aa2bc25efc1da0b12dc23))
+* **console:** let a person decide what may be recorded of them ([#124](https://github.com/OneLiteFeatherNET/Sturnus/issues/124)) ([b9a1d27](https://github.com/OneLiteFeatherNET/Sturnus/commit/b9a1d27fd08e6272ff965528e87c5fb8c6a53a25))
+* **console:** let the console speak a reader's language ([#115](https://github.com/OneLiteFeatherNET/Sturnus/issues/115)) ([97bae45](https://github.com/OneLiteFeatherNET/Sturnus/commit/97bae456a73715d195b9972524850fd6e1d8a03a))
+* **console:** put the thing a reader came to do on the page they land on ([#127](https://github.com/OneLiteFeatherNET/Sturnus/issues/127)) ([cf5e941](https://github.com/OneLiteFeatherNET/Sturnus/commit/cf5e9413ed8c51f78892a654748d4f843f554c59))
+* **console:** show that something is happening, and let a reader turn that off ([#119](https://github.com/OneLiteFeatherNET/Sturnus/issues/119)) ([efed253](https://github.com/OneLiteFeatherNET/Sturnus/commit/efed253c6a766cdf091eecfcf4cfd4379ebede34))
+* **console:** stop asking an administrator to paste snowflakes ([#122](https://github.com/OneLiteFeatherNET/Sturnus/issues/122)) ([06e7331](https://github.com/OneLiteFeatherNET/Sturnus/commit/06e7331fc2b32d4ced499e70ae50e5f91e995b92))
+* **console:** translate the pages a participant actually reads ([#125](https://github.com/OneLiteFeatherNET/Sturnus/issues/125)) ([9a41492](https://github.com/OneLiteFeatherNET/Sturnus/commit/9a414929cf5b1abd69630bf32325effde13381e4))
+
+
+### Bug Fixes
+
+* **console:** let the quick-settings tests use the rule that ships ([#129](https://github.com/OneLiteFeatherNET/Sturnus/issues/129)) ([24ef538](https://github.com/OneLiteFeatherNET/Sturnus/commit/24ef538908604969f77f559048f16af7c87fad3f))
+
 ## [0.14.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.13.0...v0.14.0) (2026-08-22)
 
 
