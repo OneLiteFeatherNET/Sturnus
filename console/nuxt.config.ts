@@ -17,7 +17,46 @@ export default defineNuxtConfig({
 
   devtools: { enabled: false },
 
-  modules: ['@nuxt/eslint'],
+  modules: ['@nuxt/eslint', '@nuxtjs/i18n'],
+
+  i18n: {
+    // **No locale in the URL.** The console is one application behind one
+    // session cookie, not a public site that a search engine needs to index
+    // twice. `/de/recordings/...` would buy nothing anybody asked for and
+    // would cost every link in the app and every bookmark anybody has: the
+    // address of a recording would depend on the language its reader
+    // happened to be using, so a link pasted into a chat would carry the
+    // sender's language to whoever opened it.
+    strategy: 'no_prefix',
+
+    // English is the source language, and the one every key is written in
+    // first. German is a translation of it -- see `i18n/README.md`.
+    defaultLocale: 'en',
+    locales: [
+      { code: 'en', language: 'en-GB', name: 'English', file: 'en.json' },
+      { code: 'de', language: 'de-DE', name: 'Deutsch', file: 'de.json' },
+    ],
+
+    detectBrowserLanguage: {
+      // A stored choice wins; failing that the browser's `Accept-Language`;
+      // failing that English.
+      //
+      // **The choice is a cookie, not `localStorage`.** This console renders
+      // on the server, and the server is where the first paint is decided --
+      // a cookie travels with the request, so the very first HTML is already
+      // in the right language. A choice kept in `localStorage` is readable
+      // only after hydration, which means every first paint of every visit
+      // would render English and then swap to German in front of the reader.
+      useCookie: true,
+      cookieKey: 'sturnus_locale',
+      // Honour the stored choice on every request rather than only the
+      // first: with `no_prefix` there is no URL to infer a language from,
+      // so the cookie is the only thing that remembers.
+      alwaysRedirect: true,
+      redirectOn: 'all',
+      fallbackLocale: 'en',
+    },
+  },
 
   css: ['~/assets/css/main.css'],
 

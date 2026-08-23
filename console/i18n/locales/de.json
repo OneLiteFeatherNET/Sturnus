@@ -1,0 +1,37 @@
+{
+  "common": {
+    "brand": "Sturnus"
+  },
+  "nav": {
+    "sections": "Bereiche",
+    "toggle": "Navigationsbeschriftungen umschalten",
+    "userView": "Benutzeransicht",
+    "adminView": "Verwaltungsansicht",
+    "dashboard": "Übersicht",
+    "recordings": "Aufnahmen",
+    "calendar": "Kalender",
+    "botSettings": "Bot-Einstellungen",
+    "userSettings": "Benutzereinstellungen",
+    "queue": "Warteschlange",
+    "reporting": "Auswertung"
+  },
+  "auth": {
+    "signIn": "Anmelden",
+    "signOut": "Abmelden",
+    "signInWithOutline": "Mit Outline anmelden",
+    "tagline": "Besprechungsprotokolle und die Aufnahmen dahinter.",
+    "notLinkedHeading": "Dieses Konto ist noch nicht verknüpft.",
+    "notLinkedBody": "Dazu {command} in Discord ausführen und sich danach erneut anmelden. Die Konsole findet Aufnahmen über das Discord-Konto, und die Verknüpfung stellt diese Verbindung her."
+  },
+  "error": {
+    "notFoundHeading": "Diese Seite gibt es nicht",
+    "notFoundDetail": "Die Adresse ist falsch, oder die Seite ist umgezogen.",
+    "unreachableHeading": "Sturnus antwortet nicht",
+    "unreachableDetail": "Die Konsole hat den Browser erreicht, aber nicht den Dienst dahinter. Das ist kein Anmeldeproblem — eine erneute Anmeldung hilft nicht. Meist startet der Dienst gerade neu, und meist erledigt sich das innerhalb einer Minute.",
+    "genericHeading": "Etwas ist schiefgelaufen",
+    "genericDetail": "Die Konsole konnte diese Seite nicht laden. Ein zweiter Versuch lohnt sich; bleibt es dabei, liegt es eher am Dienst als an der Seite.",
+    "retry": "Erneut versuchen",
+    "goToSignIn": "Zur Anmeldung",
+    "status": "Status {code}"
+  }
+}

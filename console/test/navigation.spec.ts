@@ -5,6 +5,9 @@
  * exactly this reason: what belongs in the navigation is a decision, and a
  * decision embedded in a template can only be tested by rendering one.
  */
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import {
@@ -16,21 +19,30 @@ import {
   visibleSections,
 } from '../app/utils/navigation'
 
+/** Read rather than imported, the way `palette.spec.ts` reads the
+ *  stylesheet: what ships is the file, so the file is what is checked. */
+function messages(locale: 'en' | 'de'): Record<string, Record<string, string>> {
+  return JSON.parse(readFileSync(resolve(process.cwd(), `i18n/locales/${locale}.json`), 'utf8'))
+}
+
+const EN = messages('en')
+const DE = messages('de')
+
 const ADMIN = { is_admin: true }
 const PARTICIPANT = { is_admin: false }
 
 describe('the navigation', () => {
   it('separates what a person does with their own recordings from what an administrator does', () => {
-    expect(NAV_SECTIONS.map((s) => s.label)).toEqual(['User View', 'Admin View'])
+    expect(NAV_SECTIONS.map((s) => s.labelKey)).toEqual(['nav.userView', 'nav.adminView'])
   })
 
   it('puts the personal sections first', () => {
     // A participant who administers nothing is the common case, and their
     // sections should not be below a heading they never see.
-    expect(USER_VIEW.entries.map((e) => e.label)).toEqual([
-      'Dashboard',
-      'Recordings',
-      'Calendar',
+    expect(USER_VIEW.entries.map((e) => e.labelKey)).toEqual([
+      'nav.dashboard',
+      'nav.recordings',
+      'nav.calendar',
     ])
   })
 
@@ -38,8 +50,38 @@ describe('the navigation', () => {
     // Collapsed, the sidebar is icons alone. An icon rail whose entries
     // announce nothing is a rail only its author can navigate.
     for (const entry of NAV_ENTRIES) {
-      expect(entry.label.trim()).not.toBe('')
+      expect(entry.labelKey.trim()).not.toBe('')
       expect(entry.icon.trim()).not.toBe('')
+    }
+  })
+
+  it('names every entry with a key rather than with English', () => {
+    // The label a pure module returns is data, not words -- see the note at
+    // the top of `navigation.ts`. A sentence that slipped back in here
+    // would render identically in English and be untranslatable in German,
+    // which is the failure that shows up only for a reader who does not
+    // speak English.
+    for (const named of [...NAV_ENTRIES, ...NAV_SECTIONS]) {
+      expect(named.labelKey).toMatch(/^nav\.[a-z][A-Za-z]*$/)
+    }
+  })
+
+  it('gives every entry and section a key of its own', () => {
+    // Two entries sharing a key is one label that changes in two places at
+    // once, which is how "Queue" ends up over the reporting page.
+    const keys = [...NAV_ENTRIES, ...NAV_SECTIONS].map((named) => named.labelKey)
+    expect(new Set(keys).size).toBe(keys.length)
+  })
+
+  it('has a translation for every key it names, in both languages', () => {
+    // The whole point of a key is that something else turns it into words.
+    // A key nothing translates renders as itself: `nav.reporting`, in the
+    // sidebar, in every language.
+    for (const messages of [EN, DE]) {
+      for (const named of [...NAV_ENTRIES, ...NAV_SECTIONS]) {
+        const [namespace, name] = named.labelKey.split('.')
+        expect(messages[namespace!]?.[name!], `${named.labelKey} is untranslated`).toBeTruthy()
+      }
     }
   })
 
@@ -61,19 +103,19 @@ describe('who is offered the Admin View', () => {
   })
 
   it('offers the bot settings to an administrator', () => {
-    expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('Bot Settings')
+    expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.botSettings')
   })
 
   it('offers the user settings to an administrator', () => {
-    expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('User Settings')
+    expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.userSettings')
   })
 
   it('offers the queue to an administrator', () => {
-    expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('Queue')
+    expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.queue')
   })
 
   it('offers the reporting to an administrator', () => {
-    expect(visibleEntries(ADMIN).map((e) => e.label)).toContain('Reporting')
+    expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.reporting')
   })
 
   it('hides the reporting from somebody who administers nothing', () => {
@@ -83,16 +125,16 @@ describe('who is offered the Admin View', () => {
     // read. The endpoint answers 404 to them, the same answer it gives for
     // a server that does not exist, so an entry left visible would offer a
     // page that can only ever refuse them.
-    expect(visibleEntries(PARTICIPANT).map((e) => e.label)).not.toContain('Reporting')
-    expect(visibleEntries(null).map((e) => e.label)).not.toContain('Reporting')
+    expect(visibleEntries(PARTICIPANT).map((e) => e.labelKey)).not.toContain('nav.reporting')
+    expect(visibleEntries(null).map((e) => e.labelKey)).not.toContain('nav.reporting')
   })
 
   it('hides the queue from somebody who administers nothing', () => {
     // The queue endpoint answers 404 to a non-administrator -- the same
     // answer it gives for a guild that does not exist -- so an entry left
     // visible would offer a page that can only ever refuse them.
-    expect(visibleEntries(PARTICIPANT).map((e) => e.label)).not.toContain('Queue')
-    expect(visibleEntries(null).map((e) => e.label)).not.toContain('Queue')
+    expect(visibleEntries(PARTICIPANT).map((e) => e.labelKey)).not.toContain('nav.queue')
+    expect(visibleEntries(null).map((e) => e.labelKey)).not.toContain('nav.queue')
   })
 
   it('lists the daily work first and the thing gone wrong last', () => {
@@ -104,20 +146,20 @@ describe('who is offered the Admin View', () => {
     // Reporting is last because it is the only entry nothing is ever
     // wrong on: it is read on a schedule, or when somebody asks how much
     // this server actually uses Sturnus, and never in a hurry.
-    expect(ADMIN_VIEW.entries.map((e) => e.label)).toEqual([
-      'Bot Settings',
-      'User Settings',
-      'Queue',
-      'Reporting',
+    expect(ADMIN_VIEW.entries.map((e) => e.labelKey)).toEqual([
+      'nav.botSettings',
+      'nav.userSettings',
+      'nav.queue',
+      'nav.reporting',
     ])
   })
 
   it('hides it from somebody who administers nothing', () => {
-    expect(visibleSections(PARTICIPANT).map((s) => s.label)).toEqual(['User View'])
+    expect(visibleSections(PARTICIPANT).map((s) => s.labelKey)).toEqual(['nav.userView'])
   })
 
   it('hides it when nobody is signed in', () => {
-    expect(visibleSections(null).map((s) => s.label)).toEqual(['User View'])
+    expect(visibleSections(null).map((s) => s.labelKey)).toEqual(['nav.userView'])
   })
 
   it('never renders a heading over an empty section', () => {
@@ -134,13 +176,13 @@ describe('who is offered the Admin View', () => {
     // Hiding a section is a courtesy to the person looking at the screen,
     // never a control -- so it applies to exactly the entries whose
     // endpoints refuse a non-administrator, and to nothing else.
-    const forEveryone = NAV_ENTRIES.filter((e) => !e.adminOnly).map((e) => e.label)
-    expect(visibleEntries(PARTICIPANT).map((e) => e.label)).toEqual(forEveryone)
+    const forEveryone = NAV_ENTRIES.filter((e) => !e.adminOnly).map((e) => e.labelKey)
+    expect(visibleEntries(PARTICIPANT).map((e) => e.labelKey)).toEqual(forEveryone)
   })
 
   it('offers an administrator everything a participant is offered, and more', () => {
-    const asParticipant = visibleEntries(PARTICIPANT).map((e) => e.label)
-    const asAdmin = visibleEntries(ADMIN).map((e) => e.label)
+    const asParticipant = visibleEntries(PARTICIPANT).map((e) => e.labelKey)
+    const asAdmin = visibleEntries(ADMIN).map((e) => e.labelKey)
     for (const label of asParticipant) {
       expect(asAdmin).toContain(label)
     }

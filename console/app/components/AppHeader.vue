@@ -30,7 +30,7 @@ async function signOut() {
       class="rounded-lg p-2 transition-colors hover:bg-[var(--surface-raised)]"
       :aria-expanded="!collapsed"
       aria-controls="sidebar"
-      aria-label="Toggle navigation labels"
+      :aria-label="$t('nav.toggle')"
       @click="toggle"
     >
       <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor">
@@ -40,7 +40,7 @@ async function signOut() {
 
     <NuxtLink to="/" class="flex items-center gap-2">
       <SturnusMark :size="26" />
-      <span class="text-base font-semibold tracking-tight">Sturnus</span>
+      <span class="text-base font-semibold tracking-tight">{{ $t('common.brand') }}</span>
     </NuxtLink>
 
     <div class="ml-auto flex items-center gap-3">
@@ -51,7 +51,7 @@ async function signOut() {
         :style="{ color: 'var(--text-muted)' }"
         @click="signOut"
       >
-        Sign out
+        {{ $t('auth.signOut') }}
       </button>
     </div>
   </header>

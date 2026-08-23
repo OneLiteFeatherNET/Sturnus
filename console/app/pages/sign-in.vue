@@ -7,7 +7,9 @@
  * it.
  */
 definePageMeta({ layout: 'anonymous' })
-useHead({ title: 'Sign in' })
+
+const { t } = useI18n()
+useHead({ title: () => t('auth.signIn') })
 
 const route = useRoute()
 
@@ -26,9 +28,9 @@ const notLinked = computed(() => route.query.error === 'not-linked')
     <div class="mb-6 flex justify-center">
       <SturnusMark :size="56" />
     </div>
-    <h1 class="mb-2 text-xl font-semibold">Sturnus</h1>
+    <h1 class="mb-2 text-xl font-semibold">{{ $t('common.brand') }}</h1>
     <p class="mb-8 text-sm" :style="{ color: 'var(--text-muted)' }">
-      Meeting protocols, and the recordings behind them.
+      {{ $t('auth.tagline') }}
     </p>
 
     <div
@@ -36,12 +38,22 @@ const notLinked = computed(() => route.query.error === 'not-linked')
       class="mb-6 rounded-lg border p-4 text-left text-sm"
       :style="{ borderColor: 'var(--color-brand-yellow)' }"
     >
-      <p class="mb-1 font-medium">Your account is not linked yet.</p>
-      <p :style="{ color: 'var(--text-muted)' }">
-        Run <code class="rounded bg-[var(--surface-raised)] px-1">/link</code> in Discord, then
-        sign in again. The console finds your recordings by your Discord account, and the link is
-        what connects the two.
-      </p>
+      <p class="mb-1 font-medium">{{ $t('auth.notLinkedHeading') }}</p>
+      <!-- `i18n-t` rather than three concatenated fragments: the command has
+           to sit inside a sentence, and where in the sentence it sits is a
+           property of the language. German puts it second and English puts
+           it second only by coincidence -- splitting the sentence around the
+           `<code>` would have hard-coded the English word order into every
+           translation of it. -->
+      <i18n-t
+        keypath="auth.notLinkedBody"
+        tag="p"
+        :style="{ color: 'var(--text-muted)' }"
+      >
+        <template #command>
+          <code class="rounded bg-[var(--surface-raised)] px-1">/link</code>
+        </template>
+      </i18n-t>
     </div>
 
     <a
@@ -51,7 +63,7 @@ const notLinked = computed(() => route.query.error === 'not-linked')
         background: 'linear-gradient(120deg, var(--color-brand-blue), var(--color-brand-magenta))',
       }"
     >
-      Sign in with Outline
+      {{ $t('auth.signInWithOutline') }}
     </a>
   </div>
 </template>
