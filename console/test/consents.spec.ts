@@ -23,7 +23,6 @@ import {
   describeConsentError,
   describeRefusal,
   grantedLine,
-  identityNote,
   isStaleRow,
   orderConsents,
   parseConsents,
@@ -167,20 +166,23 @@ describe('naming a person', () => {
     )
   })
 
-  it('says plainly that a nameless row is showing an id', () => {
-    const note = identityNote(row({ discord_user_id: '100' }))!
-    expect(note).toContain('Discord user id')
+  it('lets a caller supply a better name than it could derive', () => {
+    // The roster resolves the nameless against the guild directory. A
+    // confirmation reading "Withdraw Discord user 100's consent?" under a
+    // row headed "Ada Lovelace" is one the reader cannot match to the
+    // thing they clicked.
+    const nameless = row({ discord_user_id: '100', display_name: null })
+    expect(revokeConfirmation(nameless, 'Ada Lovelace').title).toContain('Ada Lovelace')
+    expect(recordingsKeptNote(nameless, 'Ada Lovelace')).toContain('Ada Lovelace')
+    expect(
+      revokeOutcome(nameless, { revoked: true, refusal: null, effective_at: null, recordings_from_effective_at: 0 }, 'Ada Lovelace').headline,
+    ).toContain('Ada Lovelace')
   })
 
-  it('explains why there is no name rather than looking broken', () => {
-    // A bare snowflake where every other row has a name reads as a fault in
-    // the console. It is not: consent is given in a command, and a name is
-    // only learned in a recorded session.
-    expect(identityNote(row({ discord_user_id: '100' }))!).toContain('recorded session')
-  })
-
-  it('says nothing at all when there is a name', () => {
-    expect(identityNote(row({ discord_user_id: '100', display_name: 'Anna' }))).toBeNull()
+  it('still derives one when the caller has nothing better', () => {
+    expect(revokeConfirmation(row({ discord_user_id: '100', display_name: null })).title).toContain(
+      'Discord user 100',
+    )
   })
 })
 
@@ -493,6 +495,16 @@ describe('when the API says no', () => {
     const said = describeConsentError(failure(404))
     expect(said).toContain('no longer administer it')
     expect(said.toLowerCase()).toContain('same')
+  })
+
+  it('explains a 400 as a request the console built, not a guild that refused', () => {
+    // Two requests on this page earn one: a page of the roster that does
+    // not exist, and a withdrawal naming a set of people the API will not
+    // take. The sentence has to be true of both, and it has to say that
+    // nothing changed — otherwise a stale bookmark reads as a failed write.
+    const said = describeConsentError(failure(400))
+    expect(said.toLowerCase()).toContain('does not exist')
+    expect(said).toContain('Nothing was changed')
   })
 
   it('describes a 409 as the row being out of date', () => {
