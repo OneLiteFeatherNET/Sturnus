@@ -44,6 +44,41 @@ TIMEZONE = "timezone"
 TRANSCRIPTION_LANGUAGE = "transcription_language"
 TRANSCRIPTION_PROMPT = "transcription_prompt"
 
+#: How many of one meeting's speaker tracks may be transcribed at the same
+#: time. A four-speaker meeting is four independent jobs -- different
+#: audio, different rows, no ordering between them -- and the queue has
+#: always been safe to claim from concurrently. This is the limit that
+#: makes claiming them concurrently *fair*: without it, one eight-speaker
+#: meeting takes every worker in the pool and every other guild's meeting
+#: waits behind all eight.
+#:
+#: It caps a **session's share of the worker pool**, not a worker's memory.
+#: Peak memory is set by how many worker replicas run, since each is its
+#: own process with its own model (`infrastructure.whisper.WhisperEngine`
+#: caches loaded models forever and unbounded, deliberately); this key
+#: cannot bound that and does not pretend to. What it bounds is latency
+#: for everyone else.
+MAX_PARALLEL_TRACKS = "max_parallel_tracks"
+
+#: Two, and the argument is that it is the smallest number that is
+#: actually parallel.
+#:
+#: One would mean the setting is off by default: an operator who scaled
+#: the worker out would see a single meeting transcribed exactly as slowly
+#: as before and no way to tell why, since the extra workers would be
+#: idling on a queue that is visibly not empty. So the default has to be
+#: at least two for scaling out to do anything at all for the common case,
+#: which is one guild, one meeting, several speakers.
+#:
+#: Higher is the direction with the real cost and it is not paid by the
+#: guild that benefits: a meeting allowed four slots in a pool of four
+#: workers starves every other guild for as long as it takes to transcribe
+#: it, and transcription is measured in minutes per speaker. Two halves a
+#: meeting's wall-clock time while leaving at least half of a two-worker
+#: pool available to whoever is next. A deployment that has measured its
+#: own pool can raise it per guild; nobody has to lower it to be safe.
+DEFAULT_MAX_PARALLEL_TRACKS = 2
+
 #: Whether this guild may offer the `audio_video` consent scope at all.
 #:
 #: A consent record naming `audio_video` under a policy document that
@@ -87,6 +122,7 @@ DEFAULTS: dict[str, str] = {
     DOCUMENT_PROVIDER: "outline",
     AUDIO_RETENTION_DAYS: "30",
     MERGE_GAP_SECONDS: "15",
+    MAX_PARALLEL_TRACKS: str(DEFAULT_MAX_PARALLEL_TRACKS),
     # Off, and this is the only defensible default: it says the policy
     # document has not been checked, which for every guild that has not
     # been asked is true. A default of `true` would assert something
@@ -167,6 +203,7 @@ INTEGER_KEYS: frozenset[str] = frozenset(
         AUDIO_RETENTION_DAYS,
         MERGE_GAP_SECONDS,
         ADMIN_ROLE_ID,
+        MAX_PARALLEL_TRACKS,
     }
 )
 

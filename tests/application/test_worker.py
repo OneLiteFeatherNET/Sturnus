@@ -25,6 +25,12 @@ from sturnus.infrastructure.documents.outline import PermanentDocumentError
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 
+#: The instant every fake claim was stamped with. `process_one` has to
+#: hand this back to `complete` and `fail` -- it is the queue's proof that
+#: the job is still this worker's -- so it is a fixed, recognisable value
+#: rather than "whatever the clock said".
+CLAIMED_AT = T0 + timedelta(minutes=5)
+
 #: The guild every `FakeSessions` reports by default -- matches
 #: `FakeConfig`'s default guild below, so a test that overrides neither
 #: still exercises real guild-scoped config resolution rather than a
@@ -39,22 +45,36 @@ class FakeQueue:
         self.failed: list[tuple[int, str]] = []
         self.last_is_final = False
         self.measured: list[JobMeasurements | None] = []
+        #: Every lease presented back to this queue, in order. Kept apart
+        #: from `completed`/`failed` for the same reason `measured` is:
+        #: the assertions that predate the fencing token do not care about
+        #: it and should not have to say so.
+        self.leases: list[datetime | None] = []
 
     async def claim(self) -> object | None:
         return self.jobs.pop(0) if self.jobs else None
 
     async def complete(
-        self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+        self,
+        job_id: int,
+        transcript: str,
+        measurements: JobMeasurements | None = None,
+        *,
+        lease: datetime | None = None,
     ) -> bool:
         self.completed.append((job_id, transcript))
         # Kept separately from `completed` so a test can assert on what was
         # measured without every existing assertion on that list having to
         # grow a third element it does not care about.
         self.measured.append(measurements)
+        self.leases.append(lease)
         return self.last_is_final
 
-    async def fail(self, job_id: int, error: str, _max_attempts: int) -> bool:
+    async def fail(
+        self, job_id: int, error: str, _max_attempts: int, *, lease: datetime | None = None
+    ) -> bool:
         self.failed.append((job_id, error))
+        self.leases.append(lease)
         # Never dead: this fake counts no attempts, and the real
         # `JobQueue.fail` is where "out of attempts" is decided and tested
         # (`tests/infrastructure/test_queue.py`).
@@ -287,6 +307,7 @@ def job(job_id: int = 1, session_id: int = 1, user_id: int = 100) -> ClaimedJob:
         s3_key=f"sessions/{session_id}/speakers/{user_id}.enc",
         encryption_key_id="k1",
         wrapped_data_key=b"wrapped",
+        claimed_at=CLAIMED_AT,
     )
 
 
@@ -319,6 +340,34 @@ async def test_a_successful_job_is_completed_with_its_transcript(tmp_path: Path)
     assert len(queue.completed) == 1
     assert "spoken words" in queue.completed[0][1]
     assert queue.failed == []
+
+
+async def test_a_worker_reports_back_under_the_claim_it_is_holding(tmp_path: Path) -> None:
+    """The transcript is written against the claim, not against the job id.
+
+    A transcription can outlive its lease, and then a second worker holds
+    the job while this one is still decoding it. The queue can only refuse
+    the loser's write if the loser says which claim it is writing under, so
+    `process_one` has to hand back the `claimed_at` it was given -- and
+    nothing else in this file would notice if it stopped.
+    """
+    queue = FakeQueue([job()])
+
+    await process_one(**run(tmp_path, queue=queue))
+
+    assert queue.leases == [CLAIMED_AT]
+
+
+async def test_a_failure_is_reported_under_the_claim_too(tmp_path: Path) -> None:
+    """`fail` needs the fence more than `complete` does: a failure from a
+    worker that has already lost the job would return a recording somebody
+    else is busy transcribing to the queue, or write it off as dead."""
+    queue = FakeQueue([job()])
+
+    await process_one(**run(tmp_path, queue=queue, engine=FakeEngine(fail=True)))
+
+    assert queue.failed
+    assert queue.leases == [CLAIMED_AT]
 
 
 async def test_no_plaintext_audio_survives_a_successful_job(tmp_path: Path) -> None:

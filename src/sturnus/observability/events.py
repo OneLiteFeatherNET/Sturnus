@@ -106,6 +106,11 @@ class Event(StrEnum):
     TRANSCRIPTION_DECODED = "transcription.decoded"
     JOB_FAILED = "job.failed"
     JOB_DEAD = "job.dead"
+    #: A worker finished a job it no longer holds: its lease expired
+    #: mid-transcription and a second worker took the job over. The work
+    #: is discarded rather than applied -- see
+    #: `sturnus.infrastructure.db.queue._report_lost_claim`.
+    JOB_CLAIM_LOST = "job.claim_lost"
     KEY_ID_MISMATCH = "key.id_mismatch"
     SESSION_DOCUMENT_CREATED = "session.document_created"
     SESSION_DOCUMENT_REJECTED = "session.document_rejected"

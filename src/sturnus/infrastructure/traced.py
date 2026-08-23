@@ -112,7 +112,12 @@ class TracedQueue:
         return claimed
 
     async def complete(
-        self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+        self,
+        job_id: int,
+        transcript: str,
+        measurements: JobMeasurements | None = None,
+        *,
+        lease: datetime | None = None,
     ) -> bool:
         # `transcript` is passed straight through and never observed: it is
         # the protected content itself, and the only thing worth recording
@@ -129,7 +134,7 @@ class TracedQueue:
                     speech_seconds=round(measurements.speech_seconds, 3),
                     segment_count=measurements.segment_count,
                 )
-            is_last = await self._inner.complete(job_id, transcript, measurements)
+            is_last = await self._inner.complete(job_id, transcript, measurements, lease=lease)
         # `outcome` lands on the enclosing `job.process` span, the same
         # place and for the same reason as `claim`'s ids: the root span is
         # opened before anything is known and cannot label itself
@@ -139,12 +144,14 @@ class TracedQueue:
         set_current_span_fields(is_last=is_last, outcome="done")
         return is_last
 
-    async def fail(self, job_id: int, error: str, max_attempts: int) -> bool:
+    async def fail(
+        self, job_id: int, error: str, max_attempts: int, *, lease: datetime | None = None
+    ) -> bool:
         # `error` is `str(exc)` from `process_one`. It goes to the database
         # column an operator queries deliberately, and it does **not** go on
         # the span -- see `telemetry.fail_span`.
         with span("job.fail", job_id=job_id, max_attempts=max_attempts):
-            dead = await self._inner.fail(job_id, error, max_attempts)
+            dead = await self._inner.fail(job_id, error, max_attempts, lease=lease)
         # `dead` and `failed` are different operational stories -- one is a
         # recording that will never exist, the other is a retry -- so the
         # root span distinguishes them exactly as the counter does.

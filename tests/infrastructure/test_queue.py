@@ -3,16 +3,24 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from sturnus.domain import settings
 from sturnus.domain.measurements import JobMeasurements
-from sturnus.infrastructure.db.models import Base, TranscriptionJob
+from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.models import Base, GuildConfig, Session, TranscriptionJob
 from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import JobRepository, SessionRepository
 from sturnus.infrastructure.telemetry import JOB_OUTCOME, record
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 GUILD, CHANNEL, ANNA, BEN = 1, 2, 100, 200
+#: Two more speakers and a second guild, for the parallel-tracks cap: the
+#: cap is only observable on a session with more speakers than the cap,
+#: and "per guild" is only observable against a second guild.
+CARLA, DORA = 300, 400
+OTHER_GUILD, OTHER_CHANNEL = 11, 12
 
 
 @pytest.fixture
@@ -23,10 +31,15 @@ async def factory(clean_database: str) -> async_sessionmaker[AsyncSession]:
     return async_sessionmaker(engine, expire_on_commit=False)
 
 
-async def seed(factory: async_sessionmaker[AsyncSession], speakers: list[int]) -> int:
+async def seed(
+    factory: async_sessionmaker[AsyncSession],
+    speakers: list[int],
+    guild: int = GUILD,
+    channel: int = CHANNEL,
+) -> int:
     sessions = SessionRepository(factory)
     jobs = JobRepository(factory)
-    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    session_id = await sessions.open_session(guild, channel, "meeting-raum", T0)
     for user_id in speakers:
         await sessions.add_participant(session_id, user_id, f"user{user_id}", T0)
         await jobs.enqueue(
@@ -490,3 +503,352 @@ async def test_measurements_do_not_change_whether_a_job_was_the_last(
     second = await queue.claim()
     assert second is not None
     assert await queue.complete(second.id, "b", JobMeasurements(20.0, 6.0, 2)) is True
+
+
+# ---------------------------------------------------------------------------
+# `max_parallel_tracks`: how much of the worker pool one meeting may take
+#
+# A four-speaker meeting is four independent jobs. Two workers may take two
+# of them safely -- `claim` has always been serialised by `FOR UPDATE SKIP
+# LOCKED` -- but nothing stopped one session from occupying *every* worker
+# while a second guild's meeting waited behind all of it. These tests are
+# the cap, and the last of them is the only one that can prove it: real
+# claimers, running at the same time, against a real PostgreSQL.
+# ---------------------------------------------------------------------------
+
+
+async def set_cap(factory: async_sessionmaker[AsyncSession], guild: int, value: str) -> None:
+    """Sets `max_parallel_tracks` for a guild the way an administrator does."""
+    await ConfigStore(factory).set(guild, settings.MAX_PARALLEL_TRACKS, value, T0)
+
+
+async def store_raw(factory: async_sessionmaker[AsyncSession], guild: int, value: str) -> None:
+    """Puts a value in `guild_config` that `ConfigStore.set` would refuse.
+
+    `docs/operations.md` section 4.1 tells operators they may edit
+    `guild_config` with SQL, so the read path has to survive what that
+    lets in -- and the read path here is the claim statement itself.
+    """
+    async with factory() as session:
+        session.add(
+            GuildConfig(
+                guild_id=guild, key=settings.MAX_PARALLEL_TRACKS, value=value, updated_at=T0
+            )
+        )
+        await session.commit()
+
+
+async def running_tracks(factory: async_sessionmaker[AsyncSession], session_id: int) -> int:
+    async with factory() as session:
+        count = await session.scalar(
+            select(func.count())
+            .select_from(TranscriptionJob)
+            .where(
+                TranscriptionJob.session_id == session_id,
+                TranscriptionJob.status == "running",
+            )
+        )
+    return int(count or 0)
+
+
+async def forget_everything(factory: async_sessionmaker[AsyncSession]) -> None:
+    """Drops every session and, by cascade, every job.
+
+    The concurrency test below runs its scenario many times over, and a
+    claim is now ordered oldest-job-first across the whole queue: without
+    this, the second round would spend its claimers on the first round's
+    leftovers instead of on the session it just seeded.
+    """
+    async with factory() as session:
+        await session.execute(delete(Session))
+        await session.commit()
+
+
+async def test_a_session_is_claimed_only_up_to_its_guilds_parallel_track_limit(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Four speakers, a limit of two: the third claim finds nothing.
+
+    Not because the queue is empty -- two of this session's jobs are still
+    `pending` -- but because this meeting has already taken as much of the
+    pool as its guild allows it to.
+    """
+    await seed(factory, [ANNA, BEN, CARLA, DORA])
+    await set_cap(factory, GUILD, "2")
+    queue = JobQueue(factory)
+
+    assert await queue.claim() is not None
+    assert await queue.claim() is not None
+    assert await queue.claim() is None
+
+
+async def test_a_guild_that_has_named_no_limit_gets_the_conservative_default(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Nothing configured is the state of every guild that has never been
+    asked, so the default is what actually governs the deployment."""
+    await seed(factory, [ANNA, BEN, CARLA, DORA])
+    queue = JobQueue(factory)
+
+    claimed = [await queue.claim() for _ in range(4)]
+
+    assert sum(job is not None for job in claimed) == int(
+        settings.DEFAULTS[settings.MAX_PARALLEL_TRACKS]
+    )
+
+
+async def test_finishing_a_track_hands_the_slot_to_the_next_one(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The cap bounds how many run at once, never how many run in total."""
+    await seed(factory, [ANNA, BEN, CARLA, DORA])
+    await set_cap(factory, GUILD, "2")
+    queue = JobQueue(factory)
+
+    first = await queue.claim()
+    second = await queue.claim()
+    assert first is not None
+    assert second is not None
+    assert await queue.claim() is None
+
+    await queue.complete(first.id, "anna's words", lease=first.claimed_at)
+
+    third = await queue.claim()
+    assert third is not None
+    assert third.id not in {first.id, second.id}
+
+
+async def test_each_guild_is_capped_by_its_own_setting(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The setting is per guild and the claim statement is guild-agnostic,
+    so the one thing worth proving is that a candidate is measured against
+    *its own* guild's value rather than against whatever row of
+    `guild_config` happened to be found first."""
+    strict = await seed(factory, [ANNA, BEN, CARLA], guild=GUILD, channel=CHANNEL)
+    relaxed = await seed(factory, [ANNA, BEN, CARLA], guild=OTHER_GUILD, channel=OTHER_CHANNEL)
+    await set_cap(factory, GUILD, "1")
+    await set_cap(factory, OTHER_GUILD, "3")
+    queue = JobQueue(factory)
+
+    while await queue.claim() is not None:
+        pass
+
+    assert await running_tracks(factory, strict) == 1
+    assert await running_tracks(factory, relaxed) == 3
+
+
+async def test_a_hand_edited_limit_that_is_not_a_number_is_ignored_rather_than_fatal(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """One bad row must not stop the worker.
+
+    `ConfigStore.set` refuses a non-integer, but a direct `UPDATE` does
+    not -- and this value is read inside the claim statement, so a value
+    the database cannot cast would fail *every* claim for *every* guild,
+    not just this one's. The queue falls back to the default instead.
+    """
+    await seed(factory, [ANNA, BEN, CARLA])
+    await store_raw(factory, GUILD, "as many as possible")
+    queue = JobQueue(factory)
+
+    claimed = [await queue.claim() for _ in range(3)]
+
+    assert sum(job is not None for job in claimed) == int(
+        settings.DEFAULTS[settings.MAX_PARALLEL_TRACKS]
+    )
+
+
+async def test_a_meeting_at_its_limit_does_not_block_another_guilds_meeting(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The cap must filter candidates, never stop the scan.
+
+    A capped session's jobs are the oldest in the queue here, so a claim
+    that gave up at the first unclaimable row would report an empty queue
+    while another guild's meeting sat behind it untranscribed.
+    """
+    busy = await seed(factory, [ANNA, BEN, CARLA], guild=GUILD, channel=CHANNEL)
+    waiting = await seed(factory, [ANNA], guild=OTHER_GUILD, channel=OTHER_CHANNEL)
+    await set_cap(factory, GUILD, "1")
+    queue = JobQueue(factory)
+
+    claimed = [job for _ in range(3) if (job := await queue.claim()) is not None]
+
+    assert [job.session_id for job in claimed] == [busy, waiting]
+
+
+async def test_the_oldest_outstanding_track_is_claimed_first(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Oldest-first is the anti-starvation guarantee.
+
+    A session that keeps enqueuing gets *newer* job ids, which sort behind
+    everything already waiting -- so a busy guild can never push a quiet
+    one's meeting back indefinitely. Before this change `claim` had no
+    `ORDER BY` at all and took whatever the scan reached first.
+    """
+    await seed(factory, [ANNA, BEN], guild=GUILD, channel=CHANNEL)
+    await seed(factory, [CARLA, DORA], guild=OTHER_GUILD, channel=OTHER_CHANNEL)
+    queue = JobQueue(factory)
+
+    claimed = [job for _ in range(4) if (job := await queue.claim()) is not None]
+
+    assert [job.id for job in claimed] == sorted(job.id for job in claimed)
+
+
+async def test_a_second_meeting_is_served_before_a_capped_ones_remaining_tracks(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Oldest-first *and* the cap together, which is the whole point.
+
+    The four-speaker meeting is older and would take the entire pool
+    without a cap; the cap gives it two slots and the meeting behind it
+    gets served rather than waiting for two more transcriptions.
+    """
+    crowded = await seed(factory, [ANNA, BEN, CARLA, DORA], guild=GUILD, channel=CHANNEL)
+    later = await seed(factory, [ANNA], guild=OTHER_GUILD, channel=OTHER_CHANNEL)
+    await set_cap(factory, GUILD, "2")
+    queue = JobQueue(factory)
+
+    claimed = [job for _ in range(4) if (job := await queue.claim()) is not None]
+
+    assert [job.session_id for job in claimed] == [crowded, crowded, later]
+
+
+async def test_workers_claiming_at_the_same_instant_never_exceed_the_limit(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The test the cap exists for, and the only one that can prove it.
+
+    Six claimers, each on its own connection, released together against a
+    real PostgreSQL: `SKIP LOCKED` semantics cannot be faked, and a cap
+    that holds when claims are awaited one after another says nothing
+    about a cap under a pool of workers all polling the same queue.
+
+    Repeated, because a race that fires once in twenty runs is a race that
+    fires in production. Each round starts from an empty queue -- claims
+    are oldest-first, so the previous round's leftovers would otherwise be
+    what the next round's claimers found.
+    """
+    queue = JobQueue(factory)
+    cap = 2
+    for _ in range(20):
+        await forget_everything(factory)
+        session_id = await seed(factory, [ANNA, BEN, CARLA, DORA])
+        await set_cap(factory, GUILD, str(cap))
+
+        claimed = await asyncio.gather(*(queue.claim() for _ in range(6)))
+
+        taken = [job for job in claimed if job is not None]
+        assert len(taken) == cap, f"expected {cap} claims, got {len(taken)}"
+        assert len({job.id for job in taken}) == len(taken), "a job was claimed twice"
+        assert await running_tracks(factory, session_id) == cap
+
+
+# ---------------------------------------------------------------------------
+# The lease as a fencing token: what a worker may still do to a job that has
+# been taken away from it
+#
+# Nothing renews a lease mid-job, so a job that outruns `lease_seconds` is
+# claimable by a second worker while the first is still transcribing it.
+# With one worker that was a latent hazard; with several it is reachable,
+# and both workers then call `complete` on the same job.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_reclaimed_job_may_not_be_completed_by_the_worker_that_lost_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Two workers on one track: only the one that holds the claim may finish it.
+
+    Without the fence both completions apply, both count zero remaining
+    jobs, and both report the session done -- so the session's protocol is
+    created twice, from whichever transcript landed last.
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory, lease_seconds=60)
+    lost = await queue.claim(T0)
+    assert lost is not None
+    holder = await queue.claim(T0 + timedelta(seconds=61))
+    assert holder is not None
+    assert holder.id == lost.id
+
+    assert await queue.complete(lost.id, "the slow worker", lease=lost.claimed_at) is False
+    assert await queue.complete(holder.id, "the holder", lease=holder.claimed_at) is True
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, holder.id)
+        assert stored is not None
+        assert stored.transcript == "the holder"
+
+
+async def test_a_job_already_finished_is_never_finished_a_second_time(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The other order of the same race, and the one that creates two documents.
+
+    The worker that lost its claim finishes *after* the holder has already
+    completed the job. Its completion must not report the session done a
+    second time.
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory, lease_seconds=60)
+    lost = await queue.claim(T0)
+    assert lost is not None
+    holder = await queue.claim(T0 + timedelta(seconds=61))
+    assert holder is not None
+
+    assert await queue.complete(holder.id, "the holder", lease=holder.claimed_at) is True
+    assert await queue.complete(lost.id, "the slow worker", lease=lost.claimed_at) is False
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, lost.id)
+        assert stored is not None
+        assert stored.transcript == "the holder"
+
+
+async def test_a_worker_that_lost_its_claim_may_not_return_the_job_to_the_queue(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`fail` needs the same fence as `complete`, for a worse reason.
+
+    A stale `fail` would yank a job out from under the worker that is
+    transcribing it right now -- back to `pending` for a third worker to
+    claim, or, once the attempts run out, straight to `dead`: a recording
+    written off while a healthy worker was busy producing its transcript.
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory, lease_seconds=60)
+    lost = await queue.claim(T0)
+    assert lost is not None
+    holder = await queue.claim(T0 + timedelta(seconds=61))
+    assert holder is not None
+
+    assert await queue.fail(lost.id, "boom", max_attempts=1, lease=lost.claimed_at) is False
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, holder.id)
+        assert stored is not None
+        assert stored.status == "running"
+        assert stored.attempts == 0
+
+
+async def test_a_completion_from_a_lost_claim_is_counted_as_stale_not_as_done(
+    factory: async_sessionmaker[AsyncSession], outcomes: list[dict[str, Any]]
+) -> None:
+    """A transcription was spent and thrown away, and the counter says so.
+
+    Counting it as `done` would be the same lie the outcome metric was
+    built to end: work that did not become a transcript, reported as work
+    that did.
+    """
+    await seed(factory, [ANNA])
+    queue = JobQueue(factory, lease_seconds=60)
+    lost = await queue.claim(T0)
+    assert lost is not None
+    assert await queue.claim(T0 + timedelta(seconds=61)) is not None
+
+    await queue.complete(lost.id, "thrown away", lease=lost.claimed_at)
+
+    assert _job_outcomes(outcomes) == ["stale"]
