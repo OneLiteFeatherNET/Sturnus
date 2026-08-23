@@ -47,6 +47,12 @@ serialises it with the *same* function, and sends a `data:` event only when
 that serialisation differs from the one it last sent. An unchanged queue
 costs the browser nothing and the network nothing.
 
+It does not, however, cost the *database* nothing, and `StreamTiming`
+spells out what it does cost. The interval was chosen so that a stream
+reads no more often than the polling it replaces; what is saved is the
+per-request overhead of asking, and what is gained is that a change
+arrives when it happens rather than on the client's next tick.
+
 The polling endpoints are unchanged and stay. A client that cannot hold an
 `EventSource` — an old browser, a proxy that eats event streams, a script —
 must still be able to ask, and a stream that became the only way to learn
@@ -111,17 +117,37 @@ class StreamTiming:
     runs. So `register` installs these defaults and a test replaces them.
     """
 
-    #: **Two seconds, and here is the bill.** One database read per
-    #: interval per *open* stream: two administrators watching two guilds
-    #: is one query a second, and a guild whose queue is at rest costs
-    #: nothing at all, because the stream ends rather than waiting for
-    #: news that cannot arrive. That is what makes two seconds affordable
-    #: where the browser's five were not. The browser paid a TLS
-    #: handshake, a Cloudflare Tunnel hop, a cookie signature check and a
-    #: whole request cycle for each of its reads, and it paid them whether
-    #: or not the answer had changed; here the only thing that crosses the
-    #: wire is a change.
-    poll_seconds: float = 2.0
+    #: **Five seconds, and here is the actual bill.** A "read" here is not
+    #: one query. `ConsoleQueueOverview.for_guild`, which the guild stream
+    #: calls, issues **seven** statements over three pooled connections --
+    #: `is_admin` is one, `load_status` is four (the status counts, the
+    #: expired leases, the oldest pending session, the stuck-closed count)
+    #: and `load_active_sessions` is two. `ConsoleQueueControl.status_for`,
+    #: which the session stream calls, issues **eight** over four --
+    #: `_administered_guild` is two, and `load_requeue_view` and
+    #: `load_session` are three each. So two administrators watching two
+    #: guilds is not "one query a second": it is about 2.8 statements a
+    #: second, and one administrator watching one guild is about 1.4.
+    #:
+    #: Five rather than the two this shipped with, because two was 2.5x
+    #: *more* database work than the polling it replaced, not less. The
+    #: guild page polled every five seconds and the panel every three, so
+    #: at five the guild stream costs exactly what its polling cost and the
+    #: panel's stream costs rather less. What is genuinely saved is
+    #: per-*request* overhead, which the browser paid on every tick whether
+    #: or not the answer had changed: a TLS handshake, a Cloudflare Tunnel
+    #: hop, a cookie signature check and a whole request cycle. That saving
+    #: is real and worth having; it is not a saving in reads, and the
+    #: argument for this endpoint must not be made as though it were.
+    #:
+    #: The improvement in *latency* is not paid for at all: a change is
+    #: sent when it happens rather than on the client's next tick, so five
+    #: seconds here is not five seconds of staleness the way five seconds
+    #: of polling was.
+    #:
+    #: A queue at rest costs nothing, because the stream ends rather than
+    #: waiting for news that cannot arrive.
+    poll_seconds: float = 5.0
     #: A comment line when nothing has changed, so that nothing in the
     #: middle decides the connection is dead. Fifteen seconds sits well
     #: inside both an nginx `proxy_read_timeout` (sixty by default) and a
@@ -131,6 +157,21 @@ class StreamTiming:
     #: its own -- which is what `EventSource` does without being asked. An
     #: unbounded server-side loop is how a process quietly accumulates
     #: tasks belonging to browsers that were closed hours ago.
+    #:
+    #: **This is also the worst case for an abandoned stream**, and the
+    #: reason it is not longer. A client that falls back to polling closes
+    #: its `EventSource` -- `openQueueStream` closes the source in the same
+    #: breath as it announces `polling`, so the browser is not paying for
+    #: both -- but this loop learns nothing from that until its next write
+    #: fails. On a direct connection that is at most `heartbeat_seconds`
+    #: away, fifteen seconds, and sooner if the queue changes meanwhile.
+    #: Behind the buffering proxy that *caused* the fallback there is no
+    #: such luck: the proxy holds its own connection to this process open
+    #: and swallows the writes, so the loop keeps re-reading for the full
+    #: ten minutes. That is the ceiling on what one abandoned stream can
+    #: cost -- 120 reads, about 840 statements for a guild stream, once --
+    #: and it is why the ceiling exists rather than being left to the
+    #: client to enforce by hanging up.
     max_seconds: float = 600.0
 
 

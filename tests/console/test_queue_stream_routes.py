@@ -2,7 +2,7 @@
 
 The property this file exists for is the one the change was made for: **an
 unchanged queue produces no event.** A stream that re-sent an identical
-snapshot every two seconds would be the browser's timer moved one process
+snapshot every five seconds would be the browser's timer moved one process
 to the left and nothing else, and no type check, lint pass or successful
 request can tell the two apart. So the tests count events.
 
@@ -52,7 +52,7 @@ from tests.console.conftest import (
 
 #: Fast enough that a whole stream's life fits in a test run, and still
 #: ordered the way the real ones are: re-read, then heartbeat, then give
-#: up. The defaults are two seconds, fifteen and ten minutes.
+#: up. The defaults are five seconds, fifteen and ten minutes.
 FAST = StreamTiming(poll_seconds=0.005, heartbeat_seconds=0.02, max_seconds=2.0)
 
 
@@ -485,3 +485,40 @@ async def test_a_session_stream_carries_the_same_headers_as_a_guild_one(
 
     assert response.headers["Content-Type"].startswith("text/event-stream")
     assert response.headers["X-Accel-Buffering"] == "no"
+
+
+async def test_a_stream_re_reads_no_more_often_than_the_polling_it_replaces() -> None:
+    """The interval is an operating cost, so it is pinned rather than assumed.
+
+    A "read" here is not one query. One read of a guild's overview is seven
+    SQL statements over three pooled connections -- `is_admin`,
+    `load_status`'s four, and `load_active_sessions`'s two -- and one read
+    of a session's queue is eight over four. At five seconds that is about
+    1.4 statements a second per open guild stream, which is exactly what
+    the five-second browser poll this replaces already cost; the panel's
+    three-second poll cost rather more than its stream now does.
+
+    Two seconds, which this shipped with, was 2.5x *more* database work
+    than polling rather than less. What streaming genuinely saves is the
+    per-request overhead the browser paid on every tick whether or not the
+    answer had changed -- a TLS handshake, a tunnel hop, a cookie signature
+    check -- and what it genuinely gains is that a change is sent when it
+    happens rather than on the client's next tick. Neither of those is a
+    reason to read more often, so the number is written down here with the
+    reasoning attached to it.
+    """
+    timing = StreamTiming()
+
+    assert timing.poll_seconds == 5.0
+    # Well inside an nginx `proxy_read_timeout` (sixty by default) and a
+    # Cloudflare Tunnel's idle timeout, and comfortably longer than a
+    # re-read, so a heartbeat is never what an idle connection is waiting
+    # on.
+    assert timing.heartbeat_seconds == 15.0
+    # The ceiling on what one abandoned stream can cost. A client that
+    # falls back to polling closes its `EventSource`, but this loop learns
+    # that only when its next write fails -- and behind the buffering proxy
+    # that caused the fallback the writes are swallowed rather than
+    # refused, so nothing but this number ends it.
+    assert timing.max_seconds == 600.0
+    assert timing.max_seconds / timing.poll_seconds == 120
