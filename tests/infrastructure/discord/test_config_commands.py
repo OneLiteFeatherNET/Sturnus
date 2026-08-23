@@ -22,6 +22,7 @@ from typing import cast
 
 import pytest
 
+from sturnus.application.channel_choice import MAX_CONCURRENT_SESSIONS_PER_GUILD
 from sturnus.application.reconfigure import ReconfigureAction, ReconfigureResult, RunningState
 from sturnus.domain import settings
 from sturnus.infrastructure.db.config_store import ConfigStore
@@ -240,7 +241,8 @@ def _live_state(guild_id: int) -> RunningState:  # noqa: ARG001
     return RunningState(
         is_live=True,
         is_recording=False,
-        channel_id=1,
+        channel_ids=(1,),
+        session_limit=MAX_CONCURRENT_SESSIONS_PER_GUILD,
         allowed_channel_ids=(1,),
         waiting_channel_ids=(),
         pending_keys=(),

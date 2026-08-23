@@ -50,11 +50,12 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.discord import client as client_module
 from sturnus.infrastructure.discord.announcer import _ALLOWED_MENTIONS
 from sturnus.infrastructure.discord.client import (
     REJOIN_COOLDOWN,
     SturnusClient,
-    _GuildRecording,
+    _ChannelRecording,
 )
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState
@@ -332,7 +333,7 @@ class _TestClient(SturnusClient):
     """A client whose built pipelines get a fake voice connection.
 
     Overriding the one seam (`_make_voice`) rather than patching
-    `_guilds` afterwards is what lets these tests drive the *real* build
+    `_recordings` afterwards is what lets these tests drive the *real* build
     path -- `reconcile_guild` -> `_build` -> `RecordingService` -- which is
     exactly the path the reported defect never reached, without needing
     `discord-ext-voice-recv` or a gateway connection.
@@ -402,8 +403,39 @@ def _in_guild(client: SturnusClient, guild: MagicMock) -> None:
     client._connection._guilds[guild.id] = guild
 
 
+def _rec(client: SturnusClient, guild_id: int) -> _ChannelRecording:
+    """The guild's one pipeline, whatever room it is currently pointed at.
+
+    `client._recordings` is keyed by `(guild_id, channel_id)` now, and a
+    retarget moves the entry rather than mutating a field -- so a test
+    that looked a guild up by id would be reading a key that no longer
+    exists the moment the bot followed a meeting into the next room. This
+    asks the client for the guild's pipeline instead, which is what
+    production code does too (`SturnusClient._recording_of`).
+
+    Assertive rather than optional, because every caller here means "the
+    pipeline that must exist by now" and a `None` slipping through would
+    otherwise surface as an `AttributeError` three lines later.
+    """
+    recording = client._recording_of(guild_id)
+    assert recording is not None, f"guild {guild_id} holds no pipeline"
+    return recording
+
+
+def _install(client: SturnusClient, recording: _ChannelRecording) -> _ChannelRecording:
+    """Files a hand-built pipeline under the room it serves.
+
+    The tests that build their own pipeline (rather than driving
+    `reconcile_guild`) have to file it the way `_build` does, key
+    included: a session belongs to a room, so `(guild_id, channel_id)` is
+    where the client will look for it.
+    """
+    client._recordings[(recording.guild_id, recording.channel_id)] = recording
+    return recording
+
+
 def _voice_of(client: SturnusClient, guild_id: int) -> FakeVoiceReceiver:
-    voice = client._guilds[guild_id].voice
+    voice = _rec(client, guild_id).voice
     assert isinstance(voice, FakeVoiceReceiver)
     return voice
 
@@ -444,9 +476,7 @@ async def test_two_consecutive_sessions_through_the_client(tmp_path: Path) -> No
     # what it was written for: two consecutive sessions on one pipeline.
     store = _configured_store()
     client = _client(clock, config_store=store)
-    client._guilds[GUILD_ID] = _GuildRecording(
-        config=_runtime_config(), service=service, voice=voice
-    )
+    _install(client, _ChannelRecording(config=_runtime_config(), service=service, voice=voice))
 
     empty_channel = _voice_channel(CHANNEL_ID, members=[])
     guild = _guild(GUILD_ID, empty_channel)
@@ -519,12 +549,12 @@ def _configured_store(
 
 async def _start_session(client: SturnusClient, guild: MagicMock, member: discord.Member) -> None:
     """Puts one consenting member in the channel, which opens a session."""
-    channel_id = client._guilds[guild.id].channel_id
+    channel_id = _rec(client, guild.id).channel_id
     guild.get_channel.return_value = _voice_channel(channel_id, members=[member])
     await client.on_voice_state_update(
         member, _voice_state(None), _voice_state(_voice_channel(channel_id, members=[member]))
     )
-    assert client._guilds[guild.id].service.is_recording is True
+    assert _rec(client, guild.id).service.is_recording is True
 
 
 async def test_a_guild_configured_after_startup_records_without_a_restart(tmp_path: Path) -> None:
@@ -537,7 +567,7 @@ async def test_a_guild_configured_after_startup_records_without_a_restart(tmp_pa
     them, but the process was not watching anything.
 
     This test fails against that code: `_tick_all` there iterates only
-    `self._guilds`, which stays empty forever, so the second tick builds
+    `self._recordings`, which stays empty forever, so the second tick builds
     nothing and `on_voice_state_update` returns early on a guild it has no
     entry for. No slash command is used here on purpose -- the periodic
     reconcile alone must be enough, because a direct database edit or a
@@ -554,14 +584,16 @@ async def test_a_guild_configured_after_startup_records_without_a_restart(tmp_pa
     _in_guild(client, guild)
 
     await client._tick_all(clock.now())
-    assert client._guilds == {}, "an unconfigured guild must not be built, and must not raise"
+    assert client._recordings == {}, "an unconfigured guild must not be built, and must not raise"
 
     # An administrator configures the guild while the process keeps running.
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, str(CHANNEL_ID))
     store.write(GUILD_ID, settings.CONSENT_ROLE_ID, str(ROLE_ID))
 
     await client._tick_all(clock.now())
-    assert GUILD_ID in client._guilds, "the periodic reconcile must pick up the new config"
+    assert client._recording_of(GUILD_ID) is not None, (
+        "the periodic reconcile must pick up the new config"
+    )
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
@@ -573,7 +605,7 @@ async def test_a_guild_configured_after_startup_records_without_a_restart(tmp_pa
 async def test_a_channel_change_mid_session_never_discards_the_recording(tmp_path: Path) -> None:
     """The load-bearing guarantee: a config change must not touch a live session.
 
-    Replacing the `_GuildRecording` here would drop a `RecordingService`
+    Replacing the `_ChannelRecording` here would drop a `RecordingService`
     holding open `AudioWriter`s (unflushed buffers, a plaintext WAV on the
     PVC that no job points at) and a `VoiceReceiveAdapter` holding a live
     voice connection nothing would ever disconnect. So the change is
@@ -592,7 +624,7 @@ async def test_a_channel_change_mid_session_never_discards_the_recording(tmp_pat
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     voice = _voice_of(client, GUILD_ID)
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
@@ -604,12 +636,12 @@ async def test_a_channel_change_mid_session_never_discards_the_recording(tmp_pat
     assert result.action is ReconfigureAction.DEFER_RETARGET
     assert set(result.deferred_keys) == {settings.VOICE_CHANNEL_IDS, settings.CONSENT_ROLE_ID}
     # Nothing was swapped, nothing was disconnected, nothing stopped recording.
-    assert client._guilds[GUILD_ID].service is service
+    assert _rec(client, GUILD_ID).service is service
     assert _voice_of(client, GUILD_ID) is voice
     assert voice.left == 0
     assert service.is_recording is True
-    assert client._guilds[GUILD_ID].channel_id == CHANNEL_ID
-    assert client._guilds[GUILD_ID].role_id == ROLE_ID
+    assert _rec(client, GUILD_ID).channel_id == CHANNEL_ID
+    assert _rec(client, GUILD_ID).role_id == ROLE_ID
 
     # A packet arriving after the reconcile still lands in the same session.
     await service.voice_packet(
@@ -628,10 +660,10 @@ async def test_a_channel_change_mid_session_never_discards_the_recording(tmp_pat
     assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
     assert sessions.participants_of(1) == {ANNA}
     # ... and only then did the deferred change land.
-    assert client._guilds[GUILD_ID].channel_id == NEW_CHANNEL_ID
-    assert client._guilds[GUILD_ID].role_id == NEW_ROLE_ID
-    assert client._guilds[GUILD_ID].pending is None
-    assert client._guilds[GUILD_ID].service is service, "still the same pipeline"
+    assert _rec(client, GUILD_ID).channel_id == NEW_CHANNEL_ID
+    assert _rec(client, GUILD_ID).role_id == NEW_ROLE_ID
+    assert _rec(client, GUILD_ID).pending is None
+    assert _rec(client, GUILD_ID).service is service, "still the same pipeline"
     assert list(tmp_path.rglob("*")) == [], "no orphaned audio left behind"
 
 
@@ -651,14 +683,14 @@ async def test_clearing_the_channel_mid_session_still_uploads_the_recording(
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, None)
     result = await client.reconcile_guild(GUILD_ID)
 
     assert result.action is ReconfigureAction.DEFER_TEARDOWN
-    assert client._guilds[GUILD_ID].service is service
+    assert _rec(client, GUILD_ID).service is service
     assert service.is_recording is True
 
     guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
@@ -668,7 +700,7 @@ async def test_clearing_the_channel_mid_session_still_uploads_the_recording(
 
     assert sessions.closed == [(1, "empty")]
     assert len(jobs.enqueued) == 1
-    assert GUILD_ID not in client._guilds
+    assert client._recording_of(GUILD_ID) is None
     assert list(tmp_path.rglob("*")) == []
 
 
@@ -688,7 +720,7 @@ async def test_a_shortened_idle_timeout_applies_to_the_session_in_progress(
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
     store.write(GUILD_ID, settings.IDLE_TIMEOUT_MINUTES, "1")
@@ -703,14 +735,15 @@ async def test_a_shortened_idle_timeout_applies_to_the_session_in_progress(
 
     assert sessions.closed == [(1, "idle_timeout")]
     assert len(jobs.enqueued) == 1
-    assert client._guilds[GUILD_ID].service is service
+    assert _rec(client, GUILD_ID).service is service
 
 
 async def test_reconciling_twice_changes_nothing(tmp_path: Path) -> None:
     """Idempotence, which is also what makes a re-fired `on_ready` safe.
 
     discord.py raises `on_ready` again after a failed RESUME. The old
-    `_configure_guild` overwrote `self._guilds[guild.id]` unconditionally,
+    `_configure_guild` overwrote the guild's entry in `self._recordings`
+    unconditionally,
     so a gateway blip during a recording destroyed the live session by
     exactly the mechanism the deferral above exists to prevent.
     """
@@ -721,14 +754,14 @@ async def test_reconciling_twice_changes_nothing(tmp_path: Path) -> None:
     _in_guild(client, guild)
 
     first = await client.reconcile_guild(GUILD_ID)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     voice = _voice_of(client, GUILD_ID)
 
     second = await client.reconcile_guild(GUILD_ID)
 
     assert first.action is ReconfigureAction.BUILD
     assert second.action is ReconfigureAction.NOTHING
-    assert client._guilds[GUILD_ID].service is service
+    assert _rec(client, GUILD_ID).service is service
     assert _voice_of(client, GUILD_ID) is voice
     assert voice.left == 0
     assert len(client.voices) == 1, "a second pipeline would leak a voice connection"
@@ -756,18 +789,20 @@ async def test_an_unparseable_value_neither_raises_nor_un_configures_a_guild(
     _in_guild(client, other)
 
     await client._tick_all(clock.now())
-    before = client._guilds[GUILD_ID].config
+    before = _rec(client, GUILD_ID).config
 
     store.write(GUILD_ID, settings.IDLE_TIMEOUT_MINUTES, "abc")
     await client._tick_all(clock.now())
 
-    assert client._guilds[GUILD_ID].config == before, "the last known-good config is kept"
-    assert OTHER_GUILD_ID in client._guilds, "one broken guild must not stop the others"
+    assert _rec(client, GUILD_ID).config == before, "the last known-good config is kept"
+    assert client._recording_of(OTHER_GUILD_ID) is not None, (
+        "one broken guild must not stop the others"
+    )
 
     # A fixed value is picked up again without a restart.
     store.write(GUILD_ID, settings.IDLE_TIMEOUT_MINUTES, "5")
     await client._tick_all(clock.now())
-    assert client._guilds[GUILD_ID].config.timeouts.idle_timeout_minutes == 5
+    assert _rec(client, GUILD_ID).config.timeouts.idle_timeout_minutes == 5
 
 
 async def test_a_role_only_change_still_refreshes_the_cached_channel_name(
@@ -894,7 +929,7 @@ async def test_a_reconcile_during_shutdown_cannot_resurrect_a_guild(tmp_path: Pa
     result = await client.reconcile_guild(GUILD_ID)
 
     assert result.action is ReconfigureAction.NOTHING
-    assert client._guilds == {}
+    assert client._recordings == {}
 
 
 async def test_retarget_refuses_to_run_mid_session(tmp_path: Path) -> None:
@@ -912,7 +947,7 @@ async def test_retarget_refuses_to_run_mid_session(tmp_path: Path) -> None:
     await _start_session(client, guild, anna)
 
     with pytest.raises(AssertionError, match="mid-session"):
-        client._guilds[GUILD_ID].service.retarget(NEW_CHANNEL_ID, None)
+        _rec(client, GUILD_ID).service.retarget(NEW_CHANNEL_ID, None)
 
 
 async def test_a_tunable_changed_while_an_identity_change_waits_is_not_rolled_back(
@@ -937,7 +972,7 @@ async def test_a_tunable_changed_while_an_identity_change_waits_is_not_rolled_ba
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, str(NEW_CHANNEL_ID))
@@ -945,16 +980,16 @@ async def test_a_tunable_changed_while_an_identity_change_waits_is_not_rolled_ba
     store.write(GUILD_ID, settings.AUDIO_RETENTION_DAYS, "7")
     await client.reconcile_guild(GUILD_ID)
 
-    assert client._guilds[GUILD_ID].config.retention_days == 7
-    assert client._guilds[GUILD_ID].channel_id == CHANNEL_ID, "the channel still waits"
+    assert _rec(client, GUILD_ID).config.retention_days == 7
+    assert _rec(client, GUILD_ID).channel_id == CHANNEL_ID, "the channel still waits"
 
     guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
     await client.on_voice_state_update(anna, _voice_state(guild.get_channel()), _voice_state(None))
     clock.advance(timedelta(seconds=61))
     await client._tick_all(clock.now())
 
-    assert client._guilds[GUILD_ID].channel_id == NEW_CHANNEL_ID
-    assert client._guilds[GUILD_ID].config.retention_days == 7, "the retune must survive"
+    assert _rec(client, GUILD_ID).channel_id == NEW_CHANNEL_ID
+    assert _rec(client, GUILD_ID).config.retention_days == 7, "the retune must survive"
     assert jobs.enqueued[0]["retention_until"] == clock.now() + timedelta(days=7)
 
 
@@ -987,7 +1022,7 @@ async def test_forcing_the_apply_ends_the_session_and_still_uploads_it(tmp_path:
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, str(NEW_CHANNEL_ID))
@@ -999,8 +1034,8 @@ async def test_forcing_the_apply_ends_the_session_and_still_uploads_it(tmp_path:
     assert result.action is ReconfigureAction.RETARGET
     assert result.deferred_keys == ()
     assert settings.VOICE_CHANNEL_IDS in result.applied_keys
-    assert client._guilds[GUILD_ID].channel_id == NEW_CHANNEL_ID
-    assert client._guilds[GUILD_ID].pending is None
+    assert _rec(client, GUILD_ID).channel_id == NEW_CHANNEL_ID
+    assert _rec(client, GUILD_ID).pending is None
     # ... and the audio captured so far went the ordinary way out.
     assert sessions.closed == [(1, "shutdown")]
     assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
@@ -1011,7 +1046,7 @@ async def test_forcing_the_apply_ends_the_session_and_still_uploads_it(tmp_path:
     ben = _member(BEN, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, ben)
     assert sessions.opened == [1, 2]
-    assert client._guilds[GUILD_ID].service is service
+    assert _rec(client, GUILD_ID).service is service
     assert _voice_of(client, GUILD_ID).joined[-1] == NEW_CHANNEL_ID
 
 
@@ -1031,7 +1066,7 @@ async def test_forcing_the_apply_after_a_cleared_key_ends_and_uploads_the_sessio
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, None)
@@ -1039,7 +1074,7 @@ async def test_forcing_the_apply_after_a_cleared_key_ends_and_uploads_the_sessio
 
     assert result.action is ReconfigureAction.TEARDOWN
     assert result.deferred_keys == ()
-    assert GUILD_ID not in client._guilds
+    assert client._recording_of(GUILD_ID) is None
     assert sessions.closed == [(1, "shutdown")]
     assert [job["discord_user_id"] for job in jobs.enqueued] == [ANNA]
     assert list(tmp_path.rglob("*")) == []
@@ -1067,7 +1102,7 @@ async def test_restoring_a_cleared_key_mid_session_cancels_the_pending_teardown(
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     voice = _voice_of(client, GUILD_ID)
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
@@ -1080,7 +1115,7 @@ async def test_restoring_a_cleared_key_mid_session_cancels_the_pending_teardown(
     result = await client.reconcile_guild(GUILD_ID)
 
     assert result.action is ReconfigureAction.NOTHING
-    assert client._guilds[GUILD_ID].pending_teardown is False
+    assert _rec(client, GUILD_ID).pending_teardown is False
     assert client.running_state(GUILD_ID).pending_teardown is False
 
     guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
@@ -1090,8 +1125,10 @@ async def test_restoring_a_cleared_key_mid_session_cancels_the_pending_teardown(
 
     assert sessions.closed == [(1, "empty")]
     assert len(jobs.enqueued) == 1
-    assert GUILD_ID in client._guilds, "the teardown was cancelled, so nothing may be torn down"
-    assert client._guilds[GUILD_ID].service is service, "the pipeline must not be rebuilt"
+    assert client._recording_of(GUILD_ID) is not None, (
+        "the teardown was cancelled, so nothing may be torn down"
+    )
+    assert _rec(client, GUILD_ID).service is service, "the pipeline must not be rebuilt"
     assert _voice_of(client, GUILD_ID) is voice
     assert len(client.voices) == 1, "a rebuild would leak a voice connection"
 
@@ -1112,7 +1149,7 @@ async def test_reverting_a_deferred_identity_change_clears_the_pending_key(
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, str(NEW_CHANNEL_ID))
@@ -1123,7 +1160,7 @@ async def test_reverting_a_deferred_identity_change_clears_the_pending_key(
     result = await client.reconcile_guild(GUILD_ID)
 
     assert result.action is ReconfigureAction.NOTHING
-    assert client._guilds[GUILD_ID].pending is None
+    assert _rec(client, GUILD_ID).pending is None
     assert client.running_state(GUILD_ID).pending_keys == ()
 
     guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[])
@@ -1131,8 +1168,8 @@ async def test_reverting_a_deferred_identity_change_clears_the_pending_key(
     clock.advance(timedelta(seconds=61))
     await client._tick_all(clock.now())
 
-    assert client._guilds[GUILD_ID].channel_id == CHANNEL_ID, "the reverted channel must not land"
-    assert client._guilds[GUILD_ID].service is service
+    assert _rec(client, GUILD_ID).channel_id == CHANNEL_ID, "the reverted channel must not land"
+    assert _rec(client, GUILD_ID).service is service
 
 
 async def test_a_standing_deferral_is_logged_once_not_every_reconcile(
@@ -1156,7 +1193,7 @@ async def test_a_standing_deferral_is_logged_once_not_every_reconcile(
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    await client._guilds[GUILD_ID].service.voice_packet(
+    await _rec(client, GUILD_ID).service.voice_packet(
         ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0
     )
 
@@ -1285,7 +1322,7 @@ async def test_a_failed_upload_must_not_leave_a_guild_recording_nothing(
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
     # Anna leaves, and the object store goes down before the grace period
@@ -1325,7 +1362,7 @@ async def test_a_failed_upload_must_not_leave_a_guild_recording_nothing(
     await _start_session(client, guild, ben)
 
     assert sessions.opened == [1, 2], "a second session must still be reachable"
-    assert client._guilds[GUILD_ID].service is service, "on the same pipeline"
+    assert _rec(client, GUILD_ID).service is service, "on the same pipeline"
     assert _voice_of(client, GUILD_ID).joined == [CHANNEL_ID, CHANNEL_ID]
 
     await service.voice_packet(BEN, "ben", ssrc=2, rtp_timestamp=RTP, pcm=pcm(960), now=clock.now())
@@ -1375,7 +1412,7 @@ async def test_a_forced_apply_whose_upload_fails_still_leaves_the_guild_recordab
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
     await _start_session(client, guild, anna)
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     await service.voice_packet(ANNA, "anna", ssrc=1, rtp_timestamp=RTP, pcm=pcm(960), now=T0)
 
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, str(NEW_CHANNEL_ID))
@@ -1393,7 +1430,7 @@ async def test_a_forced_apply_whose_upload_fails_still_leaves_the_guild_recordab
     await _start_session(client, guild, ben)
 
     assert sessions.opened == [1, 2]
-    assert client._guilds[GUILD_ID].service is service
+    assert _rec(client, GUILD_ID).service is service
 
 
 async def test_members_already_in_the_channel_start_recording_without_rejoining(
@@ -1428,14 +1465,14 @@ async def test_members_already_in_the_channel_start_recording_without_rejoining(
     guild.get_channel.return_value = _voice_channel(CHANNEL_ID, members=[anna, ben, admin])
 
     await client._tick_all(clock.now())
-    assert client._guilds == {}, "nothing to build yet"
+    assert client._recordings == {}, "nothing to build yet"
 
     # The configuration is fixed while all three are already in the channel.
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, str(CHANNEL_ID))
     store.write(GUILD_ID, settings.CONSENT_ROLE_ID, str(ROLE_ID))
     await client._tick_all(clock.now())
 
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     assert sessions.opened == [1], "the people already waiting must start a session"
     assert service.is_recording is True
     assert _voice_of(client, GUILD_ID).joined == [CHANNEL_ID], "and the bot must join them"
@@ -1490,7 +1527,7 @@ async def test_a_retarget_counts_the_people_already_in_the_new_channel(
 
     assert result.action is ReconfigureAction.RETARGET
     assert sessions.opened == [1]
-    assert client._guilds[GUILD_ID].service.is_recording is True
+    assert _rec(client, GUILD_ID).service.is_recording is True
     assert _voice_of(client, GUILD_ID).joined == [NEW_CHANNEL_ID]
 
 
@@ -1500,7 +1537,7 @@ async def test_a_join_during_a_teardown_cannot_strand_a_session_or_a_connection(
     """`on_voice_state_update` ran outside the per-guild reconfigure lock.
 
     `_teardown` awaits `voice.leave()` and only afterwards drops the guild
-    from `_guilds`. A member joining inside that await used to interleave:
+    from `_recordings`. A member joining inside that await used to interleave:
     the handler still found the pipeline, opened a session row against the
     channel being abandoned, generated its data key, and reconnected the
     voice client the teardown had just disconnected. `_teardown` then
@@ -1522,7 +1559,7 @@ async def test_a_join_during_a_teardown_cannot_strand_a_session_or_a_connection(
     await client.reconcile_guild(GUILD_ID)
 
     voice = BlockingVoiceReceiver()
-    client._guilds[GUILD_ID].voice = voice
+    _rec(client, GUILD_ID).voice = voice
 
     # The configuration is cleared, and the teardown stalls inside `leave()`.
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, None)
@@ -1545,7 +1582,7 @@ async def test_a_join_during_a_teardown_cannot_strand_a_session_or_a_connection(
 
     assert sessions.opened == [], "a join during the teardown must not open a session row"
     assert voice.joined == [], "and must not reconnect the connection just disconnected"
-    assert GUILD_ID not in client._guilds
+    assert client._recording_of(GUILD_ID) is None
     assert voice.left == 1
 
 
@@ -1585,7 +1622,7 @@ async def test_a_join_during_a_retarget_cannot_corrupt_the_reconfigure(
     await client.reconcile_guild(GUILD_ID)
 
     voice = BlockingVoiceReceiver()
-    client._guilds[GUILD_ID].voice = voice
+    _rec(client, GUILD_ID).voice = voice
 
     store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, str(NEW_CHANNEL_ID))
     voice.block_next_leave = True
@@ -1604,7 +1641,7 @@ async def test_a_join_during_a_retarget_cannot_corrupt_the_reconfigure(
     await joining
 
     assert result.action is ReconfigureAction.RETARGET
-    assert client._guilds[GUILD_ID].channel_id == NEW_CHANNEL_ID
+    assert _rec(client, GUILD_ID).channel_id == NEW_CHANNEL_ID
     assert sessions.opened == [], "the abandoned channel must not open a session"
     assert voice.joined == [], "and the new channel is empty, so nothing is joined"
 
@@ -1647,10 +1684,13 @@ def _capture_guild(
     """
     guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
     _in_guild(client, guild)
-    client._guilds[GUILD_ID] = _GuildRecording(
-        config=_runtime_config(),
-        service=_service(sessions, FakeJobs(), tmp_path),
-        voice=voice,
+    _install(
+        client,
+        _ChannelRecording(
+            config=_runtime_config(),
+            service=_service(sessions, FakeJobs(), tmp_path),
+            voice=voice,
+        ),
     )
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
@@ -1688,7 +1728,7 @@ async def test_a_join_that_fails_ends_the_session_rather_than_leaving_it_open(
 
     assert sessions.closed == [(1, "capture_failure")], "not idle_timeout, fifteen minutes later"
     assert voice.left == 1
-    assert client._guilds[GUILD_ID].service.is_recording is False
+    assert _rec(client, GUILD_ID).service.is_recording is False
 
 
 async def test_a_capture_side_end_does_not_open_another_session_straight_after(
@@ -1717,7 +1757,7 @@ async def test_a_capture_side_end_does_not_open_another_session_straight_after(
 
     # Every stream stops decoding, so the adapter arms a close that is
     # nothing like a timeout.
-    client._guilds[GUILD_ID].service.request_close(EndReason.DECODE_FAILURE)
+    _rec(client, GUILD_ID).service.request_close(EndReason.DECODE_FAILURE)
     clock.advance(timedelta(seconds=1))
     await client._tick_all(clock.now())
 
@@ -1761,7 +1801,7 @@ async def test_the_guard_lapses_on_the_tick_with_no_voice_state_update_at_all(
     anna, occupied = _capture_guild(client, sessions, voice, tmp_path)
 
     await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
-    client._guilds[GUILD_ID].service.request_close(EndReason.CAPTURE_FAILURE)
+    _rec(client, GUILD_ID).service.request_close(EndReason.CAPTURE_FAILURE)
     clock.advance(timedelta(seconds=1))
     await client._tick_all(clock.now())
 
@@ -1773,8 +1813,8 @@ async def test_the_guard_lapses_on_the_tick_with_no_voice_state_update_at_all(
 
     assert sessions.opened == [1, 2], "a pause, not a giving up"
     assert voice.joined == [CHANNEL_ID, CHANNEL_ID]
-    assert client._guilds[GUILD_ID].service.is_recording is True
-    assert client._guilds[GUILD_ID].blocked_until is None
+    assert _rec(client, GUILD_ID).service.is_recording is True
+    assert GUILD_ID not in client._capture_cooldowns
 
 
 async def test_a_pipeline_the_client_builds_can_warn_its_own_channel(tmp_path: Path) -> None:
@@ -1818,7 +1858,7 @@ async def test_a_pipeline_the_client_builds_can_warn_its_own_channel(tmp_path: P
     channel = _voice_channel(CHANNEL_ID, members=[anna])
     client.get_channel = MagicMock(return_value=channel)  # type: ignore[method-assign]
 
-    service = client._guilds[GUILD_ID].service
+    service = _rec(client, GUILD_ID).service
     silence = b"\x00" * (48_000 * 4)  # one second of 48 kHz stereo 16-bit zeroes
     for second in range(30):
         await service.voice_packet(
@@ -1897,7 +1937,7 @@ async def test_a_leave_that_fails_is_an_event_carrying_the_guild(
     assert fields["error_type"] == "RuntimeError"
     assert not failure.args
     # The point of swallowing it: the guild is recordable again.
-    assert client._guilds[GUILD_ID].service.needs_reset is False
+    assert _rec(client, GUILD_ID).service.needs_reset is False
 
 
 async def test_one_guilds_tick_raising_is_reported_and_isolated(
@@ -1923,7 +1963,7 @@ async def test_one_guilds_tick_raising_is_reported_and_isolated(
         if guild_id == GUILD_ID:
             raise RuntimeError("the database went away")
 
-    client._guilds[other_guild_id] = client._guilds[GUILD_ID]
+    client._recordings[(other_guild_id, CHANNEL_ID)] = _rec(client, GUILD_ID)
     client._tick_guild = tick  # type: ignore[method-assign]
 
     with caplog.at_level(logging.ERROR, logger="sturnus.infrastructure.discord.client"):
@@ -2161,7 +2201,8 @@ async def test_the_room_that_is_not_being_recorded_is_reported_to_administrators
     )
 
     state = client.running_state(GUILD_ID)
-    assert state.channel_id == SECOND_CHANNEL_ID
+    assert state.channel_ids == (SECOND_CHANNEL_ID,)
+    assert state.session_limit == 1, "and it is one because there is one connection"
     assert state.allowed_channel_ids == (CHANNEL_ID, SECOND_CHANNEL_ID)
     assert state.waiting_channel_ids == (CHANNEL_ID,)
 
@@ -2302,7 +2343,7 @@ async def test_adding_a_channel_mid_session_waits_for_the_recording_to_end(
     await client._tick_all(clock.now())
 
     assert sessions.closed == [(1, "empty")]
-    assert client._guilds[GUILD_ID].channel_ids == (CHANNEL_ID, SECOND_CHANNEL_ID)
+    assert _rec(client, GUILD_ID).channel_ids == (CHANNEL_ID, SECOND_CHANNEL_ID)
 
 
 async def test_a_guild_configured_before_the_rename_keeps_recording(tmp_path: Path) -> None:
@@ -2347,10 +2388,13 @@ async def test_a_capture_failure_blocks_every_allowed_channel_not_only_the_one_i
     client = _client(clock, config_store=_allowing(CHANNEL_ID, SECOND_CHANNEL_ID))
     guild = _multi_channel_guild()
     _in_guild(client, guild)
-    client._guilds[GUILD_ID] = _GuildRecording(
-        config=_runtime_config(channel_ids=(CHANNEL_ID, SECOND_CHANNEL_ID)),
-        service=_service(sessions, FakeJobs(), tmp_path),
-        voice=voice,
+    _install(
+        client,
+        _ChannelRecording(
+            config=_runtime_config(channel_ids=(CHANNEL_ID, SECOND_CHANNEL_ID)),
+            service=_service(sessions, FakeJobs(), tmp_path),
+            voice=voice,
+        ),
     )
 
     anna = _member(ANNA, guild, role_ids=[ROLE_ID])
@@ -2360,7 +2404,7 @@ async def test_a_capture_failure_blocks_every_allowed_channel_not_only_the_one_i
     )
     assert sessions.opened == [1]
 
-    client._guilds[GUILD_ID].service.request_close(EndReason.DECODE_FAILURE)
+    _rec(client, GUILD_ID).service.request_close(EndReason.DECODE_FAILURE)
     clock.advance(timedelta(seconds=1))
     await client._tick_all(clock.now())
     assert sessions.closed == [(1, "decode_failure")]
@@ -2383,6 +2427,294 @@ async def test_a_capture_failure_blocks_every_allowed_channel_not_only_the_one_i
 
     assert sessions.opened == [1, 2]
     assert voice.joined == [CHANNEL_ID, SECOND_CHANNEL_ID]
+
+
+async def test_a_live_session_whose_room_vanished_is_not_told_that_everybody_left(
+    tmp_path: Path,
+) -> None:
+    """ "I could not look" must never be written down as "the room is empty".
+
+    A channel the process cannot read is absent from the headcount rather
+    than present as a zero, and zero is precisely what starts the
+    empty-grace countdown on a live session. Pinned here before the runtime
+    was re-keyed per room, because moving a headcount from one dictionary
+    to another is exactly the kind of change that turns a missing key back
+    into a zero without anyone noticing.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    client = _client(
+        clock,
+        config_store=_allowing(CHANNEL_ID, SECOND_CHANNEL_ID),
+        sessions=sessions,
+        jobs=FakeJobs(),
+        recording_dir=tmp_path,
+    )
+    guild = _multi_channel_guild()
+    _in_guild(client, guild)
+    _occupy(guild, c2=[], c4=[])
+    await client._tick_all(clock.now())
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    _occupy(guild, c2=[anna])
+    await client.on_voice_state_update(
+        anna, _voice_state(None), _voice_state(guild.channels[CHANNEL_ID])
+    )
+    assert sessions.opened == [1]
+
+    # Anna's room is deleted out from under the session in progress, while
+    # somebody else starts a meeting in the other allowed room -- which is
+    # the update that makes the client recount everything.
+    vanished = guild.channels.pop(CHANNEL_ID)
+    ben = _member(BEN, guild, role_ids=[ROLE_ID])
+    _occupy(guild, c4=[ben])
+    await client.on_voice_state_update(
+        ben, _voice_state(None), _voice_state(guild.channels[SECOND_CHANNEL_ID])
+    )
+    del vanished
+
+    clock.advance(timedelta(seconds=61))  # past empty_grace_seconds
+    await client._tick_all(clock.now())
+
+    assert sessions.closed == [], "an unreadable room must not start the empty-grace countdown"
+
+
+# ---------------------------------------------------------------------------
+# A recording is a property of a room, and the one connection is asked about
+# ---------------------------------------------------------------------------
+
+
+async def _live_multi_channel_client(
+    clock: FakeClock, sessions: FakeSessions, tmp_path: Path
+) -> tuple[_TestClient, MagicMock]:
+    """A guild allowing two rooms, reconciled once so its pipeline exists."""
+    client = _client(
+        clock,
+        config_store=_allowing(CHANNEL_ID, SECOND_CHANNEL_ID),
+        sessions=sessions,
+        jobs=FakeJobs(),
+        recording_dir=tmp_path,
+    )
+    guild = _multi_channel_guild()
+    _in_guild(client, guild)
+    _occupy(guild, c2=[], c4=[])
+    await client._tick_all(clock.now())
+    return client, guild
+
+
+async def test_a_pipeline_that_follows_a_meeting_is_filed_under_the_room_it_moved_to(
+    tmp_path: Path,
+) -> None:
+    """The re-keying, stated as behaviour rather than as a data structure.
+
+    A recording used to be filed under the guild with its room as a field,
+    so "which room" was a detail of a server-level object. It is the room
+    that a session, its `sessions` row and its audio belong to -- so when
+    the bot follows a meeting next door, the pipeline is findable under
+    the room it is actually recording and under no other.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    client, guild = await _live_multi_channel_client(clock, sessions, tmp_path)
+    assert (GUILD_ID, CHANNEL_ID) in client._recordings
+
+    anna = _member(ANNA, guild, role_ids=[ROLE_ID])
+    _occupy(guild, c4=[anna])
+    await client.on_voice_state_update(
+        anna, _voice_state(None), _voice_state(guild.channels[SECOND_CHANNEL_ID])
+    )
+
+    assert (GUILD_ID, SECOND_CHANNEL_ID) in client._recordings
+    assert (GUILD_ID, CHANNEL_ID) not in client._recordings, (
+        "a pipeline must not be findable under a room nothing is recorded from"
+    )
+    assert len(client._recordings) == 1, "and following a meeting is a move, not a second pipeline"
+
+
+async def test_a_guild_holding_its_one_connection_may_not_open_another(tmp_path: Path) -> None:
+    """One bot identity holds one voice connection per guild.
+
+    The bot asks this rather than relying on a dictionary shaped so the
+    question cannot come up -- which is the whole difference between a
+    limit somebody can lift and one they have to discover.
+    """
+    clock = FakeClock(T0)
+    client, _guild = await _live_multi_channel_client(clock, FakeSessions(), tmp_path)
+
+    assert client._may_open_another(GUILD_ID) is False
+    assert client._may_open_another(OTHER_GUILD_ID) is True, "another server is another connection"
+
+
+async def test_a_guild_with_no_free_connection_is_not_built_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The guard is load-bearing rather than decorative.
+
+    The configuration here is complete, so `plan_reconfigure` says
+    "build" -- it compares stored values and knows nothing about voice
+    connections. What refuses is the limit, and moving the constant is
+    exactly the edit lifting it would be, in the one direction that can
+    be tested without a second Discord application.
+    """
+    monkeypatch.setattr(client_module, "MAX_CONCURRENT_SESSIONS_PER_GUILD", 0)
+    clock = FakeClock(T0)
+    client, _guild = await _live_multi_channel_client(clock, FakeSessions(), tmp_path)
+
+    assert client._recordings == {}, "no connection to spare, so nothing was built"
+
+
+async def _two_rooms(
+    client: _TestClient, sessions: FakeSessions, tmp_path: Path
+) -> tuple[_ChannelRecording, _ChannelRecording]:
+    """Two pipelines for one guild, filed under the rooms they serve.
+
+    Deliberately past the limit the client itself enforces: this is the
+    state a second bot identity would produce, and the only way to show
+    that the rules below are rules rather than accidents of there never
+    being a second room to ask about.
+    """
+    allowed = _runtime_config(channel_ids=(CHANNEL_ID, SECOND_CHANNEL_ID))
+    first = _install(
+        client,
+        _ChannelRecording(
+            config=allowed,
+            service=_service(sessions, FakeJobs(), tmp_path),
+            voice=FakeVoiceReceiver(),
+        ),
+    )
+    next_door = _service(sessions, FakeJobs(), tmp_path)
+    next_door.retarget(SECOND_CHANNEL_ID, None)
+    second = _install(
+        client,
+        _ChannelRecording(config=allowed, service=next_door, voice=FakeVoiceReceiver()),
+    )
+    return first, second
+
+
+async def test_a_deferred_change_waits_for_every_room_not_only_the_one_that_finished(
+    tmp_path: Path,
+) -> None:
+    """What a deferral carries belongs to the server, not to one room.
+
+    `consent_role_id` decides whose voice is recorded in every room at
+    once, and `voice_channel_ids` decides which rooms may be recorded at
+    all. Landing a deferred change the moment one room finished would
+    move both out from under a session still running next door -- which
+    is the exact thing the deferral exists to prevent.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    client = _client(clock, config_store=_allowing(CHANNEL_ID, SECOND_CHANNEL_ID))
+    _in_guild(client, _multi_channel_guild())
+    first, next_door = await _two_rooms(client, sessions, tmp_path)
+
+    await next_door.service.participants_changed(1, clock.now())
+    assert next_door.service.is_recording is True
+    first.pending = _runtime_config(channel_ids=(THIRD_CHANNEL_ID,), role_id=NEW_ROLE_ID)
+
+    await client._apply_pending(GUILD_ID, first)
+
+    assert first.pending is not None, "the change is still waiting"
+    assert first.config.channel_ids == (CHANNEL_ID, SECOND_CHANNEL_ID), "and has not landed"
+    assert next_door.service.is_recording is True, "and the other room is undisturbed"
+
+
+async def test_a_deferred_change_lands_once_the_last_room_is_idle(tmp_path: Path) -> None:
+    """The other half: waiting for every room is not waiting forever."""
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    client = _client(clock, config_store=_allowing(CHANNEL_ID, SECOND_CHANNEL_ID))
+    guild = _multi_channel_guild()
+    _in_guild(client, guild)
+    _occupy(guild, c2=[], c4=[])
+    first, _next_door = await _two_rooms(client, sessions, tmp_path)
+    first.pending = _runtime_config(channel_ids=(SECOND_CHANNEL_ID,), role_id=NEW_ROLE_ID)
+
+    await client._apply_pending(GUILD_ID, first)
+
+    assert first.pending is None
+    assert first.config.channel_ids == (SECOND_CHANNEL_ID,)
+    assert first.channel_id == SECOND_CHANNEL_ID
+    assert (GUILD_ID, SECOND_CHANNEL_ID) in client._recordings, "re-keyed with the move"
+
+
+async def test_a_stale_channel_is_reported_once_and_a_second_one_on_its_own(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """ "Channel 5 cannot be seen" is news about channel 5.
+
+    Keyed per guild, the deduplication compared the whole set, so a second
+    stale id appearing in the list re-announced every id already known to
+    be stale beside it. Per room, each is said once and stays quiet.
+    """
+    clock = FakeClock(T0)
+    store = _allowing(CHANNEL_ID, SECOND_CHANNEL_ID)
+    client = _client(
+        clock, config_store=store, sessions=FakeSessions(), jobs=FakeJobs(), recording_dir=tmp_path
+    )
+    guild = _multi_channel_guild()
+    _in_guild(client, guild)
+    # Only the first room exists in the guild; the second is a stale id.
+    _occupy(guild, c2=[])
+
+    with caplog.at_level(logging.WARNING, logger=CLIENT_LOGGER):
+        await client._tick_all(clock.now())
+        first_pass = [entry.getMessage() for entry in caplog.records]
+        caplog.clear()
+        store.write(
+            GUILD_ID,
+            settings.VOICE_CHANNEL_IDS,
+            f"{CHANNEL_ID},{SECOND_CHANNEL_ID},{THIRD_CHANNEL_ID}",
+        )
+        await client._tick_all(clock.now())
+        second_pass = [entry.getMessage() for entry in caplog.records]
+
+    assert any(f"allows channel {SECOND_CHANNEL_ID}" in line for line in first_pass)
+    assert any(f"allows channel {THIRD_CHANNEL_ID}" in line for line in second_pass)
+    assert not any(f"allows channel {SECOND_CHANNEL_ID}" in line for line in second_pass), (
+        "the id already reported must not be announced again"
+    )
+
+
+async def test_a_channel_that_comes_back_is_reported_again_if_it_vanishes_again(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A suppressed complaint must not be suppressed for the life of the process.
+
+    A room comes back -- the gateway cache fills in after a reconnect, or
+    somebody recreates it -- and the next time it goes missing that is a
+    fresh fault, not the old one still standing.
+    """
+    clock = FakeClock(T0)
+    client = _client(
+        clock,
+        config_store=_allowing(CHANNEL_ID, SECOND_CHANNEL_ID),
+        sessions=FakeSessions(),
+        jobs=FakeJobs(),
+        recording_dir=tmp_path,
+    )
+    guild = _multi_channel_guild()
+    _in_guild(client, guild)
+    _occupy(guild, c2=[])
+
+    async def recount() -> None:
+        """Forces a headcount without starting anything: somebody with no
+        consent role arriving in a room that does exist."""
+        bystander = _member(BEN, guild, role_ids=[])
+        await client.on_voice_state_update(
+            bystander, _voice_state(None), _voice_state(guild.channels[CHANNEL_ID])
+        )
+
+    with caplog.at_level(logging.WARNING, logger=CLIENT_LOGGER):
+        await client._tick_all(clock.now())
+        _occupy(guild, c4=[])  # the room reappears
+        await recount()
+        caplog.clear()
+        guild.channels.pop(SECOND_CHANNEL_ID)  # and goes away a second time
+        await recount()
+        after = [entry.getMessage() for entry in caplog.records]
+
+    assert any(f"allows channel {SECOND_CHANNEL_ID}" in line for line in after)
 
 
 class _RecordingDirectoryMirror:
