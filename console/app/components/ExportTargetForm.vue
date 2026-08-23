@@ -10,10 +10,21 @@
  *
  * **It shows what this format needs, never the union of every field.**
  * Outline wants a collection and offers the picker Bot Settings already
- * has for `document_target`; the two object-store formats want a key
- * prefix, which has no directory to browse and is therefore typed. Which
- * of the two a format wants is `~/utils/exportTargets`' answer, so adding
- * a format is adding an entry there rather than a branch here.
+ * has for `document_target`; the object-store formats want a key prefix,
+ * which has no directory to browse and is therefore typed. Which of the
+ * two a format wants follows from the *sink family* the deployment
+ * reports for it, so a format built tomorrow gets the right field with
+ * nothing added here and nothing added in `~/utils/exportTargets` either.
+ *
+ * **Which formats exist is the deployment's answer, and it arrives as a
+ * prop.** `formats` is `GET /api/export-formats`, parsed. This component
+ * holds no list of its own and no belief about what is buildable, which is
+ * what lets it render an unavailable format as a disabled row saying so —
+ * see the argument at the top of `~/utils/exportTargets`, and #150 for the
+ * position it replaces. When the catalogue could not be read the picker is
+ * empty and says so; it never falls back to a list of guesses, because a
+ * guess is what this component existed for two releases without being able
+ * to correct.
  *
  * **There is no credential field, and that is the point.** A `PUT` on a
  * destination does not touch its secret — the API gives the credential a
@@ -39,7 +50,9 @@ import UiSelect from '~/components/ui/UiSelect.vue'
 import { singleChoices, type NamedRow } from '~/utils/directory'
 import {
   type DraftField,
+  type FormatInfo,
   type TargetDraft,
+  SINK_OUTLINE,
   draftProblems,
   formatChoices,
   formatSpec,
@@ -53,6 +66,12 @@ const props = withDefaults(
     initial: TargetDraft
     /** Names this guild already uses, this destination's own excluded. */
     taken?: readonly string[]
+    /** What this deployment reports it knows of, buildable or not. */
+    formats?: readonly FormatInfo[]
+    /** The catalogue could not be read. Unlike the collections below this
+     *  is not decoration: the format is a required field with a closed set
+     *  of legal values, and this form has no honest way to guess it. */
+    formatsFailed?: boolean
     /** Outline's collections, for the one format that addresses one. */
     collections?: readonly NamedRow[]
     /** The collections could not be read. Decoration failing, not the
@@ -60,7 +79,14 @@ const props = withDefaults(
     collectionsFailed?: boolean
     busy?: boolean
   }>(),
-  { taken: () => [], collections: () => [], collectionsFailed: false, busy: false },
+  {
+    taken: () => [],
+    formats: () => [],
+    formatsFailed: false,
+    collections: () => [],
+    collectionsFailed: false,
+    busy: false,
+  },
 )
 
 const emit = defineEmits<{ submit: [TargetDraft]; cancel: [] }>()
@@ -94,8 +120,25 @@ watch(
   },
 )
 
-const spec = computed(() => formatSpec(draft.value.format))
-const wantsCollection = computed(() => spec.value?.targetKind === 'collection')
+const spec = computed(() => formatSpec(draft.value.format, props.formats))
+const wantsCollection = computed(() => spec.value?.sink === SINK_OUTLINE)
+
+/**
+ * What the address field is called, and the sentence under it.
+ *
+ * Neutral where the deployment has reported no sink family for this
+ * format — because it does not build it, because it has never heard of it,
+ * or because the catalogue could not be read. The previous version fell
+ * back to the object-store wording, which named a rule ("letters, digits,
+ * dot, dash…") that this console has no reason to believe applies. A field
+ * that states a constraint it invented is worse than one that states none:
+ * the API enforces the real rule either way, and only one of the two
+ * teaches the reader something false while they type.
+ */
+const targetLabelKey = computed(
+  () => spec.value?.targetLabelKey ?? 'admin.destinations.addressLabel',
+)
+const targetHintKey = computed(() => spec.value?.targetHintKey ?? 'admin.destinations.addressHint')
 
 /** Whether there is a list to pick from at all. An empty select would say
  *  "this installation has no collections", which is a claim, and the wrong
@@ -105,7 +148,16 @@ const pickerAvailable = computed(
 )
 const picking = computed(() => pickerAvailable.value && !manual.value)
 
-const formatOptions = computed(() => formatChoices(t, props.initial.format))
+/** Whether the deployment reported anything it cannot run. The sentence
+ *  explaining the greyed rows is shown only where there are some. */
+const hasUnavailable = computed(() => props.formats.some((entry) => !entry.available))
+
+// Keyed on `initial.format` rather than on the draft's current one: the
+// row kept for a format the catalogue does not report is kept because this
+// destination *stores* it, and a list that recomputed on every change would
+// drop that row the moment somebody looked at another format and leave
+// nothing to go back to.
+const formatOptions = computed(() => formatChoices(t, props.formats, props.initial.format))
 
 /** The collections, plus the stored id when the copy has no row for it.
  *  Dropping it would render as though nothing were configured and rewrite
@@ -118,7 +170,7 @@ const collectionOptions = computed<UiOption[]>(() =>
   })),
 )
 
-const problems = computed(() => draftProblems(draft.value, props.taken))
+const problems = computed(() => draftProblems(draft.value, props.taken, props.formats))
 const ready = computed(() => problems.value.length === 0)
 
 /** The complaint about one field, once it is the reader's to see. */
@@ -194,8 +246,10 @@ function submit() {
         </p>
       </div>
 
-      <!-- The format. Three rows, and a fourth only when this destination
-           already stores something else. -->
+      <!-- The format. One row per format the deployment reports, the ones
+           it cannot run among them and disabled, plus one more only when
+           this destination already stores something the catalogue does not
+           mention. -->
       <div>
         <span class="block text-sm font-medium">{{ $t('admin.destinations.formatLabel') }}</span>
         <div class="mt-1">
@@ -210,13 +264,32 @@ function submit() {
         <p class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
           {{ $t('admin.destinations.formatHint') }}
         </p>
-        <!-- Where the absent formats are accounted for. One sentence in
-             place of two inert rows, so their absence reads as a fact
-             about this deployment rather than as a list that failed to
-             render — the same answer `video_consent_offered` gets on the
-             consent card. -->
-        <p class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
+        <!-- What the greyed rows are. The list above no longer needs a
+             sentence enumerating which formats exist — the deployment says
+             so, row by row — but it does need one saying why some of them
+             cannot be chosen, because a disabled row with no explanation
+             reads as a fault.
+
+             And only where there is such a row. On a deployment that
+             builds everything it knows of, this sentence would describe
+             nothing on the screen, which is how the old hard-coded version
+             of it came to be wrong. -->
+        <p
+          v-if="hasUnavailable"
+          class="mt-1 text-xs"
+          :style="{ color: 'var(--text-muted)' }"
+        >
           {{ $t('admin.destinations.formatsNote') }}
+        </p>
+        <!-- The catalogue itself could not be read. Said plainly rather
+             than papered over with a list of guesses: the picker is empty,
+             and this is why. -->
+        <p
+          v-if="formatsFailed || formats.length === 0"
+          class="mt-1 text-xs"
+          :style="{ color: 'var(--text-muted)' }"
+        >
+          {{ $t('admin.destinations.formatsUnavailable') }}
         </p>
         <p v-if="complaint('format')" class="mt-1 text-xs" :style="{ color: 'var(--danger)' }">
           {{ say(complaint('format')) }}
@@ -231,10 +304,10 @@ function submit() {
           class="block text-sm font-medium"
           :for="`${base}-target`"
         >
-          {{ $t(spec?.targetLabelKey ?? 'admin.destinations.prefixLabel') }}
+          {{ $t(targetLabelKey) }}
         </label>
         <span v-else class="block text-sm font-medium">
-          {{ $t(spec?.targetLabelKey ?? 'admin.destinations.collectionLabel') }}
+          {{ $t(targetLabelKey) }}
         </span>
 
         <div v-if="picking" class="mt-1">
@@ -264,7 +337,7 @@ function submit() {
         >
 
         <p class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
-          {{ $t(spec?.targetHintKey ?? 'admin.destinations.prefixHint') }}
+          {{ $t(targetHintKey) }}
         </p>
         <!-- Why a field that should have been a picker is a text box. The
              list being unreadable must never stop a destination being
