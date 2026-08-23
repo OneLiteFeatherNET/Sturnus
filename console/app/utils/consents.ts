@@ -35,6 +35,7 @@
  * they chose -- and this module keeps them apart everywhere.
  */
 import { formatCount, formatMoment } from '~/utils/format'
+import type { ConsentScope } from '~/utils/myConsents'
 
 /** One person's consent, as the API describes it. */
 export interface ConsentRow {
@@ -54,6 +55,20 @@ export interface ConsentRow {
   revoked_at: string | null
   /** The API's verdict, taken as given. See the module comment. */
   active: boolean
+  /**
+   * What this person consented to, `audio` or `audio_video`.
+   *
+   * On the roster so that an administrator can see who agreed to video
+   * without opening anything. It is not editable from here and will not
+   * become so: narrowing somebody else's scope is a decision about them
+   * that stops short of stopping the recording, and the one write this page
+   * has is the one that stops it entirely. Widening it would be granting
+   * consent on their behalf, which nothing in this system does.
+   *
+   * A row from an API that predates the column reads as `audio`, which is
+   * exactly what those consents were given for.
+   */
+  scope: ConsentScope
   /** How many recordings the guild still holds that contain this person's
    *  audio. Withdrawing changes none of them. */
   recordings_with_audio: number
@@ -116,6 +131,10 @@ export function parseConsents(payload: unknown): ConsentRow[] {
       // Erring the other way would tell an administrator somebody is being
       // recorded when the bot has already stopped.
       active: entry.active === true,
+      // Anything that is not `audio_video` is `audio`, an absent field
+      // included. Erring the other way would show an administrator a video
+      // consent nobody gave.
+      scope: entry.scope === 'audio_video' ? 'audio_video' : 'audio',
       recordings_with_audio: asCount(entry.recordings_with_audio),
     })
   }
@@ -253,6 +272,25 @@ export function withdrawnLine(row: ConsentRow): string | null {
  * who came here to erase a person's audio has come to the wrong page, and
  * this is where they find that out.
  */
+/**
+ * What this person consented to, as a key.
+ *
+ * A key rather than a sentence, unlike its neighbours in this module: it is
+ * new, and `i18n/README.md` reserves `admin.consents.*` for this page. The
+ * rest of this file is still English prose because the whole administrative
+ * area is, and converting it belongs to the sweep that converts all four
+ * admin pages together rather than to the change that adds one field.
+ *
+ * `audio_video` is deliberately not painted as an upgrade. Sturnus records
+ * no video today; the scope records what somebody would allow, which is a
+ * fact worth having before the capability exists rather than after.
+ */
+export function scopeLineKey(row: ConsentRow): string {
+  return row.scope === 'audio_video'
+    ? 'admin.consents.scope.audioVideo'
+    : 'admin.consents.scope.audio'
+}
+
 export function recordingsLine(row: ConsentRow): string {
   const held = row.recordings_with_audio
   if (held === 0) return 'Sturnus holds no recordings containing their audio.'
@@ -373,6 +411,25 @@ export interface RevokeResult {
   /** A machine name for the refusal (`already_revoked`,
    *  `no_consent_on_record`), or `null` when the write succeeded. */
   refusal: string | null
+  /**
+   * The instant the withdrawal takes effect, echoed back.
+   *
+   * Echoed rather than assumed. The console may have sent an instant and
+   * may have sent none; either way the row that now exists is the one the
+   * API wrote, and a page reporting its own request rather than the
+   * answer is a page that reports a scheduled withdrawal as a completed
+   * one whenever the two disagree.
+   *
+   * Null from an API that predates the field, in which case the outcome
+   * says nothing about an instant rather than inventing one.
+   */
+  effective_at: string | null
+  /**
+   * How many recordings containing this person's audio fall on or after
+   * `effective_at`. **This withdrawal deletes none of them**, and the
+   * number is here to say so with a figure rather than with an adjective.
+   */
+  recordings_from_effective_at: number
 }
 
 /** The revoke endpoint's answer. `revoked` is read strictly: a body this
@@ -380,8 +437,15 @@ export interface RevokeResult {
  *  withdrawal, because the only person who would find out otherwise is the
  *  one still being recorded. */
 export function parseRevokeResult(payload: unknown): RevokeResult {
-  if (!isRecord(payload)) return { revoked: false, refusal: null }
-  return { revoked: payload.revoked === true, refusal: asText(payload.refusal) }
+  if (!isRecord(payload)) {
+    return { revoked: false, refusal: null, effective_at: null, recordings_from_effective_at: 0 }
+  }
+  return {
+    revoked: payload.revoked === true,
+    refusal: asText(payload.refusal),
+    effective_at: asText(payload.effective_at),
+    recordings_from_effective_at: asCount(payload.recordings_from_effective_at),
+  }
 }
 
 /**

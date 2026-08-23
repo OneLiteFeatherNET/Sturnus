@@ -43,8 +43,9 @@ matches the file that renders it:
 | `dashboard.*`      | `pages/index.vue`, `utils/format.ts`                 |
 | `recordings.*`     | `pages/recordings/*` and the components under them   |
 | `calendar.*`       | `pages/calendar.vue`, the heatmap and the timeline   |
+| `settings.*`       | `pages/settings.vue` — a person's own settings        |
 | `admin.settings.*` | `pages/admin/bot-settings.vue`                        |
-| `admin.consents.*` | `pages/admin/user-settings.vue`                       |
+| `admin.consents.*` | `pages/admin/consents.vue`                            |
 | `admin.queue.*`    | `pages/admin/queue.vue`                               |
 | `admin.reporting.*`| `pages/admin/reporting.vue`                           |
 
@@ -59,6 +60,21 @@ sentences by hand, and three helpers exist only to serve them:
 `formatCount` and `formatMoment` in `utils/format.ts`, and `formatDuration`
 in `utils/duration.ts`. Each says so in its own comment. They go when the
 last of those three pages is translated.
+
+`admin.consents.*` is the exception, and it is half-populated on purpose. The
+page it serves is still English prose, because the whole administrative area
+is and converting it belongs to the sweep that converts all four admin pages
+together. What is already keyed there is the material the effective-instant
+work added — the withdrawal's effective moment, and the scope on a roster
+row — so that the sweep has less to do rather than more. New strings on that
+page go through `$t` from now on; the existing ones move when the sweep
+reaches them.
+
+`settings.consent.*` sits under `settings.*` rather than in a namespace of
+its own, because it is a section of that page and not a page. It is the one
+place a person acts on their own consent, and every sentence in it is
+translated — a new section in English on an already-translated page is
+exactly the hole `test/i18n.spec.ts` exists to prevent.
 
 The second segment names the string by what it says, in camelCase —
 `notLinkedHeading`, `goToSignIn`, `unreachableDetail`. Not by where it sits
