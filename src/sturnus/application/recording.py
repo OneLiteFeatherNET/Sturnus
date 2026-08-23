@@ -46,6 +46,30 @@ def audio_key(session_id: int, discord_user_id: int) -> str:
     return f"sessions/{session_id}/speakers/{discord_user_id}.enc"
 
 
+def spectrogram_key(session_id: int, discord_user_id: int) -> str:
+    """Object key for the stored picture of one speaker's recording.
+
+    Beside the audio and derived from the same two ids, so an operator
+    looking at the bucket can see at a glance which recording an artefact
+    belongs to -- and so that a prefix listing of a session shows
+    everything that session put in the bucket, which is what makes "is
+    anything left?" a question the bucket can answer after a retention
+    sweep.
+
+    Still `.enc`, because it is: the picture is sealed under the same
+    session data key the recording is. What is stored is a rendering of
+    somebody's voice activity, and an object in this bucket that is
+    readable without the master key would be the only one.
+
+    The key the worker actually used is nonetheless written down on the
+    job (`transcription_job.spectrogram_key`) rather than recomputed from
+    this rule at deletion time. The rule can change; a bucket full of
+    objects written under the old one cannot, and the retention sweep must
+    delete what was written rather than what would be written today.
+    """
+    return f"sessions/{session_id}/speakers/{discord_user_id}.spectrogram.enc"
+
+
 class SessionRecorder(Protocol):
     """What `RecordingService` needs to persist about a session's rows."""
 

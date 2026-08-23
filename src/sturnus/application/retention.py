@@ -8,8 +8,13 @@ touching S3 or the database itself.
 
 `sweep_expired_audio` is the periodic sweep that actually calls it: it reads
 candidates through `JobStore`, filters them with `expired_jobs`, then --
-for each -- deletes the object through `AudioDeleter` and stamps
-`audio_deleted_at` as the durable evidence that the deletion happened. The
+for each -- deletes the recording *and its stored spectrogram* through
+`AudioDeleter` and stamps `audio_deleted_at` as the durable evidence that
+the deletion happened. Both objects, in one pass, because a spectrogram
+that outlived the recording it was drawn from would be a rendering of
+somebody's voice activity surviving the retention window that voice was
+subject to -- see `sweep_expired_audio` and
+`sturnus.domain.settings.SPECTROGRAMS_BY_DEFAULT`. The
 bucket lifecycle rule (Spec 12.2) is a second line of defence, never a
 substitute for that record. `JobStore`/`AudioDeleter` are narrow local
 `Protocol`s rather than concrete types, the same pattern
@@ -63,28 +68,61 @@ class JobStore(Protocol):
         of it anywhere in the codebase, the same reasoning
         `sturnus.application.publishing.sessions_to_announce`'s caller
         follows for `status`/`announced_at`/`document_url`.
+
+        Every candidate carries `spectrogram_key` -- `None` for the jobs
+        that have no stored picture, which is most of them and all of them
+        for a guild that never switched `spectrograms_by_default` on. It
+        is selected rather than derived from the job's ids because the
+        naming rule may change and the objects already in the bucket
+        cannot: this sweep must delete what was written.
         """
         ...
 
-    async def mark_audio_deleted(self, job_id: int, now: datetime) -> None: ...
+    async def mark_audio_deleted(self, job_id: int, now: datetime) -> None:
+        """Stamps the deletion, and forgets where the picture was.
+
+        `spectrogram_key` is cleared in the same statement. The column
+        says where this job's artefact is, and once the sweep has deleted
+        it there is no artefact for it to point at; leaving the key behind
+        would make every later sweep re-delete an object that is already
+        gone and would leave the row claiming a picture exists.
+        """
+        ...
 
 
 class AudioDeleter(Protocol):
-    """Where an expired recording's object is actually removed."""
+    """Where an expired recording's objects are actually removed.
+
+    One method for both, because both are objects in the same bucket
+    under the same credentials, and a port with a second method for the
+    artefact would invite a caller to delete one kind and not the other.
+    """
 
     async def delete(self, key: str) -> None: ...
 
 
 async def sweep_expired_audio(jobs: JobStore, store: AudioDeleter, now: datetime) -> None:
-    """Deletes every expired job's audio object and stamps `audio_deleted_at`.
+    """Deletes every expired job's audio, and its spectrogram, and stamps the row.
+
+    **A stored spectrogram is deleted when its audio is deleted, in the
+    same pass.** That rule is the whole reason storing one is defensible.
+    A spectrogram is a rendering of when somebody spoke and for how long;
+    it is less than the audio and it is not nothing, and this sweep is the
+    only thing in the system that ends a recording's life. If it deleted
+    the object and left the picture, `spectrograms_by_default` would be a
+    switch that quietly makes something about a person's voice outlive the
+    retention window that person's recording was subject to -- which is
+    what the window is for. So the picture goes with it, here, rather than
+    in a second sweep that could be forgotten, disabled, or fail on its
+    own.
 
     Survives its own errors per job: a failure deleting one job's audio
-    (or stamping it afterwards) is logged and does not stop the sweep from
-    handling the rest -- one unreachable object must not block every other
-    job's retention from being enforced.
+    (or its picture, or stamping it afterwards) is logged and does not
+    stop the sweep from handling the rest -- one unreachable object must
+    not block every other job's retention from being enforced.
 
-    `audio_deleted_at` is stamped only after `store.delete` actually
-    succeeds, so a failed deletion is retried on the next sweep instead of
+    `audio_deleted_at` is stamped only after both deletions actually
+    succeed, so a failed deletion is retried on the next sweep instead of
     being silently recorded as done. The reverse order (stamp then delete)
     would risk exactly the outcome `audio_deleted_at` exists to rule out --
     a stamp claiming deletion happened when it did not. The cost of the
@@ -92,11 +130,21 @@ async def sweep_expired_audio(jobs: JobStore, store: AudioDeleter, now: datetime
     being retried once more next sweep; `store.delete` on an
     already-missing key is idempotent (an S3 `DELETE` on a missing object
     still succeeds), so that retry costs nothing.
+
+    The audio goes first and the picture second, which matters only in the
+    one case where the sweep is interrupted between them: what is left
+    behind is then a picture whose audio is gone, and a row still asking
+    to be swept. The console refuses a track whose object has been erased
+    before it looks for a picture at all, so that interval is invisible
+    from outside and ends on the next sweep.
     """
     for job in expired_jobs(await jobs.candidates_for_retention(), now):
         job_id = cast(int, job["id"])
         try:
             await store.delete(cast(str, job["s3_key"]))
+            picture = cast("str | None", job["spectrogram_key"])
+            if picture is not None:
+                await store.delete(picture)
             await jobs.mark_audio_deleted(job_id, now)
         except Exception as exc:
             log_exception(

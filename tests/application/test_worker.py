@@ -16,8 +16,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from sturnus.application.documents import CreatedDocument, DocumentSink
 from sturnus.application.exporting import Destination, ExportPorts
+from sturnus.application.recording import spectrogram_key
+from sturnus.application.spectrogram import decode_artefact
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
 from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.domain import settings as domain_settings
@@ -153,7 +157,13 @@ class FakeStore:
 
 
 class FakeCrypto:
-    """Stands in for unwrap-and-decrypt; writes a recognisable file."""
+    """Stands in for unwrap-and-decrypt; writes a recognisable file.
+
+    The eleven bytes it writes are deliberately *not* a track anything can
+    read: a test that needs a real one reaches for `WritesARealWav` below,
+    and a test that does not is exercising some reader's refusal path
+    whether it meant to or not.
+    """
 
     def __init__(self) -> None:
         self.decrypted: list[Path] = []
@@ -161,6 +171,44 @@ class FakeCrypto:
     def decrypt_to(self, _source: Path, target: Path, _wrapped: bytes, _key_id: str) -> None:
         target.write_bytes(b"RIFFdecoded")
         self.decrypted.append(target)
+
+
+class FakeSpectrograms:
+    """Satisfies `sturnus.application.worker.SpectrogramStore`.
+
+    Records the two writes in one list, in the order they were made, so a
+    test can assert the order the protocol insists on -- the key written
+    down before the object exists -- rather than only that both happened.
+    """
+
+    def __init__(self, fail_on: str | None = None) -> None:
+        #: `("record", key)` / `("put", key)`, in call order.
+        self.calls: list[tuple[str, str]] = []
+        #: The artefact per key, as it reached the store. Plaintext here:
+        #: the sealing belongs to the adapter that satisfies this port
+        #: (`sturnus.entrypoints.worker._SpectrogramArtefacts`), and what
+        #: `process_one` is responsible for is handing over the right
+        #: envelope material to seal it with.
+        self.stored: dict[str, bytes] = {}
+        #: The `(wrapped_data_key, key_id)` each artefact was handed to be
+        #: sealed under, per key.
+        self.sealed_with: dict[str, tuple[bytes, str]] = {}
+        #: Which method blows up, for the "a failure must not fail the
+        #: job" tests. `None` means neither.
+        self._fail_on = fail_on
+
+    async def record(self, job_id: int, key: str) -> None:
+        del job_id
+        self.calls.append(("record", key))
+        if self._fail_on == "record":
+            raise RuntimeError("the database is briefly unreachable")
+
+    async def put_sealed(self, key: str, source: Path, wrapped: bytes, key_id: str) -> None:
+        self.calls.append(("put", key))
+        if self._fail_on == "put":
+            raise RuntimeError("S3 is briefly unreachable")
+        self.stored[key] = source.read_bytes()
+        self.sealed_with[key] = (wrapped, key_id)
 
 
 class FakeDocuments:
@@ -401,6 +449,7 @@ def run(tmp_path: Path, **kw: Any) -> dict[str, Any]:
         "jobs": kw.get("jobs") or FakeJobs(),
         "links": kw.get("links") or FakeLinks(),
         "config": kw.get("config") or FakeConfig(),
+        "spectrograms": kw.get("spectrograms") or FakeSpectrograms(),
         "work_dir": tmp_path,
         "max_attempts": 3,
     }
@@ -1067,6 +1116,7 @@ async def test_a_finished_job_records_what_its_recording_is(tmp_path: Path) -> N
         jobs=FakeJobs(),
         links=FakeLinks(),
         config=FakeConfig(),
+        spectrograms=FakeSpectrograms(),
         work_dir=tmp_path,
         max_attempts=3,
     )
@@ -1094,6 +1144,7 @@ async def test_the_size_recorded_is_the_stored_object_and_not_the_plaintext(tmp_
         jobs=FakeJobs(),
         links=FakeLinks(),
         config=FakeConfig(),
+        spectrograms=FakeSpectrograms(),
         work_dir=tmp_path,
         max_attempts=3,
     )
@@ -1125,6 +1176,7 @@ async def test_a_recording_whose_header_cannot_be_read_records_nothing(tmp_path:
         jobs=FakeJobs(),
         links=FakeLinks(),
         config=FakeConfig(),
+        spectrograms=FakeSpectrograms(),
         work_dir=tmp_path,
         max_attempts=3,
     )
@@ -1149,6 +1201,7 @@ async def test_a_stereo_recording_is_recorded_as_stereo(tmp_path: Path) -> None:
         jobs=FakeJobs(),
         links=FakeLinks(),
         config=FakeConfig(),
+        spectrograms=FakeSpectrograms(),
         work_dir=tmp_path,
         max_attempts=3,
     )
@@ -1173,6 +1226,7 @@ async def test_a_failed_transcription_records_nothing_about_the_file(tmp_path: P
         jobs=FakeJobs(),
         links=FakeLinks(),
         config=FakeConfig(),
+        spectrograms=FakeSpectrograms(),
         work_dir=tmp_path,
         max_attempts=3,
     )
@@ -1321,3 +1375,209 @@ async def test_a_session_in_both_candidate_sets_is_published_once() -> None:
         exports(documents), sessions, FakeJobs(), FakeLinks(), FakeConfig()
     )
     assert len(documents.created) == 1
+
+
+# ---------------------------------------------------------------------------
+# The spectrogram a guild asked to have drawn once
+#
+# Off, this changes nothing: the console goes on drawing a picture per
+# request out of S3. On, the worker draws it here, where the plaintext is
+# free, and stores it beside the recording -- under the rule that the
+# retention sweep deletes both (`sturnus.application.retention`).
+# ---------------------------------------------------------------------------
+
+
+def spectrograms_on() -> FakeConfig:
+    """A guild that switched `spectrograms_by_default` on."""
+    return guild_config({domain_settings.SPECTROGRAMS_BY_DEFAULT: domain_settings.TRUE})
+
+
+async def test_a_guild_that_never_asked_for_spectrograms_stores_none(tmp_path: Path) -> None:
+    """The default is off, and off has to mean exactly today's behaviour.
+
+    Nothing is drawn, nothing is uploaded, and no column is written --
+    because storing a rendering of somebody's voice activity for a guild
+    that did not ask for one is the thing the default exists to prevent.
+    """
+    spectrograms = FakeSpectrograms()
+
+    await process_one(**run(tmp_path, spectrograms=spectrograms, crypto=WritesARealWav()))
+
+    assert spectrograms.calls == []
+
+
+async def test_a_guild_that_asked_gets_a_picture_stored_beside_its_recording(
+    tmp_path: Path,
+) -> None:
+    """Drawn once, at completion, from the plaintext already on disk.
+
+    The key is the audio's key with a different suffix, so a prefix
+    listing of a session shows everything that session put in the bucket
+    -- which is what makes "did the sweep leave anything behind?" a
+    question the bucket can answer.
+    """
+    spectrograms = FakeSpectrograms()
+
+    await process_one(
+        **run(
+            tmp_path,
+            config=spectrograms_on(),
+            spectrograms=spectrograms,
+            crypto=WritesARealWav(),
+        )
+    )
+
+    key = spectrogram_key(1, 100)
+    assert key in spectrograms.stored
+    assert key.startswith("sessions/1/speakers/100.")
+
+
+async def test_the_stored_picture_describes_the_track_it_was_drawn_from(
+    tmp_path: Path,
+) -> None:
+    """A stored artefact that renders is not the same as one that is true.
+
+    It is read back through the same reader the console uses, and asked
+    the one question the console will ask of it: what track is this? A
+    picture whose sample rate or length disagreed with the recording would
+    label somebody's meeting with somebody else's axes.
+    """
+    spectrograms = FakeSpectrograms()
+
+    await process_one(
+        **run(
+            tmp_path,
+            config=spectrograms_on(),
+            spectrograms=spectrograms,
+            crypto=WritesARealWav(sample_rate=16_000, frames=32_000),
+        )
+    )
+
+    picture = decode_artefact(spectrograms.stored[spectrogram_key(1, 100)])
+    assert picture.sample_rate == 16_000
+    assert picture.duration_seconds == pytest.approx(2.0, abs=0.01)
+
+
+async def test_the_key_is_written_down_before_the_object_is_put(tmp_path: Path) -> None:
+    """The order that keeps the retention rule enforceable.
+
+    The sweep deletes what `transcription_job.spectrogram_key` names, so
+    an object stored before the row names it is an object that -- if the
+    write in between failed -- nothing would ever delete: a rendering of
+    somebody's voice outliving the recording's retention window, which is
+    the one outcome this feature is not allowed to produce.
+    """
+    spectrograms = FakeSpectrograms()
+
+    await process_one(
+        **run(
+            tmp_path,
+            config=spectrograms_on(),
+            spectrograms=spectrograms,
+            crypto=WritesARealWav(),
+        )
+    )
+
+    assert [call for call, _ in spectrograms.calls] == ["record", "put"]
+
+
+async def test_the_picture_is_sealed_under_the_same_key_as_the_recording(
+    tmp_path: Path,
+) -> None:
+    """The job's own envelope, handed over rather than reinvented.
+
+    The artefact is a rendering of somebody's voice activity, so it is
+    encrypted like the voice is; using the job's own wrapped data key
+    means a master-key rotation reaches the picture and the recording
+    together, and that a reader entitled to one can already open the
+    other.
+    """
+    spectrograms = FakeSpectrograms()
+    claimed = job()
+
+    await process_one(
+        **run(
+            tmp_path,
+            queue=FakeQueue([claimed]),
+            config=spectrograms_on(),
+            spectrograms=spectrograms,
+            crypto=WritesARealWav(),
+        )
+    )
+
+    sealed = spectrograms.sealed_with[spectrogram_key(1, 100)]
+    assert sealed == (claimed.wrapped_data_key, claimed.encryption_key_id)
+
+
+@pytest.mark.parametrize("fails", ["record", "put"])
+async def test_a_spectrogram_that_cannot_be_stored_does_not_fail_the_job(
+    tmp_path: Path, fails: str
+) -> None:
+    """The transcription is the valuable part and it already succeeded.
+
+    Re-queueing the job would spend minutes of inference again to retry a
+    picture the console draws for itself in a second -- and the read path
+    does exactly that when there is no artefact. So the failure is logged
+    and the job stays done.
+    """
+    queue = FakeQueue([job()])
+
+    done = await process_one(
+        **run(
+            tmp_path,
+            queue=queue,
+            config=spectrograms_on(),
+            spectrograms=FakeSpectrograms(fail_on=fails),
+            crypto=WritesARealWav(),
+        )
+    )
+
+    assert done is True
+    assert len(queue.completed) == 1
+    assert queue.failed == []
+
+
+async def test_a_track_that_cannot_be_drawn_does_not_fail_the_job(tmp_path: Path) -> None:
+    """Same argument, one step earlier: the drawing itself can refuse.
+
+    `FakeCrypto`'s default plaintext is not a track any reader can parse,
+    which is precisely the shape of a truncated or drifted recording.
+    """
+    queue = FakeQueue([job()])
+    spectrograms = FakeSpectrograms()
+
+    done = await process_one(
+        **run(tmp_path, queue=queue, config=spectrograms_on(), spectrograms=spectrograms)
+    )
+
+    assert done is True
+    assert len(queue.completed) == 1
+    assert spectrograms.stored == {}
+
+
+async def test_the_decrypted_track_is_still_deleted_after_it_has_been_drawn(
+    tmp_path: Path,
+) -> None:
+    """Drawing a picture is not a licence to keep the plaintext around.
+
+    The artefact is written into the same scratch directory the WAV is in,
+    so the one `finally` that has always removed decrypted speech removes
+    the rendering of it too. Asserted on the whole of `work_dir` rather
+    than on the two filenames: what must be gone is everything the job
+    put there, and naming the files would miss the next one somebody adds.
+    """
+    spectrograms = FakeSpectrograms()
+
+    await process_one(
+        **run(
+            tmp_path,
+            config=spectrograms_on(),
+            spectrograms=spectrograms,
+            crypto=WritesARealWav(),
+        )
+    )
+
+    # Without this the assertion below would pass on a run where nothing
+    # was ever decrypted or drawn.
+    assert spectrograms.stored
+    assert list(tmp_path.iterdir()) == []

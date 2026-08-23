@@ -41,6 +41,13 @@ are the exception: `SessionRepository` already has all three, so
 transcripts_for` and `AccountLinkRepository.external_identity`, likewise
 already exist and are wired in directly below, with no adapter needed.
 
+`_SpectrogramArtefacts` is the third, and it is here for a different
+reason: it is not filling a gap in a repository but joining two of them.
+Storing a spectrogram is one act made of a database write and an upload,
+with an order between them that the application layer decides and this
+file carries out -- plus the sealing, which is `encrypt_file` and
+therefore infrastructure by definition.
+
 **Deployment note on the working directory (see the brief's dispatch).**
 `process_one`'s scratch directory for the downloaded/decrypted audio
 defaults to `/tmp`, overridable with `STURNUS_WORK_DIR`. This matches what
@@ -80,7 +87,7 @@ from sturnus.application.exporting import ExportPorts
 from sturnus.application.retention import sweep_expired_audio
 from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.config import StrictSettings
-from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file
+from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file, encrypt_file
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.export_targets import ExportTargetStore
 from sturnus.infrastructure.db.models import Session, SessionParticipant, TranscriptionJob
@@ -287,6 +294,55 @@ class _KeyWrapperDecryptor:
         wrapper = KeyWrapper(self._master_key, self._master_key_id)
         data_key = wrapper.unwrap(wrapped)
         decrypt_file(source, target, data_key)
+
+
+class _SpectrogramArtefacts:
+    """Adapts persistence and the bucket to `worker.SpectrogramStore`.
+
+    Two collaborators behind one port because the port is one act: write
+    down where the picture goes, then put it there. See that protocol for
+    why the order is not negotiable -- an object no row names is an object
+    the retention sweep will never delete, and this feature's whole
+    justification is that a stored spectrogram dies with its audio.
+
+    The sealing happens here rather than in `sturnus.application.worker`
+    for the reason `_KeyWrapperDecryptor` exists: that module may not
+    import `sturnus.infrastructure` (tests/test_architecture.py), and
+    `encrypt_file` is the file format itself. The *decision* to seal is
+    the application's and is written into the port's name; the bytes are
+    this file's problem.
+
+    `keys` is the process's one `KeyWrapper`, handed in rather than built
+    from the master key a third time: this composition root already
+    decodes that key for `_KeyWrapperDecryptor` and for `ExportTargetStore`,
+    and a third decode is a third place a rotation has to be threaded
+    through.
+    """
+
+    def __init__(self, jobs: JobRepository, store: S3AudioStore, keys: KeyWrapper) -> None:
+        self._jobs = jobs
+        self._store = store
+        self._keys = keys
+
+    async def record(self, job_id: int, key: str) -> None:
+        await self._jobs.record_spectrogram(job_id, key)
+
+    async def put_sealed(self, key: str, source: Path, wrapped: bytes, _key_id: str) -> None:
+        """Seals the artefact under the job's own data key and uploads it.
+
+        The same single-master-key assumption `_KeyWrapperDecryptor`
+        documents, which is why `_key_id` is accepted and unused: there is
+        one live master key to unwrap with, and a job naming another is
+        already reported, loudly, where that job's audio was decrypted a
+        moment ago. A second line here would be a second report of one
+        misconfiguration.
+
+        Sealed beside the plaintext in the job's own scratch directory, so
+        `process_one`'s `finally` removes both.
+        """
+        target = source.with_name(source.name + ".enc")
+        await asyncio.to_thread(encrypt_file, source, target, self._keys.unwrap(wrapped))
+        await self._store.put(key, target)
 
 
 class _WorkerSessionStore:
@@ -602,6 +658,9 @@ async def _run() -> None:
     # `sturnus.application.worker._create_session_document` -- rather than
     # assumed to be "outline" for every guild this one process serves.
     links = AccountLinkRepository(session_factory)
+    # The same `keys` binding the export targets use: one decode of the
+    # master key in this process, not one per collaborator that needs it.
+    spectrograms = _SpectrogramArtefacts(jobs, store, keys)
     config_store = ConfigStore(session_factory)
     template_source = _load_template()
 
@@ -720,6 +779,7 @@ async def _run() -> None:
                         jobs=jobs,
                         links=links,
                         config=config_store,
+                        spectrograms=spectrograms,
                         work_dir=settings.work_dir,
                         max_attempts=settings.max_job_attempts,
                         template_source=template_source,

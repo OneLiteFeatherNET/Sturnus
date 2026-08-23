@@ -13,6 +13,23 @@ Spec 12.2 keeps the object for `audio_retention_days` so a poor
 transcription can be redone from the original audio; that deletion belongs
 to the retention sweep (`sturnus.application.retention`), not to this job.
 
+**The spectrogram, for a guild that asked for one.** `spectrograms_by_default`
+makes this function draw each track's picture once, at completion, instead
+of leaving the console to draw it again out of S3 on every view. It is done
+here for one reason: this is the only moment in the system where the
+plaintext WAV is free. It exists on disk for the length of one job and then
+the `finally` removes it, and anybody who wants the same picture afterwards
+has to fetch and decrypt the whole recording to get it.
+
+That stored picture comes with a rule, which is not this module's to enforce
+but is this module's to understand, because it is why the artefact's key is
+written onto the job rather than derived when it is needed: **a stored
+spectrogram is deleted when its audio is deleted**. The retention sweep
+deletes what `transcription_job.spectrogram_key` names, in the same pass as
+the recording. Nothing else would ever delete it, and a picture of when
+somebody spoke and for how long that outlives their recording's retention
+window is exactly the thing the window exists to end.
+
 Language (Spec 7, Spec 11). Two things can decide what language a
 recording is transcribed as, and the order between them is the whole
 point. `transcription_language` is per-guild configuration and wins
@@ -98,6 +115,7 @@ import shutil
 import time
 import uuid
 import wave
+from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Protocol, cast
@@ -119,6 +137,8 @@ from sturnus.application.exporting import (
     destinations_for,
     publish_session,
 )
+from sturnus.application.recording import spectrogram_key
+from sturnus.application.spectrogram import draw, encode_artefact
 from sturnus.application.transcription import TranscriptionEngine
 from sturnus.domain import settings as domain_settings
 from sturnus.domain.measurements import JobMeasurements, RecordedAudio
@@ -200,6 +220,51 @@ class Decryptor(Protocol):
     """
 
     def decrypt_to(self, source: Path, target: Path, wrapped: bytes, key_id: str) -> None: ...
+
+
+class SpectrogramStore(Protocol):
+    """Where a track's stored picture is written down and put.
+
+    Two methods rather than one, and **an order between them that is the
+    point of the port**: `record` first, `put` second. The reverse order
+    has one failure mode this design cannot afford -- an object in the
+    bucket that no row names. The retention sweep deletes the artefact
+    `transcription_job.spectrogram_key` points at, so an artefact nothing
+    points at is an artefact nothing will ever delete: a rendering of
+    somebody's voice activity outliving the recording it was drawn from,
+    which is precisely what the rule attached to this feature forbids.
+
+    Written in this order the worst case is the harmless one. A `record`
+    that succeeds and a `put` that fails leaves a job naming an object
+    that is not there, the read path finds nothing and draws the track
+    itself (`sturnus.console.routes_audio.track_spectrogram`), and the
+    sweep asks the store to delete a key that was never written -- which
+    an S3 `DELETE` answers successfully, exactly as it does for the audio
+    object the same sweep may have deleted twice.
+
+    Two backends behind one port because the two writes are one act. A
+    port offering only half of it is a port that will eventually be used
+    to do half of it.
+    """
+
+    async def record(self, job_id: int, key: str) -> None:
+        """Writes the artefact's key onto the job, before the object exists."""
+        ...
+
+    async def put_sealed(self, key: str, source: Path, wrapped: bytes, key_id: str) -> None:
+        """Seals `source` under the job's own data key and stores it.
+
+        Sealed rather than stored as it is: the artefact is a rendering of
+        somebody's voice activity, which is why the console puts it behind
+        the same authorisation rule as the audio, and an object in this
+        bucket readable by anybody holding the bucket would be the single
+        exception to envelope encryption in the whole system.
+
+        `wrapped`/`key_id` are the job's own, so the picture and the
+        recording are locked with the same key and a master-key rotation
+        reaches both or neither.
+        """
+        ...
 
 
 class ConfigReader(Protocol):
@@ -540,6 +605,98 @@ async def _create_session_document(
     )
 
 
+#: How much of the plaintext WAV is handed to the FFT at a time. The
+#: number is not about memory -- `draw` keeps one window regardless -- it
+#: is about giving the event loop the chance to run between pieces.
+#: Drawing an hour-long track is on the order of a second of arithmetic,
+#: and a worker that did all of it without an `await` in the middle would
+#: stop answering its own health probe while it did.
+_WAV_PIECE_BYTES = 256 * 1024
+
+
+async def _wav_pieces(path: Path) -> AsyncGenerator[bytes, None]:
+    """Yields the decrypted WAV off the scratch disk, a piece at a time.
+
+    Each read is a thread hop for the same reason every other blocking
+    call in this process is (`sturnus.infrastructure.objectstore`): the
+    file is on a pod's ephemeral disk, and a synchronous read of it inside
+    the loop is a stall nothing can preempt.
+    """
+    with path.open("rb") as handle:
+        while piece := await asyncio.to_thread(handle.read, _WAV_PIECE_BYTES):
+            yield piece
+
+
+async def _store_spectrogram(
+    spectrograms: SpectrogramStore,
+    config: ConfigReader,
+    job: _ClaimedJobShape,
+    guild: int,
+    wav_path: Path,
+) -> None:
+    """Draws this track's picture and stores it, if the guild asked for one.
+
+    **Never raises.** A transcription that succeeded and could not be
+    drawn has done the valuable part: the transcript is stored, the job is
+    `done`, and the session's document will be written from it. Letting a
+    failed artefact reach `process_one`'s handler would return an
+    already-transcribed job to the queue and transcribe it again -- minutes
+    of GPU-less inference -- to retry a picture the console can draw for
+    itself in a second. So this logs and moves on, and the read path falls
+    back to computing.
+
+    Drawn here rather than by a later sweep because *here* is the only
+    place the plaintext is free. `process_one`'s `finally` deletes the
+    decrypted WAV within milliseconds of this returning, and every other
+    place in the system that wants this picture has to fetch and decrypt
+    the whole object again to get it.
+    """
+    try:
+        offered = await config.get(guild, domain_settings.SPECTROGRAMS_BY_DEFAULT)
+        if not domain_settings.is_true(offered):
+            return
+
+        pieces = _wav_pieces(wav_path)
+        try:
+            picture = await draw(pieces)
+        finally:
+            await pieces.aclose()
+
+        # Beside the WAV in the job's scratch directory, so the `finally`
+        # that removes decrypted speech removes this too -- an artefact is
+        # a rendering of the same voice and gets the same treatment.
+        artefact = wav_path.with_name("spectrogram.json")
+        body = encode_artefact(picture)
+        await asyncio.to_thread(artefact.write_bytes, body)
+
+        key = spectrogram_key(job.session_id, job.discord_user_id)
+        # Recorded before it is stored. See `SpectrogramStore`: an object
+        # no row names is an object the retention sweep cannot delete.
+        await spectrograms.record(job.id, key)
+        await spectrograms.put_sealed(key, artefact, job.wrapped_data_key, job.encryption_key_id)
+        log_event(
+            log,
+            logging.INFO,
+            Event.SPECTROGRAM_STORED,
+            "Stored a spectrogram beside a recording",
+            job_id=job.id,
+            session_id=job.session_id,
+            discord_user_id=job.discord_user_id,
+            bytes=len(body),
+        )
+    except Exception as exc:
+        log_exception(
+            log,
+            logging.WARNING,
+            Event.SPECTROGRAM_FAILED,
+            "Could not store a spectrogram; the console will draw this track on demand",
+            exc,
+            job_id=job.id,
+            session_id=job.session_id,
+            stage="spectrogram",
+        )
+
+
 async def process_one(
     queue: Queue,
     engine: TranscriptionEngine,
@@ -550,6 +707,7 @@ async def process_one(
     jobs: JobReader,
     links: LinkRepository,
     config: ConfigReader,
+    spectrograms: SpectrogramStore,
     work_dir: Path,
     max_attempts: int,
     template_source: str = _FALLBACK_TEMPLATE,
@@ -568,17 +726,23 @@ async def process_one(
        guild asked for it (Spec 7; see the module docstring for the order
        and why it is that way round).
     5. Store the transcript on the job; ask whether it was the session's last.
-    6. If it was: assemble every participant's stored transcript into one
-       transcript (`_create_session_document`, `sturnus.application.
-       assembly.assemble`), publish it to every destination the guild has
-       enabled (`sturnus.application.exporting.publish_session`), and mark
-       the session documented from the primary one.
-    7. Every temporary file made in steps 2-3 is removed in a `finally`, so
+    6. If the guild asked for it (`spectrograms_by_default`): draw this
+       track's spectrogram from the WAV that is still on disk and store it
+       beside the audio (`_store_spectrogram`). Between step 5 and step 7
+       because that is the only window in which the plaintext exists and
+       the transcript is already safe.
+    7. If it was the session's last: assemble every participant's stored
+       transcript into one transcript (`_create_session_document`,
+       `sturnus.application.assembly.assemble`), publish it to every
+       destination the guild has enabled
+       (`sturnus.application.exporting.publish_session`), and mark the
+       session documented from the primary one.
+    8. Every temporary file made in steps 2-3 is removed in a `finally`, so
        a failure anywhere above never leaves decrypted speech on disk. The
        audio object in S3 is left alone deliberately -- see the module
        docstring.
 
-    `jobs` and `links` are only ever read from in step 6, but are accepted
+    `jobs` and `links` are only ever read from in step 7, but are accepted
     as parameters up front (rather than constructed lazily) so every
     collaborator `process_one` needs is visible in its signature, matching
     `sessions`/`exports`/`queue` and the rest.
@@ -600,7 +764,7 @@ async def process_one(
     selects `pending` jobs -- see `sturnus.infrastructure.db.queue.JobQueue`
     for the lease that also reclaims a job stranded this way).
 
-    Step 6 (publication) is deliberately handled by a *separate*
+    Step 7 (publication) is deliberately handled by a *separate*
     `try`/`except`, outside the one above: by the time it runs, `queue.
     complete` has already succeeded and the job is `done` -- calling
     `queue.fail` on it would incorrectly return an already-transcribed job
@@ -741,6 +905,16 @@ async def process_one(
                 lease=job.claimed_at,
                 audio=_recorded_audio(wav_path, encrypted_path),
             )
+
+            # After the transcript is safely stored, and before the
+            # `finally` deletes the plaintext it needs. Both halves of
+            # that sentence are load-bearing: drawn any earlier, a
+            # failure here would travel to the handler below and re-queue
+            # a job that has already been transcribed; drawn any later,
+            # there is nothing left on disk to draw. `_store_spectrogram`
+            # swallows its own failures, which is what makes the first
+            # half true.
+            await _store_spectrogram(spectrograms, config, job, guild, wav_path)
         except Exception as exc:
             # Everything other than the transcription failure already
             # handled above: a failed download, a decrypt error, a

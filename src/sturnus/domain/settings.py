@@ -121,6 +121,33 @@ VIDEO_CONSENT_OFFERED = "video_consent_offered"
 #: recorded -- see `docs/operations.md` §6.2.9.
 ADMIN_AUDIO_DOWNLOAD_OFFERED = "admin_audio_download_offered"
 
+#: Whether this guild's worker draws each track's spectrogram once, at job
+#: completion, and stores it beside the audio.
+#:
+#: Off is exactly today's behaviour: the console draws a picture per
+#: request out of the ciphertext, which costs a full streamed decrypt and
+#: 600 transforms every time somebody opens a recording and buys nothing
+#: that survives the response. On, the worker draws it while it still has
+#: the plaintext WAV on disk -- work it is already doing, on bytes it
+#: already has -- and a view becomes two object-store reads.
+#:
+#: **What turning it on actually costs is storage, and the storage is a
+#: rendering of somebody's voice activity.** That is why it carries a rule
+#: rather than only a price: *a stored spectrogram is deleted when its
+#: audio is deleted*. The retention sweep
+#: (`sturnus.application.retention.sweep_expired_audio`) deletes both in
+#: one pass, because a sweep that deleted the recording and left the
+#: picture would leave behind a record of when somebody spoke and for how
+#: long that outlives the window their recording was subject to. A
+#: spectrogram is less than the audio; it is not nothing, and it must not
+#: become the thing that survives.
+#:
+#: Default `false`, and unlike the two switches above the reason is not a
+#: claim about anybody's policy document: it is that this stores something
+#: new about every recording, and a key that starts storing on every guild
+#: the day it ships is a key that decided that on their behalf.
+SPECTROGRAMS_BY_DEFAULT = "spectrograms_by_default"
+
 #: The one value of `TRANSCRIPTION_LANGUAGE` that is not a language: it
 #: asks the engine to detect one per speaker and pin what it found for the
 #: rest of the session, which is what the worker did unconditionally before
@@ -158,6 +185,12 @@ DEFAULTS: dict[str, str] = {
     # would hand every administrator of every guild a copy of every
     # recording the moment this key shipped.
     ADMIN_AUDIO_DOWNLOAD_OFFERED: FALSE,
+    # Off, so that a guild's recordings acquire nothing new until
+    # somebody asks for it. The artefact is deleted with the audio it was
+    # drawn from, so `true` is defensible -- but it is a decision about
+    # what is kept about people who spoke, and shipping it as the default
+    # would be taking that decision for every guild at once.
+    SPECTROGRAMS_BY_DEFAULT: FALSE,
     # Protocols are read by the people who were in the room, so the
     # times in them are theirs, not the cluster's. A wrong offset is
     # not obviously wrong to a reader -- 15:08 looks like a plausible
@@ -248,6 +281,7 @@ BOOLEAN_KEYS: frozenset[str] = frozenset(
     {
         VIDEO_CONSENT_OFFERED,
         ADMIN_AUDIO_DOWNLOAD_OFFERED,
+        SPECTROGRAMS_BY_DEFAULT,
     }
 )
 

@@ -507,6 +507,11 @@ class FakeAudioSource:
         self.objects = objects if objects is not None else {}
         self.reads: list[tuple[int, int]] = []
         self.streamed_from: list[int] = []
+        #: Which objects were opened, in order. The bucket holds more than
+        #: recordings now -- a stored spectrogram sits beside each one --
+        #: and "was the recording read at all?" is a question about the
+        #: key, which the offsets alone cannot answer.
+        self.streamed_keys: list[str] = []
         self.streamed_bytes = 0
 
     async def size(self, key: str) -> int:
@@ -523,6 +528,7 @@ class FakeAudioSource:
     async def stream(self, key: str, start: int) -> AsyncGenerator[bytes, None]:
         if key not in self.objects:
             raise KeyError(key)
+        self.streamed_keys.append(key)
         self.streamed_from.append(start)
         body = self.objects[key][start:]
         for offset in range(0, len(body), self.PIECE):

@@ -16,6 +16,7 @@ from sturnus.infrastructure.db.models import (
     Consent,
     Session,
     SessionParticipant,
+    TranscriptionJob,
 )
 from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import (
@@ -977,3 +978,56 @@ async def test_mark_audio_deleted_excludes_the_job_from_later_candidates(
     await jobs.mark_audio_deleted(job_id, T0 + timedelta(days=31))
 
     assert await jobs.candidates_for_retention() == []
+
+
+async def test_a_candidate_carries_the_key_of_its_stored_spectrogram(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The sweep deletes the recording and its picture in one pass, so the
+    picture's key has to arrive with the candidate rather than be derived
+    from the job's ids: the naming rule can change and the objects already
+    in the bucket cannot."""
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
+    await jobs.record_spectrogram(job_id, "sessions/1/speakers/1.spectrogram.enc")
+
+    candidates = await jobs.candidates_for_retention()
+
+    assert candidates[0]["spectrogram_key"] == "sessions/1/speakers/1.spectrogram.enc"
+
+
+async def test_a_job_with_no_stored_spectrogram_says_so(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Which is most of them: every job whose guild never asked for one."""
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await _enqueue_job(sessions, jobs, session_id, ANNA)
+
+    assert (await jobs.candidates_for_retention())[0]["spectrogram_key"] is None
+
+
+async def test_stamping_the_deletion_forgets_where_the_picture_was(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The column says where this job's artefact is. Once the sweep has
+    deleted it there is none, and a row that went on naming it would claim
+    a picture exists and send every later sweep to delete it again."""
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
+    await jobs.record_spectrogram(job_id, "sessions/1/speakers/1.spectrogram.enc")
+
+    await jobs.mark_audio_deleted(job_id, T0 + timedelta(days=31))
+
+    async with factory() as session:
+        assert (
+            await session.scalar(
+                select(TranscriptionJob.spectrogram_key).where(TranscriptionJob.id == job_id)
+            )
+            is None
+        )

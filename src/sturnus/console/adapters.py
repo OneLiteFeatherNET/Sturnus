@@ -482,6 +482,7 @@ class ConsoleTrackDirectory:
                         TranscriptionJob.s3_key,
                         TranscriptionJob.encryption_key_id,
                         TranscriptionJob.wrapped_data_key,
+                        TranscriptionJob.spectrogram_key,
                     ).where(
                         TranscriptionJob.session_id == session_id,
                         TranscriptionJob.discord_user_id == speaker_id,
@@ -501,6 +502,11 @@ class ConsoleTrackDirectory:
                 s3_key=row.s3_key,
                 encryption_key_id=row.encryption_key_id,
                 wrapped_data_key=row.wrapped_data_key,
+                # Selected in the same statement, under the same
+                # `audio_deleted_at IS NULL`. A swept job offers neither
+                # its recording nor its picture, which is the whole point
+                # of deleting them together.
+                spectrogram_key=row.spectrogram_key,
             )
 
     async def downloadable_track_for(

@@ -59,6 +59,7 @@ from dataclasses import dataclass
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from sturnus.console.ports import EncryptedAudioSource, KeyUnwrapper, TrackDirectory
+from sturnus.domain.errors import CorruptRecording
 from sturnus.infrastructure.crypto import (
     CHUNK_SIZE,
     FILE_PREFIX_BYTES,
@@ -74,15 +75,6 @@ from sturnus.infrastructure.crypto import (
 #: only: a multi-range request is answered with the whole resource, which
 #: RFC 9110 explicitly permits and which no audio element ever sends.
 _RANGE = re.compile(r"^\s*bytes\s*=\s*(?:(\d+)\s*-\s*(\d*)|-\s*(\d+))\s*$")
-
-
-class CorruptRecording(Exception):
-    """The object in the bucket is not a recording this reader understands.
-
-    Raised before any plaintext is produced -- a wrong magic, a truncated
-    upload, an object too short to be a recording at all. The alternative
-    to refusing is plausible-looking noise on somebody's speakers.
-    """
 
 
 class UnsatisfiableRange(Exception):
@@ -197,7 +189,13 @@ async def stream_wav(
     data_key: bytes,
     span: ByteRange,
 ) -> AsyncGenerator[bytes, None]:
-    """Yields `span` of one encrypted recording, decrypted and otherwise untouched.
+    """Yields `span` of one encrypted object, decrypted and otherwise untouched.
+
+    Named for the recording it was written for, and true of any object
+    this system seals: `sturnus.console.spectrogram.stored_spectrogram`
+    reads a stored picture through it, because a picture beside a
+    recording in this bucket is sealed exactly as the recording is and
+    nothing here inspects what it is decrypting.
 
     `span` is an offset into the stored WAV file itself, which is both the
     plaintext and the served resource: there is no header to add and

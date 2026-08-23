@@ -22,14 +22,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from sturnus.console.audio import CorruptRecording, stored_length
-from sturnus.console.spectrogram import (
+from sturnus.application.spectrogram import (
     BINS,
     COLUMNS,
     WINDOW,
     parse_track_format,
-    spectrogram,
 )
+from sturnus.console.audio import stored_length
+from sturnus.console.spectrogram import spectrogram
+from sturnus.domain.errors import CorruptRecording
 from sturnus.infrastructure.audio import SOURCE_RATE, TARGET_RATE
 from sturnus.infrastructure.recording_adapters import FileAudioWriterFactory
 from tests.console.conftest import (

@@ -700,6 +700,14 @@ in — from the console. Turning it on asserts that the document at
 6.2.10 before setting it**: unlike `video_consent_offered`, this one grants
 access rather than withholding it.
 
+`spectrograms_by_default` is `true` or `false`, defaults to `false`, and
+is not about consent at all: it decides whether the worker draws each
+track's spectrogram once and stores it beside the recording, instead of
+the console drawing one per view. It stores something new about every
+recording, so it starts off; what it stores is deleted with the audio it
+was drawn from. **Read section 6.2.13 before setting it** — it has a
+storage cost and a rule attached.
+
 ### 4.0 `voice_channel_ids`, and the key it replaced
 
 `voice_channel_ids` names every voice channel Sturnus is allowed to record
@@ -778,8 +786,8 @@ when it detects this.
 invocation, per API request, and by the consent cache with a five-second
 TTL), and `transcription_language`,
 `transcription_prompt`, `document_target`, `document_provider`,
-`merge_gap_seconds` (read per job by the *worker* process, not the bot at
-all), and `max_parallel_tracks` (read by the worker *inside* the claim
+`merge_gap_seconds`, `spectrograms_by_default` (read per job by the
+*worker* process, not the bot at all), and `max_parallel_tracks` (read by the worker *inside* the claim
 query itself, so it governs the very next claim — see 4.2). The two
 transcription keys apply to the next job the worker claims,
 which means a session already recording is still transcribed with the new
@@ -1279,6 +1287,16 @@ once an hour, alongside its job loop
 needs to: a bucket lifecycle rule is a second, independent line of
 defence, never a substitute for that database record, and never a
 replacement for this sweep.
+
+**The sweep deletes the recording's spectrogram in the same pass**, when
+the guild asked for stored ones (`spectrograms_by_default`, §6.2.13) and
+there is one. A spectrogram shows when somebody spoke and for how long;
+leaving it behind would make this setting a way for something about a
+person's voice to outlive the window their recording was subject to, and
+this sweep is the only thing in the system that ends a recording's life.
+`audio_deleted_at` is stamped only once both objects are gone, so a
+partial failure is retried on the next sweep rather than recorded as
+done.
 
 Because recordings outlive their transcription by weeks, not minutes, the
 retention period is not merely an implementation detail — **it belongs in
@@ -2232,6 +2250,90 @@ clearing its secret, each emit `console.oauth_client_changed` at
 **WARNING** with `guild_id`, `requested_by` and an `outcome` of
 `registered`, `secret_set`, `secret_cleared` or `removed`. Neither half
 of the credential is on the line — not the secret, and not the client id.
+
+### 6.2.13 `spectrograms_by_default`: drawing each track's picture once
+
+The console can show a track as a spectrogram — where the speech is, and
+whether the capture worked at all (§6.3 explains what the picture is for).
+Drawing one costs a full streamed decrypt of the recording plus 600
+transforms, and by default that happens on **every view**: nothing is
+kept.
+
+`spectrograms_by_default` moves the work to the worker. When it is `true`,
+a job that finishes transcribing draws its own track's picture — from the
+plaintext WAV it already has on disk, which exists nowhere else and for no
+longer than that job — and stores it beside the recording in the same
+bucket, encrypted under the same session data key. A view then costs two
+small object reads and no arithmetic.
+
+#### What it stores, and for how long
+
+A picture is a fixed 600 × 128 cells, one byte each: **76.8 kB of matrix,
+about 100 kB stored** once it is base64'd into its small self-describing
+envelope. Fixed means fixed — a three-hour workshop costs exactly what a
+two-minute stand-up does, because the number of columns does not depend on
+the length of the recording.
+
+Per meeting that is about 100 kB × the number of people who spoke: a
+six-person meeting is 0.6 MB. A guild holding four such meetings every
+working day accumulates roughly 1.2 GB over a year — *if* nothing were
+ever deleted. Nothing here is kept that long: an artefact lives exactly as
+long as the recording it was drawn from, so the steady-state cost is a
+`audio_retention_days` window of them, not a year of them. At the default
+thirty days that is about 100 MB for the guild above, against the tens of
+gigabytes its audio occupies over the same window. The picture is a
+rounding error beside the recording, in storage. It is not a rounding
+error in what it says.
+
+#### The rule this setting is subject to
+
+> **A stored spectrogram is deleted when its audio is deleted.**
+
+The retention sweep (§6) deletes both objects in the same pass, and stamps
+`audio_deleted_at` only once both are gone. This is not an optimisation
+and it is not optional: a spectrogram shows when a person spoke and for
+how long, and a picture left behind by a sweep that erased the recording
+would be a record of somebody's voice activity outliving the retention
+window their recording — and their consent — was subject to. After a
+sweep the track is neither playable nor visualisable, exactly as it was
+before this setting existed.
+
+#### Turning it on
+
+```
+/config set key:spectrograms_by_default value:true
+```
+
+or the console's settings page. Values are `true` and `false` and nothing
+else, for the reason §6.2.10 gives. `/config clear` restores the default,
+which is `false`. It takes effect **immediately**: the worker reads it per
+job, and nothing caches it.
+
+**Nothing is backfilled.** Jobs already transcribed have no artefact and
+will not acquire one by this setting being switched on; the console goes
+on drawing those tracks on demand, at the old cost, indefinitely. A
+session that is re-queued (§6.2.9) is transcribed again by a worker that
+reads the setting again, so a redo does produce one. If you want pictures
+for a specific old session, re-queueing it is the way, and it costs a full
+re-transcription — which is rarely worth it for a picture.
+
+#### Turning it off
+
+Existing artefacts **stay**, and this is deliberate. Turning the setting
+off says "stop drawing new ones", not "destroy what has been drawn": the
+pictures already stored are still governed by the rule above, so each one
+is still deleted with its own recording and none of them outlives the
+window it was created under. Deleting them on a config change would be a
+second, unreviewable deletion path for the same objects — and one that
+runs at the moment somebody is editing a form, which is the wrong moment
+for a bulk delete of anything.
+
+What changes immediately is the cost: jobs finishing from now on store
+nothing, and views of tracks that already have a picture go on being
+answered from it until retention takes both away. If you need the stored
+pictures gone sooner than their recordings, shorten
+`audio_retention_days` — that moves the recording and the picture
+together, which is the only way this system moves them.
 
 ### 6.3 Listening to a recording by hand
 

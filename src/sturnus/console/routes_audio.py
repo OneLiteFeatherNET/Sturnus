@@ -66,17 +66,18 @@ from dataclasses import dataclass
 
 from aiohttp import web
 
+from sturnus.application.spectrogram import Spectrogram
 from sturnus.console.audio import (
     AudioDelivery,
     ByteRange,
-    CorruptRecording,
     UnsatisfiableRange,
     parse_range,
     stored_length,
     stream_wav,
 )
 from sturnus.console.ports import Track
-from sturnus.console.spectrogram import spectrogram
+from sturnus.console.spectrogram import spectrogram, stored_spectrogram
+from sturnus.domain.errors import CorruptRecording
 from sturnus.observability.events import Event, log_event, log_exception
 
 log = logging.getLogger(__name__)
@@ -287,6 +288,43 @@ async def _resolve(request: web.Request, rule: _Rule) -> _AuthorisedTrack | web.
     )
 
 
+async def _stored_picture(
+    delivery: AudioDelivery, resolved: _AuthorisedTrack, data_key: bytes
+) -> Spectrogram | None:
+    """The artefact the worker drew, or `None` to draw the track instead.
+
+    `None` covers three cases the caller must treat identically: this job
+    has no stored picture, the object it names is not in the bucket, and
+    the object is not a picture this build can read. All three have the
+    same remedy and the same cost, and none of them is a reason to refuse
+    somebody a view they are entitled to.
+
+    Deliberately not `CorruptRecording`-transparent. A stored artefact
+    that will not decode is *not* the same event as a stored recording
+    that will not decrypt: the recording is the only copy of what somebody
+    said and its loss needs a human, while the artefact is a derived
+    convenience the next line of this handler recreates. Letting the
+    exception out would have answered 500 for a request that can be
+    answered perfectly well.
+    """
+    key = resolved.track.spectrogram_key
+    if key is None:
+        return None
+    try:
+        return await stored_spectrogram(delivery.source, key, data_key)
+    except (KeyError, CorruptRecording) as exc:
+        log_exception(
+            log,
+            logging.INFO,
+            Event.CONSOLE_SPECTROGRAM_REDRAWN,
+            "A stored spectrogram could not be used; drawing this track instead",
+            exc,
+            session_id=resolved.session_id,
+            discord_user_id=resolved.speaker_id,
+        )
+        return None
+
+
 async def track_spectrogram(request: web.Request) -> web.StreamResponse:
     """One track as a picture of where its speech is.
 
@@ -294,6 +332,26 @@ async def track_spectrogram(request: web.Request) -> web.StreamResponse:
     a spectrogram is a rendering of somebody's voice, and it shows when
     they spoke and for how long. It is less than the audio; it is not
     nothing, and the rule that governs the audio is the right one for it.
+
+    **The gate is in front of the artefact too, and stays there.** A guild
+    that switched `spectrograms_by_default` on has a picture the worker
+    already drew, and answering from it makes this endpoint cheap; it must
+    not make it *open*. `_authorised_track` runs first and runs on every
+    request -- it is the same `session_participant` query, decided again,
+    never cached -- and only then does anything look for a stored picture.
+    A cache of the payload must never quietly become a cache of the
+    permission, and the ordering here is what keeps those two apart.
+
+    It also runs first for a second reason: `_authorised_track` is what
+    refuses a track whose recording the retention sweep has erased. A
+    swept job offers no picture either, because the sweep deleted both --
+    and because the row it would have come from no longer names one.
+
+    **Either source answers the same thing.** A job from before the
+    setting was enabled, a guild that never enabled it, an artefact that
+    is missing or that a later build cannot read: all of them fall through
+    to drawing the track, which is what every view cost before artefacts
+    existed. The contract does not depend on which happened.
 
     Answered as a whole small JSON body rather than streamed. The payload
     is a fixed 600 by 128 bytes whatever the meeting's length, so there is
@@ -307,12 +365,14 @@ async def track_spectrogram(request: web.Request) -> web.StreamResponse:
     delivery = request.app[AUDIO_DELIVERY]
     data_key = delivery.keys.unwrap(resolved.track.wrapped_data_key)
     try:
-        picture = await spectrogram(
-            delivery.source,
-            resolved.track.s3_key,
-            data_key,
-            stored_length(resolved.ciphertext_bytes),
-        )
+        picture = await _stored_picture(delivery, resolved, data_key)
+        if picture is None:
+            picture = await spectrogram(
+                delivery.source,
+                resolved.track.s3_key,
+                data_key,
+                stored_length(resolved.ciphertext_bytes),
+            )
     except CorruptRecording as exc:
         log_exception(
             log,

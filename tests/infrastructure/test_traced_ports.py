@@ -44,6 +44,7 @@ from tests.application.test_worker import (
     FakeLinks,
     FakeQueue,
     FakeSessions,
+    FakeSpectrograms,
     FakeStore,
     exports,
     job,
@@ -83,6 +84,7 @@ async def _run_one(tmp_path: Path, *, is_last: bool = True) -> tuple[FakeQueue, 
             jobs=FakeJobs(),
             links=FakeLinks(),
             config=FakeConfig(),
+            spectrograms=FakeSpectrograms(),
             work_dir=tmp_path,
             max_attempts=3,
         )
@@ -181,6 +183,7 @@ async def test_a_failing_stage_marks_its_span_without_a_message(
             jobs=FakeJobs(),
             links=FakeLinks(),
             config=FakeConfig(),
+            spectrograms=FakeSpectrograms(),
             work_dir=tmp_path,
             max_attempts=3,
         )
@@ -218,6 +221,7 @@ async def test_the_root_span_of_a_failed_job_does_not_say_it_was_done(
             jobs=FakeJobs(),
             links=FakeLinks(),
             config=FakeConfig(),
+            spectrograms=FakeSpectrograms(),
             work_dir=tmp_path,
             max_attempts=3,
         )

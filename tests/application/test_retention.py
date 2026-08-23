@@ -10,12 +10,20 @@ def job(
     until: datetime,
     deleted: datetime | None = None,
     s3_key: str | None = None,
+    spectrogram_key: str | None = None,
 ) -> dict[str, object]:
+    """One row as `candidates_for_retention` shapes it.
+
+    `spectrogram_key` defaults to `None`, which is what the column holds
+    for every job whose guild never asked for spectrograms -- so the
+    sweep's ordinary case stays the one most of these tests exercise.
+    """
     return {
         "id": job_id,
         "retention_until": until,
         "audio_deleted_at": deleted,
         "s3_key": s3_key or f"sessions/1/speakers/{job_id}.enc",
+        "spectrogram_key": spectrogram_key,
     }
 
 
@@ -105,3 +113,56 @@ async def test_sweep_expired_audio_survives_one_jobs_failure() -> None:
     await sweep_expired_audio(jobs, store, T0)  # must not raise
     assert store.deleted == ["succeeds"]
     assert jobs.deleted == [2]
+
+
+# ---------------------------------------------------------------------------
+# The rule a stored spectrogram exists under
+#
+# A spectrogram is a rendering of when somebody spoke and for how long. It
+# is less than the audio and it is not nothing, and this sweep is the only
+# thing that ends a recording's life -- so it has to end the picture's too,
+# or `spectrograms_by_default` becomes a switch that quietly makes
+# something about a person's voice outlive their recording's retention.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_swept_job_loses_its_spectrogram_in_the_same_pass() -> None:
+    """Both objects, one pass. Not a second sweep that could be forgotten."""
+    jobs = FakeJobs([job(1, T0 - timedelta(seconds=1), s3_key="a", spectrogram_key="a.spec")])
+    store = FakeStore()
+
+    await sweep_expired_audio(jobs, store, T0)
+
+    assert store.deleted == ["a", "a.spec"]
+    assert jobs.deleted == [1]
+
+
+async def test_a_job_with_no_spectrogram_is_swept_exactly_as_before() -> None:
+    """Most jobs have no picture, and the sweep must not invent a key for
+    them: a derived key would send a `DELETE` for an object that was never
+    written, on every job, for ever."""
+    jobs = FakeJobs([job(1, T0 - timedelta(seconds=1), s3_key="a")])
+    store = FakeStore()
+
+    await sweep_expired_audio(jobs, store, T0)
+
+    assert store.deleted == ["a"]
+    assert jobs.deleted == [1]
+
+
+async def test_a_spectrogram_that_would_not_delete_leaves_the_job_unstamped() -> None:
+    """The stamp is the claim that this recording is gone -- all of it.
+
+    A stamp written while the picture is still in the bucket would end the
+    job's candidacy for ever and leave the artefact behind with nothing
+    left that knows to delete it. Leaving the row unstamped costs one
+    repeated `DELETE` of an object already gone, which S3 answers
+    successfully.
+    """
+    jobs = FakeJobs([job(1, T0 - timedelta(seconds=1), s3_key="a", spectrogram_key="fails")])
+    store = FakeStore(fail_keys={"fails"})
+
+    await sweep_expired_audio(jobs, store, T0)  # must not raise
+
+    assert store.deleted == ["a"]
+    assert jobs.deleted == []
