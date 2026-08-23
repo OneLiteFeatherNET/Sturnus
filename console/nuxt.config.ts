@@ -94,14 +94,16 @@ export default defineNuxtConfig({
     pageTransition: PAGE_TRANSITION,
   },
 
-  routeRules: {
-    // The bot's configuration used to live at `/settings`, before there
-    // was an Admin View for it to sit inside. The old address is kept as a
-    // permanent redirect rather than deleted: it is in browser histories
-    // and in whatever anybody pasted into a chat, and a 404 there teaches
-    // people the console loses pages.
-    '/settings': { redirect: { to: '/admin/bot-settings', statusCode: 301 } },
-  },
+  // **`/settings` is a page again, and its redirect is gone.** It used to be
+  // a permanent redirect to `/admin/bot-settings`, kept alive because the
+  // bot's configuration once lived there and the address was in browser
+  // histories. It is now the person's own settings -- their theme and their
+  // language -- which is what anybody typing that address is looking for.
+  //
+  // This is a breaking change, and a 301 is a redirect a browser caches
+  // indefinitely: somebody who followed the old one still lands on
+  // `/admin/bot-settings` until they clear it. The Admin View entry in the
+  // sidebar is the way there, and it has never moved.
 
   nitro: {
     // The container runs this as a plain Node server behind a Service.

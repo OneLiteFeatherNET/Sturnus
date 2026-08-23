@@ -13,6 +13,21 @@ export interface ConsoleUser {
    *  produces an id that looks right and names nobody. */
   discord_user_id: string
   is_admin: boolean
+  /**
+   * What to call this person, when the API knows.
+   *
+   * Optional and nullable, and both are load-bearing rather than defensive
+   * typing. `/api/me` is growing this field in a different pull request, so
+   * this console has to render correctly against an API that answers with
+   * it and against one that does not -- whichever of the two lands first.
+   * And when the field does arrive it can still be null: it is copied from
+   * Outline at the moment an account was linked, and links made before that
+   * copy existed have nothing in them.
+   *
+   * Everything that renders it goes through `~/utils/profileMenu`, which
+   * has one answer for all three states.
+   */
+  display_name?: string | null
 }
 
 export function useSession() {

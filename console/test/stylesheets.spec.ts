@@ -82,7 +82,8 @@ describe('the one stylesheet', () => {
       '@theme',
       ':root',
       '@media (prefers-color-scheme: dark)',
-      ':root',
+      ':root:not([data-theme="light"])',
+      ':root[data-theme="dark"]',
       'body',
     ])
   })

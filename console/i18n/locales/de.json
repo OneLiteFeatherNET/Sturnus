@@ -30,6 +30,34 @@
     "notLinkedHeading": "Dieses Konto ist noch nicht verknüpft.",
     "notLinkedBody": "Dazu {command} in Discord ausführen und sich danach erneut anmelden. Die Konsole findet Aufnahmen über das Discord-Konto, und die Verknüpfung stellt diese Verbindung her."
   },
+  "profile": {
+    "menu": "Kontomenü",
+    "menuFor": "Kontomenü für {name}",
+    "unnamed": "Dieses Konto",
+    "settings": "Einstellungen",
+    "twoFactor": "Zwei-Faktor-Authentifizierung",
+    "multiFactor": "Mehr-Faktor-Authentifizierung",
+    "comingSoon": "In Vorbereitung"
+  },
+  "settings": {
+    "title": "Einstellungen",
+    "intro": "Wie diese Konsole aussieht und welche Sprache sie spricht. Beides gehört zum Konto und nicht zu einem Server, und beides gilt auch in einem anderen Browser.",
+    "appearance": {
+      "title": "Darstellung",
+      "note": "„System“ folgt dem Betriebssystem und folgt ihm weiter, wenn es abends dunkel wird. Hell und Dunkel setzen sich in jeweils eine Richtung darüber hinweg.",
+      "system": "System",
+      "light": "Hell",
+      "dark": "Dunkel"
+    },
+    "language": {
+      "title": "Sprache",
+      "note": "Die Auswahl wird in einem Cookie gemerkt. Dadurch kommt schon die erste Antwort des Servers in dieser Sprache, statt erst nach dem Laden der Seite umzuspringen."
+    },
+    "security": {
+      "title": "Sicherheit",
+      "note": "Beides lässt sich noch nicht einschalten. Es steht hier und im Kontomenü, weil ein Vorhaben, das nirgendwo sichtbar ist, kein Vorhaben ist, auf das sich jemand verlassen kann."
+    }
+  },
   "error": {
     "notFoundHeading": "Diese Seite gibt es nicht",
     "notFoundDetail": "Die Adresse ist falsch, oder die Seite ist umgezogen.",

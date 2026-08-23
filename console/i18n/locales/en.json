@@ -30,6 +30,34 @@
     "notLinkedHeading": "Your account is not linked yet.",
     "notLinkedBody": "Run {command} in Discord, then sign in again. The console finds your recordings by your Discord account, and the link is what connects the two."
   },
+  "profile": {
+    "menu": "Account menu",
+    "menuFor": "Account menu for {name}",
+    "unnamed": "Your account",
+    "settings": "Settings",
+    "twoFactor": "Two-factor authentication",
+    "multiFactor": "Multi-factor authentication",
+    "comingSoon": "Coming soon"
+  },
+  "settings": {
+    "title": "Settings",
+    "intro": "How this console looks, and which language it speaks. Both belong to this account rather than to a server, and both follow it to another browser.",
+    "appearance": {
+      "title": "Appearance",
+      "note": "System follows the operating system, and keeps following it when it turns dark in the evening. Light and dark override it in one direction each.",
+      "system": "System",
+      "light": "Light",
+      "dark": "Dark"
+    },
+    "language": {
+      "title": "Language",
+      "note": "The choice is remembered in a cookie, so the first thing the server sends is already in this language rather than swapping to it after the page has loaded."
+    },
+    "security": {
+      "title": "Security",
+      "note": "Neither of these can be switched on yet. They are listed here, and in the account menu, because a plan that is not written down anywhere a person can see is not a plan they can rely on."
+    }
+  },
   "error": {
     "notFoundHeading": "That page does not exist",
     "notFoundDetail": "The address is wrong, or the page has moved.",
