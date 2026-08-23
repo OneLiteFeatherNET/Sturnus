@@ -44,6 +44,7 @@ matches the file that renders it:
 | `recordings.*`     | `pages/recordings/*` and the components under them   |
 | `calendar.*`       | `pages/calendar.vue`, the heatmap and the timeline   |
 | `settings.*`       | `pages/settings.vue` — a person's own settings        |
+| `admin.onboarding.*` | `pages/admin/onboarding.vue`, `utils/onboarding.ts`  |
 | `admin.settings.*` | `pages/admin/bot-settings.vue`                        |
 | `admin.destinations.*` | `pages/admin/destinations.vue`, `utils/exportTargets.ts`, the two `ExportTarget*` components |
 | `admin.consents.*` | `pages/admin/consents.vue`                            |
@@ -76,6 +77,14 @@ effective-instant work added — the withdrawal's effective moment, and the
 scope on a roster row — so that the sweep has less to do rather than more.
 New strings on that page go through `$t` from now on; the existing ones move
 when the sweep reaches them.
+
+`admin.onboarding.*` is complete from the start for the same reason
+`admin.destinations.*` is, and nothing under it will ever be reached by the
+sweep. Three of its sentences carry a value the API composed rather than one
+this console decided — the bot's own failure text, a channel's name, a
+Discord id — and each of those is rendered beside a translated sentence
+instead of inside one, because a sentence with somebody else's prose glued
+into the middle of it cannot be re-ordered in German.
 
 `admin.destinations.*` is the one administrative namespace that is complete
 from the start, because the page under it is new: nothing on
