@@ -24,6 +24,7 @@ import {
   queueSpeakerLabel,
   queueStatusPath,
   queueStatusWords,
+  recordingNaming,
   recordingPath,
   requeuePath,
   seekTarget,
@@ -34,8 +35,12 @@ import {
   speakerSummary,
   speechShare,
   stampParts,
+  trackChannels,
   trackCoverage,
+  trackFileFacts,
   trackLabel,
+  trackSampleRate,
+  trackStoredSize,
   type RecordedSession,
   type QueueSnapshot,
   type QueueSpeaker,
@@ -50,6 +55,9 @@ function track(over: Partial<SessionTrack> = {}): SessionTrack {
     audio_seconds: 600,
     speech_seconds: 150,
     segment_count: 12,
+    sample_rate: 48000,
+    channels: 2,
+    stored_bytes: 12_400_000,
     ...over,
   }
 }
@@ -62,6 +70,8 @@ function session(over: Partial<RecordedSession> = {}): RecordedSession {
     duration_seconds: 3600,
     channel_id: '987000000000000002',
     channel_name: 'standup',
+    title: null,
+    description: null,
     document_url: 'https://outline.example/doc/standup-abc',
     other_participants: [],
     tags: [],
@@ -426,6 +436,8 @@ describe('how much of a session a track covers', () => {
     duration_seconds: duration,
     channel_id: '9',
     channel_name: 'standup',
+    title: null,
+    description: null,
     document_url: null,
     other_participants: [],
     tracks: [],
@@ -436,6 +448,9 @@ describe('how much of a session a track covers', () => {
     audio_seconds: audio,
     speech_seconds: null,
     segment_count: null,
+    sample_rate: null,
+    channels: null,
+    stored_bytes: null,
   })
 
   it('is the share of the meeting that track has audio for', () => {
@@ -572,5 +587,113 @@ describe('seeking a track from the keyboard', () => {
 
   it('says nothing about a track with no length yet', () => {
     expect(seekTarget('ArrowRight', 0, 0)).toBeNull()
+  })
+})
+
+describe('what a recording page calls the meeting', () => {
+  it('is the channel while nobody has named it', () => {
+    expect(recordingNaming(session({ title: null }))).toEqual({
+      heading: '#standup',
+      under: null,
+    })
+  })
+
+  it('is the title once somebody has', () => {
+    // A name is somebody's own prose and is never translated, so the
+    // heading is the string itself rather than a key.
+    expect(recordingNaming(session({ title: 'Sprint 34 planning' })).heading).toBe(
+      'Sprint 34 planning',
+    )
+  })
+
+  it('demotes the channel rather than dropping it', () => {
+    // Where a meeting happened is still a fact, and it is what tells two
+    // meetings both called "Retro" apart. Under the heading, not gone.
+    expect(recordingNaming(session({ title: 'Retro' })).under).toBe('#standup')
+  })
+
+  it('keeps an unnamed channel a key even underneath a title', () => {
+    expect(
+      recordingNaming(session({ title: 'Retro', channel_name: null, channel_id: '9870' })),
+    ).toEqual({
+      heading: 'Retro',
+      under: { key: 'recordings.channelById', params: { id: '9870' } },
+    })
+  })
+
+  it('treats a title of nothing but spaces as no title', () => {
+    // The API stores `null` for one, and a heading of one space is a page
+    // with no heading at all.
+    expect(recordingNaming(session({ title: '   ' })).heading).toBe('#standup')
+  })
+})
+
+describe('what a track file is', () => {
+  it('says a sample rate in the unit anybody says it in', () => {
+    expect(trackSampleRate(track({ sample_rate: 48000 }))).toEqual({
+      key: 'recordings.sizeKilohertz',
+      params: { rate: 48 },
+    })
+  })
+
+  it('keeps the fraction of a rate that has one', () => {
+    // 44.1 kHz is a real rate and 44 kHz is a different one. Whether the
+    // separator is a point or a comma is the locale's to decide, which is
+    // why this stays a number.
+    expect(trackSampleRate(track({ sample_rate: 44100 }))?.params?.rate).toBe(44.1)
+  })
+
+  it('counts channels through a param, so each language names one itself', () => {
+    // English calls a single channel "mono". An `if` here would have
+    // decided that for German too.
+    expect(trackChannels(track({ channels: 1 }))).toEqual({
+      key: 'recordings.channelCount',
+      params: { count: 1 },
+    })
+  })
+
+  it('writes a small file in kilobytes and a large one in megabytes', () => {
+    // `0.3 MB` and `13421772` are both answers nobody can picture.
+    expect(trackStoredSize(track({ stored_bytes: 312_400 }))).toEqual({
+      key: 'recordings.sizeKilobytes',
+      params: { size: 312 },
+    })
+    expect(trackStoredSize(track({ stored_bytes: 12_440_000 }))).toEqual({
+      key: 'recordings.sizeMegabytes',
+      params: { size: 12.4 },
+    })
+  })
+
+  it('says nothing at all about a measurement that was never taken', () => {
+    // **Never a zero.** Every track written before migration 0013 has all
+    // three null, and `0 kB` where nothing was measured is a claim about
+    // somebody's recording that this console cannot support. `null` is
+    // what `useSay` turns into the one em dash the console has.
+    expect(trackSampleRate(track({ sample_rate: null }))).toBeNull()
+    expect(trackChannels(track({ channels: null }))).toBeNull()
+    expect(trackStoredSize(track({ stored_bytes: null }))).toBeNull()
+  })
+
+  it('still says zero when zero is what was measured', () => {
+    // An empty file is a measurement and a missing one is not, which is
+    // the distinction `formatMeasurement` keeps further up this file.
+    expect(trackStoredSize(track({ stored_bytes: 0 }))).toEqual({
+      key: 'recordings.sizeKilobytes',
+      params: { size: 0 },
+    })
+  })
+
+  it('offers three facts in one order, whatever is missing', () => {
+    // A gap in a row of three reads as a gap. A shorter row is something
+    // somebody has to count before they can tell which one is absent.
+    const complete = trackFileFacts(track())
+    const nothing = trackFileFacts(track({ sample_rate: null, channels: null, stored_bytes: null }))
+    expect(complete.map((fact) => fact.labelKey)).toEqual([
+      'recordings.sampleRateLabel',
+      'recordings.channelsLabel',
+      'recordings.storedLabel',
+    ])
+    expect(nothing.map((fact) => fact.labelKey)).toEqual(complete.map((fact) => fact.labelKey))
+    expect(nothing.every((fact) => fact.value === null)).toBe(true)
   })
 })

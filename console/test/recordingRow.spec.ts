@@ -42,6 +42,9 @@ function track(over: Partial<SessionTrack> = {}): SessionTrack {
     audio_seconds: 600,
     speech_seconds: 150,
     segment_count: 12,
+    sample_rate: 48000,
+    channels: 2,
+    stored_bytes: 12_400_000,
     ...over,
   }
 }
@@ -54,6 +57,8 @@ function session(over: Partial<RecordedSession> = {}): RecordedSession {
     duration_seconds: 3600,
     channel_id: '987000000000000002',
     channel_name: 'standup',
+    title: null,
+    description: null,
     document_url: 'https://outline.example/doc/7f2b',
     other_participants: [{ discord_user_id: '4', display_name: 'Bo' }],
     tracks: [track()],

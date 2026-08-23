@@ -27,6 +27,25 @@ export interface SessionTrack {
    *  measured, and this person did not say anything. */
   speech_seconds: number | null
   segment_count: number | null
+  /**
+   * What the stored file itself is.
+   *
+   * Numbers rather than strings, unlike every id here: none of the three
+   * is anywhere near JavaScript's safe integer range -- `stored_bytes`
+   * would have to be nine petabytes -- so there is nothing to lose by
+   * carrying them as numbers, and a size that arrives as a string cannot
+   * be compared or rounded.
+   *
+   * `null` on any of them means the measurement was never taken: every
+   * track written before migration 0013 has all three null, and a track
+   * whose ingest failed halfway may have some. **Null is not zero**, and
+   * `trackFileFacts` below is where that distinction is kept, because a
+   * `0 kB` where nothing was measured is a claim the console cannot
+   * support.
+   */
+  sample_rate: number | null
+  channels: number | null
+  stored_bytes: number | null
 }
 
 export interface SessionParticipant {
@@ -41,6 +60,20 @@ export interface RecordedSession {
   duration_seconds: number | null
   channel_id: string
   channel_name: string | null
+  /**
+   * What this meeting is called, and what was written about it.
+   *
+   * **Shared, unlike `tags` below.** One per session: everybody who was
+   * in the meeting reads the same title and any of them may correct it,
+   * because a name that four attendees each typed separately is four
+   * names for one thing. `sturnus.console.naming` argues the asymmetry;
+   * `~/utils/sessionNaming` carries what a console may do about it.
+   *
+   * Both are `null` until somebody types one, which is every session
+   * until somebody does.
+   */
+  title: string | null
+  description: string | null
   /** The Outline protocol, when one was written. */
   document_url: string | null
   /** Everybody else who was in the channel -- including the people who did
@@ -189,6 +222,94 @@ export function channelNaming(session: RecordedSession): ChannelNaming {
   const name = session.channel_name?.trim()
   if (name) return { named: true, heading: `#${name}`, id: null }
   return { named: false, heading: { key: 'recordings.channelUnnamed' }, id: session.channel_id }
+}
+
+/**
+ * What the recording's own page calls it, and what goes under that.
+ *
+ * A meeting that somebody has named is called that. `#standup` is where
+ * it happened, which is a fact worth keeping and is not the meeting's
+ * name — so once there is a title the channel drops to a subordinate
+ * line, exactly as `channelNaming` demotes an unresolved id in a list
+ * row. A meeting nobody has named falls back to the channel, and then
+ * there is nothing left to put underneath.
+ *
+ * A title is somebody's own prose and is never translated; the fallback
+ * may be `channelLabel`'s key, so the heading is the same
+ * `string | Message` union every other name in this module returns.
+ */
+export interface RecordingNaming {
+  heading: string | Message
+  /** The channel, when the heading has stopped saying where it happened. */
+  under: string | Message | null
+}
+
+export function recordingNaming(session: RecordedSession): RecordingNaming {
+  const title = session.title?.trim()
+  if (!title) return { heading: channelLabel(session), under: null }
+  return { heading: title, under: channelLabel(session) }
+}
+
+/**
+ * One measurement of the stored file, and the label it goes under.
+ *
+ * `value` is `null` for a measurement that was never taken, and that
+ * `null` travels all the way to `useSay`, which writes the one em dash
+ * this console uses for an absence. **Nothing here ever turns a missing
+ * number into a zero**: `stored_bytes: null` is a track from before
+ * migration 0013 and `stored_bytes: 0` would be an empty file, and a tab
+ * that showed the first as the second would be inventing a fact about
+ * somebody's recording.
+ *
+ * A fixed list of three in a fixed order rather than "the ones that are
+ * known", so that a track missing a measurement reads as a gap in a row
+ * of three rather than as a shorter row somebody has to count.
+ */
+export interface TrackFileFact {
+  labelKey: string
+  value: Message | null
+}
+
+export function trackFileFacts(track: SessionTrack): TrackFileFact[] {
+  return [
+    { labelKey: 'recordings.sampleRateLabel', value: trackSampleRate(track) },
+    { labelKey: 'recordings.channelsLabel', value: trackChannels(track) },
+    { labelKey: 'recordings.storedLabel', value: trackStoredSize(track) },
+  ]
+}
+
+/** A sample rate in kHz, which is the unit anybody says it in. 44100 is
+ *  44.1, and the fraction is the locale's to write. */
+export function trackSampleRate(track: SessionTrack): Message | null {
+  const hertz = track.sample_rate
+  if (hertz === null || hertz === undefined) return null
+  return { key: 'recordings.sizeKilohertz', params: { rate: hertz / 1000 } }
+}
+
+/** How many channels the file has. `count` rather than a word, so that
+ *  each language decides for itself what one channel is called — English
+ *  says "mono", and an `if` here would have decided that for German too. */
+export function trackChannels(track: SessionTrack): Message | null {
+  const channels = track.channels
+  if (channels === null || channels === undefined) return null
+  return { key: 'recordings.channelCount', params: { count: channels } }
+}
+
+/**
+ * How much was stored, in a unit somebody reads.
+ *
+ * A threshold rather than one unit throughout: `0.3 MB` and `13421772`
+ * are both answers nobody can picture. The switch is a magnitude and not
+ * a plural, so it is decided here; what the two sentences look like stays
+ * in the locale files.
+ */
+export function trackStoredSize(track: SessionTrack): Message | null {
+  const bytes = track.stored_bytes
+  if (bytes === null || bytes === undefined) return null
+  if (bytes < 1_000_000) {
+    return { key: 'recordings.sizeKilobytes', params: { size: Math.round(bytes / 1000) } }
+  }
+  return { key: 'recordings.sizeMegabytes', params: { size: Math.round(bytes / 100_000) / 10 } }
 }
 
 function instantOf(value: string | null): number | null {
