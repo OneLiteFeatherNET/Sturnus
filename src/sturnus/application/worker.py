@@ -79,10 +79,10 @@ it: `transcription_language`, `transcription_prompt`, `document_target`,
 therefore its guild -- is in hand. The first two are read in `process_one`
 itself, just before the engine is called; the last three inside
 `_create_session_document`. None of them is read once at process start,
-because one worker serves every guild. `_BoundLinks`
-adapts one call's resolved provider back down to the plain `LinkReader`
-shape `assemble` itself calls, so `assemble` stays ignorant of
-configuration entirely.
+because one worker serves every guild. `sturnus.application.assembly.
+BoundLinks` adapts one call's resolved provider back down to the plain
+`LinkReader` shape `assemble` itself calls, so `assemble` stays ignorant
+of configuration entirely.
 """
 
 from __future__ import annotations
@@ -92,12 +92,20 @@ import logging
 import shutil
 import time
 import uuid
-from datetime import UTC, datetime, timedelta, tzinfo
+import wave
+from datetime import UTC, datetime, tzinfo
 from pathlib import Path
 from typing import Protocol, cast
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sturnus.application.assembly import JobReader, assemble, serialize_transcript
+from sturnus.application.assembly import (
+    BoundLinks,
+    JobReader,
+    LinkRepository,
+    assemble,
+    merge_gap_from,
+    serialize_transcript,
+)
 from sturnus.application.documents import (
     ChannelRef,
     CreatedDocument,
@@ -107,8 +115,7 @@ from sturnus.application.documents import (
 )
 from sturnus.application.transcription import TranscriptionEngine
 from sturnus.domain import settings as domain_settings
-from sturnus.domain.measurements import JobMeasurements
-from sturnus.domain.transcript import DEFAULT_MERGE_GAP
+from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 from sturnus.observability.events import Event, log_event, log_exception
 
 log = logging.getLogger(__name__)
@@ -141,6 +148,13 @@ class Queue(Protocol):
     taken over by another one -- see `sturnus.infrastructure.db.queue.
     JobQueue.complete`. `process_one` always has one, so it always passes
     one.
+
+    `audio` travels with the transcript rather than through a write of its
+    own, because it is read off the same two files in the same breath and
+    is fenced by the same lease: a worker that has lost its job must not
+    stamp the row with a size it measured for a copy nobody is waiting
+    for. `None` when the header could not be read, which leaves the
+    columns null -- see `_recorded_audio`.
     """
 
     async def claim(self) -> object | None: ...
@@ -152,6 +166,7 @@ class Queue(Protocol):
         measurements: JobMeasurements | None = None,
         *,
         lease: datetime | None = None,
+        audio: RecordedAudio | None = None,
     ) -> bool: ...
 
     #: Returns whether the job is now **dead** -- out of attempts, so this
@@ -191,39 +206,6 @@ class ConfigReader(Protocol):
     """
 
     async def get(self, guild_id: int, key: str) -> str | None: ...
-
-
-class LinkRepository(Protocol):
-    """Where a speaker's external identity is read from, keyed by provider.
-
-    Unlike `sturnus.application.assembly.LinkReader`, `provider` is a
-    parameter of `external_identity` here rather than fixed once at
-    construction: the worker serves every guild from one process, and
-    which provider's account-link mapping applies is itself per-guild
-    configuration (Spec 11's `document_provider`) that cannot be resolved
-    until a session's guild is known. `_BoundLinks` below adapts one
-    resolved provider back down to the narrower `LinkReader` shape
-    `assemble` actually calls.
-    """
-
-    async def external_identity(
-        self, discord_user_id: int, provider: str
-    ) -> tuple[str, str] | None: ...
-
-
-class _BoundLinks:
-    """Adapts `LinkRepository` to `sturnus.application.assembly.LinkReader`
-    for one already-resolved provider, so `assemble` -- which knows
-    nothing about per-guild configuration -- can keep calling
-    `external_identity` with just a Discord user id.
-    """
-
-    def __init__(self, links: LinkRepository, provider: str) -> None:
-        self._links = links
-        self._provider = provider
-
-    async def external_identity(self, discord_user_id: int) -> tuple[str, str] | None:
-        return await self._links.external_identity(discord_user_id, self._provider)
 
 
 class SessionStore(Protocol):
@@ -329,6 +311,40 @@ def _configured_language(configured: str | None) -> str | None:
     return named
 
 
+def _recorded_audio(plaintext: Path, stored: Path) -> RecordedAudio | None:
+    """What this track is, read off the two files the job already has.
+
+    The one moment in the system where both exist at once: the encrypted
+    object has just been downloaded and the plaintext WAV has just been
+    decrypted out of it, and both are deleted a few lines later. Every
+    later reader -- the spectrogram, a metadata tab -- would otherwise pay
+    a ranged GET and a chunk decrypt to walk the same RIFF header, plus a
+    second round trip to ask S3 how big the object is.
+
+    Read with `wave` rather than by walking the chunk list as
+    `sturnus.console.spectrogram.parse_track_format` does, because the
+    file is on local disk here and the standard library is already the
+    writer: `sturnus.infrastructure.audio.SpeakerWriter` produced this
+    file through `wave`. The streaming reader exists because a console
+    request has no file, not because two parsers were wanted.
+
+    `None` rather than an exception for anything unreadable. This is
+    metadata about a recording whose transcript is the point, and failing
+    a job -- and eventually killing it after `max_attempts` -- over a
+    header nobody can parse would trade the words for the file size. A
+    null column says "nobody could look", which is the truth.
+    """
+    try:
+        with wave.open(str(plaintext), "rb") as track:
+            return RecordedAudio(
+                sample_rate=track.getframerate(),
+                channels=track.getnchannels(),
+                stored_bytes=stored.stat().st_size,
+            )
+    except (OSError, wave.Error, ValueError, EOFError):
+        return None
+
+
 async def _guild_timezone(config: ConfigReader, guild: int) -> tzinfo:
     """The timezone the protocol's times are written in (Spec 11).
 
@@ -388,7 +404,7 @@ async def _create_session_document(
       administrator has not configured this yet" -- unlike a rejected
       token or a deleted collection, this can and does resolve itself.
     - `document_provider`: which provider's account-link mapping a
-      speaker's external identity is read from, via `_BoundLinks`.
+      speaker's external identity is read from, via `BoundLinks`.
     - `merge_gap_seconds`: how long a pause may be before one speaker's
       blocks split, forwarded to `assemble`.
     """
@@ -407,15 +423,10 @@ async def _create_session_document(
     # key always resolves to a value.
     assert provider is not None
 
-    merge_gap_value = await config.get(guild, domain_settings.MERGE_GAP_SECONDS)
-    merge_gap = (
-        timedelta(seconds=int(merge_gap_value))
-        if merge_gap_value is not None
-        else DEFAULT_MERGE_GAP
-    )
+    merge_gap = merge_gap_from(await config.get(guild, domain_settings.MERGE_GAP_SECONDS))
 
     transcript = await assemble(
-        session_id, sessions, jobs, _BoundLinks(links, provider), UTC, merge_gap
+        session_id, sessions, jobs, BoundLinks(links, provider), UTC, merge_gap
     )
 
     # `assemble` works in UTC deliberately -- ordering and merging must not
@@ -640,8 +651,16 @@ async def process_one(
             # not rare on a long track; what must not happen is two workers
             # each storing a transcript for it and each reporting the
             # session's last job, which creates the protocol twice.
+            # Read before the `finally` below removes both files, and
+            # written in the same call as the transcript so one lease
+            # fences both. See `_recorded_audio` for why an unreadable
+            # header leaves the columns null rather than failing the job.
             is_last = await queue.complete(
-                job.id, serialize_transcript(result), result.measurements, lease=job.claimed_at
+                job.id,
+                serialize_transcript(result),
+                result.measurements,
+                lease=job.claimed_at,
+                audio=_recorded_audio(wav_path, encrypted_path),
             )
         except Exception as exc:
             # Everything other than the transcription failure already

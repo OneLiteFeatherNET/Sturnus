@@ -26,7 +26,7 @@ from datetime import datetime
 
 from aiohttp import web
 
-from sturnus.console import routes_settings, routes_tags
+from sturnus.console import routes_recording, routes_settings, routes_tags
 from sturnus.console.audio import AudioDelivery
 from sturnus.console.auth import (
     ConsoleAuth,
@@ -47,10 +47,12 @@ from sturnus.console.ports import (
     ProfileDirectory,
     QueueControl,
     QueueOverview,
+    SessionNaming,
     SessionReads,
     SettingsStore,
     StateStore,
     TagWriter,
+    TranscriptReader,
 )
 from sturnus.console.routes_audio import AUDIO_DELIVERY
 from sturnus.console.routes_audio import register as register_audio
@@ -279,6 +281,8 @@ def build_api(
     prefs: PreferenceDirectory,
     names: GuildNames,
     collections: CollectionNames,
+    transcripts: TranscriptReader,
+    naming: SessionNaming,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
 
@@ -313,6 +317,8 @@ def build_api(
     app[PREFERENCES] = prefs
     app[GUILD_NAMES] = names
     app[COLLECTION_NAMES] = collections
+    app[routes_recording.TRANSCRIPTS] = transcripts
+    app[routes_recording.SESSION_NAMING] = naming
     app.add_routes(
         [
             web.get("/healthz", healthz),
@@ -332,4 +338,5 @@ def build_api(
     register_directory(app)
     routes_settings.register(app)
     routes_tags.register(app)
+    routes_recording.register(app)
     return app

@@ -24,11 +24,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import Row, case, delete, distinct, func, or_, select
+from sqlalchemy import Row, case, delete, distinct, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Subquery
 
+from sturnus.application.assembly import BoundLinks, assemble, merge_gap_from
 from sturnus.application.collection_mirror import MirroredCollection
 from sturnus.application.directory_mirror import (
     MirroredChannel,
@@ -60,6 +61,7 @@ from sturnus.console.ports import (
     Track,
 )
 from sturnus.console.reporting import RecordedSession
+from sturnus.console.statistics import SessionName, SessionTranscript
 from sturnus.domain import settings
 from sturnus.domain.consent import (
     ConsentRecord,
@@ -82,8 +84,13 @@ from sturnus.infrastructure.db.models import (
     TranscriptionJob,
 )
 from sturnus.infrastructure.db.models import Session as SessionRow
-from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS
-from sturnus.infrastructure.db.repositories import AccountLinkRepository, ConsentRepository
+from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, TERMINAL_STATUSES
+from sturnus.infrastructure.db.repositories import (
+    AccountLinkRepository,
+    ConsentRepository,
+    JobRepository,
+    SessionRepository,
+)
 from sturnus.infrastructure.db.requeue import (
     ActiveSession,
     SessionView,
@@ -430,6 +437,178 @@ class ConsoleTagWriter:
         # a caller that rendered this answer in another order would show
         # chips that rearrange themselves on the next page load.
         return tuple(sorted(wanted))
+
+
+class ConsoleSessionNaming:
+    """Names one session, if the person asking was in it.
+
+    The same shape and the same rule as `ConsoleTagWriter` above, and
+    deliberately not the same class: a tag is one person's private label
+    and a title is the session's shared name, so the two write different
+    tables under different keys and only their authorisation is common
+    (see `sturnus.console.naming`).
+
+    The authorisation is the first statement and there is no path past
+    it. A session that does not exist and one this person was not in both
+    answer `None` -- the same 404, for the same reason the audio endpoint
+    gives it: a 403 would confirm that a meeting exists to somebody just
+    established as having no part in it.
+
+    **A blind write, on purpose.** The update sets both columns to what
+    it was handed, without reading what was there first. Two participants
+    renaming a meeting in the same minute is a last-writer-wins, which is
+    what a shared name is; the alternative is a version token on a field
+    two people edit twice a year, and a conflict dialogue nobody would
+    know what to do with.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def rename(
+        self, session_id: int, *, by: int, title: str | None, description: str | None
+    ) -> SessionName | None:
+        """The name afterwards, or `None` for a session not theirs."""
+        async with self._session_factory() as db:
+            was_there = await db.scalar(
+                select(SessionParticipant.id)
+                .where(
+                    SessionParticipant.session_id == session_id,
+                    SessionParticipant.discord_user_id == by,
+                )
+                .limit(1)
+            )
+            if was_there is None:
+                return None
+            await db.execute(
+                update(SessionRow)
+                .where(SessionRow.id == session_id)
+                .values(title=title, description=description)
+            )
+            await db.commit()
+        # What was stored, which is what was passed in: `naming` already
+        # trimmed it at the edge and this method changes nothing further,
+        # so re-reading the row would be a round trip to be told what this
+        # call just said.
+        return SessionName(title=title, description=description)
+
+
+class ConsoleTranscripts:
+    """A session's assembled transcript, built the way the protocol was.
+
+    `assemble` is called rather than reimplemented, and that is the whole
+    design of this class: the worker builds the published document with
+    the same function, from the same rows, under the same guild's
+    `merge_gap_seconds` and `document_provider`. A second merge here
+    would be a console that quietly disagrees with the document about
+    where one speaker stopped and the next began.
+
+    Localised to UTC, exactly as `_create_session_document` assembles in
+    UTC: ordering and merging must not depend on an offset, and the times
+    go out as ISO 8601 with theirs attached for the console to render in
+    the viewer's own zone (the argument `sturnus.console.statistics.
+    calendar_year` makes about a person who meets across several guilds).
+
+    **This class does not authorise anything, and must not be reached
+    without something that did.** See `sturnus.console.ports.
+    TranscriptReader` for why the participant rule is the caller's
+    `SessionReads.session_for` and not a second `WHERE` here.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        config: SettingsStore,
+    ) -> None:
+        self._session_factory = session_factory
+        self._config = config
+        # The three readers `assemble` declares as protocols, built once
+        # rather than per request: each is a thin wrapper over the same
+        # factory, and naming them here is what shows at a glance that
+        # this class reads exactly the rows the worker's document does.
+        self._sessions = SessionRepository(session_factory)
+        self._jobs = JobRepository(session_factory)
+        self._links = AccountLinkRepository(session_factory)
+
+    async def transcript_of(self, session_id: int) -> SessionTranscript | None:
+        async with self._session_factory() as db:
+            bounds = (
+                await db.execute(
+                    select(SessionRow.guild_id, SessionRow.started_at, SessionRow.ended_at).where(
+                        SessionRow.id == session_id
+                    )
+                )
+            ).first()
+            if bounds is None:
+                return None
+            # One statement for both counts. `audio_deleted_at` is per
+            # job, so "the audio is gone" is a property of the whole
+            # session only when every one of its tracks has been swept --
+            # and a session with no tracks at all has nothing to play
+            # either, which is the same answer.
+            tallies = (
+                await db.execute(
+                    select(
+                        func.count()
+                        .filter(TranscriptionJob.audio_deleted_at.is_(None))
+                        .label("with_audio"),
+                        func.count()
+                        # `TERMINAL_STATUSES` is the queue's own
+                        # answer to "this job is over": `done` wrote
+                        # a transcript and `dead` never will.
+                        # Everything else is a speaker the tab is
+                        # still waiting for.
+                        .filter(TranscriptionJob.status.not_in(TERMINAL_STATUSES))
+                        .label("pending"),
+                    ).where(TranscriptionJob.session_id == session_id)
+                )
+            ).one()
+
+        started_at, ended_at = bounds.started_at, bounds.ended_at
+        audio_available = tallies.with_audio > 0
+        if ended_at is None:
+            # A session still being recorded has no transcript to
+            # assemble: its jobs are not enqueued until it closes, and
+            # `assemble` cannot place words between a start and an end
+            # that does not exist yet. Answered rather than refused, so
+            # the tab can say "still recording" instead of 404.
+            return SessionTranscript(
+                session_id=session_id,
+                started_at=started_at,
+                ended_at=None,
+                audio_available=audio_available,
+                pending_tracks=tallies.pending,
+                participants=(),
+                blocks=(),
+            )
+
+        stored = await self._config.snapshot(bounds.guild_id)
+        # Which provider's account-link mapping names a speaker outside
+        # Discord. The same key `_create_session_document` reads, so the
+        # transcript tab attributes a block to the same person the
+        # published document does. `snapshot` layers `DEFAULTS` over the
+        # stored rows and this key has one, so the fallback is only ever
+        # reached by a `SettingsStore` that answers with nothing.
+        provider = (
+            stored.get(settings.DOCUMENT_PROVIDER) or settings.DEFAULTS[settings.DOCUMENT_PROVIDER]
+        )
+        transcript = await assemble(
+            session_id,
+            self._sessions,
+            self._jobs,
+            BoundLinks(self._links, provider),
+            UTC,
+            merge_gap_from(stored.get(settings.MERGE_GAP_SECONDS)),
+        )
+        return SessionTranscript(
+            session_id=session_id,
+            started_at=transcript.session_started_at,
+            ended_at=transcript.session_ended_at,
+            audio_available=audio_available,
+            pending_tracks=tallies.pending,
+            participants=transcript.participants,
+            blocks=transcript.blocks,
+        )
 
 
 class ConsoleQueueControl:

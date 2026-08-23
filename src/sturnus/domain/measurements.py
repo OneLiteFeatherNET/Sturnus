@@ -1,5 +1,10 @@
 """What a finished transcription job measured about its recording.
 
+Two values, kept apart deliberately. `JobMeasurements` is what *decoding*
+observed and is only meaningful as a whole; `RecordedAudio` is what the
+file is, and would be the same had nobody decoded it. See each type for
+why they are not one.
+
 Three numbers the worker has always computed and never kept. They went
 into a log line and a metric, and both of those are retained for weeks
 while the job's own row lives as long as the guild does -- so "how much
@@ -79,3 +84,50 @@ class JobMeasurements:
         if self.audio_seconds == 0:
             return 0.0
         return self.speech_seconds / self.audio_seconds
+
+
+@dataclass(frozen=True)
+class RecordedAudio:
+    """What a recording *is* as a file, as opposed to what it said.
+
+    Three facts the system has always had and never kept. `sample_rate`
+    and `channels` are re-read out of the object store on every request
+    that wants them (`sturnus.console.spectrogram.parse_track_format`
+    walks the RIFF header live, which costs a ranged GET and a chunk
+    decrypt to answer "how many channels"), and `stored_bytes` is a
+    second round trip asking S3 how big the object is. The worker holds
+    both files on disk at the moment it transcribes and can simply write
+    them down.
+
+    Separate from `JobMeasurements` rather than three more fields on it,
+    because the two are answers to different questions and are not
+    meaningful together: `JobMeasurements` is what decoding observed and
+    carries an invariant between its numbers, while these three are
+    properties of the file that would be the same if nobody ever decoded
+    it. Folding them in would put a size next to a speech duration and
+    invite a fourth reader to compare them.
+
+    Every field is a positive quantity and none of them is optional here.
+    A track whose header cannot be read produces no `RecordedAudio` at
+    all, so the columns stay null -- null is "nobody ever looked", zero
+    would be a claim about the recording (see `sturnus.console.
+    statistics`).
+    """
+
+    sample_rate: int
+    channels: int
+    #: The size of the *stored* object, which is the encrypted one -- the
+    #: number `S3AudioStore.size` is asked for today. Bigger than the
+    #: plaintext WAV by the envelope framing, and that is the honest
+    #: figure for "what does this recording cost us to keep".
+    stored_bytes: int
+
+    def __post_init__(self) -> None:
+        if self.sample_rate <= 0:
+            raise ValueError(f"sample_rate must be positive: {self.sample_rate}")
+        if self.channels <= 0:
+            raise ValueError(f"channels must be positive: {self.channels}")
+        # Zero is allowed: an object can genuinely be empty, and that is a
+        # fact about the recording rather than a failure to measure one.
+        if self.stored_bytes < 0:
+            raise ValueError(f"stored_bytes cannot be negative: {self.stored_bytes}")

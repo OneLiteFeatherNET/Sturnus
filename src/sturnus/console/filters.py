@@ -6,8 +6,9 @@ not mean, are decisions worth testing without a server.
 
 ## What is searched, and what deliberately is not
 
-**Metadata only: the channel, the date, who was there, and the reader's
-own tags.** Not the transcripts, and not the protocols.
+**Metadata only: the channel, the date, who was there, what somebody
+named the meeting, and the reader's own tags.** Not the transcripts, and
+not the protocols.
 
 That is a decision about other people's speech and not a limitation of
 the implementation. Everybody in a recorded session consented to being
@@ -19,10 +20,20 @@ the system answers, which is a use of a colleague's voice that nobody in
 the room agreed to when they clicked yes.
 
 Everything this module *does* search is already on the page. A session's
-channel, its times, the names of everybody who was in it and the labels
-this reader wrote are all in the response `/api/sessions` has always
-returned to this same person. Filtering by them narrows what somebody can
-already see; it does not widen it.
+channel, its times, the names of everybody who was in it, its title and
+description, and the labels this reader wrote are all in the response
+`/api/sessions` returns to this same person. Filtering by them narrows
+what somebody can already see; it does not widen it.
+
+A title and a description are the one searchable thing here that somebody
+*typed about the meeting* rather than something the system observed, and
+they are searchable for exactly that reason: a person writes "Sprint 34
+planning" on a recording so that they can find it again by typing
+"sprint". They are also shared, unlike a tag, so a search over them can
+find a meeting a colleague named -- which is a meeting the searcher was
+already in and could already open. The console still says on screen that
+search does not reach transcripts, because that remains true and is the
+part people assume otherwise.
 
 If content search is wanted later, the shape it must have is fixed by
 Section 3.3 of the console design and by nothing in this file: the
@@ -53,9 +64,12 @@ from datetime import date
 from sturnus.console.tags import InvalidTag, normalise
 
 #: The longest search text accepted. Not a storage limit -- it is what
-#: keeps a `LIKE` pattern from being megabytes long, and a hundred
-#: characters is already longer than any channel name, display name or
-#: tag it could match.
+#: keeps a `LIKE` pattern from being megabytes long. A hundred characters
+#: is longer than any channel name, display name or tag it could match,
+#: and shorter than a title or a description, which it is matched
+#: *within*: nobody searches by pasting a whole paragraph, and a pattern
+#: long enough to be one is a pattern the planner has to walk every row
+#: for.
 MAX_QUERY_CHARS = 100
 
 #: How many tags one request may filter by at once. They are combined with
@@ -78,9 +92,10 @@ class SessionFilter:
     than being spelled as a wildcard somebody has to remember to write.
     """
 
-    #: Free text, matched against the channel name, the display names of
-    #: everybody who was in the session, and this reader's own tags.
-    #: Never against a transcript; see the module docstring.
+    #: Free text, matched against the channel name, the session's title
+    #: and description, the display names of everybody who was in it, and
+    #: this reader's own tags. Never against a transcript; see the module
+    #: docstring.
     text: str | None
     #: Tags the recording must carry, all of them. AND rather than OR
     #: because a second chip is somebody narrowing a list -- selecting

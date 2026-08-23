@@ -7,7 +7,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.domain import settings
-from sturnus.domain.measurements import JobMeasurements
+from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.models import Base, GuildConfig, Session, TranscriptionJob
 from sturnus.infrastructure.db.queue import JobQueue
@@ -852,3 +852,82 @@ async def test_a_completion_from_a_lost_claim_is_counted_as_stale_not_as_done(
     await queue.complete(lost.id, "thrown away", lease=lost.claimed_at)
 
     assert _job_outcomes(outcomes) == ["stale"]
+
+
+# ---------------------------------------------------------------------------
+# What the recording is, as a file
+#
+# `sample_rate`, `channels` and `stored_bytes` are re-read out of the
+# object store on every request that wants them -- a ranged GET and a
+# chunk decrypt to answer "how many channels". The worker holds both
+# copies on disk at the moment it completes a job, and this is where it
+# writes them down.
+# ---------------------------------------------------------------------------
+
+
+async def test_completing_a_job_stores_what_the_recording_is(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    queue = JobQueue(factory)
+    job = await _claim_one(factory, queue)
+
+    await queue.complete(
+        job.id,
+        "the transcript",
+        audio=RecordedAudio(sample_rate=16_000, channels=1, stored_bytes=1_048_576),
+    )
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, job.id)
+        assert stored is not None
+        assert stored.sample_rate == 16_000
+        assert stored.channels == 1
+        assert stored.stored_bytes == 1_048_576
+
+
+async def test_a_job_completed_without_a_readable_header_stores_null_not_zero(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Null means "nobody could look"; nought hertz would be a claim about
+    a recording. The same rule the measurements follow, one column set
+    over."""
+    queue = JobQueue(factory)
+    job = await _claim_one(factory, queue)
+
+    await queue.complete(job.id, "the transcript")
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, job.id)
+        assert stored is not None
+        assert stored.sample_rate is None
+        assert stored.channels is None
+        assert stored.stored_bytes is None
+
+
+async def test_a_worker_that_lost_its_job_does_not_stamp_the_file_it_measured(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Fenced by the same lease as the transcript.
+
+    A worker whose lease expired mid-job is measuring a copy nobody is
+    waiting for, and the row belongs to whoever holds it now.
+    """
+    queue = JobQueue(factory)
+    job = await _claim_one(factory, queue)
+    stale = job.claimed_at - timedelta(hours=1)
+
+    assert (
+        await queue.complete(
+            job.id,
+            "the transcript",
+            lease=stale,
+            audio=RecordedAudio(sample_rate=48_000, channels=2, stored_bytes=1),
+        )
+        is False
+    )
+
+    async with factory() as session:
+        stored = await session.get(TranscriptionJob, job.id)
+        assert stored is not None
+        assert stored.sample_rate is None
+        assert stored.stored_bytes is None

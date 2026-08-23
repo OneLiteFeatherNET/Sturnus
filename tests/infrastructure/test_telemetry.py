@@ -21,7 +21,7 @@ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanE
 from opentelemetry.trace import NonRecordingSpan, StatusCode
 
 from sturnus.config import OtelSettings
-from sturnus.domain.measurements import JobMeasurements
+from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 from sturnus.infrastructure import telemetry
 from sturnus.infrastructure.telemetry import (
     AllowlistingSpanExporter,
@@ -111,8 +111,9 @@ def test_the_whole_worker_pipeline_runs_with_no_collector() -> None:
             measurements: JobMeasurements | None = None,
             *,
             lease: datetime | None = None,
+            audio: RecordedAudio | None = None,
         ) -> bool:
-            del job_id, transcript, measurements, lease
+            del job_id, transcript, measurements, lease, audio
             raise AssertionError("not reached: the queue is empty")
 
         async def fail(

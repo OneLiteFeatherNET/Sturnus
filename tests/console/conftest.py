@@ -48,14 +48,22 @@ from sturnus.console.ports import (
     RequeueOutcome,
     RevocationOutcome,
     ScopeOutcome,
+    SessionNaming,
     SessionReads,
     SettingsStore,
     StateStore,
     TagWriter,
     Track,
+    TranscriptReader,
 )
 from sturnus.console.session import SessionCookie
-from sturnus.console.statistics import AttendedSession, SessionPage, TagUse
+from sturnus.console.statistics import (
+    AttendedSession,
+    SessionName,
+    SessionPage,
+    SessionTranscript,
+    TagUse,
+)
 from sturnus.domain import preferences
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
@@ -816,6 +824,62 @@ class FakeCollections:
         return self.listing
 
 
+class FakeTranscripts:
+    """A session's transcript, in memory, keyed by session id.
+
+    Deliberately unscoped: `TranscriptReader` carries no `requested_by`
+    because the participant rule is the handler's `session_for` call (see
+    the port's docstring). What the route tests use this for is the other
+    half -- that the handler asked the reads adapter first and only then
+    came here, which is visible in `asked` and in the 404 a fake with no
+    session still produces.
+    """
+
+    def __init__(self, transcripts: dict[int, SessionTranscript] | None = None) -> None:
+        self.transcripts = transcripts if transcripts is not None else {}
+        #: Every session this was asked about, in order.
+        self.asked: list[int] = []
+
+    async def transcript_of(self, session_id: int) -> SessionTranscript | None:
+        self.asked.append(session_id)
+        return self.transcripts.get(session_id)
+
+
+class FakeNaming:
+    """The rename path, in memory, scoped by the asking user.
+
+    Answers `None` for a session nobody says this person was in, which is
+    what the real writer answers for both "no such session" and "not
+    yours" -- so a route test that forgot to pass the signed-in user gets
+    a 404 here too rather than a fake that renames anybody's meeting.
+
+    Whether the *statement* scopes is a property of SQL and is tested
+    against the real database in `tests/console/test_adapters.py`.
+    """
+
+    def __init__(
+        self,
+        participants: dict[int, set[int]] | None = None,
+        stored: dict[int, SessionName] | None = None,
+    ) -> None:
+        self.participants = participants if participants is not None else {}
+        self.stored = stored if stored is not None else {}
+        #: Every write this was asked to make, in order. The route tests
+        #: assert on it, because "the handler wrote for the signed-in
+        #: person and not for anybody the request could name" cannot be
+        #: seen in a response body.
+        self.written: list[tuple[int, int, str | None, str | None]] = []
+
+    async def rename(
+        self, session_id: int, *, by: int, title: str | None, description: str | None
+    ) -> SessionName | None:
+        self.written.append((session_id, by, title, description))
+        if by not in self.participants.get(session_id, set()):
+            return None
+        self.stored[session_id] = SessionName(title=title, description=description)
+        return self.stored[session_id]
+
+
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
@@ -835,6 +899,8 @@ def build_test_api(
     prefs: PreferenceDirectory | None = None,
     names: GuildNames | None = None,
     collections: CollectionNames | None = None,
+    transcripts: TranscriptReader | None = None,
+    naming: SessionNaming | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -883,6 +949,8 @@ def build_test_api(
         prefs=prefs or FakePreferences(),
         names=names or FakeNames(admins=administrators),
         collections=collections or FakeCollections(),
+        transcripts=transcripts or FakeTranscripts(),
+        naming=naming or FakeNaming(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,

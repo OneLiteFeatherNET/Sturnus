@@ -11,7 +11,7 @@ from dataclasses import FrozenInstanceError
 
 import pytest
 
-from sturnus.domain.measurements import JobMeasurements
+from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 
 
 def test_it_carries_the_three_numbers_a_finished_job_produced() -> None:
@@ -81,3 +81,52 @@ def test_it_is_immutable() -> None:
     m = JobMeasurements(1.0, 1.0, 1)
     with pytest.raises(FrozenInstanceError):
         m.audio_seconds = 2.0  # type: ignore[misc]
+
+
+# ---------------------------------------------------------------------------
+# What the recording is, as a file
+# ---------------------------------------------------------------------------
+
+
+def test_it_carries_what_the_riff_header_and_the_object_store_say() -> None:
+    audio = RecordedAudio(sample_rate=16_000, channels=1, stored_bytes=1_048_576)
+    assert audio.sample_rate == 16_000
+    assert audio.channels == 1
+    assert audio.stored_bytes == 1_048_576
+
+
+def test_a_recording_at_no_sample_rate_is_not_a_recording() -> None:
+    """Zero hertz decodes to nothing and describes no file.
+
+    A header that says so was misread, and storing it would put a claim
+    about a recording in a column whose whole contract is that null means
+    nobody looked.
+    """
+    with pytest.raises(ValueError, match="sample_rate"):
+        RecordedAudio(sample_rate=0, channels=1, stored_bytes=100)
+
+
+def test_a_recording_with_no_channels_is_not_a_recording() -> None:
+    with pytest.raises(ValueError, match="channels"):
+        RecordedAudio(sample_rate=16_000, channels=0, stored_bytes=100)
+
+
+def test_an_empty_object_is_a_fact_and_not_an_error() -> None:
+    """Zero bytes is something that genuinely happened to a recording.
+
+    Unlike a zero sample rate, it is not a misread header: a speaker who
+    was in the channel and never sent a packet can leave one, and the
+    honest answer is the size it actually is.
+    """
+    assert RecordedAudio(sample_rate=16_000, channels=1, stored_bytes=0).stored_bytes == 0
+
+
+def test_a_negative_size_is_refused() -> None:
+    with pytest.raises(ValueError, match="stored_bytes"):
+        RecordedAudio(sample_rate=16_000, channels=1, stored_bytes=-1)
+
+
+def test_it_cannot_be_edited_after_it_is_measured() -> None:
+    audio = RecordedAudio(sample_rate=16_000, channels=1, stored_bytes=10)
+    with pytest.raises(FrozenInstanceError):
+        audio.sample_rate = 48_000  # type: ignore[misc]

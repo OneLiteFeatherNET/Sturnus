@@ -91,7 +91,7 @@ from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
 
 from sturnus.domain import settings
-from sturnus.domain.measurements import JobMeasurements
+from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 from sturnus.infrastructure.db.models import GuildConfig, Session, TranscriptionJob
 from sturnus.infrastructure.telemetry import JOB_OUTCOME, record
 from sturnus.observability.events import Event, log_event
@@ -361,6 +361,7 @@ class JobQueue:
         measurements: JobMeasurements | None = None,
         *,
         lease: datetime | None = None,
+        audio: RecordedAudio | None = None,
     ) -> bool:
         """Stores the transcript, marks the job done, and reports whether it
         was the session's last job.
@@ -416,6 +417,15 @@ class JobQueue:
         only ever see `status == "closed"` once `close_session`'s own
         transaction has actually committed, so a stale read here is always
         the safe direction (a false "not yet last", never a false "last").
+
+        `audio` is what the recording is as a file -- its sample rate, its
+        channel count, the size of the stored object. It is written here
+        rather than at enqueue because this is the one moment both files
+        exist: the worker has the encrypted object and the plaintext WAV
+        it decrypted out of it, and deletes both a few lines later. It is
+        fenced by the same `lease` as everything else in this method, so a
+        worker that has lost its job cannot stamp the row with a
+        measurement nobody is waiting for.
         """
         async with self._session_factory() as session:
             job = await session.get(TranscriptionJob, job_id)
@@ -470,6 +480,16 @@ class JobQueue:
                 # default, and the three numbers above mean nothing
                 # without knowing which.
                 job.model = measurements.model
+            # The same rule, one layer out: absent means nobody could
+            # read the header, and null is how a row says so. Zero
+            # channels at zero hertz would be a claim about a recording
+            # that nothing ever looked at -- and `sturnus.console.
+            # statistics` insists on that distinction for `audio_seconds`
+            # already, for the same reason.
+            if audio is not None:
+                job.sample_rate = audio.sample_rate
+                job.channels = audio.channels
+                job.stored_bytes = audio.stored_bytes
             await session.flush()
             remaining = await session.scalar(
                 select(func.count())

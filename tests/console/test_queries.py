@@ -49,6 +49,8 @@ async def a_session(
     channel_name: str | None = "meeting",
     document_url: str | None = None,
     people: dict[int, str] | None = None,
+    title: str | None = None,
+    description: str | None = None,
 ) -> int:
     """A closed session with participants, written straight to the tables.
 
@@ -61,6 +63,8 @@ async def a_session(
             guild_id=GUILD,
             channel_id=channel_id,
             channel_name=channel_name,
+            title=title,
+            description=description,
             started_at=started_at,
             ended_at=ended_at,
             status="closed" if ended_at else "recording",
@@ -91,6 +95,9 @@ async def a_track(
     segment_count: int | None = 4,
     transcript: str | None = None,
     status: str = "done",
+    sample_rate: int | None = 16_000,
+    channels: int | None = 1,
+    stored_bytes: int | None = 4096,
 ) -> None:
     async with factory() as db:
         db.add(
@@ -106,6 +113,9 @@ async def a_track(
                 audio_seconds=audio_seconds,
                 speech_seconds=speech_seconds,
                 segment_count=segment_count,
+                sample_rate=sample_rate,
+                channels=channels,
+                stored_bytes=stored_bytes,
             )
         )
         await db.commit()
@@ -818,3 +828,144 @@ async def test_a_filtered_list_is_still_paged(
         matching=session_filter(text="retro", tags=[], since=None, until=None, protocol=None),
     )
     assert (len(page.sessions), page.total) == (2, 3)
+
+
+# ---------------------------------------------------------------------------
+# What a meeting is called, and searching for it by that
+# ---------------------------------------------------------------------------
+
+
+async def test_a_session_carries_what_somebody_named_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await a_session(factory, title="Sprint 34 planning", description="agenda")
+    found = await ConsoleQueries(factory).session_for(ANNA, session_id)
+    assert found is not None
+    assert found.title == "Sprint 34 planning"
+    assert found.description == "agenda"
+
+
+async def test_a_session_nobody_has_named_reads_as_null(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await a_session(factory)
+    found = await ConsoleQueries(factory).session_for(ANNA, session_id)
+    assert found is not None
+    assert found.title is None
+    assert found.description is None
+
+
+async def test_a_search_finds_a_meeting_by_what_it_was_called(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The reason somebody types a title onto a recording at all.
+
+    A title is already in the response this same person gets for these
+    sessions, so searching it narrows what they can see rather than
+    widening it.
+    """
+    wanted = await a_session(factory, channel_name="allgemein", title="Sprint 34 planning")
+    await a_session(factory, channel_name="allgemein", title="Retro")
+    assert await matching(factory, text="sprint") == [wanted]
+
+
+async def test_a_search_finds_a_meeting_by_what_was_written_about_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wanted = await a_session(factory, description="we decided to drop the second queue")
+    await a_session(factory)
+    assert await matching(factory, text="second queue") == [wanted]
+
+
+async def test_a_search_over_a_title_ignores_the_case_it_was_typed_in(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    wanted = await a_session(factory, title="Sprint 34 Planning")
+    assert await matching(factory, text="PLANNING") == [wanted]
+
+
+async def test_a_title_a_colleague_typed_is_searchable_by_everybody_in_the_room(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The asymmetry with a tag, in one test. Ben's *label* is not Anna's
+    to search by, because a label is a private remark; the meeting's
+    *name* is shared, because it is what the meeting was."""
+    wanted = await a_session(
+        factory, title="Kunde OneLiteFeather", people={ANNA: "anna", BEN: "ben"}
+    )
+    assert await matching(factory, text="onelitefeather") == [wanted]
+
+
+async def test_a_search_over_titles_never_reaches_a_session_you_were_not_in(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The scope survives the filter. A search is a narrowing of what
+    somebody may already see, never a way to reach past it."""
+    await a_session(factory, title="Sprint 34 planning", people={BEN: "ben"})
+    assert await matching(factory, text="sprint") == []
+
+
+async def test_a_meeting_nobody_named_does_not_match_a_search(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A null matches no pattern, which is right: the recording has no
+    name to have been searched for."""
+    await a_session(factory, title=None, channel_name=None)
+    assert await matching(factory, text="sprint") == []
+
+
+async def test_a_percent_sign_in_a_title_search_is_a_percent_sign(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await a_session(factory, title="planning")
+    wanted = await a_session(factory, title="100% agreed")
+    assert await matching(factory, text="100%") == [wanted]
+
+
+async def test_a_search_still_does_not_reach_a_transcript(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The one thing extending the search must not have done.
+
+    A transcript index turns spoken words into a lookup key, which is a
+    use of a colleague's voice nobody agreed to when they consented to
+    being recorded. The console says so on screen and this is what keeps
+    it true.
+    """
+    session_id = await a_session(factory, title="Retro", channel_name="allgemein")
+    await a_track(factory, session_id, ANNA, transcript=words("zeitverschwendung"))
+    assert await matching(factory, text="zeitverschwendung") == []
+
+
+# ---------------------------------------------------------------------------
+# What each track is, as a file
+# ---------------------------------------------------------------------------
+
+
+async def test_a_session_carries_what_each_track_is_as_a_file(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Read from the row the worker wrote, so a metadata tab costs the
+    statement the page already issues rather than a ranged GET and a
+    chunk decrypt per track."""
+    session_id = await a_session(factory)
+    await a_track(factory, session_id, ANNA, sample_rate=16_000, channels=1, stored_bytes=4096)
+    found = await ConsoleQueries(factory).session_for(ANNA, session_id)
+    assert found is not None
+    assert (found.tracks[0].sample_rate, found.tracks[0].channels) == (16_000, 1)
+    assert found.tracks[0].stored_bytes == 4096
+
+
+async def test_a_track_from_before_those_columns_reads_as_null_not_zero(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Nullable with no backfill, exactly as `audio_seconds` was: a row
+    that predates the columns has audio that may already be deleted, so
+    there is nothing left to read a header from."""
+    session_id = await a_session(factory)
+    await a_track(factory, session_id, ANNA, sample_rate=None, channels=None, stored_bytes=None)
+    found = await ConsoleQueries(factory).session_for(ANNA, session_id)
+    assert found is not None
+    assert found.tracks[0].sample_rate is None
+    assert found.tracks[0].channels is None
+    assert found.tracks[0].stored_bytes is None

@@ -48,9 +48,11 @@ from sturnus.console.adapters import (
     ConsoleProfileDirectory,
     ConsoleQueueControl,
     ConsoleQueueOverview,
+    ConsoleSessionNaming,
     ConsoleStateStore,
     ConsoleTagWriter,
     ConsoleTrackDirectory,
+    ConsoleTranscripts,
 )
 from sturnus.console.app import build_api
 from sturnus.console.audio import AudioDelivery
@@ -249,6 +251,13 @@ async def _run() -> None:
         prefs=PreferenceStore(session_factory),
         names=ConsoleGuildNames(session_factory, admins),
         collections=ConsoleCollectionNames(session_factory, admins),
+        # The configuration store again, because a transcript is
+        # assembled under the same guild's `merge_gap_seconds` and
+        # `document_provider` the published protocol was built with --
+        # anything else would be a console disagreeing with the document
+        # about the same meeting.
+        transcripts=ConsoleTranscripts(session_factory, config),
+        naming=ConsoleSessionNaming(session_factory),
     )
 
     runner = web.AppRunner(app)

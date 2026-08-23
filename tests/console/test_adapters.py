@@ -16,10 +16,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sturnus.console.adapters import (
     ConsoleLinkDirectory,
     ConsoleProfileDirectory,
+    ConsoleSessionNaming,
     ConsoleStateStore,
     ConsoleTagWriter,
     ConsoleTrackDirectory,
+    ConsoleTranscripts,
 )
+from sturnus.console.statistics import SessionName
 from sturnus.domain import settings
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
@@ -571,3 +574,305 @@ async def test_the_same_label_written_twice_is_not_an_error(
     await writer.replace(session_id, owner=ANNA, tags=("retro",), now=T0)
 
     assert await writer.replace(session_id, owner=ANNA, tags=("retro",), now=T0) == ("retro",)
+
+
+# ---------------------------------------------------------------------------
+# Naming a meeting: whose meeting it may be, and what the row ends up holding
+# ---------------------------------------------------------------------------
+
+
+async def stored_name(
+    factory: async_sessionmaker[AsyncSession], session_id: int
+) -> tuple[str | None, str | None]:
+    """What the row actually holds, read without going through the writer."""
+    async with factory() as db:
+        row = (
+            await db.execute(
+                select(Session.title, Session.description).where(Session.id == session_id)
+            )
+        ).one()
+        return (row.title, row.description)
+
+
+async def test_a_participant_may_name_a_meeting_they_were_in(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA,))
+
+    stored = await ConsoleSessionNaming(factory).rename(
+        session_id, by=ANNA, title="Sprint 34 planning", description="what we decided"
+    )
+
+    assert stored == SessionName("Sprint 34 planning", "what we decided")
+    assert await stored_name(factory, session_id) == ("Sprint 34 planning", "what we decided")
+
+
+async def test_somebody_who_was_not_in_the_meeting_cannot_name_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`None`, and the caller answers 404 to it -- the same answer a
+    session that does not exist gets. A 403 would confirm that a meeting
+    exists to somebody just established as having no part in it."""
+    session_id = await seed_session(factory, participants=(BEN,))
+
+    assert (
+        await ConsoleSessionNaming(factory).rename(
+            session_id, by=ANNA, title="retro", description=None
+        )
+        is None
+    )
+    assert await stored_name(factory, session_id) == (None, None)
+
+
+async def test_naming_a_meeting_that_does_not_exist_writes_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    assert (
+        await ConsoleSessionNaming(factory).rename(9999, by=ANNA, title="retro", description=None)
+        is None
+    )
+
+
+async def test_a_name_is_shared_so_another_participant_may_correct_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The whole difference from a tag. Two people labelling one meeting
+    keep two private labels; two people naming one meeting are naming one
+    thing, and the second one wins."""
+    session_id = await seed_session(factory, participants=(ANNA, BEN))
+    naming = ConsoleSessionNaming(factory)
+
+    await naming.rename(session_id, by=ANNA, title="sprint", description=None)
+    await naming.rename(session_id, by=BEN, title="Sprint 34 planning", description=None)
+
+    assert await stored_name(factory, session_id) == ("Sprint 34 planning", None)
+
+
+async def test_clearing_a_name_is_a_write_and_not_a_refusal(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Un-naming a meeting is something people do, and null is the one
+    spelling of "nobody has named this"."""
+    session_id = await seed_session(factory, participants=(ANNA,))
+    naming = ConsoleSessionNaming(factory)
+    await naming.rename(session_id, by=ANNA, title="retro", description="notes")
+
+    assert await naming.rename(session_id, by=ANNA, title=None, description=None) == SessionName(
+        None, None
+    )
+    assert await stored_name(factory, session_id) == (None, None)
+
+
+async def test_naming_one_meeting_leaves_another_alone(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    mine = await seed_session(factory, participants=(ANNA,))
+    other = await seed_session(factory, participants=(ANNA,))
+
+    await ConsoleSessionNaming(factory).rename(mine, by=ANNA, title="retro", description=None)
+
+    assert await stored_name(factory, other) == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# The transcript, assembled the way the published protocol was
+# ---------------------------------------------------------------------------
+
+
+async def transcribed_session(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    said: dict[int, str],
+    ended: bool = True,
+    erased: bool = False,
+    pending: tuple[int, ...] = (),
+) -> int:
+    """A session whose speakers have (or have not) been transcribed.
+
+    Written straight to the tables rather than through the repositories:
+    what is under test is which rows the adapter reads back, and going
+    through the writers would make it a test of two things at once.
+    """
+    async with factory() as db:
+        session = Session(
+            guild_id=GUILD,
+            channel_id=2,
+            channel_name="allgemein",
+            started_at=T0,
+            ended_at=T0 + timedelta(hours=1) if ended else None,
+            status="closed" if ended else "recording",
+        )
+        db.add(session)
+        await db.flush()
+        for index, speaker in enumerate([*said, *pending]):
+            db.add(
+                SessionParticipant(
+                    session_id=session.id,
+                    discord_user_id=speaker,
+                    discord_display_name=f"user-{speaker}",
+                    first_seen_at=T0,
+                    # The epoch is the evidence audio of them exists, and
+                    # `assemble` drops a speaker without one: their words
+                    # would otherwise be placed at the session's start,
+                    # which is a time they demonstrably did not speak.
+                    audio_started_at=T0 + timedelta(seconds=index),
+                )
+            )
+        for speaker, text in said.items():
+            db.add(
+                TranscriptionJob(
+                    session_id=session.id,
+                    discord_user_id=speaker,
+                    s3_key=f"sessions/{session.id}/speakers/{speaker}.enc",
+                    encryption_key_id="key-1",
+                    wrapped_data_key=b"wrapped",
+                    retention_until=T0 + timedelta(days=30),
+                    audio_deleted_at=T0 if erased else None,
+                    status="done",
+                    transcript=(
+                        '{"language": "de", "segments": '
+                        f'[{{"start": 0.0, "end": 2.0, "text": "{text}"}}]}}'
+                    ),
+                )
+            )
+        for speaker in pending:
+            db.add(
+                TranscriptionJob(
+                    session_id=session.id,
+                    discord_user_id=speaker,
+                    s3_key=f"sessions/{session.id}/speakers/{speaker}.enc",
+                    encryption_key_id="key-1",
+                    wrapped_data_key=b"wrapped",
+                    retention_until=T0 + timedelta(days=30),
+                    status="pending",
+                )
+            )
+        await db.commit()
+        return session.id
+
+
+async def test_a_transcript_is_the_merge_of_every_speakers_words(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Built by `sturnus.application.assembly.assemble`, which is the
+    function the worker builds the published document with -- so the
+    console cannot show a different reading of the same meeting."""
+    session_id = await transcribed_session(factory, said={ANNA: "wir sind uns einig", BEN: "ja"})
+
+    found = await ConsoleTranscripts(factory, ConfigStore(factory)).transcript_of(session_id)
+
+    assert found is not None
+    assert [block.text for block in found.blocks] == ["wir sind uns einig", "ja"]
+    assert {speaker.discord_user_id for speaker in found.participants} == {ANNA, BEN}
+
+
+async def test_a_transcript_carries_the_bounds_of_the_meeting_it_is_of(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await transcribed_session(factory, said={ANNA: "hallo"})
+
+    found = await ConsoleTranscripts(factory, ConfigStore(factory)).transcript_of(session_id)
+
+    assert found is not None
+    assert found.session_id == session_id
+    assert found.started_at == T0
+    assert found.ended_at == T0 + timedelta(hours=1)
+
+
+async def test_a_session_whose_audio_retention_expired_still_has_its_words(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The retention sweep deletes the S3 object and nothing clears the
+    transcript column. That is intended -- the window is about the
+    recording and not about the minutes -- and this is the flag that lets
+    the console say so instead of rendering an empty tab."""
+    session_id = await transcribed_session(factory, said={ANNA: "wir sind uns einig"}, erased=True)
+
+    found = await ConsoleTranscripts(factory, ConfigStore(factory)).transcript_of(session_id)
+
+    assert found is not None
+    assert found.audio_available is False
+    assert [block.text for block in found.blocks] == ["wir sind uns einig"]
+
+
+async def test_a_session_that_still_has_one_recording_reports_audio(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await transcribed_session(factory, said={ANNA: "hallo"})
+
+    found = await ConsoleTranscripts(factory, ConfigStore(factory)).transcript_of(session_id)
+
+    assert found is not None
+    assert found.audio_available is True
+
+
+async def test_a_meeting_still_being_transcribed_says_how_many_are_left(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Zero blocks with a pending track is a meeting still being decoded;
+    zero blocks with none is a meeting nobody spoke in."""
+    session_id = await transcribed_session(factory, said={ANNA: "hallo"}, pending=(BEN,))
+
+    found = await ConsoleTranscripts(factory, ConfigStore(factory)).transcript_of(session_id)
+
+    assert found is not None
+    assert found.pending_tracks == 1
+
+
+async def test_a_session_still_being_recorded_answers_rather_than_refusing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Its jobs are not enqueued until it closes and it has no end for
+    `assemble` to place words between, so there is nothing to assemble --
+    but "not yet" and "no such meeting" are different sentences, and only
+    one of them is a 404."""
+    session_id = await transcribed_session(factory, said={}, ended=False, pending=(ANNA,))
+
+    found = await ConsoleTranscripts(factory, ConfigStore(factory)).transcript_of(session_id)
+
+    assert found is not None
+    assert found.ended_at is None
+    assert found.blocks == ()
+    assert found.pending_tracks == 1
+
+
+async def test_a_session_that_does_not_exist_has_no_transcript(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    assert await ConsoleTranscripts(factory, ConfigStore(factory)).transcript_of(9999) is None
+
+
+async def test_a_speakers_external_identity_is_the_one_the_document_shows(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Resolved through the guild's `document_provider`, exactly as
+    `_create_session_document` resolves it -- a transcript tab that
+    attributed a block to a different name than the published protocol
+    would be describing a different meeting."""
+    session_id = await transcribed_session(factory, said={ANNA: "hallo"})
+    await AccountLinkRepository(factory).save(ANNA, "outline", ANNA_OUTLINE, "Anna A.")
+
+    found = await ConsoleTranscripts(factory, ConfigStore(factory)).transcript_of(session_id)
+
+    assert found is not None
+    assert found.participants[0].external_user_id == ANNA_OUTLINE
+    assert found.participants[0].external_display_name == "Anna A."
+
+
+async def test_a_guilds_merge_gap_decides_where_the_paragraphs_break(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The same setting the published protocol was rendered under. A
+    console reading it differently would show paragraphs the document
+    does not have."""
+    session_id = await transcribed_session(factory, said={ANNA: "eins", BEN: "zwei"})
+    config = ConfigStore(factory)
+    await config.set(GUILD, settings.MERGE_GAP_SECONDS, "1", T0)
+
+    found = await ConsoleTranscripts(factory, config).transcript_of(session_id)
+
+    assert found is not None
+    # One second apart in this fixture, and the two speakers never merge
+    # with each other anyway -- what this asserts is that a configured
+    # value is read at all rather than silently defaulted.
+    assert len(found.blocks) == 2

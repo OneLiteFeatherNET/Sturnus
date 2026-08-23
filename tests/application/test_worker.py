@@ -11,6 +11,7 @@ onward, that the document created for a session's last job is the real
 of whichever job happened to finish last.
 """
 
+import wave
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,7 @@ from sturnus.application.documents import CreatedDocument
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
 from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.domain import settings as domain_settings
-from sturnus.domain.measurements import JobMeasurements
+from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 from sturnus.infrastructure.db.queue import ClaimedJob
 from sturnus.infrastructure.documents.outline import PermanentDocumentError
 
@@ -45,6 +46,11 @@ class FakeQueue:
         self.failed: list[tuple[int, str]] = []
         self.last_is_final = False
         self.measured: list[JobMeasurements | None] = []
+        #: What each `complete` was told the recording is, as a file.
+        #: Kept apart from `completed` for the same reason `measured` is:
+        #: the assertions that predate it should not have to grow an
+        #: element they do not care about.
+        self.recorded: list[RecordedAudio | None] = []
         #: Every lease presented back to this queue, in order. Kept apart
         #: from `completed`/`failed` for the same reason `measured` is:
         #: the assertions that predate the fencing token do not care about
@@ -61,12 +67,14 @@ class FakeQueue:
         measurements: JobMeasurements | None = None,
         *,
         lease: datetime | None = None,
+        audio: RecordedAudio | None = None,
     ) -> bool:
         self.completed.append((job_id, transcript))
         # Kept separately from `completed` so a test can assert on what was
         # measured without every existing assertion on that list having to
         # grow a third element it does not care about.
         self.measured.append(measurements)
+        self.recorded.append(audio)
         self.leases.append(lease)
         return self.last_is_final
 
@@ -935,3 +943,167 @@ async def test_an_engine_that_measured_nothing_completes_the_job_anyway(
 
     assert queue.measured == [None]
     assert len(queue.completed) == 1
+
+
+# ---------------------------------------------------------------------------
+# What the recording is, as a file
+#
+# The one moment in the system where both copies exist: the encrypted
+# object has just been downloaded and the plaintext WAV has just been
+# decrypted out of it, and both are removed a few lines later. Every
+# later reader would otherwise pay a ranged GET and a chunk decrypt to
+# walk the same header, plus a second round trip for the object size.
+# ---------------------------------------------------------------------------
+
+
+class WritesARealWav:
+    """A decryptor that produces a file `wave` can actually read.
+
+    The other tests here use `FakeCrypto`, which writes eleven
+    recognisable bytes -- enough to prove the pipeline moved the file and
+    not a WAV. What is under test below is reading a header, so the header
+    has to be real, and it is written by the standard library rather than
+    assembled by hand for the same reason `tests/console/conftest.sealed`
+    goes through `encrypt_file`: a fixture that reimplements a format
+    agrees with itself and with nothing else.
+    """
+
+    def __init__(self, *, sample_rate: int = 16_000, channels: int = 1, frames: int = 8_000):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self.frames = frames
+
+    def decrypt_to(self, source: Path, target: Path, _wrapped: bytes, _key_id: str) -> None:
+        del source
+        with wave.open(str(target), "wb") as track:
+            track.setnchannels(self.channels)
+            track.setsampwidth(2)
+            track.setframerate(self.sample_rate)
+            track.writeframes(b"\x00\x00" * self.frames * self.channels)
+
+
+async def test_a_finished_job_records_what_its_recording_is(tmp_path: Path) -> None:
+    queue = FakeQueue([job()])
+
+    await process_one(
+        queue=queue,
+        engine=FakeEngine(),
+        store=FakeStore(),
+        crypto=WritesARealWav(sample_rate=16_000, channels=1),
+        documents=FakeDocuments(),
+        sessions=FakeSessions(),
+        jobs=FakeJobs(),
+        links=FakeLinks(),
+        config=FakeConfig(),
+        work_dir=tmp_path,
+        max_attempts=3,
+    )
+
+    assert queue.recorded[0] is not None
+    assert queue.recorded[0].sample_rate == 16_000
+    assert queue.recorded[0].channels == 1
+
+
+async def test_the_size_recorded_is_the_stored_object_and_not_the_plaintext(tmp_path: Path) -> None:
+    """`stored_bytes` answers "what does keeping this cost us", which is a
+    question about the object in S3 -- the encrypted one, which
+    `S3AudioStore.size` is asked for today. The plaintext WAV never
+    existed anywhere but this worker's scratch directory.
+    """
+    queue = FakeQueue([job()])
+
+    await process_one(
+        queue=queue,
+        engine=FakeEngine(),
+        store=FakeStore(),
+        crypto=WritesARealWav(frames=8_000),
+        documents=FakeDocuments(),
+        sessions=FakeSessions(),
+        jobs=FakeJobs(),
+        links=FakeLinks(),
+        config=FakeConfig(),
+        work_dir=tmp_path,
+        max_attempts=3,
+    )
+
+    assert queue.recorded[0] is not None
+    # `FakeStore.get` writes exactly `b"encrypted"`, and the WAV the
+    # decryptor produced is 16 000 bytes of samples plus a header -- so
+    # these two are impossible to confuse.
+    assert queue.recorded[0].stored_bytes == len(b"encrypted")
+
+
+async def test_a_recording_whose_header_cannot_be_read_records_nothing(tmp_path: Path) -> None:
+    """A null column, not a failed job.
+
+    The transcript is the point of the work; failing -- and eventually
+    killing after `max_attempts` -- over a header nobody can parse would
+    trade the words for the file size.
+    """
+    queue = FakeQueue([job()])
+
+    await process_one(
+        queue=queue,
+        engine=FakeEngine(),
+        store=FakeStore(),
+        # Writes `b"RIFFdecoded"`, which is not a WAV.
+        crypto=FakeCrypto(),
+        documents=FakeDocuments(),
+        sessions=FakeSessions(),
+        jobs=FakeJobs(),
+        links=FakeLinks(),
+        config=FakeConfig(),
+        work_dir=tmp_path,
+        max_attempts=3,
+    )
+
+    assert queue.completed[0][1] != ""
+    assert queue.recorded == [None]
+
+
+async def test_a_stereo_recording_is_recorded_as_stereo(tmp_path: Path) -> None:
+    """Read rather than assumed. `sturnus.console.audio` used to *state*
+    the sample rate and was wrong by a factor of three, which is the
+    defect this whole column set descends from."""
+    queue = FakeQueue([job()])
+
+    await process_one(
+        queue=queue,
+        engine=FakeEngine(),
+        store=FakeStore(),
+        crypto=WritesARealWav(sample_rate=48_000, channels=2),
+        documents=FakeDocuments(),
+        sessions=FakeSessions(),
+        jobs=FakeJobs(),
+        links=FakeLinks(),
+        config=FakeConfig(),
+        work_dir=tmp_path,
+        max_attempts=3,
+    )
+
+    assert queue.recorded[0] is not None
+    assert (queue.recorded[0].sample_rate, queue.recorded[0].channels) == (48_000, 2)
+
+
+async def test_a_failed_transcription_records_nothing_about_the_file(tmp_path: Path) -> None:
+    """The columns travel with the transcript, so a job that produced no
+    transcript stamps no row: `fail` returns it to the queue, and the
+    worker that eventually succeeds measures the same file again."""
+    queue = FakeQueue([job()])
+
+    await process_one(
+        queue=queue,
+        engine=FakeEngine(fail=True),
+        store=FakeStore(),
+        crypto=WritesARealWav(),
+        documents=FakeDocuments(),
+        sessions=FakeSessions(),
+        jobs=FakeJobs(),
+        links=FakeLinks(),
+        config=FakeConfig(),
+        work_dir=tmp_path,
+        max_attempts=3,
+    )
+
+    assert queue.failed
+    assert queue.recorded == []

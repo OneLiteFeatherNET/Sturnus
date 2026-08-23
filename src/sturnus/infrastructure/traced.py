@@ -50,7 +50,7 @@ from sturnus.application.ports import AudioStore, Encryptor, SessionKey
 from sturnus.application.recording import JobQueue
 from sturnus.application.transcription import TranscriptionEngine, TranscriptionResult
 from sturnus.application.worker import AudioDownloader, Decryptor, Queue
-from sturnus.domain.measurements import JobMeasurements
+from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 from sturnus.infrastructure.telemetry import (
     DOCUMENT_CREATE_DURATION,
     JOB_STAGE_DURATION,
@@ -118,6 +118,7 @@ class TracedQueue:
         measurements: JobMeasurements | None = None,
         *,
         lease: datetime | None = None,
+        audio: RecordedAudio | None = None,
     ) -> bool:
         # `transcript` is passed straight through and never observed: it is
         # the protected content itself, and the only thing worth recording
@@ -127,6 +128,11 @@ class TracedQueue:
         # it is safe to put on a span -- and worth putting there, since a
         # trace of a job that decoded nothing is otherwise a trace with no
         # sign of what went wrong.
+        #
+        # `audio` is forwarded and not observed. It is the file's own
+        # description rather than the decoder's, so it says nothing about
+        # why a job was slow -- and `object_bytes` is already on
+        # `job.download`, measured on the same object.
         with span("job.complete", job_id=job_id), _StageTimer("complete"):
             if measurements is not None:
                 set_current_span_fields(
@@ -134,7 +140,9 @@ class TracedQueue:
                     speech_seconds=round(measurements.speech_seconds, 3),
                     segment_count=measurements.segment_count,
                 )
-            is_last = await self._inner.complete(job_id, transcript, measurements, lease=lease)
+            is_last = await self._inner.complete(
+                job_id, transcript, measurements, lease=lease, audio=audio
+            )
         # `outcome` lands on the enclosing `job.process` span, the same
         # place and for the same reason as `claim`'s ids: the root span is
         # opened before anything is known and cannot label itself

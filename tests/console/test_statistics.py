@@ -14,6 +14,8 @@ from datetime import UTC, datetime, timedelta
 from sturnus.console.statistics import (
     AttendedSession,
     Participant,
+    SessionName,
+    SessionTranscript,
     TagUse,
     Track,
     calendar_year,
@@ -22,9 +24,12 @@ from sturnus.console.statistics import (
     day_bounds,
     day_timeline,
     session_json,
+    session_name_json,
     tags_json,
+    transcript_json,
     year_bounds,
 )
+from sturnus.domain.transcript import SpeakerIdentity, TranscriptBlock
 
 T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 ANNA, BEN, CARL = 100, 200, 300
@@ -38,6 +43,9 @@ def track(
     audio_seconds: float | None = 60.0,
     speech_seconds: float | None = 30.0,
     segment_count: int | None = 4,
+    sample_rate: int | None = 16_000,
+    channels: int | None = 1,
+    stored_bytes: int | None = 1_048_576,
 ) -> Track:
     return Track(
         discord_user_id=discord_user_id,
@@ -45,6 +53,9 @@ def track(
         audio_seconds=audio_seconds,
         speech_seconds=speech_seconds,
         segment_count=segment_count,
+        sample_rate=sample_rate,
+        channels=channels,
+        stored_bytes=stored_bytes,
     )
 
 
@@ -62,6 +73,8 @@ def attended(
     ),
     tracks: tuple[Track, ...] = (),
     tags: tuple[str, ...] = (),
+    title: str | None = None,
+    description: str | None = None,
 ) -> AttendedSession:
     return AttendedSession(
         id=session_id,
@@ -73,6 +86,8 @@ def attended(
         participants=participants,
         tracks=tracks,
         tags=tags,
+        title=title,
+        description=description,
     )
 
 
@@ -466,3 +481,163 @@ def test_the_labels_somebody_uses_are_a_list_and_not_an_object() -> None:
         {"tag": "retro", "sessions": 2},
         {"tag": "kunde", "sessions": 1},
     ]
+
+
+# ---------------------------------------------------------------------------
+# What the recording is, as a file
+# ---------------------------------------------------------------------------
+
+
+def test_a_track_carries_what_its_file_is_so_a_metadata_tab_needs_no_s3() -> None:
+    """The whole point of the three columns the worker now fills.
+
+    Before them, answering "how many channels" meant a ranged GET and a
+    chunk decrypt per track, on every view.
+    """
+    session = attended(tracks=(track(ANNA, sample_rate=48_000, channels=2, stored_bytes=99),))
+    measured = session_json(session, viewer=ANNA)["tracks"][0]
+    assert measured["sample_rate"] == 48_000
+    assert measured["channels"] == 2
+    assert measured["stored_bytes"] == 99
+
+
+def test_a_track_from_before_those_columns_reads_as_null_and_not_as_zero() -> None:
+    """The same rule the measurements follow, for the same reason: a job
+    whose audio may already be deleted has nothing left to read a header
+    from, and nought hertz would be a claim about it."""
+    session = attended(tracks=(track(ANNA, sample_rate=None, channels=None, stored_bytes=None),))
+    measured = session_json(session, viewer=ANNA)["tracks"][0]
+    assert measured["sample_rate"] is None
+    assert measured["channels"] is None
+    assert measured["stored_bytes"] is None
+
+
+def test_a_size_is_a_number_and_not_a_string() -> None:
+    """Unlike a snowflake. `stored_bytes` would have to reach nine
+    petabytes before a JSON number lost a digit of it, so the rule that
+    makes ids strings does not reach here."""
+    session = attended(tracks=(track(ANNA, stored_bytes=1_048_576),))
+    assert isinstance(session_json(session, viewer=ANNA)["tracks"][0]["stored_bytes"], int)
+
+
+# ---------------------------------------------------------------------------
+# What a meeting is called
+# ---------------------------------------------------------------------------
+
+
+def test_a_session_carries_what_somebody_named_it() -> None:
+    session = attended(title="Sprint 34 planning", description="What we decided")
+    body = session_json(session, viewer=ANNA)
+    assert body["title"] == "Sprint 34 planning"
+    assert body["description"] == "What we decided"
+
+
+def test_a_session_nobody_has_named_says_so_with_null() -> None:
+    body = session_json(attended(), viewer=ANNA)
+    assert body["title"] is None
+    assert body["description"] is None
+
+
+def test_a_name_is_served_straight_through() -> None:
+    named = session_name_json(SessionName(title="Retro", description=None))
+    assert named == {"title": "Retro", "description": None}
+
+
+# ---------------------------------------------------------------------------
+# The transcript, as the recording page consumes it
+# ---------------------------------------------------------------------------
+
+ANNA_SPEAKING = SpeakerIdentity(
+    discord_user_id=ANNA,
+    discord_display_name="anna",
+    external_user_id="c9a1b2e3",
+    external_display_name="Anna A.",
+)
+BEN_SPEAKING = SpeakerIdentity(discord_user_id=BEN, discord_display_name="ben")
+
+
+def a_transcript(
+    *,
+    ended_at: datetime | None = T0 + timedelta(hours=1),
+    audio_available: bool = True,
+    pending_tracks: int = 0,
+    participants: tuple[SpeakerIdentity, ...] = (ANNA_SPEAKING, BEN_SPEAKING),
+    blocks: tuple[TranscriptBlock, ...] = (),
+) -> SessionTranscript:
+    return SessionTranscript(
+        session_id=4711,
+        started_at=T0,
+        ended_at=ended_at,
+        audio_available=audio_available,
+        pending_tracks=pending_tracks,
+        participants=participants,
+        blocks=blocks,
+    )
+
+
+def test_a_transcripts_session_id_is_a_string_like_every_other_id() -> None:
+    assert transcript_json(a_transcript())["session_id"] == "4711"
+
+
+def test_a_speaker_is_named_by_their_discord_id_as_a_string() -> None:
+    """A snowflake exceeds JavaScript's safe integer range, where a JSON
+    number silently loses its last digits."""
+    people = transcript_json(a_transcript())["participants"]
+    assert [person["discord_user_id"] for person in people] == [str(ANNA), str(BEN)]
+
+
+def test_a_speaker_carries_the_external_identity_the_document_shows() -> None:
+    """The published protocol renders it, so a transcript tab that could
+    not would be showing a different meeting."""
+    anna = transcript_json(a_transcript())["participants"][0]
+    assert anna["external_user_id"] == "c9a1b2e3"
+    assert anna["external_display_name"] == "Anna A."
+
+
+def test_a_speaker_who_never_linked_an_account_has_no_external_name() -> None:
+    ben = transcript_json(a_transcript())["participants"][1]
+    assert ben["external_user_id"] is None
+    assert ben["external_display_name"] is None
+
+
+def test_a_block_carries_the_moment_it_started_with_its_offset() -> None:
+    """Without the offset a browser reads the string as local time, and
+    every block silently moves by the viewer's own timezone."""
+    block = TranscriptBlock(speaker=ANNA_SPEAKING, start=T0, text="we agreed")
+    rendered = transcript_json(a_transcript(blocks=(block,)))["blocks"][0]
+    assert rendered["started_at"] == T0.isoformat()
+    assert rendered["started_at"].endswith("+00:00")
+    assert rendered["text"] == "we agreed"
+    assert rendered["discord_user_id"] == str(ANNA)
+
+
+def test_blocks_are_served_in_the_order_they_were_assembled() -> None:
+    """`build_transcript` owns the ordering, and this serialiser must not
+    have a second opinion about it."""
+    first = TranscriptBlock(ANNA_SPEAKING, T0, "one")
+    second = TranscriptBlock(BEN_SPEAKING, T0 + timedelta(minutes=1), "two")
+    rendered = transcript_json(a_transcript(blocks=(first, second)))["blocks"]
+    assert [block["text"] for block in rendered] == ["one", "two"]
+
+
+def test_a_session_whose_audio_was_swept_still_has_its_words() -> None:
+    """The retention window is about the recording and not about the
+    minutes, so this is the tab saying "the audio is gone and these are
+    still the words" rather than looking broken."""
+    block = TranscriptBlock(ANNA_SPEAKING, T0, "we agreed")
+    rendered = transcript_json(a_transcript(audio_available=False, blocks=(block,)))
+    assert rendered["audio_available"] is False
+    assert [spoken["text"] for spoken in rendered["blocks"]] == ["we agreed"]
+
+
+def test_a_meeting_still_being_transcribed_says_how_many_speakers_are_left() -> None:
+    """Zero blocks with a pending track is a meeting still being decoded;
+    zero blocks with none is a meeting nobody spoke in. Both are an empty
+    list, and only this number tells them apart."""
+    rendered = transcript_json(a_transcript(pending_tracks=2, participants=(), blocks=()))
+    assert rendered["pending_tracks"] == 2
+    assert rendered["blocks"] == []
+
+
+def test_a_session_still_being_recorded_has_no_end_yet() -> None:
+    assert transcript_json(a_transcript(ended_at=None))["ended_at"] is None
