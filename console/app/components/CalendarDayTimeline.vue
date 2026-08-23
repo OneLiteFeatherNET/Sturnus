@@ -17,14 +17,17 @@
  * is a browser with a real timezone. Rendering it during SSR would print
  * the *server's* zone and then rewrite every label on hydration.
  */
-import { formatDuration } from '~/utils/duration'
-import { formatIsoDate, weekdayOf } from '~/utils/heatmap'
+import { durationMessage } from '~/utils/duration'
+import { dayInstant } from '~/utils/heatmap'
 import { axisTicks, layOutDay, summarise, type DaySession, type TimelineBar } from '~/utils/timeline'
 
 const props = defineProps<{
   date: string
   sessions: readonly DaySession[]
 }>()
+
+const { d } = useI18n()
+const say = useSay()
 
 const bars = computed(() => layOutDay(props.date, props.sessions))
 const ticks = computed(() => axisTicks(props.date, 3))
@@ -33,17 +36,21 @@ const laneCount = computed(() => Math.max(1, ...bars.value.map((bar) => bar.lane
 
 const LANE_HEIGHT = 34
 
-/** The viewer's zone, named, so the axis is not silently in "some" zone. */
+/** The viewer's zone, named, so the axis is not silently in "some" zone. An
+ *  IANA name is not a word in any language; the fallback is. */
 const zone = computed(() => {
   try {
-    return Intl.DateTimeFormat().resolvedOptions().timeZone || 'your local time'
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || say({ key: 'calendar.zoneUnknown' })
   } catch {
-    return 'your local time'
+    return say({ key: 'calendar.zoneUnknown' })
   }
 })
 
+/** A time of day in the viewer's zone. The `clock` format is the one shape
+ *  in `i18n.config.ts` with no zone pinned to it, which is what this panel
+ *  wants and says out loud. */
 function clock(at: Date): string {
-  return at.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  return d(at, 'clock')
 }
 
 function endOf(bar: TimelineBar): Date | null {
@@ -51,16 +58,26 @@ function endOf(bar: TimelineBar): Date | null {
   return new Date(bar.startedAt.getTime() + bar.durationSeconds * 1000)
 }
 
-/** The words on the bar: when it started, and where. */
+/** The words on the bar: when it started, and where. A time, a dot and a
+ *  channel name -- no sentence, and so nothing for a language to reorder. */
 function label(bar: TimelineBar): string {
-  return `${clock(bar.startedAt)} · ${bar.channel}`
+  return `${clock(bar.startedAt)} · ${say(bar.channel)}`
 }
 
 /** The whole sentence, for the tooltip and for a screen reader. */
 function describe(bar: TimelineBar): string {
   const ended = endOf(bar)
-  const span = ended ? `${clock(bar.startedAt)} to ${clock(ended)}` : `from ${clock(bar.startedAt)}`
-  return `${bar.channel}, ${span} (${zone.value}), ${formatDuration(bar.durationSeconds)}.`
+  return say({
+    key: 'calendar.barDescribed',
+    params: {
+      channel: bar.channel,
+      span: ended
+        ? { key: 'calendar.barSpan', params: { from: clock(bar.startedAt), to: clock(ended) } }
+        : { key: 'calendar.barFrom', params: { from: clock(bar.startedAt) } },
+      zone: zone.value,
+      duration: durationMessage(bar.durationSeconds),
+    },
+  })
 }
 
 /**
@@ -122,23 +139,45 @@ function paint(bar: TimelineBar): Record<string, string> {
 
 <template>
   <section aria-labelledby="day-heading">
+    <!-- One `fullDate`, not a weekday glued to a date: whether a comma goes
+         after the weekday is a thing the two languages disagree on, and
+         `Intl` already knows the answer for both. -->
     <h2 id="day-heading" tabindex="-1" class="text-lg font-semibold">
-      {{ weekdayOf(date) }}, {{ formatIsoDate(date) }}
+      {{ $d(dayInstant(date), 'fullDate') }}
     </h2>
     <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-      <template v-if="summary.sessions === 0">No recordings on this day.</template>
+      <template v-if="summary.sessions === 0">{{ $t('calendar.dayNoRecordings') }}</template>
+      <!-- Two sentences rather than one with a parenthesis inside it: the
+           counts pluralise separately, and a message chooses its form from
+           one number. -->
       <template v-else>
-        {{ summary.sessions }} session{{ summary.sessions === 1 ? '' : 's' }},
-        {{ formatDuration(summary.totalDurationSeconds) }} in total<template
-          v-if="summary.unknownDurations > 0"
-        >
-          (plus {{ summary.unknownDurations }} whose length was never recorded)</template
-        >.
+        {{
+          say({
+            key: 'calendar.daySummary',
+            params: {
+              count: summary.sessions,
+              duration: durationMessage(summary.totalDurationSeconds),
+            },
+          })
+        }}
+        <template v-if="summary.unknownDurations > 0">
+          {{
+            say({
+              key: 'calendar.dayUnknownLengths',
+              params: { count: summary.unknownDurations },
+            })
+          }}
+        </template>
       </template>
     </p>
     <p class="mt-0.5 text-xs" :style="{ color: 'var(--text-muted)' }">
-      The API groups days in UTC; the clock below is {{ zone }}, so this day runs from
-      {{ clock(ticks[0]!.at) }} to {{ clock(ticks[ticks.length - 1]!.at) }} where you are.
+      {{
+        $t('calendar.zoneNote', {
+          zone,
+          start: clock(ticks[0]!.at),
+          end: clock(ticks[ticks.length - 1]!.at),
+        })
+      }}
     </p>
 
     <div v-if="summary.sessions > 0" class="mt-5">

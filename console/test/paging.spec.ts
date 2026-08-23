@@ -101,17 +101,29 @@ describe('choosing which page numbers to offer', () => {
 
 describe('saying what is on screen', () => {
   it('names the first and last row actually shown', () => {
-    expect(pageSummary(47, 0, 20)).toBe('Recordings 1–20 of 47')
+    expect(pageSummary(47, 0, 20)).toEqual({
+      key: 'recordings.pageSummary',
+      params: { from: 1, to: 20, total: 47 },
+    })
   })
 
   it('stops at the last row of a short final page', () => {
     // `offset + size` would announce "41–60 of 47", which is a list
     // nobody trusts about anything else either.
-    expect(pageSummary(47, 40, 7)).toBe('Recordings 41–47 of 47')
+    expect(pageSummary(47, 40, 7)).toEqual({
+      key: 'recordings.pageSummary',
+      params: { from: 41, to: 47, total: 47 },
+    })
   })
 
   it('says one recording in the singular', () => {
-    expect(pageSummary(1, 0, 1)).toBe('Recording 1 of 1')
+    // A separate key rather than a range of one: "1–1 of 1" is arithmetic
+    // showing through, and only the locale can decide what the sentence
+    // for a single row looks like.
+    expect(pageSummary(1, 0, 1)).toEqual({
+      key: 'recordings.pageSummaryOne',
+      params: { from: 1, total: 1 },
+    })
   })
 
   it('says nothing at all about an empty list', () => {

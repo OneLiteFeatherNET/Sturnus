@@ -50,7 +50,8 @@
  * second answer to "is something stuck" would be a second definition of
  * stuck, and the two would drift.
  */
-import { formatCount, formatDuration, formatMoment } from '~/utils/format'
+import { figureDuration, figureMoment } from '~/utils/format'
+import { NOT_MEASURED, type Instant, type Message } from '~/utils/message'
 
 /* -------------------------------------------------------------------- */
 /* What the API describes                                                */
@@ -234,62 +235,37 @@ export function reportPath(guildId: string): string {
 /* Writing a figure down                                                 */
 /* -------------------------------------------------------------------- */
 
-/** The one thing that means "there is no figure here". Never "0", and the
- *  same glyph the dashboard uses, so an absence looks the same in both
- *  places a reader might meet one. */
-const NO_FIGURE = '—'
+/**
+ * `2026-08` as the UTC instant that month begins at.
+ *
+ * This replaces `reportMonthLabel`, which wrote `August 2026` out of a
+ * table of English month names kept in this file. The comment defending
+ * that table said `Intl` formats for the runtime's locale and would
+ * disagree between a server render and a browser -- true of an *ambient*
+ * locale, and no longer true of a chosen one that travels in a cookie. The
+ * month names are `Intl`'s now, through the `monthYear` format, which is
+ * pinned to UTC so that the instant below cannot slide into July on the way
+ * to the screen.
+ *
+ * A month this cannot read has already been dropped: `parseGuildReport`
+ * refuses anything that is not `YYYY-MM`, and every other key here is one
+ * `monthKey` produced.
+ */
+function monthInstant(month: string): Date {
+  return new Date(Date.UTC(Number(month.slice(0, 4)), Number(month.slice(5, 7)) - 1, 1))
+}
 
 /**
- * Full month names, written out here rather than taken from `Intl`.
+ * Nothing here counts by hand any more.
  *
- * `Intl.DateTimeFormat` formats for the runtime's locale, so the same
- * month would render as "August" during the server render and "August"
- * only by luck in a browser set to German -- which Vue reports as a
- * hydration mismatch and the reader sees as a flicker across every row of
- * the table. The console's own text is English; its months should be too.
+ * This module used to keep a `plural(count, one, many)` and a
+ * `meetings(count)` beside it, and every sentence below was assembled by
+ * calling them -- which is an English decision about English words, made in
+ * a module German cannot reach. The counting is now the locale file's: a
+ * message carries a `count`, and each language says what that does to the
+ * sentence. Where a sentence has two counts in it, the one that governs the
+ * verb is the `count`; the other is a value like any other.
  */
-const MONTH_NAMES = [
-  'January',
-  'February',
-  'March',
-  'April',
-  'May',
-  'June',
-  'July',
-  'August',
-  'September',
-  'October',
-  'November',
-  'December',
-]
-
-/** `2026-08` → `August 2026`. A month key this function cannot read comes
- *  back unchanged rather than as a blank: a raw key is at least something
- *  the reader can match against the payload. */
-export function reportMonthLabel(month: string): string {
-  if (!MONTH_KEY.test(month)) return month
-  const year = Number(month.slice(0, 4))
-  const index = Number(month.slice(5, 7)) - 1
-  return `${MONTH_NAMES[index]} ${year}`
-}
-
-/** An average of people, to one decimal, without the trailing `.0` that
- *  makes a whole number look like a measurement it is not. */
-function averageInWords(value: number): string {
-  const rounded = Math.round(value * 10) / 10
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1)
-}
-
-/** One or the other, chosen by the count. Written out at each call rather
- *  than derived by adding an `s`, because half the pairs this page needs
- *  are `is`/`are` and `was`/`were`. */
-function plural(count: number, one: string, many: string): string {
-  return count === 1 ? one : many
-}
-
-function meetings(count: number): string {
-  return `${formatCount(count)} ${plural(count, 'meeting', 'meetings')}`
-}
 
 /* -------------------------------------------------------------------- */
 /* The figures themselves                                                */
@@ -318,12 +294,24 @@ export type ReportTone = 'plain' | 'absent' | 'watch'
  */
 export interface ReportFigure {
   key: string
-  label: string
-  value: string
-  /** The line under the figure. Never null for a missing value: an em dash
-   *  with nothing beside it reads as "still loading", which is the one
-   *  thing this page is not doing. */
-  note: string | null
+  /** A translation key, resolved by whoever renders this. Named `…Key` so
+   *  that nothing puts it on screen by mistake. */
+  labelKey: string
+  /** A quantity, a length, or the absence of one. `null` is what an em
+   *  dash used to be: a distinction that lived inside a string, where
+   *  nothing downstream could tell it from a value. */
+  value: Message | number | null
+  /**
+   * The lines under the figure, one message per sentence. Never empty for a
+   * missing value: an em dash with nothing beside it reads as "still
+   * loading", which is the one thing this page is not doing.
+   *
+   * A list rather than one string, because several of these notes are two
+   * or three sentences and were built by adding one to another. A sentence
+   * glued to the end of a sentence carries the order it was glued in, and
+   * whether German wants the caveat first is not this module's to decide.
+   */
+  note: Message[]
   tone: ReportTone
 }
 
@@ -354,29 +342,31 @@ export function reportDocumentedShare(report: GuildReport): number | null {
  * has not ended cannot have been written up, and counting it as a failure
  * of the pipeline would be blaming the pipeline for the clock.
  */
-export function reportDocumentedLine(report: GuildReport): string {
-  if (report.sessions <= 0) {
-    return 'Nothing has been recorded in this server yet, so there is nothing to write up.'
-  }
-  const open
-    = report.open_sessions > 0
-      ? ` ${meetings(report.open_sessions)} ${plural(report.open_sessions, 'is', 'are')} still `
-        + 'recording and cannot have been written up yet; they are counted in the total all the '
-        + 'same.'
-      : ''
+export function reportDocumentedLine(report: GuildReport): Message[] {
+  if (report.sessions <= 0) return [{ key: 'admin.reporting.documentedNothing' }]
+
+  const said: Message[] = []
   if (report.documented >= report.sessions) {
-    return (
-      `Every one of the ${meetings(report.sessions)} recorded in this server reached a protocol.`
-      + open
-    )
+    said.push({ key: 'admin.reporting.documentedAll', params: { count: report.sessions } })
   }
-  const missing = report.sessions - report.documented
-  const share = reportDocumentedShare(report)
-  return (
-    `${formatCount(report.documented)} of the ${meetings(report.sessions)} recorded in this server `
-    + `reached a protocol — ${share} %. The other ${formatCount(missing)} `
-    + `${plural(missing, 'was', 'were')} recorded and never written up.${open}`
-  )
+  else {
+    const missing = report.sessions - report.documented
+    said.push({
+      key: 'admin.reporting.documentedPartial',
+      params: {
+        // The count that governs the verb, and therefore the sentence's
+        // plural form: "the other one was" against "the other three were".
+        count: missing,
+        documented: report.documented,
+        sessions: report.sessions,
+        share: reportDocumentedShare(report) ?? 0,
+      },
+    })
+  }
+  if (report.open_sessions > 0) {
+    said.push({ key: 'admin.reporting.documentedOpen', params: { count: report.open_sessions } })
+  }
+  return said
 }
 
 /**
@@ -386,15 +376,14 @@ export function reportDocumentedLine(report: GuildReport): string {
  * mentioned only when they bite is a total whose scope the reader has to
  * infer from its own silence.
  */
-export function reportRecordedLine(report: GuildReport): string {
+export function reportRecordedLine(report: GuildReport): Message[] {
   if (report.open_sessions > 0) {
-    return (
-      'Adds up the length of every meeting in this server that has ended. The '
-      + `${meetings(report.open_sessions)} still recording ${plural(report.open_sessions, 'is', 'are')} `
-      + 'not in it — a meeting has no length until it stops.'
-    )
+    return [
+      { key: 'admin.reporting.recordedScope' },
+      { key: 'admin.reporting.recordedOpenExcluded', params: { count: report.open_sessions } },
+    ]
   }
-  return 'Adds up the length of every meeting this server has recorded, all of which have ended.'
+  return [{ key: 'admin.reporting.recordedAllEnded' }]
 }
 
 /**
@@ -410,29 +399,20 @@ export function reportRecordedLine(report: GuildReport): string {
  * ten minutes is a meeting; one open since Tuesday is a session that never
  * closed, and the number alone cannot tell them apart.
  */
-export function reportOpenSessionsLine(report: GuildReport): string {
-  if (report.open_sessions <= 0) {
-    return (
-      'Nothing is being recorded in this server right now — every meeting it has recorded has '
-      + 'ended and has a length.'
-    )
-  }
-  const count = report.open_sessions
-  return (
-    `${meetings(count)} in this server ${plural(count, 'has', 'have')} no end time yet. That is `
-    + 'either a meeting happening at this moment or a session that never closed, and this figure '
-    + 'cannot tell the two apart — a session open for days is the second. Neither its length nor '
-    + 'its speech is counted anywhere else on this page.'
-  )
+export function reportOpenSessionsLine(report: GuildReport): Message[] {
+  if (report.open_sessions <= 0) return [{ key: 'admin.reporting.openNone' }]
+  return [
+    { key: 'admin.reporting.openSome', params: { count: report.open_sessions } },
+    { key: 'admin.reporting.openAmbiguous' },
+  ]
 }
 
 /** The reason a figure is absent, said as the absence it is rather than
- *  left as a dash the reader has to account for. */
-function noFinishedMeetings(what: string): string {
-  return (
-    `No meeting in this server has finished, so there is no ${what} to give. This is the absence `
-    + 'of a figure and not a figure of zero.'
-  )
+ *  left as a dash the reader has to account for. The second sentence is the
+ *  same for all four, which is why it is a key of its own rather than four
+ *  copies of one sentence that would drift apart one edit at a time. */
+function noFinishedMeetings(reasonKey: string): Message[] {
+  return [{ key: reasonKey }, { key: 'admin.reporting.absentNotZero' }]
 }
 
 /**
@@ -446,29 +426,29 @@ export function reportHeadlineFigures(report: GuildReport): ReportFigure[] {
   return [
     {
       key: 'sessions',
-      label: 'Meetings recorded',
-      value: formatCount(report.sessions),
-      note: reportSpanLine(report),
+      labelKey: 'admin.reporting.sessionsLabel',
+      value: report.sessions,
+      note: [reportSpanLine(report)],
       tone: 'plain',
     },
     {
       key: 'documented',
-      label: 'Meetings written up',
-      value: formatCount(report.documented),
+      labelKey: 'admin.reporting.documentedLabel',
+      value: report.documented,
       note: reportDocumentedLine(report),
       tone: 'plain',
     },
     {
       key: 'recorded',
-      label: 'Time recorded',
-      value: formatDuration(report.recorded_seconds),
+      labelKey: 'admin.reporting.recordedLabel',
+      value: figureDuration(report.recorded_seconds),
       note: reportRecordedLine(report),
       tone: report.recorded_seconds === null ? 'absent' : 'plain',
     },
     {
       key: 'speech',
-      label: 'Time spoken',
-      value: formatDuration(report.speech_seconds),
+      labelKey: 'admin.reporting.speechLabel',
+      value: figureDuration(report.speech_seconds),
       note: reportSpeechCaveat(report),
       tone: report.speech_seconds === null ? 'absent' : 'plain',
     },
@@ -496,57 +476,60 @@ export function reportShapeFigures(report: GuildReport): ReportFigure[] {
   return [
     {
       key: 'average-duration',
-      label: 'Typical meeting',
-      value: average === null ? NO_FIGURE : formatDuration(average),
+      labelKey: 'admin.reporting.averageDurationLabel',
+      value: figureDuration(average),
       note:
         average === null
-          ? noFinishedMeetings('length to average')
-          : 'The mean length of the meetings that have ended here.',
+          ? noFinishedMeetings('admin.reporting.absentAverageDuration')
+          : [{ key: 'admin.reporting.averageDurationNote' }],
       tone: average === null ? 'absent' : 'plain',
     },
     {
       key: 'longest-duration',
-      label: 'Longest meeting',
-      value: longest === null ? NO_FIGURE : formatDuration(longest),
+      labelKey: 'admin.reporting.longestDurationLabel',
+      value: figureDuration(longest),
       note:
         longest === null
-          ? noFinishedMeetings('length to compare')
-          : 'The longest single meeting this server has recorded from start to finish.',
+          ? noFinishedMeetings('admin.reporting.absentLongestDuration')
+          : [{ key: 'admin.reporting.longestDurationNote' }],
       tone: longest === null ? 'absent' : 'plain',
     },
     {
       key: 'average-participants',
-      label: 'People per meeting',
-      value: perMeeting === null ? NO_FIGURE : averageInWords(perMeeting),
+      // To one decimal, and rounded here rather than on screen: a mean of
+      // 4.25 people is a precision the payload does not have. The trailing
+      // `.0` that used to be trimmed by hand goes on its own now -- the
+      // locale's number format does not write digits nobody asked for --
+      // and German gets its comma with it.
+      labelKey: 'admin.reporting.averageParticipantsLabel',
+      value: perMeeting === null ? null : Math.round(perMeeting * 10) / 10,
       note:
         perMeeting === null
-          ? noFinishedMeetings('attendance to average')
-          : 'The mean number of people recorded in a meeting that has ended here.',
+          ? noFinishedMeetings('admin.reporting.absentAverageParticipants')
+          : [{ key: 'admin.reporting.averageParticipantsNote' }],
       tone: perMeeting === null ? 'absent' : 'plain',
     },
     {
       key: 'largest-meeting',
-      label: 'Largest meeting',
-      value: largest === null ? NO_FIGURE : formatCount(largest),
+      labelKey: 'admin.reporting.largestMeetingLabel',
+      value: largest,
       note:
         largest === null
-          ? noFinishedMeetings('attendance to compare')
-          : 'The most people recorded in any one meeting in this server.',
+          ? noFinishedMeetings('admin.reporting.absentLargestMeeting')
+          : [{ key: 'admin.reporting.largestMeetingNote' }],
       tone: largest === null ? 'absent' : 'plain',
     },
     {
       key: 'participants',
-      label: 'People recorded',
-      value: formatCount(report.distinct_participants),
-      note:
-        'How many different people this server has recorded at all. A count and nothing else — '
-        + 'Sturnus does not send this page their names, and this page does not ask.',
+      labelKey: 'admin.reporting.participantsLabel',
+      value: report.distinct_participants,
+      note: [{ key: 'admin.reporting.participantsNote' }],
       tone: 'plain',
     },
     {
       key: 'open',
-      label: 'Still recording',
-      value: formatCount(report.open_sessions),
+      labelKey: 'admin.reporting.openLabel',
+      value: report.open_sessions,
       note: reportOpenSessionsLine(report),
       tone: report.open_sessions > 0 ? 'watch' : 'plain',
     },
@@ -573,43 +556,31 @@ export function reportShapeFigures(report: GuildReport): ReportFigure[] {
  * The obvious reading is wrong, so the sentence rules it out in words
  * rather than leaving it to be inferred from a ratio.
  */
-export function reportSpeechCaveat(report: GuildReport): string {
+export function reportSpeechCaveat(report: GuildReport): Message[] {
   const { tracks, unmeasured_tracks: unmeasured } = report
 
-  if (tracks <= 0) {
-    return (
-      'No audio has been recorded in this server, so there is nothing to have measured. The '
-      + 'speaking time above is missing rather than zero.'
-    )
-  }
+  if (tracks <= 0) return [{ key: 'admin.reporting.speechNoTracks' }]
 
   if (unmeasured <= 0) {
-    return (
-      `Every one of the ${formatCount(tracks)} recorded ${plural(tracks, 'track', 'tracks')} in `
-      + 'this server carries a measured speaking time, so the figure above covers all of what was '
-      + 'recorded.'
-    )
+    return [{ key: 'admin.reporting.speechAllMeasured', params: { count: tracks } }]
   }
 
   const measured = Math.max(0, tracks - unmeasured)
   if (measured === 0) {
-    return (
-      `None of the ${formatCount(tracks)} recorded ${plural(tracks, 'track', 'tracks')} in this `
-      + 'server was ever measured for speaking time — they all predate the columns that hold it — '
-      + 'so there is no speaking time here to report. Read the figure above as a measurement that '
-      + 'was never taken, not as a server that was quiet.'
-    )
+    return [{ key: 'admin.reporting.speechNoneMeasured', params: { count: tracks } }]
   }
 
-  return (
-    `${formatCount(unmeasured)} of the ${formatCount(tracks)} recorded `
-    + `${plural(tracks, 'track', 'tracks')} in this server ${plural(unmeasured, 'was', 'were')} `
-    + 'never measured for speaking time — they predate the columns that hold it — and a sum skips '
-    + `them in silence. The speaking time above is therefore the total for the other `
-    + `${formatCount(measured)} ${plural(measured, 'track', 'tracks')} only: it describes part of `
-    + 'what was recorded, and the larger this number grows the further short the figure falls. It '
-    + 'does not mean this server was quiet.'
-  )
+  return [
+    // The count that governs the verb is the unmeasured one -- "one was
+    // never measured" against "forty were" -- and the total is a value
+    // alongside it.
+    {
+      key: 'admin.reporting.speechPartlyMeasured',
+      params: { count: unmeasured, tracks },
+    },
+    { key: 'admin.reporting.speechPartlyMeasuredTotal', params: { count: measured } },
+    { key: 'admin.reporting.speechNotQuiet' },
+  ]
 }
 
 /**
@@ -629,28 +600,17 @@ export function reportSpeechCaveat(report: GuildReport): string {
  * which is which is cheaper than a reader discovering it from a date that
  * does not match a month.
  */
-export function reportTimezoneNote(report: GuildReport): string {
-  if (!report.timezone) {
-    return (
-      'Sturnus did not say which calendar the months below were cut in, so do not assume it is '
-      + 'yours: a meeting near midnight falls on either side of a month boundary depending on the '
-      + 'zone. Every instant on this page is written in UTC, which may not be that calendar '
-      + 'either.'
-    )
-  }
-  return (
-    `The months below are cut in ${report.timezone}, this server's own calendar — not in UTC and `
-    + 'not in yours. A meeting that begins at 00:30 belongs to the month the people in it think it '
-    + 'does, which is why Sturnus does not bucket by UTC. The instants elsewhere on this page are '
-    + 'written in UTC all the same, because a page rendered on a server cannot know your zone, so '
-    + 'a meeting near a month boundary can carry a UTC date that reads as the neighbouring month.'
-  )
+export function reportTimezoneNote(report: GuildReport): Message {
+  if (!report.timezone) return { key: 'admin.reporting.timezoneUnknown' }
+  // An IANA zone name is not a word in any language -- `Europe/Berlin` is
+  // `Europe/Berlin` -- so it travels as the string it is.
+  return { key: 'admin.reporting.timezoneKnown', params: { zone: report.timezone } }
 }
 
 export interface ReportCaveat {
   key: string
-  label: string
-  text: string
+  labelKey: string
+  text: Message[]
 }
 
 /**
@@ -665,13 +625,13 @@ export function reportCaveats(report: GuildReport): ReportCaveat[] {
   return [
     {
       key: 'speech',
-      label: 'What the speaking time covers',
+      labelKey: 'admin.reporting.caveatSpeechLabel',
       text: reportSpeechCaveat(report),
     },
     {
       key: 'timezone',
-      label: 'Which calendar the months use',
-      text: reportTimezoneNote(report),
+      labelKey: 'admin.reporting.caveatTimezoneLabel',
+      text: [reportTimezoneNote(report)],
     },
   ]
 }
@@ -688,23 +648,29 @@ export function reportCaveats(report: GuildReport): ReportCaveat[] {
  * last one, may have nothing to close the span with. Each case gets its
  * own sentence rather than an em dash standing in for half a range.
  */
-export function reportSpanLine(report: GuildReport): string {
+export function reportSpanLine(report: GuildReport): Message {
   const first = report.first_session_at
   const last = report.last_session_at
 
-  if (!first && !last) {
-    return 'No meeting has been recorded in this server yet, so this report covers no time at all.'
-  }
+  if (!first && !last) return { key: 'admin.reporting.spanNothing' }
   if (first && last) {
     if (first === last) {
-      return `One meeting, recorded ${formatMoment(first)}.`
+      return { key: 'admin.reporting.spanOne', params: { at: moment(first) } }
     }
-    return `Everything recorded in this server between ${formatMoment(first)} and ${formatMoment(last)}.`
+    return {
+      key: 'admin.reporting.spanBetween',
+      params: { from: moment(first), to: moment(last) },
+    }
   }
-  const known = first ?? last
-  return (
-    `Everything recorded in this server. Only one end of the span is known: ${formatMoment(known)}.`
-  )
+  return { key: 'admin.reporting.spanPartial', params: { at: moment((first ?? last)!) } }
+}
+
+/** An instant, or the em dash that stands for one the API sent in a shape
+ *  nothing can read. `figureMoment` already makes that judgement for the
+ *  dashboard; making it again here would be a second answer to one
+ *  question. */
+function moment(iso: string): Instant | string {
+  return figureMoment(iso) ?? NOT_MEASURED
 }
 
 /* -------------------------------------------------------------------- */
@@ -736,10 +702,13 @@ export const REPORT_MONTH_FILL_LIMIT = 120
 export interface ReportMonthRow {
   /** `YYYY-MM`, unique across the rows, so it keys a `v-for` safely. */
   month: string
-  label: string
+  /** The month as its first UTC instant, for the `monthYear` format to
+   *  name in whichever language is reading. */
+  at: Date
   sessions: number
   documented: number
-  recorded: string
+  /** How long was recorded, or `null` where the API had no total to give. */
+  recorded: Message | null
   /** True for a month this module added because the payload skipped it. */
   silent: boolean
   /** 0 to 1, against the busiest month in the list. The bar's width, and
@@ -748,7 +717,7 @@ export interface ReportMonthRow {
   /** The row said as a sentence, for the reader who is listening to the
    *  page rather than looking at it. A bar with no text is a bar only its
    *  author can read. */
-  detail: string
+  detail: Message
 }
 
 /** A month key as a count of months since year zero, so two of them can be
@@ -814,23 +783,26 @@ export function reportMonthRows(report: GuildReport): ReportMonthRow[] {
     const entry = byMonth.get(key)
     const sessions = entry?.sessions ?? 0
     const documented = entry?.documented ?? 0
-    const recorded = entry ? formatDuration(entry.recorded_seconds) : NO_FIGURE
+    const recorded = entry ? figureDuration(entry.recorded_seconds) : null
     const silent = entry === undefined
-    const label = reportMonthLabel(key)
+    const at = monthInstant(key)
+    const month = { at, format: 'monthYear' }
 
     // A month present in the payload with no sessions in it is not the
     // same as one the payload skipped, and it does not get the silent
     // row's wording -- the API said something about it, and this page
     // should not overwrite that with an assumption.
-    const detail = silent
-      ? `${label}: nothing was recorded in this server.`
-      : `${label}: ${meetings(sessions)}, ${recorded} recorded, `
-        + `${formatCount(documented)} written up.`
+    const detail: Message = silent
+      ? { key: 'admin.reporting.monthSilent', params: { month } }
+      : {
+          key: 'admin.reporting.monthDetail',
+          params: { month, count: sessions, recorded: recorded ?? NOT_MEASURED, documented },
+        }
 
     const scaled = busiest > 0 ? sessions / busiest : 0
     return {
       month: key,
-      label,
+      at,
       sessions,
       documented,
       recorded,
@@ -850,37 +822,30 @@ export function reportMonthRows(report: GuildReport): ReportMonthRow[] {
  * read an unfilled list as a steady run of months. Both are wrong in a way
  * the page can settle in one sentence.
  */
-export function reportMonthsNote(report: GuildReport): string {
+export function reportMonthsNote(report: GuildReport): Message[] {
   const rows = reportMonthRows(report)
-  if (rows.length === 0) {
-    return 'No month in this server has any recording in it yet.'
-  }
+  if (rows.length === 0) return [{ key: 'admin.reporting.monthsNothing' }]
+
   // The two questions are asked in this order because a list too long to
   // fill has no silent rows in it at all, and would otherwise answer the
   // "nothing was skipped" branch by saying nothing was skipped -- which is
   // the exact opposite of what happened.
   const span = monthIndex(rows[rows.length - 1]!.month) - monthIndex(rows[0]!.month) + 1
   if (rows.length < span) {
-    return (
-      'Only the months in which something was recorded are listed, oldest first. This server\'s '
-      + `history spans more than ${REPORT_MONTH_FILL_LIMIT / 12} years, which is too long to list `
-      + 'month by month, so the quiet months between these are not shown as rows — two rows next '
-      + 'to each other are not necessarily neighbouring months.'
-    )
+    return [
+      {
+        key: 'admin.reporting.monthsTooLong',
+        params: { years: REPORT_MONTH_FILL_LIMIT / 12 },
+      },
+    ]
   }
   const silent = rows.filter((row) => row.silent).length
-  if (silent === 0) {
-    return (
-      'Every month from the first recording in this server to the most recent one, oldest first. '
-      + 'Something was recorded in each of them.'
-    )
-  }
-  return (
-    'Every month from the first recording in this server to the most recent one, oldest first. '
-    + `The ${formatCount(silent)} ${plural(silent, 'month', 'months')} in which nothing was `
-    + `recorded ${plural(silent, 'is', 'are')} listed with a zero rather than left out, so a quiet `
-    + 'stretch reads as a gap instead of closing up.'
-  )
+  return [
+    { key: 'admin.reporting.monthsOldestFirst' },
+    silent === 0
+      ? { key: 'admin.reporting.monthsAllBusy' }
+      : { key: 'admin.reporting.monthsSomeSilent', params: { count: silent } },
+  ]
 }
 
 /* -------------------------------------------------------------------- */
@@ -912,14 +877,9 @@ export function isReportEmpty(report: GuildReport): boolean {
  *  it. A page of dashes and zeros for a server that has recorded nothing
  *  reads as a page that failed to load, and is also a claim -- that this
  *  server holds meetings of no length attended by nobody. */
-export const REPORT_EMPTY_HEADING = 'Sturnus has not recorded anything in this server yet'
+export const REPORT_EMPTY_HEADING_KEY = 'admin.reporting.emptyHeading'
 
-export const REPORT_EMPTY_NOTE =
-  'There are no meetings here to report on, so this page shows no figures rather than a grid of '
-  + 'zeros — a zero would be a measurement, and nothing has been measured. Once a meeting happens '
-  + 'in a channel Sturnus watches and the people in it have consented, this page fills in: how '
-  + 'many meetings, how long they ran, how many of them were written up, and how that changed '
-  + 'month by month.'
+export const REPORT_EMPTY_NOTE_KEY = 'admin.reporting.emptyNote'
 
 /**
  * What this report is about, and what it is deliberately not about.
@@ -932,12 +892,7 @@ export const REPORT_EMPTY_NOTE =
  * also the honest answer to the reader who was about to ask where the
  * breakdown is.
  */
-export const REPORT_SCOPE_NOTE =
-  'Every figure here is about the server as a whole and never about the people in it. Sturnus '
-  + 'sends this page no names and no ids, and there is no per-person breakdown behind it — how '
-  + 'long one named person sat in meetings, or spoke in them, is a measure of that person rather '
-  + 'than of this server, and that is not something a console should hand out. Counts of people '
-  + 'are counts, and stop there.'
+export const REPORT_SCOPE_NOTE_KEY = 'admin.reporting.scopeNote'
 
 /* -------------------------------------------------------------------- */
 /* When the API says no                                                  */
@@ -972,31 +927,25 @@ function statusOf(error: unknown): number | null {
  * auto-imported into every component, and two exports sharing a name is a
  * build warning and a coin toss over which one a page actually gets.
  */
-export function describeReportError(error: unknown): string {
+export function describeReportError(error: unknown): Message {
   const status = statusOf(error)
   switch (status) {
     case 401:
-      return 'Your session has ended. Sign in again to see this server’s figures.'
+      return { key: 'admin.reporting.errorSession' }
     case 403:
-      return (
-        'You do not administer this server. Administrators are the members holding the role named '
-        + 'by that guild’s `admin_role_id`.'
-      )
+      return { key: 'admin.reporting.errorNotAdmin' }
     case 404:
       // The API answers 404 both for a server that does not exist and for
       // one the caller does not administer, on purpose: it will not
       // confirm the existence of a server to somebody with no business
       // there. So this sentence has to cover both without guessing which.
-      return (
-        'Sturnus does not know this server, or you no longer administer it — it answers the same '
-        + 'way to both. Reload the page; the list of servers is rebuilt from Discord.'
-      )
+      return { key: 'admin.reporting.errorUnknownGuild' }
     case null:
-      return (
-        'Could not reach the API. Nothing here is out of date on purpose; check the connection and '
-        + 'retry.'
-      )
+      return { key: 'admin.reporting.errorUnreachable' }
     default:
-      return `Sturnus answered ${status} and could not produce this server’s figures. Nothing is known about why.`
+      // A status is a number without being a quantity, so it travels as a
+      // string: `useSay` would otherwise group it, and there is no such
+      // status as 1,000.
+      return { key: 'admin.reporting.errorStatus', params: { status: String(status) } }
   }
 }

@@ -36,21 +36,29 @@ matches the file that renders it:
 
 | Namespace          | Serves                                              |
 | ------------------ | --------------------------------------------------- |
-| `common.*`         | Strings with no single home — the product name       |
+| `common.*`         | Strings with no single home — the product name, a duration |
 | `nav.*`            | `utils/navigation.ts`, `AppSidebar`, the header burger |
 | `auth.*`           | `pages/sign-in.vue`, signing out                     |
 | `error.*`          | `error.vue`                                          |
-| `dashboard.*`      | `pages/index.vue`                                    |
-| `recordings.*`     | `pages/recordings/*`                                 |
-| `calendar.*`       | `pages/calendar.vue`                                 |
+| `dashboard.*`      | `pages/index.vue`, `utils/format.ts`                 |
+| `recordings.*`     | `pages/recordings/*` and the components under them   |
+| `calendar.*`       | `pages/calendar.vue`, the heatmap and the timeline   |
 | `admin.settings.*` | `pages/admin/bot-settings.vue`                        |
 | `admin.consents.*` | `pages/admin/user-settings.vue`                       |
 | `admin.queue.*`    | `pages/admin/queue.vue`                               |
 | `admin.reporting.*`| `pages/admin/reporting.vue`                           |
 
-The namespaces below `error.*` do not exist yet. They are listed so that the
-first pull request to convert one of those pages does not have to invent a
-name, and so that two of them converted in parallel do not invent two.
+`admin.settings.*`, `admin.consents.*` and `admin.queue.*` do not exist yet:
+Bot Settings, User Settings and the Queue are still English, and are being
+rewritten in three other pull requests. They are listed so that whichever of
+those lands first does not have to invent a name, and so that two of them
+landing in parallel do not invent two.
+
+Until then `utils/queue.ts` and `utils/consents.ts` still build English
+sentences by hand, and three helpers exist only to serve them:
+`formatCount` and `formatMoment` in `utils/format.ts`, and `formatDuration`
+in `utils/duration.ts`. Each says so in its own comment. They go when the
+last of those three pages is translated.
 
 The second segment names the string by what it says, in camelCase —
 `notLinkedHeading`, `goToSignIn`, `unreachableDetail`. Not by where it sits
@@ -73,6 +81,66 @@ pure function should return.
 Where a util's return value is passed straight to `$t`, name the field
 `…Key`, so that a reader of the interface can see that the value is not
 displayable on its own.
+
+## Most sentences carry values, so a key alone is not enough
+
+A bare key covers a label. It does not cover the sentences this console is
+mostly made of, which count things, quote an instant, name a channel, and
+several of which put one decided sentence inside another — a heatmap cell
+says a date, a number of meetings, a length and a word for how busy the day
+was, and every one of those four is a decision of its own.
+
+So a pure module returns a **`Message`**: a key, and named values that are
+strings, quantities, instants, or further messages. The type and the
+reasoning are in `app/utils/message.ts`; `app/composables/useSay.ts` is the
+one thing that turns one into words, and templates call it as `say(…)`.
+
+Nesting rather than concatenation is the point. A sentence assembled by
+adding one fragment to another carries the word order of whoever assembled
+it, and no translation can move the pieces; a sentence with named holes in
+it can be rewritten from scratch in German and handed the same four values.
+Where a note is several sentences, return **a list of messages** rather than
+one joined string, for the same reason.
+
+A sentence with inline markup uses `<i18n-t keypath=…>` and a named slot —
+see `pages/sign-in.vue` and the `admin_role_id` sentence in
+`pages/admin/reporting.vue`.
+
+### Counting
+
+**Never an `if` in a module.** A parameter named `count` chooses the plural
+form, and each locale file says what that does to its own sentence. Where a
+sentence has two counts in it, the one that governs the verb is the `count`
+and the other is a value beside it; where both need to pluralise, they are
+two messages nested into one sentence with a hole for each.
+
+Both files must keep the same placeholders, and `test/i18n.spec.ts` counts
+them — so if the English singular writes the number out as a word, the
+German singular does too.
+
+### Numbers, dates and times
+
+**A number in `params` is a quantity**, and `say` writes it in the locale's
+grouping: 48213 is `48,213` to an English reader and `48.213` to a German
+one. Anything that is a number without being a quantity — a year, a status
+code, an id, a page number — is passed as a **string**, because `2,026` is
+not a year.
+
+**A date is an `Instant`**: the moment, and the name of a datetime format in
+`i18n.config.ts`. That file decides the shapes and the zone each of them is
+pinned to, and says why. Modules no longer keep tables of English month or
+weekday names; `Intl` supplies those, and the console formats with the
+language *tag* (`en-GB`) rather than the locale code (`en`), because the two
+disagree about the order of a date.
+
+The hydration argument that used to forbid all of this — `Intl` formats for
+whatever locale the runtime resolves, so a server render and a browser could
+disagree — was about an *ambient* locale. The console has a chosen one now,
+carried in a cookie that travels with the request. Two places still assemble
+a string by hand and should stay that way, and both say so in their own
+comments: `formatTimestamp` in `utils/recordings.ts`, whose `YYYY-MM-DD
+HH:MM` is unambiguous in every country and sorts the way it reads, and
+`formatSeconds` beside it, which is a clock and not prose.
 
 ## The German
 

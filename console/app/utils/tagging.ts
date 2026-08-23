@@ -21,6 +21,7 @@
  * pairs of colliding names (`formatCount`, `channelLabel`) where the
  * winner is decided by file order and nobody is told.
  */
+import type { Message } from './message'
 
 /** The longest a tag may be. The same number the API enforces; it is here
  *  so an input can carry a `maxlength` rather than let somebody type a
@@ -115,17 +116,17 @@ export function tagsWithout(existing: readonly string[], tag: string): string[] 
  * what the server would say; the server still decides, and its refusal is
  * handled separately (see `tagWriteFailed`).
  */
-export function tagRefusal(existing: readonly string[], typed: string): string | null {
+export function tagRefusal(existing: readonly string[], typed: string): Message | null {
   const wanted = splitTagInput(typed)
   if (wanted.length === 0) return null
   if (wanted.some((tag) => tag.length > TAG_MAX_CHARS)) {
-    return `A tag can be at most ${TAG_MAX_CHARS} characters.`
+    return { key: 'recordings.tagTooLong', params: { count: TAG_MAX_CHARS } }
   }
   const added = wanted.filter((tag) => !existing.includes(tag))
   if (existing.length + added.length > TAG_MAX_PER_RECORDING) {
-    return `A recording can carry at most ${TAG_MAX_PER_RECORDING} tags.`
+    return { key: 'recordings.tagTooMany', params: { count: TAG_MAX_PER_RECORDING } }
   }
-  if (added.length === 0) return 'That tag is already on this recording.'
+  if (added.length === 0) return { key: 'recordings.tagAlreadyHeld' }
   return null
 }
 
@@ -151,8 +152,8 @@ export function sessionTagsPath(sessionId: string): string {
  * decides the wording, and there are only three answers worth
  * distinguishing.
  */
-export function tagWriteFailed(status: number): string {
-  if (status === 0) return 'Your tags could not be saved: the console could not reach the server.'
-  if (status === 404) return 'This recording is no longer yours to label.'
-  return 'Your tags could not be saved. Nothing was changed.'
+export function tagWriteFailed(status: number): Message {
+  if (status === 0) return { key: 'recordings.tagSaveUnreachable' }
+  if (status === 404) return { key: 'recordings.tagSaveGone' }
+  return { key: 'recordings.tagSaveFailed' }
 }

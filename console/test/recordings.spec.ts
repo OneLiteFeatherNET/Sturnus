@@ -12,10 +12,8 @@ import {
   audioUrl,
   channelLabel,
   decodeMagnitudes,
-  formatCount,
   formatMeasurement,
   formatSeconds,
-  formatShare,
   formatTimestamp,
   hasProtocol,
   isInProgress,
@@ -110,12 +108,6 @@ describe('a measurement that may never have been taken', () => {
   it('writes a measured length as a clock', () => {
     expect(formatMeasurement(150)).toBe('2:30')
   })
-
-  it('counts nothing as an em dash and none as a zero', () => {
-    expect(formatCount(null)).toBe('—')
-    expect(formatCount(0)).toBe('0')
-    expect(formatCount(12)).toBe('12')
-  })
 })
 
 describe('how much of a track is speech', () => {
@@ -133,6 +125,9 @@ describe('how much of a track is speech', () => {
 
   it('is unknown when there is no audio to be a share of', () => {
     // Not zero: a share of nothing is not a small share, it is no answer.
+    // This is the whole of what "no share" means now that the rendering of
+    // one has moved to the locale's percent format -- `null` here is what
+    // the em dash on screen is drawn from.
     expect(speechShare(track({ audio_seconds: 0, speech_seconds: 0 }))).toBeNull()
   })
 
@@ -146,12 +141,6 @@ describe('how much of a track is speech', () => {
     // could put speech above audio. A bar past its own end is a worse way
     // to learn that than a bar at its end.
     expect(speechShare(track({ audio_seconds: 100, speech_seconds: 140 }))).toBe(1)
-  })
-
-  it('writes a share as a percentage, and no share as an em dash', () => {
-    expect(formatShare(0.25)).toBe('25%')
-    expect(formatShare(0)).toBe('0%')
-    expect(formatShare(null)).toBe('—')
   })
 })
 
@@ -171,11 +160,18 @@ describe('naming a speaker and a channel', () => {
   })
 
   it('writes a channel the way Discord does', () => {
+    // A name is somebody's own word for their channel, so it comes back as
+    // the string it is rather than as a key: there is nothing here for a
+    // translator to decide.
     expect(channelLabel(session({ channel_name: 'standup' }))).toBe('#standup')
   })
 
   it('names a channel by id when its name was never captured', () => {
-    expect(channelLabel(session({ channel_name: null, channel_id: '9870' }))).toBe('Channel 9870')
+    // "Channel" is a word, though, so this half is a key with the id in it.
+    expect(channelLabel(session({ channel_name: null, channel_id: '9870' }))).toEqual({
+      key: 'recordings.channelById',
+      params: { id: '9870' },
+    })
   })
 })
 

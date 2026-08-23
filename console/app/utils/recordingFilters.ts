@@ -21,6 +21,7 @@
  * lives; what matters here is that the console must not offer a control
  * that promises more than the API will do.
  */
+import type { Message } from './message'
 
 /** What the API calls things, so the two spellings live in one place. */
 const TEXT = 'q'
@@ -150,21 +151,35 @@ export function toggledTag(filters: RecordingFilters, tag: string): RecordingFil
 }
 
 /**
- * What is being narrowed, in words, one phrase per active control.
+ * What is being narrowed, one phrase per active control.
  *
  * Shown above the list so that a reader arriving on a link knows why they
  * are seeing eleven recordings out of forty-seven. A list that is
  * filtered without saying so is one people report as having lost their
  * meetings.
+ *
+ * A phrase rather than a sentence, and one per control rather than one
+ * string: the page puts them in a row and the count in front of them, and
+ * whether German wants them in that order is the locale file's business.
+ * The dates travel as the `YYYY-MM-DD` strings the controls hold, not as
+ * instants -- a date input has no time of day to convert, and turning one
+ * into midnight somewhere would move it a day for half the world.
  */
-export function activeFilterLabels(filters: RecordingFilters): string[] {
-  const said: string[] = []
-  if (filters.q) said.push(`matching “${filters.q}”`)
-  for (const tag of filters.tags) said.push(`tagged ${tag}`)
-  if (filters.from && filters.to) said.push(`between ${filters.from} and ${filters.to}`)
-  else if (filters.from) said.push(`since ${filters.from}`)
-  else if (filters.to) said.push(`up to ${filters.to}`)
-  if (filters.protocol === 'with') said.push('with a protocol')
-  if (filters.protocol === 'without') said.push('without a protocol')
+export function activeFilterLabels(filters: RecordingFilters): Message[] {
+  const said: Message[] = []
+  if (filters.q) said.push({ key: 'recordings.filterMatching', params: { text: filters.q } })
+  for (const tag of filters.tags) said.push({ key: 'recordings.filterTagged', params: { tag } })
+  if (filters.from && filters.to) {
+    said.push({
+      key: 'recordings.filterBetween',
+      params: { from: filters.from, to: filters.to },
+    })
+  }
+  else if (filters.from) {
+    said.push({ key: 'recordings.filterSince', params: { from: filters.from } })
+  }
+  else if (filters.to) said.push({ key: 'recordings.filterUntil', params: { to: filters.to } })
+  if (filters.protocol === 'with') said.push({ key: 'recordings.filterWithProtocol' })
+  if (filters.protocol === 'without') said.push({ key: 'recordings.filterWithoutProtocol' })
   return said
 }

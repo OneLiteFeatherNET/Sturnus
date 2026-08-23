@@ -19,7 +19,7 @@
  *   four hundred times to escape.
  */
 import {
-  WEEKDAY_LABELS,
+  WEEKDAY_INSTANTS,
   buildYearGrid,
   describeCell,
   monthColumns,
@@ -27,6 +27,8 @@ import {
   type CalendarDay,
   type HeatmapCell,
 } from '~/utils/heatmap'
+
+const say = useSay()
 
 const props = defineProps<{
   year: number
@@ -157,7 +159,7 @@ function showTip(cell: HeatmapCell, event: Event) {
   if (!target || !anchor.value) return
   const width = anchor.value.offsetWidth
   tip.value = {
-    text: describeCell(cell),
+    text: say(describeCell(cell)),
     // Clamped so a cell in the first or last week does not push the
     // tooltip out of the scrolling area, where it would be clipped.
     left: Math.min(Math.max(target.offsetLeft + target.offsetWidth / 2, 110), Math.max(width - 110, 110)),
@@ -181,33 +183,35 @@ function hideTip() {
           @mouseleave="hideTip"
         >
           <caption class="sr-only">
-            Recording activity for {{ year }}, one cell per UTC day, laid out as weeks. Use the
-            arrow keys to move between days and Enter to open one.
+            {{ $t('calendar.gridCaption', { year: String(year) }) }}
           </caption>
           <thead>
             <tr>
               <th class="w-9" />
               <th
                 v-for="(month, index) in months"
-                :key="`${month.label}-${index}`"
+                :key="index"
                 :colspan="month.span"
                 scope="colgroup"
                 class="pb-1 text-left text-[11px] font-medium"
                 :style="{ color: 'var(--text-muted)' }"
               >
-                {{ month.label }}
+                {{ $d(month.at, 'shortMonth') }}
               </th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="(weekday, row) in WEEKDAY_LABELS" :key="weekday">
+            <!-- The weekday names come from the locale, not from a table
+                 of English words with `.slice(0, 3)` applied to it: the
+                 shortening German wants is "Mo", not "Mon". -->
+            <tr v-for="(weekday, row) in WEEKDAY_INSTANTS" :key="row">
               <th scope="row" class="pr-2 text-right align-middle text-[11px] font-normal">
-                <span class="sr-only">{{ weekday }}</span>
+                <span class="sr-only">{{ $d(weekday, 'weekday') }}</span>
                 <span
                   v-if="VISIBLE_WEEKDAYS.has(row)"
                   aria-hidden="true"
                   :style="{ color: 'var(--text-muted)' }"
-                >{{ weekday.slice(0, 3) }}</span>
+                >{{ $d(weekday, 'weekdayShort') }}</span>
               </th>
               <td v-for="(week, column) in weeks" :key="`${row}-${column}`" class="p-0">
                 <!-- The selection is drawn in yellow rather than a deeper
@@ -230,7 +234,7 @@ function hideTip() {
                   :data-date="week[row]!.date"
                   :data-intensity="week[row]!.intensity"
                   :tabindex="week[row]!.date === roving ? 0 : -1"
-                  :aria-label="describeCell(week[row]!)"
+                  :aria-label="say(describeCell(week[row]!))"
                   :aria-pressed="week[row]!.date === selected"
                   @click="emit('select', week[row]!.date!)"
                   @focus="showTip(week[row]!, $event)"
@@ -267,7 +271,7 @@ function hideTip() {
     <!-- The legend names the ends of the scale in words as well as colour,
          for the same reason every cell does. -->
     <div class="mt-3 flex items-center gap-1.5 text-[11px]" :style="{ color: 'var(--text-muted)' }">
-      <span>Less recorded</span>
+      <span>{{ $t('calendar.legendLess') }}</span>
       <span
         v-for="step in [0, 1, 2, 3, 4]"
         :key="step"
@@ -275,7 +279,7 @@ function hideTip() {
         :style="{ background: `var(--heat-${step})` }"
         :data-intensity="step"
       />
-      <span>More recorded</span>
+      <span>{{ $t('calendar.legendMore') }}</span>
     </div>
   </div>
 </template>

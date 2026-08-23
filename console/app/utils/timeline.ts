@@ -32,6 +32,7 @@
  * apart in UTC that carry the same local clock time, and formatting each
  * instant separately renders that correctly instead of hiding it.
  */
+import type { Message } from './message'
 
 /** One session as `GET /api/calendar/{date}` returns it. */
 export interface DaySession {
@@ -50,8 +51,10 @@ export interface DaySession {
 /** One bar, ready to be positioned as a percentage of the axis. */
 export interface TimelineBar {
   id: string
-  /** What to write on the bar. Never empty -- see {@link layOutDay}. */
-  channel: string
+  /** What to write on the bar. Never empty -- see {@link layOutDay}. A
+   *  channel's own name is the string it is; a channel with no name left
+   *  is a key, because "Channel" is a word. */
+  channel: string | Message
   startedAt: Date
   durationSeconds: number | null
   /** How far along the axis the bar starts, 0 to 1. */
@@ -128,7 +131,9 @@ export function layOutDay(date: string, sessions: readonly DaySession[]): Timeli
       id: session.id,
       // A channel deleted after the recording has no name left to give, and
       // an unlabelled bar is a bar that says only "something happened".
-      channel: session.channel_name ?? `Channel ${session.channel_id}`,
+      channel:
+        session.channel_name
+        ?? { key: 'recordings.channelById', params: { id: session.channel_id } },
       startedAt,
       durationSeconds: seconds ?? null,
       offset,

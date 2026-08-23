@@ -15,6 +15,7 @@
  * `limit` and `offset`; a human speaks pages. `offsetForPage` is the only
  * place the two meet.
  */
+import type { Message } from './message'
 
 /** How many recordings one page holds. The API's own default, restated
  *  here so the console asks for a window it named rather than inheriting
@@ -97,12 +98,12 @@ export function pageNumbers(current: number, count: number): (number | null)[] {
  * announcing "41–60 of 47" is a list nobody trusts about anything else
  * either.
  */
-export function pageSummary(total: number, offset: number, shown: number): string | null {
+export function pageSummary(total: number, offset: number, shown: number): Message | null {
   if (total <= 0 || shown <= 0) return null
   const first = offset + 1
   const last = offset + shown
-  if (first === last) return `Recording ${first} of ${total}`
-  return `Recordings ${first}–${last} of ${total}`
+  if (first === last) return { key: 'recordings.pageSummaryOne', params: { from: first, total } }
+  return { key: 'recordings.pageSummary', params: { from: first, to: last, total } }
 }
 
 /**

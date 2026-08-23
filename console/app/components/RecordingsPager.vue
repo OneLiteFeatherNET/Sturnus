@@ -42,7 +42,7 @@ const hasNext = computed(() => props.page < props.count)
   <nav
     v-if="count > 1"
     class="flex flex-wrap items-center justify-center gap-1"
-    aria-label="Recordings pages"
+    :aria-label="$t('recordings.pagesNav')"
   >
     <NuxtLink
       v-if="hasPrevious"
@@ -51,11 +51,13 @@ const hasNext = computed(() => props.page < props.count)
       class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
       :style="{ color: 'var(--text)' }"
     >
-      ← Newer
+      {{ $t('recordings.newer') }}
     </NuxtLink>
     <!-- Kept in the flow as inert text rather than removed, so the number
          strip does not slide sideways on the first and last pages. -->
-    <span v-else class="px-3 py-1.5 text-sm" :style="{ color: 'var(--text-muted)' }">← Newer</span>
+    <span v-else class="px-3 py-1.5 text-sm" :style="{ color: 'var(--text-muted)' }">
+      {{ $t('recordings.newer') }}
+    </span>
 
     <template v-for="(number, index) in numbers">
       <span
@@ -73,7 +75,7 @@ const hasNext = computed(() => props.page < props.count)
         :to="linkTo(number)"
         class="rounded-lg px-3 py-1.5 text-sm tabular-nums transition-colors hover:bg-[var(--surface-raised)]"
         :style="{ color: 'var(--text)' }"
-        :aria-label="`Page ${number}`"
+        :aria-label="$t('recordings.pageNumber', { number: String(number) })"
       >
         {{ number }}
       </NuxtLink>
@@ -99,8 +101,10 @@ const hasNext = computed(() => props.page < props.count)
       class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
       :style="{ color: 'var(--text)' }"
     >
-      Older →
+      {{ $t('recordings.older') }}
     </NuxtLink>
-    <span v-else class="px-3 py-1.5 text-sm" :style="{ color: 'var(--text-muted)' }">Older →</span>
+    <span v-else class="px-3 py-1.5 text-sm" :style="{ color: 'var(--text-muted)' }">
+      {{ $t('recordings.older') }}
+    </span>
   </nav>
 </template>
