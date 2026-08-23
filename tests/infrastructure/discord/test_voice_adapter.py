@@ -148,13 +148,27 @@ def recording_service(sessions: FakeSessions) -> RecordingService:
     )
 
 
+def _gateway_client() -> MagicMock:
+    """A stand-in `discord.Client` that answers `shard_count`.
+
+    `shard_count` is an *instance* attribute discord.py assigns in
+    `Client.__init__`, not a class attribute, so `MagicMock(spec=...)` does
+    not know about it and raises on access. The adapter reads it to decide
+    whether a `shard_id` is worth putting on `voice.joined`/`voice.left`
+    (see `VoiceReceiveAdapter._shard`), so it has to be present. `None`
+    is what a client whose shards have not launched reports, and it is the
+    value that keeps these tests asserting the single-shard behaviour.
+    """
+    return MagicMock(spec=discord.Client, shard_count=None)
+
+
 def adapter(
     *,
     service: RecordingService | None = None,
     clock: FakeClock | None = None,
 ) -> VoiceReceiveAdapter:
     voice = VoiceReceiveAdapter(
-        MagicMock(spec=discord.Client),
+        _gateway_client(),
         service or MagicMock(spec=RecordingService),
         MagicMock(spec=ConfigStore),
         clock or FakeClock(),
@@ -394,7 +408,7 @@ async def test_join_refuses_to_enter_the_channel_when_libopus_is_missing() -> No
     channel = MagicMock(spec=discord.VoiceChannel)
     channel.guild = MagicMock(id=GUILD_ID)
     channel.connect = AsyncMock()
-    client = MagicMock(spec=discord.Client)
+    client = _gateway_client()
     client.get_channel = MagicMock(return_value=channel)
 
     def broken_factory() -> FrameDecoder:
@@ -425,7 +439,7 @@ async def test_a_failed_connect_leaves_no_task_running_behind_it() -> None:
     channel = MagicMock(spec=discord.VoiceChannel)
     channel.guild = MagicMock(id=GUILD_ID)
     channel.connect = AsyncMock(side_effect=discord.ClientException("no voice"))
-    client = MagicMock(spec=discord.Client)
+    client = _gateway_client()
     client.get_channel = MagicMock(return_value=channel)
 
     voice = VoiceReceiveAdapter(
@@ -454,7 +468,7 @@ def _joinable() -> tuple[MagicMock, MagicMock]:
     # are `AsyncMock`s too, so `listen()` would hand back an un-awaited
     # coroutine and the resulting warnings would drown the assertion.
     channel.connect = AsyncMock(return_value=MagicMock(disconnect=AsyncMock()))
-    client = MagicMock(spec=discord.Client)
+    client = _gateway_client()
     client.get_channel = MagicMock(return_value=channel)
     return client, channel
 

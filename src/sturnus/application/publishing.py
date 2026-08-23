@@ -33,6 +33,7 @@ from typing import Protocol, cast
 
 from jinja2.sandbox import SandboxedEnvironment
 
+from sturnus.application.sharding import process_serves_guild
 from sturnus.observability.events import Event, log_event, log_exception
 
 log = logging.getLogger(__name__)
@@ -177,6 +178,13 @@ class SessionReader(Protocol):
         mention them. An implementation that omits the key still works:
         `announce_ready_sessions` falls back to no mentions rather than
         failing to post the link.
+
+        Each row also carries `guild_id`, which is not used to render
+        anything: it is what lets `announce_ready_sessions` ask whether
+        this process serves that guild at all. This is the one sweep in
+        the bot whose input is the database rather than a gateway cache,
+        so it is the one that has to ask -- see
+        `sturnus.application.sharding`.
         """
         ...
 
@@ -194,6 +202,8 @@ async def announce_ready_sessions(
     announcer: Announcer,
     now: datetime,
     template_source: str = DEFAULT_ANNOUNCEMENT_TEMPLATE,
+    *,
+    shard_count: int | None = None,
 ) -> None:
     """Posts each documented session's link once and stamps `announced_at`.
 
@@ -212,10 +222,22 @@ async def announce_ready_sessions(
     at all whenever the post itself is what fails, which is the more
     common failure mode (a flaky Discord API call) and the one this
     function exists to survive.
+
+    **The one sweep in the bot that asks whether it serves a guild.**
+    Everything else the bot sweeps periodically is driven off its own
+    gateway cache and is therefore scoped to this process's shards for
+    free; this reads `sessions` rows for every guild there is. Today
+    `process_serves_guild` answers `True` for all of them -- one process
+    holds every shard -- and the call is there so that the day it does
+    not, four pods do not each post the same document link four times.
+    `shard_count` is `None` for a caller with no gateway (every test of
+    this function), which changes nothing today and is the honest value.
     """
     for session in sessions_to_announce(await sessions.candidates_for_announcement()):
         session_id = cast(int, session["id"])
         channel_id = cast(int, session["channel_id"])
+        if not process_serves_guild(cast(int, session["guild_id"]), shard_count):
+            continue
         document_url = cast(str, session["document_url"])
         # `.get`, not `[...]`: a reader that does not supply participants
         # loses the mentions, not the announcement itself.

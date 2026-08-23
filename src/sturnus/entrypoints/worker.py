@@ -555,7 +555,10 @@ async def _run() -> None:
     config_store = ConfigStore(session_factory)
     template_source = _load_template()
 
-    readiness = ReadinessState(discord_connected=True)  # this process has no gateway to wait on
+    # This process holds no gateway connection, so it holds all zero of the
+    # shards it is supposed to hold -- which is what makes the gateway half
+    # of readiness satisfied here without a second flag meaning "ignore it".
+    readiness = ReadinessState(expected_shards=0)
 
     async def database_ping() -> bool:
         """Proves the database answers *and* samples the queue depth.

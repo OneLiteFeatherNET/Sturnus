@@ -33,6 +33,14 @@ class _FakeClient:
     is constructed but never actually calls `get_channel`/`fetch_channel`.
     """
 
+    #: The announce sweep is told how many shards this process holds, so it
+    #: can ask whether it serves each candidate's guild
+    #: (`sturnus.application.sharding`). `None` is what a client reports
+    #: before `launch_shards` has run. Without the attribute the sweep's
+    #: own `except Exception` would swallow the `AttributeError` and this
+    #: test would keep passing while announcing nothing at all.
+    shard_count: int | None = None
+
     async def wait_until_ready(self) -> None:
         return None
 

@@ -7,6 +7,18 @@ metadata:
 spec:
   # Fixed at 1, not a values knob: two instances would hold two Discord
   # gateway connections and record every session twice (Spec 4.1).
+  #
+  # `STURNUS_SHARD_COUNT` (bot.env in values.yaml) does not relax this and
+  # is not a step towards relaxing it by itself. Shards are gateway
+  # connections *within* one process: N shards here is still one pod, one
+  # voice connection per guild, one RWO recording PVC. Two pods would each
+  # open the same shards and record every session twice exactly as before.
+  #
+  # Running one shard range per pod is a different deployment shape, not a
+  # larger `replicas`: it needs a StatefulSet (stable ordinals, so a pod
+  # knows which shard range it owns), a volumeClaimTemplate instead of the
+  # single shared PVC below, and an announcement sweep that speaks only for
+  # the guilds its own shards carry. See docs/operations.md section 3.6.
   replicas: 1
   # Recreate, not RollingUpdate: a rolling update briefly runs the old and
   # the new pod together, which is exactly the double-recording situation

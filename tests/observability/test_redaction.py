@@ -123,6 +123,33 @@ def test_unregistered_fields_are_dropped_not_stripped() -> None:
     assert "Alice" not in str(out)
 
 
+def test_a_field_registered_as_omittable_is_dropped_rather_than_written_as_null() -> None:
+    """`shard_id=None` means "this process has one shard", not "shard none".
+
+    Writing it as `null` would put a key that says nothing into every guild
+    line of every single-shard deployment -- which is every deployment
+    today. The registry decides which fields work this way; see
+    `OMITTED_WHEN_NONE`.
+    """
+    assert scrub_fields({"guild_id": 5, "shard_id": None}, warn=False) == {"guild_id": 5}
+    assert scrub_fields({"guild_id": 5, "shard_id": 3}, warn=False) == {
+        "guild_id": 5,
+        "shard_id": 3,
+    }
+
+
+def test_a_null_that_is_a_finding_still_travels() -> None:
+    """The contrast that gives `OMITTED_WHEN_NONE` its shape.
+
+    `close_code: null` on a `voice.reader_stopped` line is a fact somebody
+    established -- the adapter looked, and the exception was an `OSError`
+    rather than a `discord.ConnectionClosed`. Dropping every `None`
+    everywhere would have taken that with it, which is why the behaviour is
+    registered per field instead of applied to all of them.
+    """
+    assert scrub_fields({"close_code": None}, warn=False) == {"close_code": None}
+
+
 def test_an_object_renders_as_its_type_never_its_repr() -> None:
     """A repr is how an object holding a transcript prints itself into a line."""
 

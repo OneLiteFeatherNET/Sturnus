@@ -356,6 +356,7 @@ def _client(
     recording_dir: Path | None = None,
     audio_store: AudioStore | None = None,
     directory_mirror: object | None = None,
+    shard_count: int | None = None,
 ) -> _TestClient:
     """A `SturnusClient` with every dependency these tests do not touch stubbed out.
 
@@ -367,6 +368,11 @@ def _client(
     `directory_mirror` for the tests that assert the tick writes the names
     the console needs -- left `None` everywhere else, which is a client
     that does not mirror at all.
+
+    `shard_count` is `None` -- discord.py's "let the gateway decide" --
+    for everything except `test_client_shards`, which is the one suite
+    that has anything to say about how many connections this process
+    holds.
     """
     client = _TestClient(
         clock=clock,
@@ -388,6 +394,7 @@ def _client(
         outline_oauth=MagicMock(spec=OutlineOAuth),
         link_states=MagicMock(spec=LinkStateStore),
         account_links=MagicMock(spec=AccountLinkRepository),
+        shard_count=shard_count,
     )
     client.voices = []
     return client

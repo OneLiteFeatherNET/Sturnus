@@ -13,6 +13,8 @@ from pathlib import Path
 from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from sturnus.application.sharding import MIN_SHARD_COUNT
+
 
 class StrictSettings(BaseSettings):
     """Settings that refuse to start on a blank required value.
@@ -174,12 +176,57 @@ class Settings(StrictSettings):
     outline_client_id: str
     outline_redirect_uri: str
     health_port: int = 8080
+    # How many gateway connections this one process opens. **Unset means
+    # "let Discord decide"** -- `discord.AutoShardedClient` asks
+    # `/gateway/bot` and uses the recommendation, which grows with the
+    # guild count on its own. A number pinned in a values file does not,
+    # so an explicit value is for an operator who knows why they want one
+    # (matching a `max_concurrency` bucket, reproducing a routing problem)
+    # and is prepared to revisit it.
+    #
+    # It does **not** make the bot horizontally scalable: every shard here
+    # lives in this one process, and `replicas: 1` is unchanged. See
+    # `sturnus.application.sharding` for the two stages this distinguishes.
+    shard_count: int | None = None
     # Off by default, and meant to be turned on for one recording at a
     # time. Measures what Discord actually sends and what the Opus decoder
     # makes of it, which is the one thing a finished WAV cannot show --
     # see `sturnus.infrastructure.discord.capture_diagnostics`. Records no
     # audio: packet sizes, packet shapes and three aggregate numbers.
     capture_diagnostics: bool = False
+
+    @field_validator("shard_count", mode="before")
+    @classmethod
+    def _blank_shard_count_is_absent(cls, value: object) -> object:
+        """A blank `STURNUS_SHARD_COUNT` means "let Discord decide", not a failure.
+
+        The same load-bearing normalisation `OtelSettings` performs on its
+        endpoint, and for the same reason: the chart renders every optional
+        value, so a cluster that has not opted in supplies `""` rather than
+        omitting the variable. Pydantic would reject that as an unparseable
+        `int` and the pod would crash-loop on a setting nobody had touched.
+        """
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("shard_count", mode="after")
+    @classmethod
+    def _at_least_one_shard(cls, value: int | None) -> int | None:
+        """Refuses a shard count below one while an operator is still looking.
+
+        Left to the gateway, zero would build an empty shard range: no
+        connection, `on_ready` never fires, and the process sits there
+        looking alive behind a readiness probe that never turns green and
+        no line saying why. Naming the variable at startup is the whole
+        point of `StrictSettings`.
+        """
+        if value is not None and value < MIN_SHARD_COUNT:
+            raise ValueError(
+                f"STURNUS_SHARD_COUNT must be at least {MIN_SHARD_COUNT}. "
+                f"Leave it unset to let Discord choose the shard count."
+            )
+        return value
 
 
 @lru_cache(maxsize=1)

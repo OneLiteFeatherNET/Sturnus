@@ -52,7 +52,12 @@ from pathlib import Path
 from typing import Final
 
 from sturnus.domain.errors import DiagnosticSafeError
-from sturnus.observability.fields import ALLOWED_FIELDS, CREDENTIAL_NAMES, DENIED_NAMES
+from sturnus.observability.fields import (
+    ALLOWED_FIELDS,
+    CREDENTIAL_NAMES,
+    DENIED_NAMES,
+    OMITTED_WHEN_NONE,
+)
 
 REDACTED: Final = "<redacted>"
 
@@ -228,6 +233,15 @@ def scrub_fields(fields: Mapping[str, object], *, warn: bool = True) -> dict[str
     """
     out: dict[str, object] = {}
     for key, value in fields.items():
+        # A `None` in `OMITTED_WHEN_NONE` means "this field does not apply
+        # to this process", not "we looked and there was none" -- see the
+        # registry entry, which draws the contrast with `close_code`
+        # explicitly. It is what lets a call site emit a field
+        # *conditionally* without reaching for `**kwargs`, which rule R3 in
+        # `tests/test_logging_discipline.py` forbids outright so that every
+        # emitted field name stays statically visible at its call site.
+        if value is None and key in OMITTED_WHEN_NONE:
+            continue
         if key not in ALLOWED_FIELDS:
             if warn:
                 log.warning(

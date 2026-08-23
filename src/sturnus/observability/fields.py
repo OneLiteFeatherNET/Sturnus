@@ -74,6 +74,24 @@ _IDENTIFIERS = frozenset(
         "configured_key_id",
         "provider",
         "ssrc",
+        #: Which of this process's gateway connections a guild's events
+        #: arrive on -- Discord's `(guild_id >> 22) % shard_count`. An
+        #: identifier of a connection rather than of a row, and bounded by
+        #: the shard count, which is why it sits here rather than among
+        #: the measurements.
+        #:
+        #: **Emitted only when this process holds more than one shard.**
+        #: It is a pure function of `guild_id`, so on a single-shard
+        #: process it is `0` on every line for ever -- a key in every Loki
+        #: stream that answers nothing. `sturnus.application.sharding.
+        #: shard_fields` is the one place that decision is made; see its
+        #: docstring for why LogQL cannot recover it from `guild_id`
+        #: instead.
+        #:
+        #: Deliberately **not** in `METRIC_LABEL_FIELDS`. `guild_id`
+        #: already is, and a shard id adds no dimension a guild id does
+        #: not already carry -- it would only multiply series.
+        "shard_id",
     }
 )
 
@@ -186,6 +204,13 @@ _MEASUREMENTS = frozenset(
         "seconds_since_last_packet",
         "consented_present",
         "jobs_enqueued",
+        #: How many gateway connections this one process holds. On the
+        #: shard lifecycle lines only -- `bot.connected`,
+        #: `bot.shard_ready`, `bot.shard_disconnected` -- where it is the
+        #: denominator that makes "shard 3 is down" mean something. Not on
+        #: per-guild lines: there it would be the same number on every one
+        #: of them, which is what `shard_id` is conditional to avoid.
+        "shard_count",
     }
 )
 
@@ -197,6 +222,29 @@ _CORRELATION = frozenset({"trace_id", "span_id"})
 ALLOWED_FIELDS: Final[frozenset[str]] = (
     _IDENTIFIERS | _SUBJECT_IDENTIFIERS | _LITERALS | _MEASUREMENTS | _CORRELATION
 )
+
+#: Fields whose `None` means "this does not apply here" rather than "we
+#: looked, and there was none" -- dropped by `redaction.scrub_fields`
+#: instead of being written as `null`.
+#:
+#: **The contrast that defines the set is `close_code`.** A
+#: `voice.reader_stopped` line with `close_code: null` is a *finding*: the
+#: adapter looked at the exception, it was an `OSError` rather than a
+#: `discord.ConnectionClosed`, and there genuinely is no close code. That
+#: null is worth a key, and `voice_close_code`'s docstring argues the case.
+#:
+#: `shard_id` is the other kind. On a process holding one shard it is not
+#: "no shard"; the concept simply has nothing to say, and writing
+#: `shard_id: null` into every guild line for ever is the noise the
+#: registry exists to keep out. The distinction is registered here rather
+#: than decided by `scrub_fields` for every field at once, precisely so
+#: that adding a field to it is a deliberate act with a reason attached.
+#:
+#: This is also what lets a call site emit a field conditionally at all:
+#: rule R3 in `tests/test_logging_discipline.py` forbids `**kwargs` into a
+#: log event, so the field name must be written in the source and the
+#: *value* is the only place the condition can live.
+OMITTED_WHEN_NONE: Final[frozenset[str]] = frozenset({"shard_id"})
 
 #: Registered, logged, and deliberately kept out of spans and metrics.
 #:

@@ -65,6 +65,23 @@ class Event(StrEnum):
     GUILD_CONFIGURED = "guild.configured"
     GUILD_UNCONFIGURED = "guild.unconfigured"
     BOT_CONNECTED = "bot.connected"
+    #: One gateway connection finished its IDENTIFY and handed this process
+    #: its share of the guilds. Fires once per shard, and on every
+    #: re-IDENTIFY of that shard afterwards -- which is the *only* signal
+    #: that a shard came back, because `on_ready` does not fire again for
+    #: a single shard once the whole set has been ready once. See
+    #: `SturnusClient.on_shard_ready`.
+    BOT_SHARD_READY = "bot.shard_ready"
+    #: One gateway connection resumed after a blip, replaying the events it
+    #: missed. INFO rather than WARNING: a RESUME is the gateway working,
+    #: and no guild cache was lost, so nothing is re-reconciled.
+    BOT_SHARD_RESUMED = "bot.shard_resumed"
+    #: One gateway connection dropped. **WARNING**, not ERROR: discord.py
+    #: reconnects on its own and the overwhelming majority of these are
+    #: followed by `bot.shard_resumed` within seconds. It is ERROR-shaped
+    #: only if it stays -- which is what `/readyz` is for, and why
+    #: readiness is scoped to shards rather than to a single boolean.
+    BOT_SHARD_DISCONNECTED = "bot.shard_disconnected"
     VOICE_JOINED = "voice.joined"
     VOICE_LEFT = "voice.left"
     VOICE_JOIN_FAILED = "voice.join_failed"

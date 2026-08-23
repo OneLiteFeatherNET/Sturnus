@@ -220,9 +220,35 @@ bot:
   # record every session twice. Not exposed as a values knob -- the
   # Deployment template hardcodes both `replicas: 1` and `strategy.type:
   # Recreate` for this reason, so nothing can turn it into a rolling update.
+  #
+  # `STURNUS_SHARD_COUNT` below does NOT change this, and it is worth being
+  # blunt about that because the word "sharding" invites the opposite
+  # conclusion. Shards are gateway connections *inside* one process: four
+  # shards is still one pod, one voice connection per guild, one recording
+  # PVC. Two pods would still record every session twice, shard count or
+  # not, because both would identify as the same bot on overlapping shard
+  # ranges. Splitting shard ranges across pods is a different change --
+  # a StatefulSet, a PVC per pod, a shard range per ordinal -- and
+  # docs/operations.md section 3.6 lists what it needs.
   command: ["sturnus-bot"]
   env:
     STURNUS_RECORDING_DIR: /data/recordings
+    # How many gateway connections this one process opens. **Empty means
+    # "let Discord decide"**, which is the right answer for almost every
+    # deployment: `AutoShardedClient` asks `/gateway/bot` and takes the
+    # recommendation, and that recommendation grows with the guild count
+    # on its own where a number pinned here would not.
+    #
+    # Discord *requires* sharding above 2500 guilds; below that it is
+    # headroom and resilience -- one shard's reconnect no longer stalls
+    # every other guild's events behind it. Set it only if you know why
+    # (matching a `max_concurrency` bucket, reproducing a routing
+    # problem), and note that `/readyz` then requires *every* shard to be
+    # up: four shards with one reconnecting is a NotReady pod, on purpose.
+    #
+    # Values below 1 are refused at startup rather than at the gateway,
+    # so a typo names itself in the pod's first log line.
+    STURNUS_SHARD_COUNT: ""
   # Recordings themselves go straight to the PVC above; this only needs to
   # cover Python/library scratch writes to /tmp under readOnlyRootFilesystem.
   tmpSizeLimit: 256Mi
