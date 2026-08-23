@@ -10,6 +10,11 @@ anywhere, the second is raised by `sturnus.application.spectrogram` and by
 both are stdlib-only by construction so that every layer, `domain`
 included, can raise them.
 
+`UnreadableArtefact` is here for the same reason in the other direction:
+it is raised by an adapter in `sturnus.infrastructure` and caught by a
+route in `sturnus.console`, and a route reaching into the adapter package
+for an exception type would be the route knowing which adapter it has.
+
 Sturnus records people talking. Spec 12.4 -- "Neither audio data nor
 transcript content appears in logs" -- is the standard the pod logs are held
 to, and `sturnus.infrastructure.observability` holds Sentry to at least the
@@ -84,4 +89,29 @@ class CorruptRecording(Exception):
     it is a claim about every future message too, and the class is raised
     from two modules now; see that class's docstring for what the claim
     costs to make honestly.
+    """
+
+
+class UnreadableArtefact(Exception):
+    """A stored protocol is there, and these are not bytes to serve.
+
+    Raised where a sealed export artefact fails to open: a wrong master
+    key, an envelope that does not authenticate under the guild it was
+    found filed against, a body somebody edited in the bucket. Every one
+    of those is the same answer for the person asking -- there is no
+    document here -- and the console gives it the same 404 it gives an
+    artefact the object store no longer has.
+
+    **It is not `KeyError`, and that distinction is the reason the class
+    exists.** An object that is missing is an ordinary event with an
+    ordinary cause; an object that is present and will not open is
+    somebody's meeting failing to authenticate, which is the one outcome
+    an operator has to be able to find in a log. Folding it into
+    "artefact erased" would report an integrity failure as a tidy-up.
+
+    A sibling of `CorruptRecording` rather than the same class. That one
+    is about the stored *audio* format and is raised by two readers of it;
+    this is about the artefact envelope, which is a different format with
+    a different lifetime. Naming both "corrupt recording" would make the
+    one search an operator runs return the other's failures.
     """

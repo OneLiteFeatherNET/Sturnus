@@ -32,9 +32,22 @@ log = logging.getLogger(__name__)
 
 
 class DocumentObjectStore(Protocol):
-    """Where a rendered protocol is written. `S3DocumentStore`, structurally."""
+    """Where a rendered protocol is written. `SealedArtefacts`, structurally.
 
-    async def put(self, key: str, body: bytes, content_type: str) -> None: ...
+    **One method, and its name is the decision.** A Markdown export is
+    every word every participant said, in one object, in the bucket that
+    otherwise holds nothing but ciphertext; a port offering a plain `put`
+    beside this one would be a port somebody eventually writes a protocol
+    through in clear. There is no such method, so there is nothing to
+    choose between.
+
+    `guild_id` is here because sealing binds the artefact's key to the
+    guild and the purpose -- see
+    `sturnus.infrastructure.documents.artefacts.SealedArtefacts` and
+    `sturnus.infrastructure.crypto.seal_artefact`.
+    """
+
+    async def put_sealed(self, key: str, body: bytes, *, guild_id: int) -> None: ...
 
 
 def document_path(session_id: int, target_id: int) -> str:
@@ -70,14 +83,14 @@ class ObjectStoreSink(DocumentSink):
         console_origin: str,
         session_id: int,
         target_id: int,
-        media_type: str,
+        guild_id: int,
         file_extension: str,
     ) -> None:
         self._store = store
         self._console_origin = console_origin.rstrip("/")
         self._session_id = session_id
         self._target_id = target_id
-        self._media_type = media_type
+        self._guild_id = guild_id
         self._file_extension = file_extension
 
     async def create(self, title: str, body: str, target: str) -> CreatedDocument:
@@ -96,10 +109,19 @@ class ObjectStoreSink(DocumentSink):
         parameter stays because `DocumentSink` is one port and a sink that
         quietly took a different shape would not be interchangeable with
         the others.
+
+        The artefact is **sealed**, and the port says so in its one
+        method's name. This object is the most sensitive thing in the
+        bucket -- a recording is one speaker, a protocol is every word
+        every participant said -- and until now it was the only thing in
+        it that was not ciphertext. What the media type described is
+        still true of the document and no longer true of the object, so
+        it is not written here at all: the console reads it back from the
+        format registry, which is where it always came from.
         """
         key = document_key(target, self._session_id, self._target_id, self._file_extension)
         payload = body.encode("utf-8")
-        await self._store.put(key, payload, self._media_type)
+        await self._store.put_sealed(key, payload, guild_id=self._guild_id)
         # DEBUG and sizes only, matching `OutlineSink.create`: `title` is
         # derived from the transcript and `body` *is* the transcript. The
         # key is not logged either -- `s3_key` is in `DENIED_NAMES`, and an
@@ -161,7 +183,7 @@ class DocumentSinks:
                 console_origin=self._console_origin,
                 session_id=destination.session_id,
                 target_id=destination.target_id,
-                media_type=destination.format.media_type,
+                guild_id=destination.guild_id,
                 file_extension=destination.format.file_extension,
             )
         return None

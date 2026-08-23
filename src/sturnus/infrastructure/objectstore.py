@@ -160,17 +160,20 @@ class S3DocumentStore:
     what `S3AudioStore` refuses to offer -- a protocol is tens of kilobytes
     of text and a recording is hundreds of megabytes of somebody's voice.
 
-    **The stored object is not encrypted, and that is a consequence of a
-    scope decision rather than an oversight.** Envelope encryption needs
-    somewhere to put a wrapped data key, `session_document` has no column
-    for one, and this change adds no migration. The content is the same
-    transcript `transcription_job.transcript` already holds in clear in the
-    database, so nothing is newly exposed to anybody who can read the
-    database; what *is* new is a bucket that until now held only ciphertext.
-    Access control is the console route in front of it, which is why the
-    URL a sink hands back points there and never at a presigned S3 URL --
-    a presigned URL outlives the access rules that issued it, and the
-    participant rule this content sits behind is checked per request.
+    **This class moves bytes and does not decide what they are.** The
+    objects it carries today are sealed envelopes
+    (`sturnus.infrastructure.documents.artefacts.SealedArtefacts`, which
+    is what both processes actually hold): a protocol is every word every
+    participant said, and it was for one release the only thing in this
+    bucket that was not ciphertext. The sealing is deliberately *not*
+    here, because "put whole small object" and "seal a protocol" are
+    different jobs and a store that did both would be a store somebody
+    reaches for when they want the first.
+
+    Access control is the console route in front of the artefact, which is
+    why the URL a sink hands back points there and never at a presigned S3
+    URL -- a presigned URL outlives the access rules that issued it, and
+    the participant rule this content sits behind is checked per request.
     """
 
     def __init__(

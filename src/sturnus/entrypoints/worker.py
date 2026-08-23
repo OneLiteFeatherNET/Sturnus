@@ -99,6 +99,7 @@ from sturnus.infrastructure.db.repositories import (
     SessionRepository,
 )
 from sturnus.infrastructure.db.session_documents import SessionDocumentStore
+from sturnus.infrastructure.documents.artefacts import SealedArtefacts
 from sturnus.infrastructure.documents.outline import OutlineSink
 from sturnus.infrastructure.documents.sinks import DocumentSinks
 from sturnus.infrastructure.health import ReadinessState, start_health_server
@@ -619,12 +620,19 @@ async def _run() -> None:
     # The same bucket the recordings are in, through a class that reads and
     # writes whole small objects rather than streaming large encrypted ones
     # -- see `sturnus.infrastructure.objectstore`, which keeps the two
-    # apart on purpose.
-    document_objects = S3DocumentStore(
-        settings.s3_endpoint,
-        settings.s3_bucket,
-        settings.s3_access_key.get_secret_value(),
-        settings.s3_secret_key.get_secret_value(),
+    # apart on purpose -- and sealed on the way in. `keys` again, the same
+    # one the export targets' credentials are wrapped with: one decode of
+    # the master key in this process. An artefact is *not* sealed under
+    # the recording's data key, and `sturnus.infrastructure.documents.
+    # artefacts` is where that decision is argued.
+    document_objects = SealedArtefacts(
+        S3DocumentStore(
+            settings.s3_endpoint,
+            settings.s3_bucket,
+            settings.s3_access_key.get_secret_value(),
+            settings.s3_secret_key.get_secret_value(),
+        ),
+        keys,
     )
 
     # Tracing is applied here, on the way into `process_one`, and nowhere
