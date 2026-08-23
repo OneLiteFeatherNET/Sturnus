@@ -486,5 +486,77 @@
       "noChannelsChosen": "Kein Kanal ausgewählt. Solange das so bleibt, nimmt Sturnus auf diesem Server nichts auf.",
       "chosenIds": "Gespeichert als"
     }
+  },
+  "ui": {
+    "select": {
+      "placeholder": "Option wählen",
+      "empty": "Es gibt nichts zur Auswahl."
+    },
+    "combobox": {
+      "filter": "Liste filtern",
+      "matchCount": "{count} Option passt. | {count} Optionen passen.",
+      "noMatches": "Nichts passt zu „{query}“."
+    },
+    "datePicker": {
+      "openCalendar": "Kalender öffnen",
+      "previousMonth": "Vorheriger Monat",
+      "nextMonth": "Nächster Monat",
+      "sends": "Wird als {instant} gesendet",
+      "unreadable": "Dieses Datum gibt es nicht.",
+      "nothingChosen": "Noch kein Zeitpunkt gewählt."
+    },
+    "chipInput": {
+      "placeholder": "Schlagwort hinzufügen oder einfach tippen",
+      "remove": "Schlagwort {chip} entfernen",
+      "suggestions": "Vorgeschlagene Schlagwörter",
+      "empty": "Noch nichts eingegeben.",
+      "chipsOnly": "{count} Schlagwort. | {count} Schlagwörter.",
+      "textOnly": "Suche nach „{text}“.",
+      "chipsAndText": "{count} Schlagwort, und Suche nach „{text}“. | {count} Schlagwörter, und Suche nach „{text}“."
+    },
+    "list": {
+      "selectPage": "Diese Seite auswählen",
+      "selectRow": "Zeile {row} auswählen",
+      "expand": "Aktionen anzeigen",
+      "collapse": "Aktionen ausblenden",
+      "empty": "In dieser Liste steht nichts.",
+      "selected": "{count} Zeile ausgewählt. | {count} Zeilen ausgewählt.",
+      "selectedWithOffPage": "{count} Zeile ausgewählt, davon {away} nicht auf dieser Seite. | {count} Zeilen ausgewählt, davon {away} nicht auf dieser Seite.",
+      "bulkScope": "„{action}“ würde {count} Zeile betreffen. | „{action}“ würde {count} Zeilen betreffen."
+    },
+    "pagination": {
+      "nav": "Seiten",
+      "previous": "Zurück",
+      "next": "Weiter",
+      "page": "Seite {number}",
+      "position": "Seite {page} von {count}"
+    },
+    "gallery": {
+      "title": "Bedienelemente der Konsole",
+      "intro": "Alle Bedienelemente aus app/components/ui, in den Zuständen, die eine Durchsicht braucht: leer, gefüllt, deaktiviert, abgelehnt und eine Liste, die zu lang zum Scrollen ist. Diese Seite gibt es, damit die Bedienelemente ohne die übrige Konsole gelesen werden können; erreichbar ist sie nur in der Entwicklung.",
+      "select": "Auswahlliste",
+      "combobox": "Auswahlliste mit Filter",
+      "datePicker": "Datum und Uhrzeit",
+      "chipInput": "Schlagwörter und Freitext",
+      "tabs": "Reiter",
+      "list": "Aufklappbare Liste mit Sammelaktionen",
+      "pagination": "Seitenwechsel",
+      "stateEmpty": "Nichts gewählt",
+      "stateFilled": "Etwas gewählt",
+      "stateDisabled": "Nicht benutzbar",
+      "stateInvalid": "Als falsch markiert",
+      "stateLong": "Zweihundert Zeilen",
+      "stateNone": "Nichts zur Auswahl",
+      "emits": "Was dabei herauskommt",
+      "panelOverview": "Dieser Bereich entstand beim Öffnen der Seite, weil die Adresse seinen Reiter genannt hat.",
+      "panelQueue": "Diesen Bereich gab es nicht, bevor sein Reiter gedrückt wurde. Genau das ist das späte Aufbauen: ein Bereich mit teuren Daten darf nicht laden, bloß weil es ihn gibt.",
+      "panelConsents": "Und dieser wird ebenfalls erst aufgebaut, wenn jemand danach fragt.",
+      "tabOverview": "Übersicht",
+      "tabQueue": "Warteschlange",
+      "tabConsents": "Einwilligungen",
+      "tabLocked": "Gesperrt",
+      "erase": "Löschen",
+      "rowAction": "Die Aktionen einer Zeile stehen hier und gehören zu der Seite, die die Liste benutzt."
+    }
   }
 }
