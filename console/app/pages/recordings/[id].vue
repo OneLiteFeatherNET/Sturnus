@@ -1,24 +1,37 @@
 <script setup lang="ts">
 /**
- * One recording, at its own address.
+ * One recording, at its own address, divided into the questions people
+ * arrive with.
  *
  * `/recordings/{id}` is canonical: a link in a protocol, a chat message or
  * a bookmark lands on the recording itself rather than on a list somebody
- * then has to search through. That is why this page exists separately
- * from `/recordings`, which stays a list.
+ * then has to search through. Since #141 it is also the **only** place a
+ * recording can be heard — the list is a list again — so everything that
+ * page stopped showing had to have somewhere to live here.
  *
- * Everything about the session hangs off it — when it ran, who was in it,
- * what each track measured, the protocol it produced, and the audio. The
- * list view deliberately shows less: a page of ten sessions that loaded
- * this much would pull hundreds of megabytes for somebody scanning for a
- * link.
+ * **Tabs, not one long scroll.** What was here was a metadata card, a tag
+ * editor, a transport, an administrator's panel and then one `<audio>` and
+ * one spectrogram per speaker, stacked. Every part of it was worth having
+ * and no two of them answered the same question, which is the shape a tab
+ * bar is for. `~/utils/recordingTabs` holds the division and the argument
+ * for it: which four, why there is no metadata tab, why the re-queue panel
+ * is on `details`, and why `meeting` is the one a bare address opens.
  *
- * **Two ways to listen, because they answer different questions.** The
- * multi-track transport at the top plays the meeting: every speaker on one
- * clock, which is the only way a conversation makes sense. Each track also
- * gets its own player below, because "what did this one person say" is a
- * question the shared transport cannot answer without muting everybody
- * else first.
+ * `UiTabs` mounts a panel the first time it is shown and keeps it
+ * afterwards, and that matters here more than anywhere else in the
+ * console: the tracks tab is one `<audio>` and one spectrogram request per
+ * speaker, and an eight-speaker meeting would otherwise fire sixteen
+ * requests at somebody who came for the protocol link.
+ *
+ * **Both the session and its transcript are fetched on arrival, and only
+ * one of them is lazy.** The transcript response is the only thing that
+ * says whether this session still has any audio, and *two* tabs have to
+ * know that before anybody clicks them — a player that is going to 404 has
+ * to say why instead of looking broken. So the words come with the page;
+ * what the tab bar defers is rendering them, which is where the cost of a
+ * ninety-minute meeting actually is. A transcript that fails to load is
+ * not a failed page: the session is still here, the audio still plays, and
+ * the transcript tab says what happened.
  *
  * A 404 from the API is not an error page here. Somebody who was not in a
  * session and somebody following a link to one that never existed get the
@@ -26,18 +39,29 @@
  * module docstring for why that is a security property and not a
  * politeness.
  */
+import UiTabs from '~/components/ui/UiTabs.vue'
 import {
-  audioUrl,
-  channelLabel,
   formatSeconds,
   formatTimestamp,
   hasProtocol,
   isInProgress,
+  recordingNaming,
   sessionLength,
-  trackLabel,
   type RecordedSession,
 } from '~/utils/recordings'
+import { recordingTabQuery, recordingTabs } from '~/utils/recordingTabs'
+import { transcriptAudioErased, transcriptPath, type SessionTranscript } from '~/utils/transcript'
+import type { SessionName } from '~/utils/sessionNaming'
 import { ApiError } from '~/utils/apiError'
+
+/** Everything the page needs before it can render anything. */
+interface Recording {
+  session: RecordedSession
+  /** The words, or `null` when the transcript alone could not be read.
+   *  The session is authoritative for the page's existence; a transcript
+   *  that failed is one tab's problem and not five. */
+  transcript: SessionTranscript | null
+}
 
 const { t } = useI18n()
 const say = useSay()
@@ -46,23 +70,77 @@ const route = useRoute()
 const api = useApi()
 const id = computed(() => String(route.params.id ?? ''))
 
-const { data, status, error, refresh } = await useAsyncData(
+const { data, status, error, refresh } = await useAsyncData<Recording>(
   () => `recording-${id.value}`,
-  () => api<RecordedSession>(`/sessions/${encodeURIComponent(id.value)}`),
+  async () => {
+    const sessionId = id.value
+    // In parallel. They are two independent reads behind the same
+    // authorisation, and doing them one after the other would double the
+    // wait for no answer either of them needs from the other.
+    const [session, transcript] = await Promise.all([
+      api<RecordedSession>(`/sessions/${encodeURIComponent(sessionId)}`),
+      // Swallowed on purpose, and only here: a transcript that cannot be
+      // read must not take down the audio, the tags or the metadata. What
+      // it costs is the distinction between a 500 and a 404 on this one
+      // call, and neither of those is a sentence the transcript tab needs
+      // — "the words could not be read" covers both, and the session's own
+      // 404 is what decides whether this recording is anybody's at all.
+      api<SessionTranscript>(transcriptPath(sessionId)).catch(() => null),
+    ])
+    return { session, transcript }
+  },
   { watch: [id] },
 )
 
-const session = computed<RecordedSession | null>(() => data.value ?? null)
-const length = computed(() => (session.value ? sessionLength(session.value) : null))
+/**
+ * What somebody has just renamed this to, laid over what arrived.
+ *
+ * The heading above the tabs is a title, and the editor that writes it is
+ * three tabs away — so without this, saving a name leaves the page
+ * disagreeing with the box it was typed into until a reload. Cleared when
+ * the address changes, because it belongs to one recording.
+ */
+const renamed = ref<SessionName | null>(null)
+watch(id, () => {
+  renamed.value = null
+})
 
-/** A session this viewer may not see, and one that does not exist, are
- *  the same answer. Distinguishing them here would undo the endpoint's
- *  care in not distinguishing them. */
+const session = computed<RecordedSession | null>(() => {
+  const found = data.value?.session ?? null
+  if (found === null) return null
+  return renamed.value === null ? found : { ...found, ...renamed.value }
+})
+const transcript = computed<SessionTranscript | null>(() => data.value?.transcript ?? null)
+const length = computed(() => (session.value ? sessionLength(session.value) : null))
+const naming = computed(() => (session.value ? recordingNaming(session.value) : null))
+
+/** The retention sweep has taken the recordings and left the minutes.
+ *  Needs the track count as well as the flag: a session nobody consented
+ *  to answers `audio_available: false` too, and "your recording was
+ *  deleted" is not what happened to that one. */
+const audioGone = computed(() =>
+  transcriptAudioErased(transcript.value, session.value?.tracks.length ?? 0),
+)
+
+/** A session this viewer may not see, and one that does not exist, are the
+ *  same answer. Distinguishing them here would undo the endpoint's care in
+ *  not distinguishing them. */
 const missing = computed(() => error.value instanceof ApiError && error.value.status === 404)
 
+const tabs = computed(() => recordingTabs(t))
+/** Where the audio tabs send somebody once there is no audio left. */
+const toTranscript = computed(() => ({
+  path: route.path,
+  query: recordingTabQuery(route.query, 'transcript'),
+}))
+const toDetails = computed(() => ({
+  path: route.path,
+  query: recordingTabQuery(route.query, 'details'),
+}))
+
 useHead(() => ({
-  title: session.value
-    ? t('recordings.headTitle', { channel: say(channelLabel(session.value)) })
+  title: naming.value
+    ? t('recordings.headTitle', { name: say(naming.value.heading) })
     : t('recordings.one'),
 }))
 
@@ -75,60 +153,11 @@ onMounted(() => {
   }
 })
 
-const base = useRuntimeConfig().public.apiBase
-
-/** Playback position per track, so each spectrogram can show its own
- *  playhead without the tracks having to know about each other. */
-const positions = ref<Record<string, number>>({})
-const players = new Map<string, HTMLAudioElement>()
-
-/**
- * A ref callback per track, cached so its identity is stable.
- *
- * This used to return a fresh closure on every call, and the template
- * calls it on every render. Vue treats a new ref function as a new
- * binding, so a `timeupdate` — four a second, per playing track — tore
- * down and re-seated *every* track's ref, rebuilt every `<li>`, every
- * four-entry `<dl>` and every `<audio>` vnode on the page. The sibling
- * component (`MultiTrackPlayer`) already cached its binders for exactly
- * this reason and says so; the rule was written down and then not
- * applied one file over.
- */
-const binders = new Map<string, (el: unknown) => void>()
-
-function bindPlayer(trackId: string) {
-  let existing = binders.get(trackId)
-  if (!existing) {
-    existing = (el: unknown) => {
-      // Duck-typed rather than `instanceof HTMLAudioElement`, so the
-      // check holds wherever this runs.
-      if (el && typeof (el as HTMLAudioElement).play === 'function') {
-        players.set(trackId, el as HTMLAudioElement)
-      } else {
-        players.delete(trackId)
-      }
-    }
-    binders.set(trackId, existing)
-  }
-  return existing
-}
-
-function onTime(trackId: string, event: Event) {
-  positions.value = {
-    ...positions.value,
-    [trackId]: (event.target as HTMLAudioElement).currentTime,
-  }
-}
-
-/** Clicking a spectrogram moves that track's own player to that moment. */
-function seek(trackId: string, seconds: number) {
-  const player = players.get(trackId)
-  if (!player) return
-  player.currentTime = seconds
-  positions.value = { ...positions.value, [trackId]: seconds }
-}
-
 const others = computed(() => session.value?.other_participants ?? [])
+
+function onRenamed(name: SessionName) {
+  renamed.value = name
+}
 </script>
 
 <template>
@@ -141,10 +170,9 @@ const others = computed(() => session.value?.other_participants ?? [])
       {{ $t('recordings.backToAll') }}
     </NuxtLink>
 
-    <!-- Three blocks, in the three sizes this page is: the metadata card,
-         the reader's tags, and the transport. The back link above is real
-         and stays put, so the only thing that moves when the recording
-         lands is the recording. -->
+    <!-- The header, the bar and the panel, in the three sizes this page
+         is. The back link above is real and stays put, so the only thing
+         that moves when the recording lands is the recording. -->
     <div
       v-if="status === 'pending' && !error"
       aria-busy="true"
@@ -152,12 +180,12 @@ const others = computed(() => session.value?.other_participants ?? [])
     >
       <p class="sr-only">{{ $t('recordings.loadingOne') }}</p>
       <div
-        class="h-56 animate-pulse rounded-2xl border motion-reduce:animate-none"
+        class="h-44 animate-pulse rounded-2xl border motion-reduce:animate-none"
         :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
       />
       <div
-        class="h-24 animate-pulse rounded-2xl border motion-reduce:animate-none"
-        :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+        class="h-9 w-80 max-w-full animate-pulse rounded-t-lg motion-reduce:animate-none"
+        :style="{ background: 'var(--surface)' }"
       />
       <div
         class="h-72 animate-pulse rounded-2xl border motion-reduce:animate-none"
@@ -186,9 +214,9 @@ const others = computed(() => session.value?.other_participants ?? [])
         {{ $t('recordings.oneFailedDetail') }}
       </p>
       <!-- Disabled rather than replaced while the retry runs: the button
-           that started it is the one that would vanish, and a control
-           that unmounts itself when pressed drops the keyboard to the top
-           of the document. -->
+           that started it is the one that would vanish, and a control that
+           unmounts itself when pressed drops the keyboard to the top of
+           the document. -->
       <button
         type="button"
         class="mt-3 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-60"
@@ -200,14 +228,17 @@ const others = computed(() => session.value?.other_participants ?? [])
       </button>
     </div>
 
-    <template v-else-if="session">
-      <!-- Metadata: everything about this session that is not audio. -->
+    <template v-else-if="session && naming">
+      <!-- Above the bar, because it identifies the meeting every tab is
+           about. This is where the answer to "is there a metadata tab"
+           lives: somebody reading the transcript should not have to leave
+           it to find out when the meeting was. -->
       <header
         class="rounded-2xl border p-5"
         :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
       >
         <h1 class="flex flex-wrap items-center gap-2 text-2xl font-semibold">
-          <span>{{ say(channelLabel(session)) }}</span>
+          <span>{{ say(naming.heading) }}</span>
           <span
             v-if="isInProgress(session)"
             class="rounded-full px-2 py-0.5 text-xs font-medium"
@@ -216,6 +247,13 @@ const others = computed(() => session.value?.other_participants ?? [])
             {{ $t('recordings.recordingNow') }}
           </span>
         </h1>
+        <!-- Where it happened, once the heading has stopped saying so. A
+             named meeting is called what somebody named it; the channel is
+             still a fact and drops to a subordinate line rather than
+             disappearing. -->
+        <p v-if="naming.under" class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+          {{ say(naming.under) }}
+        </p>
 
         <dl class="mt-4 grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-4">
           <div>
@@ -240,113 +278,219 @@ const others = computed(() => session.value?.other_participants ?? [])
           </div>
         </dl>
 
-        <div class="mt-4 flex flex-wrap items-center gap-3">
-          <a
-            v-if="hasProtocol(session)"
-            :href="session.document_url ?? ''"
-            target="_blank"
-            rel="noreferrer"
-            class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-            :style="{ color: 'var(--action)' }"
-          >
-            {{ $t('recordings.openProtocol') }}
-          </a>
-          <span v-else class="text-sm" :style="{ color: 'var(--text-muted)' }">
-            {{ $t('recordings.noProtocolWritten') }}
-          </span>
+        <!-- Retention, said once and above the bar, because it explains
+             the state of two tabs and has to be legible from the third.
+             Not in the danger role: a recording deleted when its window
+             closed is the system keeping a promise, not a fault. -->
+        <div
+          v-if="audioGone"
+          class="mt-4 rounded-lg border border-dashed p-3"
+          :style="{ borderColor: 'var(--border)' }"
+        >
+          <p class="text-sm font-medium">{{ $t('recordings.audioGoneHeading') }}</p>
+          <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+            {{ $t('recordings.audioGoneDetail') }}
+          </p>
         </div>
-
-        <!-- Everybody who was in the channel but has no track: they did
-             not consent before it began. Named rather than omitted, because
-             "who else was there" is a fact about the meeting and their
-             absence from the audio is the point. -->
-        <p v-if="others.length > 0" class="mt-4 text-sm" :style="{ color: 'var(--text-muted)' }">
-          {{
-            $t('recordings.alsoInChannelUnrecorded', {
-              people: others.map((person) => person.display_name).join(', '),
-            })
-          }}
-        </p>
       </header>
 
-      <!-- The reader's own labels on this recording. Placed above the
-           audio because it is the half of the page somebody returns to a
-           recording to *write*, and below the metadata because it is not
-           what the recording is. -->
-      <RecordingTags :session-id="session.id" :tags="session.tags" />
+      <UiTabs :tabs="tabs" :label="$t('recordings.tabsLabel')">
+        <!-- The meeting, on one clock. -->
+        <template #meeting>
+          <div class="flex flex-col gap-4">
+            <section
+              class="rounded-2xl border p-5"
+              :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+            >
+              <h2 class="text-base font-semibold">{{ $t('recordings.wholeMeetingHeading') }}</h2>
+              <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+                {{ $t('recordings.wholeMeetingNote') }}
+              </p>
 
-      <!-- The meeting, on one clock. -->
-      <section
-        class="rounded-2xl border p-5"
-        :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
-      >
-        <h2 class="text-base font-semibold">{{ $t('recordings.wholeMeetingHeading') }}</h2>
-        <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-          {{ $t('recordings.wholeMeetingNote') }}
-        </p>
-        <MultiTrackPlayer :session="session" />
-      </section>
+              <!-- "Nobody consented" is asked first and is the more
+                   specific answer: a session with no tracks reports no
+                   available audio for the honest reason that there never
+                   was any, and calling that an erasure would report a loss
+                   that did not happen. -->
+              <p
+                v-if="session.tracks.length === 0"
+                class="mt-4 rounded-lg border border-dashed p-4 text-sm"
+                :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+              >
+                {{ $t('recordings.noAudio') }}
+              </p>
+              <p
+                v-else-if="audioGone"
+                class="mt-4 rounded-lg border border-dashed p-4 text-sm"
+                :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+              >
+                {{ $t('recordings.audioGoneNothingToPlay') }}
+                <NuxtLink
+                  :to="toTranscript"
+                  class="font-medium transition-colors hover:underline"
+                  :style="{ color: 'var(--action)' }"
+                >
+                  {{ $t('recordings.audioGoneReadInstead') }}
+                </NuxtLink>
+              </p>
+              <MultiTrackPlayer v-else :session="session" />
+            </section>
 
-      <!-- Second wave: only an administrator of this guild sees anything
-           here, and for everybody else the component renders nothing at
-           all rather than a disabled control that confirms it exists. -->
-      <RequeuePanel :session-id="session.id" />
+            <section
+              class="rounded-2xl border p-5"
+              :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+            >
+              <h2 class="text-base font-semibold">{{ $t('recordings.aboutHeading') }}</h2>
 
-      <!-- One speaker at a time. -->
-      <section
-        class="rounded-2xl border p-5"
-        :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
-      >
-        <h2 class="text-base font-semibold">{{ $t('recordings.eachTrackHeading') }}</h2>
-        <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-          {{ $t('recordings.eachTrackNote') }}
-        </p>
+              <div class="mt-3 flex flex-wrap items-center gap-3">
+                <a
+                  v-if="hasProtocol(session)"
+                  :href="session.document_url ?? ''"
+                  target="_blank"
+                  rel="noreferrer"
+                  class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+                  :style="{ color: 'var(--action)' }"
+                >
+                  {{ $t('recordings.openProtocol') }}
+                </a>
+                <span v-else class="text-sm" :style="{ color: 'var(--text-muted)' }">
+                  {{ $t('recordings.noProtocolWritten') }}
+                </span>
+              </div>
 
-        <p
-          v-if="session.tracks.length === 0"
-          class="mt-4 rounded-lg border border-dashed p-4 text-sm"
-          :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
-        >
-          {{ $t('recordings.noAudio') }}
-        </p>
+              <!-- What somebody wrote about the meeting, shown where a
+                   listener wants it and edited on `details`. The rest of
+                   this page is the reading room; that tab is the desk.
+                   `whitespace-pre-line` because a description keeps its
+                   paragraphs and the API keeps them too. -->
+              <p
+                v-if="session.description"
+                class="mt-3 max-w-3xl whitespace-pre-line text-sm"
+              >
+                {{ session.description }}
+              </p>
+              <p v-else class="mt-3 text-sm" :style="{ color: 'var(--text-muted)' }">
+                {{ $t('recordings.noDescriptionYet') }}
+                <NuxtLink
+                  :to="toDetails"
+                  class="font-medium transition-colors hover:underline"
+                  :style="{ color: 'var(--action)' }"
+                >
+                  {{ $t('recordings.nameThisMeeting') }}
+                </NuxtLink>
+              </p>
 
-        <ul v-else class="mt-4 flex flex-col gap-4">
-          <li
-            v-for="track in session.tracks"
-            :key="track.discord_user_id"
-            class="rounded-xl p-4"
-            :style="{ background: 'var(--surface-raised)' }"
+              <!-- Everybody who was in the channel but has no track: they
+                   did not consent before it began. Named rather than
+                   omitted, because "who else was there" is a fact about
+                   the meeting and their absence from the audio is the
+                   point. The list deliberately does not carry this; this
+                   page is where there is room to say why. -->
+              <p
+                v-if="others.length > 0"
+                class="mt-4 text-sm"
+                :style="{ color: 'var(--text-muted)' }"
+              >
+                {{
+                  $t('recordings.alsoInChannelUnrecorded', {
+                    people: others.map((person) => person.display_name).join(', '),
+                  })
+                }}
+              </p>
+            </section>
+          </div>
+        </template>
+
+        <!-- One speaker at a time, with what each file is. -->
+        <template #tracks>
+          <section
+            class="rounded-2xl border p-5"
+            :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
           >
-            <!-- The four measurements are not repeated here. The
-                 transport directly above already shows them per speaker,
-                 and rendering them twice was around a hundred redundant
-                 nodes on an eight-speaker page and every speaker's
-                 numbers read out twice in a row by a screen reader. -->
-            <h3 class="text-sm font-medium">{{ trackLabel(track) }}</h3>
+            <h2 class="text-base font-semibold">{{ $t('recordings.eachTrackHeading') }}</h2>
+            <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+              {{ $t('recordings.eachTrackNote') }}
+            </p>
 
-            <!-- Named, because eight identical "audio" controls in a row
-                 tell a screen-reader user nothing about which speaker
-                 they are on. `preload="none"`: nothing is fetched until
-                 somebody presses play on this particular speaker. -->
-            <audio
-              :ref="bindPlayer(track.discord_user_id)"
-              :src="audioUrl(base, session.id, track.discord_user_id)"
-              class="mt-3 w-full"
-              controls
-              preload="none"
-              :aria-label="$t('recordings.trackAlone', { name: trackLabel(track) })"
-              @timeupdate="onTime(track.discord_user_id, $event)"
-            />
+            <!-- Retention took the recordings and left what was written
+                 from them. The list stays, without its players and its
+                 pictures, because the measurements are part of "what was
+                 written from it" — dropping them here would make the
+                 notice above the tab bar untrue on the one page it is
+                 shown on. -->
+            <template v-if="audioGone">
+              <p
+                class="mt-4 rounded-lg border border-dashed p-4 text-sm"
+                :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+              >
+                {{ $t('recordings.audioGoneNoTracks') }}
+                <NuxtLink
+                  :to="toTranscript"
+                  class="font-medium transition-colors hover:underline"
+                  :style="{ color: 'var(--action)' }"
+                >
+                  {{ $t('recordings.audioGoneReadInstead') }}
+                </NuxtLink>
+              </p>
+              <RecordingTrackList class="mt-4" :session="session" :playable="false" />
+            </template>
+            <p
+              v-else-if="session.tracks.length === 0"
+              class="mt-4 rounded-lg border border-dashed p-4 text-sm"
+              :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+            >
+              {{ $t('recordings.noAudio') }}
+            </p>
+            <RecordingTrackList v-else class="mt-4" :session="session" />
+          </section>
+        </template>
 
-            <TrackSpectrogram
+        <!-- The words. -->
+        <template #transcript>
+          <RecordingTranscript v-if="transcript" :transcript="transcript" />
+          <!-- The one failure that is a tab's own and not the page's. The
+               retry re-reads the recording, because the two arrived
+               together and a transcript alone has nothing to be right
+               about. -->
+          <div
+            v-else
+            class="rounded-2xl border p-6"
+            :style="{ borderColor: 'var(--danger)' }"
+          >
+            <p class="text-sm font-medium">{{ $t('recordings.transcriptFailedHeading') }}</p>
+            <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+              {{ $t('recordings.transcriptFailedDetail') }}
+            </p>
+            <button
+              type="button"
+              class="mt-3 rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-60"
+              :style="{ color: 'var(--action)' }"
+              :disabled="status === 'pending'"
+              @click="refresh()"
+            >
+              {{ status === 'pending' ? $t('recordings.retrying') : $t('error.retry') }}
+            </button>
+          </div>
+        </template>
+
+        <!-- The writing desk: what this meeting is called, what the reader
+             files it under, and — for an administrator of the guild — the
+             one control that changes what the recording *is*. The panel
+             renders nothing at all for everybody else, which is why it is
+             here rather than behind a tab that would be empty for almost
+             every reader. -->
+        <template #details>
+          <div class="flex flex-col gap-4">
+            <RecordingName
               :session-id="session.id"
-              :discord-user-id="track.discord_user_id"
-              :position="positions[track.discord_user_id] ?? null"
-              @seek="(seconds) => seek(track.discord_user_id, seconds)"
+              :name="{ title: session.title, description: session.description }"
+              @saved="onRenamed"
             />
-          </li>
-        </ul>
-      </section>
+            <RecordingTags :session-id="session.id" :tags="session.tags" />
+            <RequeuePanel :session-id="session.id" />
+          </div>
+        </template>
+      </UiTabs>
     </template>
   </div>
 </template>
