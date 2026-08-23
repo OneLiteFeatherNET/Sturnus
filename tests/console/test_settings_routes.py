@@ -435,6 +435,35 @@ async def test_a_key_with_no_default_may_not_be_cleared(
     assert await stores.config.get_stored(GUILD, key) == "42"
 
 
+@pytest.mark.parametrize("key", ["policy_version", "voice_channel_ids", "voice_channel_id"])
+async def test_the_listing_says_a_key_may_not_be_cleared_before_anybody_tries(
+    aiohttp_client: AiohttpClientFactory, stores: Stores, key: str
+) -> None:
+    """The other half of `test_a_key_with_no_default_may_not_be_cleared`.
+
+    The 409 is the right answer, and a page that had to provoke it to find
+    out is the wrong interface. `voice_channel_id` is the key that makes
+    this worth pinning: it is *not* required, so a console reading
+    clearability off `required` renders a live Clear button beside it and
+    then explains the refusal as "this key is required" on a field the
+    same page called optional.
+    """
+    await stores.admins.replace(GUILD, [ANNA], T0)
+    await stores.config.set(GUILD, key, "42", T0)
+    client = await signed_in_client(aiohttp_client, stores)
+    body = await (await client.get(f"/api/guilds/{GUILD}/settings")).json()
+    assert setting(body, key)["may_clear"] is False
+
+
+async def test_the_listing_offers_a_clear_for_a_key_with_a_default(
+    aiohttp_client: AiohttpClientFactory, stores: Stores
+) -> None:
+    await stores.admins.replace(GUILD, [ANNA], T0)
+    client = await signed_in_client(aiohttp_client, stores)
+    body = await (await client.get(f"/api/guilds/{GUILD}/settings")).json()
+    assert setting(body, "timezone")["may_clear"] is True
+
+
 async def test_clearing_an_unknown_key_is_not_found(
     aiohttp_client: AiohttpClientFactory, stores: Stores
 ) -> None:

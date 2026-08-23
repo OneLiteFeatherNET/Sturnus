@@ -298,3 +298,23 @@ def test_every_clearable_key_has_something_to_fall_back_to() -> None:
     for key in settings_view.KNOWN_KEYS:
         if settings_view.may_clear(key):
             assert settings_view.describe(key, NOTHING_CONFIGURED).default is not None
+
+
+def test_the_view_ships_the_clear_rule_rather_than_leaving_it_to_be_inferred() -> None:
+    """`required` is not the rule, and a console inferring it from `required` is wrong.
+
+    `voice_channel_id` is required of nobody and clearable by nobody, so
+    the two answers disagree for exactly one key -- which is one more than
+    a wire format may leave to the reader. The payload therefore carries
+    the answer the clear endpoint actually enforces.
+    """
+    payload = settings_view.describe(settings.VOICE_CHANNEL_ID, NOTHING_CONFIGURED).as_json()
+    assert payload["required"] is False
+    assert payload["may_clear"] is False
+
+
+def test_every_view_reports_the_same_verdict_the_clear_endpoint_will_give() -> None:
+    """One rule, serialised -- not a second one assembled on the wire."""
+    for key in settings_view.KNOWN_KEYS:
+        payload = settings_view.describe(key, NOTHING_CONFIGURED).as_json()
+        assert payload["may_clear"] is settings_view.may_clear(key), key

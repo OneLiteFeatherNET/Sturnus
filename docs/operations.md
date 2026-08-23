@@ -1114,6 +1114,17 @@ Plus `deferred_while_recording` for `voice_channel_ids` and
 `consent_role_id`, which a reconcile holds back for the length of a
 running session.
 
+Every settings response also carries `may_clear`, and a front end must
+gate its Clear control on that flag rather than on `!required`. The two
+are not the same question. `DELETE` restores a default, so a key with no
+default is refused with 409 — and there are now three classes of key, not
+two: required (no default, must be set), defaulted (clearable), and the
+deprecated `voice_channel_id` (no default, required of nobody, still
+serving any guild that has not moved to `voice_channel_ids`). Deriving
+the button from `required` puts a live Clear beside that last one and
+then explains the refusal as "this key is required" on a field the same
+page has just rendered as optional.
+
 There is no console equivalent of `/config apply force:true`, and there
 cannot be without giving `api` a Discord token.
 

@@ -444,9 +444,12 @@ const TONE_COLOUR: Record<string, string> = {
             >
               Clear
             </button>
-            <!-- No clear button for a required key. The API answers 409,
-                 and an interface that offers an action it knows will fail
-                 is worse than one that explains why it cannot. -->
+            <!-- No clear button for a key the API will not clear -- its
+                 own `may_clear`, not "not required" guessed here. The two
+                 differ for the deprecated voice_channel_id, which is
+                 optional and still answers 409; an interface that offers
+                 an action it knows will fail is worse than one that
+                 explains why it cannot. -->
             <span v-else class="text-xs" :style="{ color: 'var(--text-muted)' }">
               {{ clearReason(view) }}
             </span>

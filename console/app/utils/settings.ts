@@ -34,6 +34,14 @@ export interface SettingView {
   value: string | null
   default: string | null
   required: boolean
+  /** Whether `DELETE` on this key restores something rather than taking
+   *  the guild out of service -- the clear endpoint's own verdict, sent
+   *  rather than inferred. It is *not* `!required`: `voice_channel_id` is
+   *  required of nobody and refused to everybody, because a guild still
+   *  being served by the deprecated spelling has nothing to fall back to
+   *  either. Deriving the button from `required` is what put a live Clear
+   *  next to that key and answered it with "this key is required". */
+  may_clear: boolean
   integer: boolean
   invalidates_consent: boolean
   /** Deliberately a plain string rather than a union of the three known
@@ -76,6 +84,12 @@ function asView(key: string, raw: Record<string, unknown>): SettingView {
     // and so must a string "false", which is what a careless serialiser
     // produces and what would otherwise turn every key into a required one.
     required: raw.required === true,
+    // `=== true` here means an API that does not send the flag renders no
+    // Clear button at all. That is the right way round: a control that is
+    // missing costs a support question, and one that is offered and then
+    // refused costs a 409 in somebody's face on a page that had already
+    // told them the field was optional.
+    may_clear: raw.may_clear === true,
     integer: raw.integer === true,
     invalidates_consent: raw.invalidates_consent === true,
     takes_effect: typeof raw.takes_effect === 'string' ? raw.takes_effect : '',
@@ -255,17 +269,27 @@ export type Clearability = { clearable: true } | { clearable: false; reason: str
 /**
  * Whether to offer a clear at all.
  *
- * A required key answers 409, always. Offering the button and rendering
- * the refusal afterwards would be an interface that invites an action it
- * already knows the outcome of.
+ * A key with no default answers 409, always. Offering the button and
+ * rendering the refusal afterwards would be an interface that invites an
+ * action it already knows the outcome of.
+ *
+ * The verdict is `may_clear`, sent by the API, and deliberately not
+ * `!required` computed here. Those two agreed while there were two
+ * classes of key and stopped agreeing the moment there were three: the
+ * deprecated `voice_channel_id` is required of nobody and clearable by
+ * nobody, and a console with its own copy of the rule is a console that
+ * can disagree with the endpoint enforcing it. `required` still decides
+ * how the field is *marked*; it decides nothing about this button.
  */
 export function clearability(view: SettingView): Clearability {
-  if (view.required) {
+  if (!view.may_clear) {
     return {
       clearable: false,
-      reason:
-        'Cannot be cleared: required, with no default to fall back to. Set a different value ' +
-        'instead.',
+      reason: view.required
+        ? 'Cannot be cleared: required, with no default to fall back to. Set a different value ' +
+          'instead.'
+        : 'Cannot be cleared: there is no default to fall back to, so clearing it would stop ' +
+          'this server recording rather than restore anything. Set a different value instead.',
     }
   }
   if (view.value === null) {

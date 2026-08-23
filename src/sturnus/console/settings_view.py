@@ -42,8 +42,8 @@ wait is possible rather than pretending it is not.
 
 **Not a second opinion about the deprecated key, either.** `voice_channel_id`
 and the `voice_channel_ids` that replaced it are one setting with two
-names. Both are rendered — the old one has to stay visible and clearable
-for a guild to be able to move off it — and both are described through
+names. Both are rendered — a guild cannot be moved off a key the console
+will not show it — and both are described through
 `settings.canonical_key`, so the console cannot end up calling one of them
 immediate and the other deferred. Which of the two the bot actually reads
 is `settings.recording_channel_ids`' answer, and this module does not
@@ -113,6 +113,7 @@ class KeyView:
     value: str | None
     default: str | None
     required: bool
+    may_clear: bool
     integer: bool
     invalidates_consent: bool
     takes_effect: str
@@ -124,12 +125,22 @@ class KeyView:
         No coercion of `"45"` to `45` for an integer key: the column is
         `Text`, the bot parses it, and a JSON number here would mean the
         console and the store disagreed about what was stored.
+
+        `may_clear` travels beside `required` rather than being left for
+        the reader to infer from it. They agreed while there were two
+        classes of key and stopped agreeing the moment there were three:
+        `voice_channel_id` is required of nobody and clearable by nobody.
+        A front end deriving the button from `required` would offer a
+        Clear that `clear_setting` answers 409 to, on the same page that
+        has just said the field is optional -- so the rule the endpoint
+        enforces is the one that is sent.
         """
         return {
             "key": self.key,
             "value": self.value,
             "default": self.default,
             "required": self.required,
+            "may_clear": self.may_clear,
             "integer": self.integer,
             "invalidates_consent": self.invalidates_consent,
             "takes_effect": self.takes_effect,
@@ -192,6 +203,10 @@ def describe(key: str, stored: Mapping[str, str]) -> KeyView:
         value=stored.get(key),
         default=settings.DEFAULTS.get(key),
         required=key in settings.REQUIRED_KEYS,
+        # The same function `clear_setting` asks, not a restatement of it:
+        # a view whose verdict can differ from the endpoint's is a page
+        # offering a button that answers 409.
+        may_clear=may_clear(key),
         integer=key in settings.INTEGER_KEYS,
         invalidates_consent=key in _CONSENT_INVALIDATING_KEYS,
         takes_effect=takes_effect(key),
