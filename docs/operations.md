@@ -653,7 +653,9 @@ invocation, per API request, and by the consent cache with a five-second
 TTL), and `transcription_language`,
 `transcription_prompt`, `document_target`, `document_provider`,
 `merge_gap_seconds` (read per job by the *worker* process, not the bot at
-all). The two transcription keys apply to the next job the worker claims,
+all), and `max_parallel_tracks` (read by the worker *inside* the claim
+query itself, so it governs the very next claim — see 4.2). The two
+transcription keys apply to the next job the worker claims,
 which means a session already recording is still transcribed with the new
 value — and a job that has already run is not redone. Changing them
 because a protocol came out wrong therefore affects the next meeting, not
@@ -691,6 +693,98 @@ than falling back to defaults (which would silently un-configure a
 working guild). Run `/config apply` to re-read immediately instead of
 waiting for the next tick; `/config show` will tell you whether what is
 stored is actually what is running.
+
+### 4.2 `max_parallel_tracks`, and what it takes to have more than one worker
+
+A meeting is transcribed one speaker at a time: closing a session enqueues
+one `transcription_job` per participant who spoke, and each is an
+independent piece of work over a different recording. Nothing has ever
+stopped two workers taking two of them — the claim has always been
+serialised with `SELECT ... FOR UPDATE SKIP LOCKED`, so the same job is
+never handed out twice.
+
+**What the setting caps.** `max_parallel_tracks` is how many of *one
+session's* tracks may be `running` at the same time. It exists because
+without it a large meeting takes the whole worker pool: eight speakers on
+four workers means every other guild's meeting waits for eight
+transcriptions, each of which is minutes of CPU. With the cap, that
+meeting takes two workers and the pool keeps serving everyone else. The
+default is **2** — the smallest value that is actually parallel, so that
+adding a worker helps the common case (one guild, one meeting, several
+speakers) without letting one guild's meeting monopolise a shared
+deployment.
+
+```
+/config set max_parallel_tracks 3
+```
+
+It is a positive integer, per guild, and it takes effect on the next claim:
+the value is read inside the claim query itself, from `guild_config`, so
+there is nothing to restart and nothing cached anywhere.
+
+**What it does not cap: memory.** Each worker is its own process with its
+own loaded Whisper model, and the model cache is deliberately unbounded.
+Peak memory across the cluster is therefore set by
+`worker.replicaCount` and `worker.resources`, not by this key — raising
+`max_parallel_tracks` above the number of workers you run changes nothing
+at all, and raising the worker count is what costs memory.
+
+**A capped meeting never blocks the queue.** Claims are ordered
+oldest-job-first, and a session that is already at its limit is skipped
+rather than waited for: the worker takes the next session's oldest
+outstanding track instead. That ordering is also the anti-starvation rule
+in the other direction — a guild that keeps meeting produces jobs with
+newer ids, which sort *behind* everything already waiting, so it cannot
+push a quieter guild's meeting back indefinitely.
+
+**Running more than one worker is a storage change, not a config change.**
+The chart ships `worker.replicaCount: 1` and that is not a limit of the
+queue. It is one volume: the model cache
+(`worker.persistence`) is a single `ReadWriteOnce` claim, so a second pod
+can only mount it if the scheduler happens to place it on the same node,
+and across nodes it stays `Pending` on a multi-attach error. (The
+worker's working directory is *not* shared — `/tmp` is a per-pod
+`emptyDir` sized by `worker.tmpSizeLimit`, so the decrypted audio needs no
+change at all.) To run two workers, do one of:
+
+- set `worker.persistence.accessMode: ReadWriteMany` on a storage class
+  that provides it (CephFS, NFS, Longhorn RWX) — one shared, read-mostly
+  cache, written only by the first download;
+- give each pod its own claim, which means running the worker as a
+  StatefulSet with `volumeClaimTemplates`: every replica then downloads
+  the ~3.1GB checkpoint once, inside its `startupProbe` budget;
+- drop the cache entirely and mount an `emptyDir` in its place — simplest
+  to deploy, and every pod restart re-downloads the model.
+
+Then remember that `worker.resources` is per replica (two workers is 8
+CPUs and 12Gi of limit, not 4 and 6), and that `strategy: Recreate` in
+`worker-deployment.yaml` exists only because of that ReadWriteOnce claim —
+once the volume is shared or per-pod, a rolling update becomes possible.
+
+**The lease, with several workers.** `STURNUS_JOB_LEASE_SECONDS` (default
+1800) is how long a claimed job may stay `running` before another worker
+treats it as abandoned, and nothing renews it while a job runs. With one
+worker that only mattered after a crash. With several, a transcription
+that genuinely takes longer than the lease is claimed a second time while
+the first worker is still decoding — so the first worker eventually
+reports a job it no longer holds. That report is **refused**: `complete`
+and `fail` check the claim the worker presents against the one on the row,
+and a worker that lost its job changes nothing. The protocol is written
+once, from the transcript of whoever actually held the job.
+
+The cost is a whole transcription thrown away, and it is visible:
+
+```logql
+{app_kubernetes_io_component="worker"} | json | event="job.claim_lost"
+```
+
+```promql
+sum(rate(sturnus_job_outcome_total{outcome="stale"}[15m]))
+```
+
+Either of those firing means the lease is too short for the recordings
+this deployment gets, not that the worker count is too high. Raise
+`STURNUS_JOB_LEASE_SECONDS`.
 
 ## 5. Troubleshooting
 
@@ -2096,7 +2190,7 @@ show up in that check.
 | Instrument | Type | Unit | Attributes | Question it answers |
 |---|---|---|---|---|
 | `sturnus.job.stage.duration` | histogram | s | `stage`, `outcome` | Which pipeline stage is slow, across all jobs? |
-| `sturnus.job.outcome` | counter | 1 | `outcome` | How many jobs died today? **The alerting signal** — unsampled, unlike a span. `outcome` is one of `done` / `failed` / `dead` / `crashed`, and it is recorded by the transition that decided it (`infrastructure/db/queue.py`), never inferred from the worker loop's return value — see the note below the table. |
+| `sturnus.job.outcome` | counter | 1 | `outcome` | How many jobs died today? **The alerting signal** — unsampled, unlike a span. `outcome` is one of `done` / `failed` / `dead` / `crashed` / `stale`, and it is recorded by the transition that decided it (`infrastructure/db/queue.py`), never inferred from the worker loop's return value — see the note below the table. `stale` is a transcription that finished on a job its worker no longer held (its lease expired and another worker took over): real work, discarded rather than stored, and never to be counted as `done` — see 4.2. |
 | `sturnus.queue.depth` | gauge | 1 | `status` | Is the worker keeping up? One series per status: `pending`, `running`, `done`, `failed`, `dead`. **Sampled once per poll**, so during a long transcription it is as old as that job — see the caveat below. |
 | `sturnus.transcription.audio_duration` | histogram | s | — | Paired with the `transcribe` stage histogram, gives the realtime factor. |
 | `sturnus.transcription.decoded_seconds` | counter | s | `model` | **Seconds of audio handed to the decoder** — the gated speech, concatenated, not the padded recording it was cut from (§ the worker hands the model only what the speech gate found). Divided by wall time this is the real-time factor, which is the single most useful operational number here — see 7.5.1. |

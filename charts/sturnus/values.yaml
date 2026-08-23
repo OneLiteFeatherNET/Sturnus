@@ -472,11 +472,42 @@ httpRoute:
 
 worker:
   command: ["sturnus-worker"]
-  # Safe to raise: the job queue hands each job to exactly one worker
-  # (`FOR UPDATE SKIP LOCKED`). But the model cache below is a
-  # ReadWriteOnce volume, so replicas beyond the first only schedule onto
-  # the node already holding it -- give each replica its own claim before
-  # spreading them across nodes.
+  # **One replica, and raising it needs a storage decision first.** The
+  # queue itself is ready for a pool: it hands each job to exactly one
+  # worker (`FOR UPDATE SKIP LOCKED`), it caps how many of one meeting's
+  # speaker tracks may run at once so that a single eight-speaker session
+  # cannot occupy every worker (the per-guild `max_parallel_tracks`
+  # setting -- see docs/operations.md 4.2), and `complete`/`fail` now
+  # refuse a worker whose lease expired and whose job was taken over, so
+  # two workers on one track waste a transcription rather than writing the
+  # session's protocol twice.
+  #
+  # What is not ready is this deployment's storage, and it is exactly one
+  # volume. The working directory is already per pod -- `/tmp` is an
+  # `emptyDir` sized by `tmpSizeLimit` below, so nothing about the
+  # decrypted audio is shared between replicas and no change is needed
+  # there. The **model cache** (`persistence` below) is the whole problem:
+  # it is a single ReadWriteOnce claim, which a second pod can mount only
+  # if the scheduler puts it on the node already holding it. Across nodes
+  # the second pod stays Pending on a multi-attach error, which is also
+  # why `strategy: Recreate` is set in worker-deployment.yaml.
+  #
+  # To actually run more than one worker, pick one of these:
+  #
+  #   * `persistence.accessMode: ReadWriteMany` on a storage class that
+  #     provides it (CephFS, NFS, Longhorn RWX). One shared, read-mostly
+  #     cache of ~3.1GB; the only write is the first download.
+  #   * A per-pod claim, which means turning this Deployment into a
+  #     StatefulSet with `volumeClaimTemplates`. Every replica then pays
+  #     the ~3.1GB download once, on first start, inside the startupProbe
+  #     budget below.
+  #   * No cache at all: mount an `emptyDir` where the claim is now. The
+  #     simplest of the three and the most expensive to run -- every pod
+  #     restart re-downloads the model.
+  #
+  # Then also: `strategy: RollingUpdate` becomes possible (and worth it)
+  # once the volume is no longer ReadWriteOnce, and `resources` below is
+  # per replica -- two workers is 8 CPUs and 12Gi of limit, not 4 and 6.
   replicaCount: 1
   env:
     STURNUS_MODEL_CACHE_DIR: /data/model-cache
@@ -561,13 +592,23 @@ worker:
   # actual speech (60 x 50MB of extraction + 1.55 + 0.5 ~= 5.1GB) and the
   # lease expires just before that, so for a four-hour session the lease,
   # not this limit, is the number to revisit. Beyond
-  # that the lease expires mid-job; with `replicas: 1` (hardcoded in the
-  # Deployment template) and the worker processing one job at a time,
-  # nothing else can claim it, so the only consequence today is that a
-  # restart may reclaim a job that was still running. Raising the worker
-  # beyond one replica is what would turn this into two workers
-  # transcribing the same recording, and is the moment to revisit the
-  # lease.
+  # that the lease expires mid-job; with `replicaCount: 1` above and the
+  # worker processing one job at a time, nothing else can claim it, so the
+  # only consequence today is that a restart may reclaim a job that was
+  # still running.
+  #
+  # With more than one replica that changes: a second worker claims the
+  # job while the first is still decoding it. The outcome is now bounded
+  # rather than corrupting -- the first worker's `complete` is refused,
+  # because the claim it presents is no longer the one on the row, and the
+  # job is counted `stale` instead of `done` (see
+  # `sturnus.infrastructure.db.queue`), so the session's protocol is still
+  # written exactly once. What it costs is a whole transcription, thrown
+  # away. `job.claim_lost` in the logs and
+  # `sturnus_job_outcome_total{outcome="stale"}` are the signal that
+  # STURNUS_JOB_LEASE_SECONDS is too short for the material being
+  # recorded: raise the lease, rather than reading it as a reason not to
+  # scale out.
   resources:
     requests:
       cpu: "4"
@@ -614,6 +655,11 @@ worker:
     # unused gigabytes are expensive.
     size: 10Gi
     storageClassName: ""
+    # ReadWriteOnce is what pins the worker to a single replica, and it is
+    # the only thing that does -- the working directory is a per-pod
+    # `emptyDir` already. This is the value to change (to ReadWriteMany, on
+    # a storage class that offers it) before raising `replicaCount` above;
+    # see the alternatives spelled out there.
     accessMode: ReadWriteOnce
   service:
     enabled: true

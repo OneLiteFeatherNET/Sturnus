@@ -6,12 +6,19 @@ metadata:
     {{- include "sturnus.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
 spec:
   replicas: {{ .Values.worker.replicaCount }}
-  # Recreate, not RollingUpdate: the work directory below is a
+  # Recreate, not RollingUpdate: the **model cache** below is a
   # ReadWriteOnce volume, and a rolling update starts the new pod before
   # the old one releases it. On a ReadWriteOnce claim the new pod then
   # stays Pending on a multi-attach error while the old one waits to be
   # replaced -- a deadlock that blocks every future image update. The bot
   # sets the same strategy for a different reason (see bot-deployment.yaml).
+  #
+  # Not the work directory, which this comment used to name: that is a
+  # per-pod `emptyDir` (see the volumes below) and has never been shared
+  # between pods. The distinction matters now that the queue supports a
+  # pool of workers -- the model cache is the one volume standing between
+  # this deployment and `worker.replicaCount: 2`, and values.yaml says
+  # what to do about it.
   strategy:
     type: Recreate
   selector:

@@ -51,6 +51,32 @@ state and `complete`'s remaining-jobs count never reaches zero for that
 session either. `claim` therefore also selects a `running` job whose
 `claimed_at` is older than `lease_seconds`, exactly as if it were
 `pending` — see `claim`'s docstring.
+
+**A session's share of the pool is bounded, and the bound is part of the
+claim.** The unit of work is one job per speaker track, so a meeting is as
+many jobs as it had people talking; they are independent and two workers
+may take two of them. What that does not license is one meeting taking
+*every* worker while another guild's meeting waits behind all of it, so a
+candidate is rejected when its session already has as much work
+outstanding ahead of it as its guild's `max_parallel_tracks` allows — in
+the same statement that selects the row, under the same `FOR UPDATE SKIP
+LOCKED`, because once a claim has returned the row is `running` and there
+is no spelling for giving it back. `_outstanding_before` and
+`_parallel_track_limit` are the two halves of that, and the first carries
+the argument for why it is a *rank* rather than a count of running
+siblings: only one of those two survives two workers claiming at the same
+instant.
+
+**The lease is a fencing token as well as a reclaim deadline.** Nothing
+renews it while a job runs, so a job that outlives `lease_seconds` is
+claimable by a second worker while the first is still transcribing it.
+With one worker that was latent; with a pool it is reachable, and both
+workers then arrive at `complete` for the same job — which, before this
+was fenced, applied both completions, counted zero remaining jobs twice
+and reported the session's last job twice, creating its protocol twice
+from whichever transcript landed last. `complete` and `fail` therefore
+take back the `claimed_at` their caller was handed and refuse to act on a
+job that no longer carries it. See `complete`'s docstring.
 """
 
 from __future__ import annotations
@@ -59,11 +85,14 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import Integer, and_, case, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
+from sqlalchemy.sql.elements import ColumnElement
 
+from sturnus.domain import settings
 from sturnus.domain.measurements import JobMeasurements
-from sturnus.infrastructure.db.models import Session, TranscriptionJob
+from sturnus.infrastructure.db.models import GuildConfig, Session, TranscriptionJob
 from sturnus.infrastructure.telemetry import JOB_OUTCOME, record
 from sturnus.observability.events import Event, log_event
 
@@ -77,6 +106,155 @@ log = logging.getLogger(__name__)
 #: processing the same recording at once.
 DEFAULT_LEASE_SECONDS = 1800.0
 
+#: The two statuses a job never comes back from. Everything else --
+#: `pending`, `running` -- is a track its session still owes, and that is
+#: the distinction `_outstanding_before` is built on.
+TERMINAL_STATUSES: tuple[str, str] = ("done", "dead")
+
+#: Matches a decimal integer of at least one. Deliberately not `\d`:
+#: PostgreSQL's `\d` matches any Unicode digit, and `cast(... AS INTEGER)`
+#: does not accept most of them.
+_POSITIVE_INTEGER = "^[1-9][0-9]*$"
+
+
+def _parallel_track_limit() -> ColumnElement[int]:
+    """The candidate job's guild's `max_parallel_tracks`, resolved in SQL.
+
+    **How a per-guild setting reaches a guild-agnostic query.** `claim`
+    serves every guild from one statement and must not read configuration
+    per call: a `ConfigStore.get` before the claim would be a second round
+    trip resolving the wrong guild's value (the guild is not known until a
+    candidate is in hand), and a value cached at worker start would be a
+    setting that quietly stops applying. `guild_config` is an ordinary
+    table, so the honest answer is to join to it: the value is resolved
+    inside the same statement that selects the row, per candidate, from
+    the row an administrator's last write left behind. No extra round
+    trip, and nothing to go stale.
+
+    **A value the database cannot read falls back to the default rather
+    than raising.** `ConfigStore.set` refuses a non-integer, but
+    `docs/operations.md` section 4.1 tells operators they may edit
+    `guild_config` with SQL, and this expression runs inside *every*
+    claim: a bare `cast(value AS INTEGER)` would turn one guild's typo
+    into a worker that can no longer claim anything for anyone. The
+    regular expression is what keeps the cast total.
+    """
+    stored = (
+        select(GuildConfig.value)
+        .select_from(GuildConfig)
+        .join(Session, Session.guild_id == GuildConfig.guild_id)
+        .where(
+            Session.id == TranscriptionJob.session_id,
+            GuildConfig.key == settings.MAX_PARALLEL_TRACKS,
+        )
+        .correlate(TranscriptionJob)
+        .scalar_subquery()
+    )
+    return case(
+        (stored.regexp_match(_POSITIVE_INTEGER), cast(stored, Integer)),
+        else_=literal(settings.DEFAULT_MAX_PARALLEL_TRACKS),
+    )
+
+
+def _outstanding_before() -> ColumnElement[int]:
+    """How many of this session's tracks are still owed and sort ahead of
+    the candidate -- the candidate's rank among its own session's work.
+
+    **Why a rank and not a count of `running` siblings.** Both express the
+    cap, and only one of them survives two workers claiming at the same
+    instant. Under PostgreSQL's READ COMMITTED isolation a statement sees
+    one snapshot, and `FOR UPDATE` re-checks the search condition only for
+    the row it actually locks -- never for other rows the condition
+    mentions. A count of `running` siblings is therefore read from a
+    snapshot that a rival claimer's just-committed `UPDATE` may not be in
+    yet: both claimers count the same zero, both claim, and the cap is
+    exceeded. That failure is not fixable by locking harder, because the
+    stale read is of a *different* row than the one being locked.
+
+    A rank is immune to exactly that, and for one reason: it is computed
+    over `status NOT IN ('done', 'dead')`, a predicate a claim does not
+    change. `pending` and `running` are both outstanding, so a concurrent
+    claim moves no sibling into or out of the set being counted and cannot
+    change any other candidate's rank. The one transition that does change
+    it -- a sibling finishing -- only ever *shrinks* the set, so a claimer
+    reading a stale snapshot ranks its candidate too high and claims less
+    than it could. The error is always in the safe direction and is gone
+    by the next poll.
+
+    (`sturnus.infrastructure.db.requeue` moves finished jobs back to
+    `pending`, which grows the set. It runs only against a `documented`
+    session, whose every job is `done` and none of which is running, so it
+    cannot race a claim of the same session.)
+    """
+    sibling = aliased(TranscriptionJob)
+    return (
+        select(func.count())
+        .select_from(sibling)
+        .where(
+            sibling.session_id == TranscriptionJob.session_id,
+            sibling.id < TranscriptionJob.id,
+            sibling.status.not_in(TERMINAL_STATUSES),
+        )
+        .correlate(TranscriptionJob)
+        .scalar_subquery()
+    )
+
+
+def _claim_is_current(job: TranscriptionJob, lease: datetime | None) -> bool:
+    """Whether the caller may still act on this job.
+
+    Two ways to have lost it, and a worker that outran its lease can hit
+    either depending on how far the worker that took the job over has got:
+    the job has since been finished or written off (`TERMINAL_STATUSES`),
+    or it has been re-claimed and no longer carries the `claimed_at` this
+    caller was handed.
+
+    A caller that presents no lease is not a rival worker and is taken at
+    its word -- see `complete`'s docstring for why the token is optional
+    -- but even then a job already in a terminal state is never acted on
+    twice.
+    """
+    if job.status in TERMINAL_STATUSES:
+        return False
+    return lease is None or job.claimed_at == lease
+
+
+def _report_lost_claim(job_id: int, session_id: int, status: str) -> None:
+    """One place to say that a worker's work has been thrown away.
+
+    A warning rather than an error: nothing is lost that the worker
+    holding the job will not produce again, and the recording is still
+    going to be transcribed. It is worth a line all the same, because it
+    is the only visible symptom of a lease that is too short for the
+    material -- the job took longer than `STURNUS_JOB_LEASE_SECONDS` and
+    a second worker started it over. Seeing this repeatedly means raising
+    the lease, not raising the worker count.
+
+    Counted as `stale`, never as `done`: a transcription really did run
+    and really did produce nothing that will ever be read, and reporting
+    it as a success is the exact failure `sturnus.job.outcome` was rebuilt
+    to end.
+
+    The counter and this line are where a lost claim shows up; the
+    `job.process` span is not. Its `outcome` is stamped by
+    `sturnus.infrastructure.traced.TracedQueue`, which sees only the
+    boolean these methods return -- and it is a decorator around the
+    enclosing span rather than this one, so this module cannot correct it
+    from here without writing to the wrong span. Said out loud rather than
+    left to be discovered: a trace of a lost claim reads `outcome="done"`.
+    """
+    log_event(
+        log,
+        logging.WARNING,
+        Event.JOB_CLAIM_LOST,
+        "A job was taken over by another worker while this one was still "
+        "processing it; the work done here is discarded",
+        job_id=job_id,
+        session_id=session_id,
+        status=status,
+    )
+    record(JOB_OUTCOME, 1, outcome="stale")
+
 
 @dataclass(frozen=True)
 class ClaimedJob:
@@ -86,6 +264,11 @@ class ClaimedJob:
     s3_key: str
     encryption_key_id: str
     wrapped_data_key: bytes
+    #: The instant this claim was stamped on the row, and the worker's
+    #: proof that the job is still its own. Presented back to `complete`
+    #: and `fail` as `lease=`; a reclaim overwrites it, which is how those
+    #: two recognise a worker whose job has been taken away from it.
+    claimed_at: datetime
     #: The model this job was re-queued with, or `None` for the worker's
     #: own default -- which is every job nobody asked a question about.
     requested_model: str | None = None
@@ -113,6 +296,28 @@ class JobQueue:
         docstring's "Defect 4" note on why this exists. `claimed_at` is
         then stamped with `now` regardless of which branch matched, so a
         reclaim starts a fresh lease rather than an immediately-expired one.
+
+        **The cap, and why it is in this statement.** A candidate is
+        rejected when its session already owes more work ahead of it than
+        its guild's `max_parallel_tracks` allows to run at once
+        (`_outstanding_before`, `_parallel_track_limit`). It is part of the
+        search condition rather than a check the caller makes afterwards:
+        by the time a claim has returned, the row is `running`, and handing
+        it back would be an unclaim that the lease logic has no spelling
+        for. As a `WHERE` clause it costs nothing -- the scan simply walks
+        past a session that is at its limit and takes the next session's
+        work.
+
+        **Oldest first.** `ORDER BY id` is the ordering guarantee this
+        method now makes and did not make before: previously there was no
+        `ORDER BY` at all and a claim took whatever the scan reached
+        first. Jobs are enqueued when a session closes, so ascending id is
+        the order the meetings ended in -- and a guild that keeps meeting
+        gets ids that sort *behind* everything already waiting, which is
+        what stops it from starving a quieter guild. The cap and the
+        ordering answer opposite halves of the same question: the cap
+        stops one session monopolising the pool, the ordering stops the
+        sessions it makes room for being served out of turn.
         """
         now = now if now is not None else datetime.now(UTC)
         lease_cutoff = now - timedelta(seconds=self._lease_seconds)
@@ -126,8 +331,10 @@ class JobQueue:
                             TranscriptionJob.status == "running",
                             TranscriptionJob.claimed_at < lease_cutoff,
                         ),
-                    )
+                    ),
+                    _outstanding_before() < _parallel_track_limit(),
                 )
+                .order_by(TranscriptionJob.id)
                 .with_for_update(skip_locked=True)
                 .limit(1)
             )
@@ -143,14 +350,44 @@ class JobQueue:
                 s3_key=job.s3_key,
                 encryption_key_id=job.encryption_key_id,
                 wrapped_data_key=job.wrapped_data_key,
+                claimed_at=now,
                 requested_model=job.requested_model,
             )
 
     async def complete(
-        self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+        self,
+        job_id: int,
+        transcript: str,
+        measurements: JobMeasurements | None = None,
+        *,
+        lease: datetime | None = None,
     ) -> bool:
         """Stores the transcript, marks the job done, and reports whether it
         was the session's last job.
+
+        **`lease` is a fencing token, and without it this method is not
+        safe to call from more than one worker.** Nothing renews a lease
+        while a job runs, so a transcription that outlives
+        `lease_seconds` leaves its job claimable by a second worker while
+        the first is still decoding it -- and both then arrive here for the
+        same `job_id`. Before this parameter existed both completions
+        applied: each stored its own transcript over the other's, each
+        counted zero jobs remaining, and each reported the session's last
+        job, so the session's protocol was created twice from whichever
+        transcript happened to land last. Passing back the `claimed_at`
+        this job's claim returned is what tells the two apart -- a reclaim
+        overwrites it, so the worker that lost the job presents a value
+        the row no longer holds, and its completion is refused and counted
+        as `stale` rather than as `done`. A job that is already `done` or
+        `dead` is refused the same way, which is the same race in the other
+        order.
+
+        The token is optional because a caller that never claimed the job
+        has nothing to present: a test completing a `pending` row is not a
+        rival worker, and there is no claim for it to have lost. Every
+        production caller goes through `sturnus.application.worker.
+        process_one`, which always holds a `ClaimedJob` and always passes
+        its `claimed_at`.
 
         Being in one transaction does *not*, by itself, make the
         remaining-jobs count safe: under READ COMMITTED, this transaction
@@ -196,6 +433,21 @@ class JobQueue:
                 .order_by(TranscriptionJob.id)
                 .with_for_update()
             )
+
+            # Re-read *after* that lock, because the row this transaction
+            # loaded a moment ago is exactly what a rival worker may have
+            # been rewriting: the lock above covers this job too, so once
+            # it is held nothing else can be mid-completion of it, and a
+            # fresh read here is the last word on whose claim this is.
+            await session.refresh(job)
+            if not _claim_is_current(job, lease):
+                # Read before the rollback, which expires every attribute
+                # this object has and would send the report below back to
+                # a database it no longer has a transaction on.
+                status = job.status
+                await session.rollback()
+                _report_lost_claim(job_id, session_id, status)
+                return False
 
             job.transcript = transcript
             job.status = "done"
@@ -248,7 +500,9 @@ class JobQueue:
         record(JOB_OUTCOME, 1, outcome="done")
         return remaining == 0 and session_status == "closed"
 
-    async def fail(self, job_id: int, error: str, max_attempts: int) -> bool:
+    async def fail(
+        self, job_id: int, error: str, max_attempts: int, *, lease: datetime | None = None
+    ) -> bool:
         """Records the error and either returns the job to `pending` or, once
         `attempts` reaches `max_attempts`, marks it `dead`. Returns whether
         it is now dead.
@@ -260,10 +514,30 @@ class JobQueue:
         permanent loss from a retry -- `process_one` returns `True` for both
         -- and the distinction is the whole point of the outcome metric and
         of the `job.process` span's `outcome` attribute.
+
+        `lease` fences this exactly as it fences `complete`, and for a
+        worse failure. A worker whose lease expired mid-job, reporting a
+        failure it hit afterwards, would otherwise pull the job out from
+        under the worker that is decoding it right now -- back to
+        `pending` for a third worker to pick up in parallel, or, if this
+        was the last attempt, straight to `dead`: a recording written off
+        while a healthy worker was busy producing its transcript. A
+        refused failure changes nothing and reports "not dead", which is
+        the truth about a job somebody else still holds.
         """
         async with self._session_factory() as session:
-            job = await session.get(TranscriptionJob, job_id)
+            # Locked rather than merely read, so that a `complete` for this
+            # same job -- which holds a lock on every job of its session,
+            # this one included -- cannot be halfway through when the check
+            # below decides whose claim this is.
+            job = await session.get(TranscriptionJob, job_id, with_for_update=True)
             assert job is not None, f"job {job_id} does not exist"
+            if not _claim_is_current(job, lease):
+                # Read before the rollback expires them; see `complete`.
+                session_id, status = job.session_id, job.status
+                await session.rollback()
+                _report_lost_claim(job_id, session_id, status)
+                return False
             job.attempts += 1
             job.error = error
             job.status = "dead" if job.attempts >= max_attempts else "pending"

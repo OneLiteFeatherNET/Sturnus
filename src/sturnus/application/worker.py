@@ -135,12 +135,23 @@ class Queue(Protocol):
     type: the real job (`ClaimedJob`) lives in `sturnus.infrastructure.db.
     queue`, which this module must never import. `process_one` narrows the
     claimed value to `_ClaimedJobShape` with `cast` immediately after.
+
+    `lease` on `complete` and `fail` is the claim `process_one` is holding,
+    handed back so the queue can refuse a worker whose job has since been
+    taken over by another one -- see `sturnus.infrastructure.db.queue.
+    JobQueue.complete`. `process_one` always has one, so it always passes
+    one.
     """
 
     async def claim(self) -> object | None: ...
 
     async def complete(
-        self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+        self,
+        job_id: int,
+        transcript: str,
+        measurements: JobMeasurements | None = None,
+        *,
+        lease: datetime | None = None,
     ) -> bool: ...
 
     #: Returns whether the job is now **dead** -- out of attempts, so this
@@ -148,7 +159,9 @@ class Queue(Protocol):
     #: try. Only the queue can answer that, because only the queue counts
     #: the attempts, and without the answer a caller cannot tell permanent
     #: loss from an ordinary retry: `process_one` returns `True` for both.
-    async def fail(self, job_id: int, error: str, max_attempts: int) -> bool: ...
+    async def fail(
+        self, job_id: int, error: str, max_attempts: int, *, lease: datetime | None = None
+    ) -> bool: ...
 
 
 class AudioDownloader(Protocol):
@@ -282,6 +295,9 @@ class _ClaimedJobShape(Protocol):
     s3_key: str
     encryption_key_id: str
     wrapped_data_key: bytes
+    #: When this claim was stamped, and the token that proves the job is
+    #: still this worker's when it reports back.
+    claimed_at: datetime
     #: `None` for every job nobody asked a question about, which is
     #: almost all of them.
     requested_model: str | None
@@ -577,7 +593,7 @@ async def process_one(
                     stage="transcribe",
                     max_attempts=max_attempts,
                 )
-                await queue.fail(job.id, str(exc), max_attempts)
+                await queue.fail(job.id, str(exc), max_attempts, lease=job.claimed_at)
                 return True
 
             wall_seconds = time.monotonic() - started
@@ -618,8 +634,14 @@ async def process_one(
             # the wrong number for the database -- on a track whose speaker
             # fell silent halfway through it is nowhere near the length of
             # the recording.
+            # `lease` is this worker's claim, handed back so the queue can
+            # refuse the write if the job was taken over while it ran. A
+            # transcription that outlives the lease is not an error and is
+            # not rare on a long track; what must not happen is two workers
+            # each storing a transcript for it and each reporting the
+            # session's last job, which creates the protocol twice.
             is_last = await queue.complete(
-                job.id, serialize_transcript(result), result.measurements
+                job.id, serialize_transcript(result), result.measurements, lease=job.claimed_at
             )
         except Exception as exc:
             # Everything other than the transcription failure already
@@ -643,7 +665,7 @@ async def process_one(
                 stage="pipeline",
                 max_attempts=max_attempts,
             )
-            await queue.fail(job.id, str(exc), max_attempts)
+            await queue.fail(job.id, str(exc), max_attempts, lease=job.claimed_at)
             return True
     finally:
         # Runs whether processing succeeded, the transcription failed, or

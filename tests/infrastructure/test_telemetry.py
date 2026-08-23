@@ -10,6 +10,7 @@ between a control and a comment.
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Any
 
 import pytest
@@ -104,13 +105,20 @@ def test_the_whole_worker_pipeline_runs_with_no_collector() -> None:
             return None
 
         async def complete(
-            self, job_id: int, transcript: str, measurements: JobMeasurements | None = None
+            self,
+            job_id: int,
+            transcript: str,
+            measurements: JobMeasurements | None = None,
+            *,
+            lease: datetime | None = None,
         ) -> bool:
-            del job_id, transcript, measurements
+            del job_id, transcript, measurements, lease
             raise AssertionError("not reached: the queue is empty")
 
-        async def fail(self, job_id: int, error: str, max_attempts: int) -> bool:
-            del job_id, error, max_attempts
+        async def fail(
+            self, job_id: int, error: str, max_attempts: int, *, lease: datetime | None = None
+        ) -> bool:
+            del job_id, error, max_attempts, lease
             raise AssertionError("not reached: the queue is empty")
 
     import asyncio
