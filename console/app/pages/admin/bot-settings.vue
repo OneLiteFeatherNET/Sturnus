@@ -17,7 +17,32 @@
  *   Discord `/config` replies were built to stop telling.
  * - **It never offers an action it knows will fail.** A required key has
  *   no clear control at all, only the sentence saying why.
+ *
+ * Four of the keys hold ids rather than words, and for those the page asks
+ * the API for the guild's mirror of Discord and for Outline's collections
+ * and offers a picker over names — see `~/utils/directory`. The id is
+ * still the value; the picker only spares somebody the copy-paste. Both of
+ * those endpoints are decoration: if either one refuses, the keys it
+ * served fall back to the text input this page has always had, with one
+ * sentence saying why. A configuration page that cannot be used because a
+ * name list is down would be worse than one that asks for ids.
  */
+import {
+  type Choice,
+  addToIdList,
+  blankOption,
+  channelChoices,
+  controlKind,
+  idListHas,
+  mirrorFreshness,
+  parseCollections,
+  parseDirectory,
+  removeFromIdList,
+  singleChoices,
+  type ControlKind,
+  type Freshness,
+  type NamedRow,
+} from '~/utils/directory'
 import {
   type SettingView,
   type WriteOutcome,
@@ -99,6 +124,53 @@ const views = computed(() =>
 const missing = computed(() => missingRequired(views.value))
 const currentGuild = computed(() => guilds.value.find((guild) => guild.id === selected.value) ?? null)
 
+/* -------------------------------------------------------------------- */
+/* The names behind the ids                                              */
+/* -------------------------------------------------------------------- */
+
+// Both of these are allowed to fail. `useAsyncData` puts a rejection in
+// its `error` rather than throwing, which is the whole reason the page can
+// treat a missing endpoint as "no pickers today" instead of as a page that
+// does not render. The guild travels with the rows for the same reason it
+// does above: a channel list belonging to the other server is worse than
+// no channel list.
+const { data: directoryData, error: directoryError } = await useAsyncData(
+  'settings-directory',
+  async () => {
+    const guildId = selected.value
+    if (!guildId) return null
+    return { guildId, mirror: parseDirectory(await api(`/guilds/${guildId}/directory`)) }
+  },
+  { watch: [selected] },
+)
+
+const { data: collectionData, error: collectionError } = await useAsyncData(
+  'settings-collections',
+  async () => parseCollections(await api('/outline/collections')),
+)
+
+const mirror = computed(() =>
+  directoryData.value && directoryData.value.guildId === selected.value
+    ? directoryData.value.mirror
+    : null,
+)
+const collections = computed(() => collectionData.value ?? null)
+
+/** The clock arrives on mount and not before. A server render that
+ *  computed an age and a browser render a second later would disagree
+ *  about the text of the same paragraph, which Vue reports as a hydration
+ *  mismatch — so until this is set the freshness sentence names the
+ *  instant and no age, in both renders. */
+const now = ref<number | null>(null)
+onMounted(() => {
+  now.value = Date.now()
+})
+
+/** The keys whose picker somebody has stepped around. A mirror can be
+ *  stale, and an administrator who knows the id must not be locked out by
+ *  a list that has not caught up. */
+const manual = ref<Record<string, boolean>>({})
+
 /** The key whose confirmation panel is open, and what it would do. */
 const confirming = ref<{ key: string; action: 'save' | 'clear' } | null>(null)
 
@@ -119,6 +191,9 @@ watch(selected, () => {
   failures.value = {}
   outcomes.value = {}
   confirming.value = null
+  // A picker stepped around on one server says nothing about the next
+  // one, whose mirror may be perfectly current.
+  manual.value = {}
 })
 // A reload must not throw away an edit somebody is in the middle of, so
 // only keys with no draft yet are seeded. The key that was just written is
@@ -135,6 +210,98 @@ watch(
 )
 
 const edited = (view: SettingView) => (drafts.value[view.key] ?? '') !== (view.value ?? '')
+
+/** Whether the mirror has anything to offer for this key at all. An empty
+ *  list is not a picker: a select with no options says "this server has no
+ *  roles", which is a claim, and the wrong one. */
+function pickerAvailable(view: SettingView): boolean {
+  const wanted = controlKind(view)
+  if (wanted === 'plain') return false
+  if (wanted === 'collection') return (collections.value?.collections.length ?? 0) > 0
+  const rows = wanted === 'channels' ? mirror.value?.channels : mirror.value?.roles
+  return (rows?.length ?? 0) > 0
+}
+
+/** Which control a key actually gets, as opposed to which one it deserves.
+ *  `plain` is the text input or textarea this page has always had, and it
+ *  is where every key ends up when the names cannot be had. */
+function control(view: SettingView): ControlKind {
+  if (manual.value[view.key] || !pickerAvailable(view)) return 'plain'
+  return controlKind(view)
+}
+
+/** True while a key would have had a picker, whether or not it got one. */
+const wantsPicker = (view: SettingView) => controlKind(view) !== 'plain'
+
+function rowsFor(view: SettingView): NamedRow[] {
+  if (controlKind(view) === 'collection') return collections.value?.collections ?? []
+  return mirror.value?.roles ?? []
+}
+
+const channelsFor = (view: SettingView) =>
+  channelChoices(mirror.value?.channels ?? [], drafts.value[view.key] ?? '')
+
+const singleFor = (view: SettingView) => singleChoices(rowsFor(view), drafts.value[view.key] ?? '')
+
+const currentFor = (view: SettingView): Choice | null => singleFor(view).current
+
+function toggleChannel(view: SettingView, id: string, chosen: boolean) {
+  const raw = drafts.value[view.key] ?? ''
+  // Only a real add or remove rewrites the value. `10, 11` and `10,11`
+  // configure the same two channels, and canonicalising one into the other
+  // on sight would make opening this page look like an unsaved edit.
+  drafts.value[view.key] = chosen ? addToIdList(raw, id) : removeFromIdList(raw, id)
+}
+
+/**
+ * Why a key that should have had a picker is showing a text field.
+ *
+ * Three different sentences, because they ask for three different things:
+ * a failed request is somebody's to look into, an unswept mirror resolves
+ * itself, and a mirror that swept and found nothing is a server that has
+ * no such rows at all.
+ */
+function fallbackNote(view: SettingView): Freshness {
+  if (controlKind(view) === 'collection') {
+    if (collectionError.value) {
+      return { key: 'admin.settings.collectionsUnavailable', params: {}, stale: true }
+    }
+    return collections.value?.syncedAt
+      ? { key: 'admin.settings.mirrorEmpty', params: {}, stale: true }
+      : mirrorFreshness(null, now.value)
+  }
+  if (directoryError.value) {
+    return { key: 'admin.settings.directoryUnavailable', params: {}, stale: true }
+  }
+  return mirror.value?.syncedAt
+    ? { key: 'admin.settings.mirrorEmpty', params: {}, stale: true }
+    : mirrorFreshness(null, now.value)
+}
+
+/**
+ * The sentence under a control, as a list of nought or one.
+ *
+ * A list rather than a nullable value so the template can `v-for` over it:
+ * `$t` needs the key and its arguments together, and a template that had
+ * to assert a value is not null three times to render one paragraph is a
+ * template nobody edits twice.
+ *
+ * A picker always says how fresh its list is. A field that would have been
+ * a picker says why it is not. A picker somebody has deliberately stepped
+ * around says what typing an id here means.
+ */
+function mirrorNotes(view: SettingView): Freshness[] {
+  if (!wantsPicker(view)) return []
+  if (manual.value[view.key]) {
+    return pickerAvailable(view)
+      ? [{ key: 'admin.settings.manualNote', params: {}, stale: false }]
+      : [fallbackNote(view)]
+  }
+  if (control(view) === 'plain') return [fallbackNote(view)]
+  const at
+    = controlKind(view) === 'collection' ? collections.value?.syncedAt : mirror.value?.syncedAt
+  return [mirrorFreshness(at ?? null, now.value)]
+}
 
 /** The client-side objection to what is currently typed, if any. Shown
  *  while it is typed rather than after Save, which is the whole point of
@@ -371,8 +538,93 @@ const TONE_COLOUR: Record<string, string> = {
             </span>
           </header>
 
+          <!-- A picker over names, for the keys that hold ids. The value
+               written is still the id: the checkbox list serialises back
+               into the same comma-separated string `voice_channel_ids` has
+               always held, and the selects hand over one id each. -->
+          <div
+            v-if="control(view) === 'channels'"
+            role="group"
+            :aria-label="keyLabel(view.key)"
+            class="max-h-64 overflow-y-auto rounded-lg border p-2"
+            :style="{ borderColor: 'var(--border)', background: 'var(--surface-raised)' }"
+          >
+            <fieldset
+              v-for="(group, index) in channelsFor(view).groups"
+              :key="`${group.kind}-${index}`"
+              class="mb-3 last:mb-0"
+            >
+              <!-- A kind this console has no word for is rendered as the
+                   kind Discord called it. Dropping the group would hide a
+                   recordable channel and say nothing about it. -->
+              <legend
+                class="mb-1 text-xs font-medium uppercase tracking-wide"
+                :style="{ color: group.unresolved ? 'var(--color-brand-yellow)' : 'var(--text-muted)' }"
+              >
+                {{ group.labelKey ? $t(group.labelKey) : group.raw }}
+              </legend>
+              <label
+                v-for="choice in group.choices"
+                :key="choice.id"
+                class="flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 hover:bg-[var(--surface)]"
+              >
+                <input
+                  type="checkbox"
+                  class="mt-1 shrink-0"
+                  :checked="idListHas(drafts[view.key] ?? '', choice.id)"
+                  :disabled="busy[view.key]"
+                  @change="toggleChannel(view, choice.id, ($event.target as HTMLInputElement).checked)"
+                >
+                <span class="min-w-0">
+                  <span class="block break-words text-sm">{{ choice.label }}</span>
+                  <code
+                    class="block break-all font-mono text-xs"
+                    :style="{ color: 'var(--text-muted)' }"
+                    >{{ choice.id }}</code
+                  >
+                </span>
+              </label>
+            </fieldset>
+          </div>
+
+          <!-- `:value` and `@change` rather than `v-model`: the option
+               values are the ids the mirror holds, and a stored value with
+               a stray space would match none of them and leave the select
+               showing the first role as though it were configured. -->
+          <select
+            v-else-if="control(view) === 'role' || control(view) === 'collection'"
+            :aria-label="keyLabel(view.key)"
+            :disabled="busy[view.key]"
+            class="w-full rounded-lg border px-3 py-2 text-sm"
+            :style="{
+              borderColor: 'var(--border)',
+              background: 'var(--surface-raised)',
+              color: 'var(--text)',
+            }"
+            :value="currentFor(view)?.id ?? ''"
+            @change="drafts[view.key] = ($event.target as HTMLSelectElement).value"
+          >
+            <!-- "Not set" is offered only where an empty value is one the
+                 API accepts. For a required or integer key it is a
+                 placeholder that disappears once something is chosen --
+                 this page does not offer an action it knows will fail. -->
+            <option
+              v-if="blankOption(view, currentFor(view)) === 'placeholder'"
+              value=""
+              disabled
+            >
+              {{ $t('admin.settings.choose') }}
+            </option>
+            <option v-else-if="blankOption(view, currentFor(view)) === 'offer'" value="">
+              {{ $t('admin.settings.notSet') }}
+            </option>
+            <option v-for="choice in singleFor(view).choices" :key="choice.id" :value="choice.id">
+              {{ choice.label }}
+            </option>
+          </select>
+
           <textarea
-            v-if="inputKind(view) === 'multiline'"
+            v-else-if="inputKind(view) === 'multiline'"
             v-model="drafts[view.key]"
             :aria-label="keyLabel(view.key)"
             :disabled="busy[view.key]"
@@ -403,6 +655,57 @@ const TONE_COLOUR: Record<string, string> = {
             }"
           >
 
+          <!-- The id under the name, in the same monospace face the key
+               itself is rendered in. The name is what a human recognises;
+               the id is what is stored, and it stays on screen so that the
+               two are never in doubt. -->
+          <template v-if="control(view) === 'channels'">
+            <p class="mt-1.5 text-xs" :style="{ color: 'var(--text-muted)' }">
+              <template v-if="channelsFor(view).selected.length === 0">
+                {{ $t('admin.settings.noChannelsChosen') }}
+              </template>
+              <template v-else>
+                {{ $t('admin.settings.chosenIds') }}
+                <code
+                  v-for="choice in channelsFor(view).selected"
+                  :key="choice.id"
+                  class="ml-1 inline-block break-all rounded bg-[var(--surface-raised)] px-1 font-mono"
+                  >{{ choice.id }}</code
+                >
+              </template>
+            </p>
+            <!-- A chosen channel the mirror has no row for. Said out loud
+                 rather than left as a tick beside a bare number: it is a
+                 configuration problem, and this is the only page that can
+                 show it. -->
+            <p
+              v-if="channelsFor(view).selected.some((choice) => !choice.resolved)"
+              class="mt-1.5 text-xs"
+              :style="{ color: 'var(--color-brand-yellow)' }"
+            >
+              {{ $t('admin.settings.unresolvedChannel') }}
+            </p>
+          </template>
+
+          <template v-else-if="control(view) === 'role' || control(view) === 'collection'">
+            <p v-if="currentFor(view)" class="mt-1.5 text-xs" :style="{ color: 'var(--text-muted)' }">
+              <code class="break-all rounded bg-[var(--surface-raised)] px-1 font-mono">{{
+                currentFor(view)?.id
+              }}</code>
+            </p>
+            <p
+              v-if="currentFor(view) && currentFor(view)?.resolved === false"
+              class="mt-1.5 text-xs"
+              :style="{ color: 'var(--color-brand-yellow)' }"
+            >
+              {{
+                control(view) === 'collection'
+                  ? $t('admin.settings.unresolvedCollection')
+                  : $t('admin.settings.unresolvedRole')
+              }}
+            </p>
+          </template>
+
           <p
             v-for="hint in fieldHints(view)"
             :key="hint"
@@ -418,6 +721,36 @@ const TONE_COLOUR: Record<string, string> = {
             :style="{ color: 'var(--color-brand-yellow)' }"
           >
             {{ liveIssue(view) }}
+          </p>
+
+          <!-- How fresh the list is, or why there is no list. A picker
+               that silently offered a copy of last week is how somebody
+               configures a channel that was deleted on Tuesday. -->
+          <p
+            v-for="note in mirrorNotes(view)"
+            :key="note.key"
+            class="mt-1.5 text-xs"
+            :style="{ color: note.stale ? 'var(--color-brand-yellow)' : 'var(--text-muted)' }"
+          >
+            {{ $t(note.key, note.params) }}
+          </p>
+
+          <!-- The way past the picker. A mirror can be behind Discord, and
+               an administrator who already knows the id must not be locked
+               out by a list that has not caught up. -->
+          <p v-if="pickerAvailable(view)" class="mt-1.5 text-xs">
+            <button
+              type="button"
+              class="underline underline-offset-2 transition-colors hover:text-[var(--text)]"
+              :style="{ color: 'var(--text-muted)' }"
+              @click="manual[view.key] = !manual[view.key]"
+            >
+              {{
+                manual[view.key]
+                  ? $t('admin.settings.backToPicker')
+                  : $t('admin.settings.enterIdManually')
+              }}
+            </button>
           </p>
 
           <div class="mt-3 flex flex-wrap items-center gap-2">

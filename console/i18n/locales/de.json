@@ -460,6 +460,31 @@
         "fromOne": "{count} Aufnahme mit dieser Stimme fällt auf {when} oder danach. Gelöscht wurde sie nicht.",
         "fromMany": "{count} Aufnahmen mit dieser Stimme fallen auf {when} oder danach. Gelöscht wurde keine davon."
       }
+    },
+    "settings": {
+      "kindVoice": "Sprachkanäle",
+      "kindStage": "Bühnenkanäle",
+      "kindText": "Textkanäle",
+      "kindUnknown": "Kanäle ohne angegebene Art",
+      "kindUnresolved": "Eingetragen, aber nicht in der Kopie",
+      "mirrorSynced": "Diese Namen stammen aus der Kopie, die Sturnus am {moment} von diesem Server angelegt hat.",
+      "mirrorSyncedAgo": "Diese Namen stammen aus der Kopie, die Sturnus am {moment} von diesem Server angelegt hat, vor {age}.",
+      "mirrorStale": "Diese Namen stammen aus der Kopie, die Sturnus am {moment} angelegt hat — vor {age}. Was seitdem in Discord umbenannt oder entfernt wurde, steht hier nicht.",
+      "mirrorNeverSwept": "Sturnus hat diesen Server noch nicht aus Discord kopiert, deshalb gibt es hier nichts zur Auswahl. Die ID von Hand eintragen, oder den nächsten Abgleich des Bots abwarten.",
+      "mirrorSyncUnreadable": "Sturnus hat für den letzten Abgleich einen Zeitpunkt gemeldet, den diese Konsole nicht lesen kann. Wie aktuell diese Namen sind, ist damit unbekannt.",
+      "mirrorEmpty": "Sturnus hat eine Kopie dieses Servers, darin aber nichts für diesen Schlüssel gefunden. Der Schlüssel fragt deshalb weiterhin nach einer ID.",
+      "directoryUnavailable": "Die Kanal- und Rollennamen konnten nicht gelesen werden. Dieser Schlüssel fragt deshalb wie bisher nach einer ID; alles Übrige auf dieser Seite funktioniert unverändert.",
+      "collectionsUnavailable": "Die Outline-Sammlungen konnten nicht gelesen werden. Dieser Schlüssel fragt deshalb wie bisher nach einer Sammlungs-ID.",
+      "unresolvedChannel": "Zu einer der IDs oben gibt es in der Kopie keinen Kanal. Möglicherweise in Discord entfernt, möglicherweise ist die Kopie noch nicht nachgezogen — eingetragen ist sie so oder so.",
+      "unresolvedRole": "Zu dieser ID gibt es in der Kopie keine Rolle. Möglicherweise in Discord entfernt, möglicherweise ist die Kopie noch nicht nachgezogen — eingetragen ist sie so oder so.",
+      "unresolvedCollection": "Zu dieser ID gibt es in der Kopie keine Sammlung. Möglicherweise in Outline entfernt, möglicherweise ist die Kopie noch nicht nachgezogen — eingetragen ist sie so oder so.",
+      "enterIdManually": "ID von Hand eintragen",
+      "backToPicker": "Stattdessen aus der Liste wählen",
+      "manualNote": "Wird genau so gespeichert, wie eingetragen. Die Liste kennt nur, was die letzte Kopie gefunden hat.",
+      "choose": "Bitte auswählen",
+      "notSet": "Nicht gesetzt",
+      "noChannelsChosen": "Kein Kanal ausgewählt. Solange das so bleibt, nimmt Sturnus auf diesem Server nichts auf.",
+      "chosenIds": "Gespeichert als"
     }
   }
 }
