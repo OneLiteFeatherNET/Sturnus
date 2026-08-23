@@ -61,14 +61,19 @@ sentences by hand, and three helpers exist only to serve them:
 in `utils/duration.ts`. Each says so in its own comment. They go when the
 last of those three pages is translated.
 
-`admin.consents.*` is the exception, and it is half-populated on purpose. The
-page it serves is still English prose, because the whole administrative area
-is and converting it belongs to the sweep that converts all four admin pages
-together. What is already keyed there is the material the effective-instant
-work added — the withdrawal's effective moment, and the scope on a roster
-row — so that the sweep has less to do rather than more. New strings on that
-page go through `$t` from now on; the existing ones move when the sweep
-reaches them.
+`admin.settings.*` is a partial exception. The name pickers on the bot
+settings page were written against this convention from the start, while the
+sentences that page had before them are still hard-coded English awaiting
+their own conversion.
+
+`admin.consents.*` is another exception, and it is half-populated on purpose.
+The page it serves is still English prose, because the whole administrative
+area is and converting it belongs to the sweep that converts all four admin
+pages together. What is already keyed there is the material the
+effective-instant work added — the withdrawal's effective moment, and the
+scope on a roster row — so that the sweep has less to do rather than more.
+New strings on that page go through `$t` from now on; the existing ones move
+when the sweep reaches them.
 
 `settings.consent.*` sits under `settings.*` rather than in a namespace of
 its own, because it is a section of that page and not a page. It is the one

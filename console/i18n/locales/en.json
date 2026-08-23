@@ -460,6 +460,31 @@
         "fromOne": "{count} recording containing their audio falls on or after {when}. It was not deleted.",
         "fromMany": "{count} recordings containing their audio fall on or after {when}. None of them were deleted."
       }
+    },
+    "settings": {
+      "kindVoice": "Voice channels",
+      "kindStage": "Stage channels",
+      "kindText": "Text channels",
+      "kindUnknown": "Channels of no stated kind",
+      "kindUnresolved": "Configured, but not in the copy",
+      "mirrorSynced": "These names come from the copy Sturnus made of this server at {moment}.",
+      "mirrorSyncedAgo": "These names come from the copy Sturnus made of this server at {moment}, {age} ago.",
+      "mirrorStale": "These names come from the copy Sturnus made of this server at {moment} — {age} ago. Anything renamed or deleted in Discord since then is not shown here.",
+      "mirrorNeverSwept": "Sturnus has not copied this server from Discord yet, so there is nothing to choose from. Enter the id by hand, or wait for the bot's next sweep.",
+      "mirrorSyncUnreadable": "Sturnus reported a time for its last sweep that this console cannot read, so how current these names are is not known.",
+      "mirrorEmpty": "Sturnus has a copy of this server and found nothing in it for this key, so this key still asks for an id.",
+      "directoryUnavailable": "The channel and role names could not be read, so this key asks for an id, as it always did. Everything else on this page works as it always did too.",
+      "collectionsUnavailable": "The Outline collections could not be read, so this key asks for a collection id, as it always did.",
+      "unresolvedChannel": "One of the ids above matches no channel in the copy. It may have been deleted in Discord, or the copy may not have caught up — either way it is still what Sturnus is configured with.",
+      "unresolvedRole": "This id matches no role in the copy. It may have been deleted in Discord, or the copy may not have caught up — either way it is still what Sturnus is configured with.",
+      "unresolvedCollection": "This id matches no collection in the copy. It may have been deleted in Outline, or the copy may not have caught up — either way it is still what Sturnus is configured with.",
+      "enterIdManually": "Enter an id by hand",
+      "backToPicker": "Choose from the list instead",
+      "manualNote": "Stored exactly as typed. The list only knows what the last copy found.",
+      "choose": "Choose one",
+      "notSet": "Not set",
+      "noChannelsChosen": "No channel chosen. Sturnus records nothing in this server until at least one is.",
+      "chosenIds": "Stored as"
     }
   }
 }
