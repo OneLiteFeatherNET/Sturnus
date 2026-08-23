@@ -171,3 +171,35 @@ describe('a page whose translations never arrived', () => {
     expect(translateOr(t, 'error.status', 'Status 500', { code: 500 })).toBe('error.status:500')
   })
 })
+
+/**
+ * The third failure: a key that is in the file and not in the object.
+ *
+ * `JSON.parse` keeps the last of two identically-named siblings and drops
+ * the first without a word. Every check above runs against the parsed
+ * object, so a file carrying two `"admin"` blocks passes all of them --
+ * the shadowed block is simply not there to be compared, and if both
+ * locales were corrupted the same way they still agree with each other.
+ * Lint, typecheck and build are equally blind to it.
+ *
+ * That is not hypothetical. Rebasing the console pull requests onto one
+ * another produced exactly it: git's line-based merge is happy to place
+ * two `"dashboard"` objects in one file, and a whole namespace stopped
+ * existing at runtime while this suite stayed green.
+ *
+ * Re-serialising catches it, because a dropped key comes back shorter. It
+ * also pins the files to the shape a tool writes -- two-space indent,
+ * insertion order, one trailing newline -- which is what lets them be
+ * merged structurally rather than textually the next time two branches
+ * both add keys.
+ */
+describe('the locale files say everything they contain', () => {
+  it.each(['en', 'de'])(
+    '%s.json is exactly what re-serialising it produces',
+    (locale) => {
+      const text = readFileSync(resolve(process.cwd(), `i18n/locales/${locale}.json`), 'utf8')
+
+      expect(`${JSON.stringify(JSON.parse(text), null, 2)}\n`).toBe(text)
+    },
+  )
+})
