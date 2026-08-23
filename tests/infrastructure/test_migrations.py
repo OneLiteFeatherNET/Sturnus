@@ -31,6 +31,11 @@ EXPECTED_TABLES = {
     "guild_role",
     "guild_member",
     "outline_collection",
+    "guild",
+    "guild_export_target",
+    "session_document",
+    "guild_oauth_client",
+    "guild_setup_intent",
 }
 
 

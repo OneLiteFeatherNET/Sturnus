@@ -14,12 +14,15 @@ reads and the database writes, for the same reason it does there: every
 case that matters is a decision, and none of them needs a Discord
 connection to exercise.
 
-**The three things carried, and why those three.** Channels and roles
+**The four things carried, and why those four.** Channels and roles
 because they are what `voice_channel_id`, `consent_role_id` and
 `admin_role_id` point at. Members because a consent roster, the speakers
 in a queue and an administrator list all name people -- but only the
 holders of the consent role and the admin role, never the guild's whole
-membership. See `members_to_mirror`.
+membership. See `members_to_mirror`. And the guild's own name, which was
+the one thing nobody mirrored and the one that appears on every admin
+page: `GET /api/guilds` could answer with ids alone, so every guild
+switcher in the console renders "Server 1289374650912837465".
 
 **Skip versus clear, again.** `admin_mirror` draws the distinction for
 one role; the same distinction applies here and means the same thing. A
@@ -43,6 +46,27 @@ from enum import Enum
 #: ignores rather than a failed write that takes the sweep with it.
 VOICE = "voice"
 TEXT = "text"
+
+
+@dataclass(frozen=True, slots=True)
+class MirroredGuild:
+    """The name of the guild itself, which nothing mirrored until now.
+
+    `guild_channel`, `guild_role` and `guild_member` all existed; the
+    guild did not. So `GET /api/guilds` had nothing but ids to answer
+    with, and every guild switcher on every admin page renders
+    "Server 1289374650912837465" -- the exact complaint the mirrors were
+    built to end, left standing on the one name that appears on every
+    page.
+
+    `icon_url` is carried because the sweep that reads the name has it in
+    the same object and dropping it would mean coming back for it. Null
+    for a guild with no icon, which is ordinary.
+    """
+
+    guild_id: int
+    name: str
+    icon_url: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
