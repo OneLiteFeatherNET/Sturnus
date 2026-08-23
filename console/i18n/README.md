@@ -38,7 +38,7 @@ matches the file that renders it:
 | ------------------ | --------------------------------------------------- |
 | `common.*`         | Strings with no single home — the product name, a duration |
 | `nav.*`            | `utils/navigation.ts`, `AppSidebar`, the header burger |
-| `auth.*`           | `pages/sign-in.vue`, signing out                     |
+| `auth.*`           | `pages/sign-in.vue`, `pages/g/[slug]/sign-in.vue`, signing out |
 | `error.*`          | `error.vue`                                          |
 | `dashboard.*`      | `pages/index.vue`, `utils/format.ts`                 |
 | `recordings.*`     | `pages/recordings/*` and the components under them   |
@@ -46,6 +46,7 @@ matches the file that renders it:
 | `settings.*`       | `pages/settings.vue` — a person's own settings        |
 | `admin.settings.*` | `pages/admin/bot-settings.vue`                        |
 | `admin.destinations.*` | `pages/admin/destinations.vue`, `utils/exportTargets.ts`, the two `ExportTarget*` components |
+| `admin.signInLink.*` | `pages/admin/sign-in-link.vue`, `utils/oauthClient.ts`, the two `SignInClient*` components |
 | `admin.consents.*` | `pages/admin/consents.vue`                            |
 | `admin.queue.*`    | `pages/admin/queue.vue`                               |
 | `admin.reporting.*`| `pages/admin/reporting.vue`                           |
@@ -84,6 +85,15 @@ for the sweep to reach. Three of its strings are not in it — a format's
 name (`common.formatOutline` and its two neighbours) lives in `common.*`,
 because the recording page has to say the same three words beside a
 published document and two copies of a word are two words that drift.
+
+`admin.signInLink.*` is complete from the start on the same terms, and for
+the same reason: `/admin/sign-in-link` is a new page and never had any
+hard-coded English for the sweep to reach. The page a guild's link points
+at is **not** in it — `/g/{slug}/sign-in` is keyed under `auth.*`, beside
+the deployment's own sign-in page, because the two are the same screen for
+the same act and a reader who has been sent to one of them has no way to
+tell which. A namespace named after an administrative page would put those
+two sentences in different files and let them drift apart.
 
 `admin.queue.*` is half-populated on the same terms. The Queue page's older
 prose — its four lifecycle notes, its three caveats, its per-row state

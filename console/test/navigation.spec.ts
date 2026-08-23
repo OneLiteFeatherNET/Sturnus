@@ -174,9 +174,15 @@ describe('who is offered the Admin View', () => {
     // it became a page, and `document_target` is still the fallback for a
     // guild that configures nothing here. Two adjacent entries is what
     // stops them reading as rival settings.
+    //
+    // The sign-in link sits third, closing the run of three that configure
+    // a guild, and next to Bot Settings for the same kind of reason: what a
+    // guild's own OAuth client decides is who gets a session, and
+    // `admin_role_id` over there decides who may then reach any of this.
     expect(ADMIN_VIEW.entries.map((e) => e.labelKey)).toEqual([
       'nav.botSettings',
       'nav.destinations',
+      'nav.signInLink',
       'nav.consents',
       'nav.queue',
       'nav.reporting',
