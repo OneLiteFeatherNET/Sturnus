@@ -1,5 +1,31 @@
 # Changelog
 
+## [0.16.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.15.0...v0.16.0) (2026-08-23)
+
+
+### Features
+
+* **api:** let a guild be set up from the console, by asking the bot to do it ([#149](https://github.com/OneLiteFeatherNET/Sturnus/issues/149)) ([67b02e9](https://github.com/OneLiteFeatherNET/Sturnus/commit/67b02e9a54a15b4307ad7f6fcdbc852f5c402610))
+* **api:** let a guild bring its own sign-in ([#147](https://github.com/OneLiteFeatherNET/Sturnus/issues/147)) ([b831c05](https://github.com/OneLiteFeatherNET/Sturnus/commit/b831c05ae84a253ec919b49841f4c0fb2e86dd68))
+* **api:** let a recording carry its own words, name and measurements ([#142](https://github.com/OneLiteFeatherNET/Sturnus/issues/142)) ([1f6918f](https://github.com/OneLiteFeatherNET/Sturnus/commit/1f6918fa9188476add7aa60c5eede474a0145cf4))
+* **api:** let an administrator download a recording, once a guild says its policy covers it ([#132](https://github.com/OneLiteFeatherNET/Sturnus/issues/132)) ([1315f7e](https://github.com/OneLiteFeatherNET/Sturnus/commit/1315f7e7bf0d698f35938b47d910dd8e52f6c525))
+* **api:** let an administrator say what the queue should do first ([#145](https://github.com/OneLiteFeatherNET/Sturnus/issues/145)) ([7f4f17d](https://github.com/OneLiteFeatherNET/Sturnus/commit/7f4f17d25c855a9643f7d037129f8fc2b9e63402))
+* **api:** let the console call a server by its name ([#140](https://github.com/OneLiteFeatherNET/Sturnus/issues/140)) ([bd0d8d2](https://github.com/OneLiteFeatherNET/Sturnus/commit/bd0d8d2706294e75e3b7fba860df2653d2234597))
+* **api:** name the transcription models, and who may choose one ([#131](https://github.com/OneLiteFeatherNET/Sturnus/issues/131)) ([1b7e832](https://github.com/OneLiteFeatherNET/Sturnus/commit/1b7e83212a09c92cf6db798d27d0f848dc5ba0b0))
+* **api:** serve a guild's consent roster a page at a time, and withdraw several at once ([#139](https://github.com/OneLiteFeatherNET/Sturnus/issues/139)) ([4d2e809](https://github.com/OneLiteFeatherNET/Sturnus/commit/4d2e80989828f4cbe449871b52964ee77f29b13b))
+* **api:** the tables this round's features all need ([#137](https://github.com/OneLiteFeatherNET/Sturnus/issues/137)) ([da7833d](https://github.com/OneLiteFeatherNET/Sturnus/commit/da7833d27a36f9d62a346c2f3744f69a0ac56b4a))
+* **bot:** let one process hold several gateway shards ([#135](https://github.com/OneLiteFeatherNET/Sturnus/issues/135)) ([b478453](https://github.com/OneLiteFeatherNET/Sturnus/commit/b47845308ca0dd7598c23a52c219d9b788516a2c))
+* **console:** build the controls this console keeps re-inventing ([#133](https://github.com/OneLiteFeatherNET/Sturnus/issues/133)) ([4464d9a](https://github.com/OneLiteFeatherNET/Sturnus/commit/4464d9a26a6553039b7ddebc86c1da6656564e30))
+* **console:** give one recording the room to be several things ([#148](https://github.com/OneLiteFeatherNET/Sturnus/issues/148)) ([02c9bd6](https://github.com/OneLiteFeatherNET/Sturnus/commit/02c9bd688e29745bccafb3371e50848955f8e9f5))
+* **console:** group a guild's settings by what they are for ([#138](https://github.com/OneLiteFeatherNET/Sturnus/issues/138)) ([9d52570](https://github.com/OneLiteFeatherNET/Sturnus/commit/9d52570b72c884153536aed4f864f59a5c982992))
+* **console:** let a guild say where its protocols should go ([#150](https://github.com/OneLiteFeatherNET/Sturnus/issues/150)) ([364eb29](https://github.com/OneLiteFeatherNET/Sturnus/commit/364eb29b80e53f9fe7415976a358ef442125ac76))
+* **console:** let an administrator work a long queue ([#151](https://github.com/OneLiteFeatherNET/Sturnus/issues/151)) ([f32d46f](https://github.com/OneLiteFeatherNET/Sturnus/commit/f32d46f9718794a6b786ca22464577fe461449c9))
+* **console:** make the consent roster a list somebody can work through ([#143](https://github.com/OneLiteFeatherNET/Sturnus/issues/143)) ([5f3345e](https://github.com/OneLiteFeatherNET/Sturnus/commit/5f3345e8421654b3c1b1230def9da8af99d47d4a))
+* **console:** make the recordings list a list again ([#141](https://github.com/OneLiteFeatherNET/Sturnus/issues/141)) ([a6e09fb](https://github.com/OneLiteFeatherNET/Sturnus/commit/a6e09fb2a986e998359b52a6d0206231e0d1927a))
+* **worker:** compute a spectrogram once, and delete it when the audio goes ([#146](https://github.com/OneLiteFeatherNET/Sturnus/issues/146)) ([19f49ac](https://github.com/OneLiteFeatherNET/Sturnus/commit/19f49ac02f07798fb37f1a7cc60da563a07f98e7))
+* **worker:** publish a protocol to more than one place, in more than one shape ([#144](https://github.com/OneLiteFeatherNET/Sturnus/issues/144)) ([e1f272e](https://github.com/OneLiteFeatherNET/Sturnus/commit/e1f272e9aa7cb251d08a83a1d7378b152066021e))
+* **worker:** transcribe a meeting's speakers side by side, up to a limit ([#134](https://github.com/OneLiteFeatherNET/Sturnus/issues/134)) ([5766811](https://github.com/OneLiteFeatherNET/Sturnus/commit/57668119fbc6025a18313a7c727d429f4eb7899e))
+
 ## [0.15.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.14.0...v0.15.0) (2026-08-23)
 
 
