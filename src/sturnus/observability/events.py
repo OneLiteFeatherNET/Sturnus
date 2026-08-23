@@ -132,6 +132,17 @@ class Event(StrEnum):
     SESSION_DOCUMENT_CREATED = "session.document_created"
     SESSION_DOCUMENT_REJECTED = "session.document_rejected"
     SESSION_DOCUMENT_RETRY_FAILED = "session.document_retry_failed"
+    #: One destination of a guild that has several failed, and the others
+    #: were published anyway. A different event from
+    #: `SESSION_DOCUMENT_RETRY_FAILED`, which says the session published
+    #: nowhere: "Confluence is down and Outline is fine" and "nothing
+    #: reached anywhere" are different mornings for whoever is on call.
+    SESSION_EXPORT_FAILED = "session.export_failed"
+    #: A destination was not attempted -- it names a format this deployment
+    #: cannot publish. Not a failure: on a deployment that has not built
+    #: `pdf` yet it is a configured intention, and it repeats on every
+    #: publish for as long as the row exists.
+    SESSION_EXPORT_SKIPPED = "session.export_skipped"
     RETENTION_SWEPT = "retention.swept"
     RETENTION_FAILED = "retention.failed"
 
@@ -199,6 +210,29 @@ class Event(StrEnum):
     #: the one place where the console and the store could ever disagree
     #: about what a valid value is.
     CONSOLE_SETTING_REJECTED = "console.setting_rejected"
+
+    #: An administrator changed where a guild publishes its protocols. The
+    #: same argument `console.setting_written` makes, and a sharper one: a
+    #: destination is where a meeting's contents *leave* this system, so
+    #: "somebody redirected the protocols" is a question that has to be
+    #: answerable afterwards. Names who, which guild, which destination and
+    #: what kind of change -- never the destination's address, its name or
+    #: its credential.
+    CONSOLE_EXPORT_TARGET_WRITTEN = "console.export_target_written"
+    #: Somebody who does not administer a guild asked for its export
+    #: configuration. INFO: a stale link to a guild somebody left is the
+    #: ordinary cause, and the response tells them nothing either way.
+    CONSOLE_EXPORT_TARGET_REFUSED = "console.export_target_refused"
+    #: A participant read one of their session's stored protocols. The
+    #: access log for the meeting written down, and the counterpart of
+    #: `console.track_served` for the text rather than the voice.
+    CONSOLE_DOCUMENT_SERVED = "console.document_served"
+    #: A protocol was not served. One event for "you were not in that
+    #: session", "there is no such destination" and "the object is gone",
+    #: because the response cannot tell them apart either -- `reason` is
+    #: the only place they differ, and it is not fine-grained enough to
+    #: reconstruct the response from.
+    CONSOLE_DOCUMENT_REFUSED = "console.document_refused"
 
     #: An administrator withdrew somebody else's consent to be recorded.
     #: **WARNING, and for a stronger reason than `console.requeue_applied`

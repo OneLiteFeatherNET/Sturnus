@@ -70,6 +70,12 @@ _IDENTIFIERS = frozenset(
         "channel_id",
         "document_id",
         "collection_id",
+        #: `guild_export_target.id` -- which of a guild's destinations a
+        #: line is about. A database primary key, and deliberately the only
+        #: thing about a destination that is ever logged: its `name` is
+        #: free text an administrator typed, and its `target` is an address
+        #: in somebody else's system.
+        "target_id",
         "key_id",
         "configured_key_id",
         "provider",
@@ -161,6 +167,12 @@ _LITERALS = frozenset(
         #: not here and must not be: `transcription_prompt` is free text
         #: an administrator typed, and `policy_url` is a URL.
         "config_key",
+        #: Which renderer/sink pair carried a protocol -- a key of
+        #: `sturnus.application.export_formats.FORMATS`, one of a handful
+        #: of literals from this repository's own source. It is what
+        #: separates "the Markdown export failed" from "Outline is down",
+        #: and neither the destination's name nor its address can say it.
+        "format",
         #: Whether the person who downloaded a recording was in the
         #: session it belongs to. A boolean, and the whole difference
         #: between two acts that leave otherwise identical lines: somebody

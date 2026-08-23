@@ -8,6 +8,8 @@ from sturnus.application.assembly import serialize_transcript
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
 from sturnus.domain.consent import ConsentScope
 from sturnus.entrypoints.worker import _WorkerSessionStore
+from sturnus.infrastructure.crypto import KeyWrapper
+from sturnus.infrastructure.db.export_targets import ExportTargetStore
 from sturnus.infrastructure.db.models import (
     AccountLink,
     Base,
@@ -22,6 +24,7 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.db.session_documents import SessionDocumentStore
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 GUILD, CHANNEL, ANNA, BEN = 1, 2, 100, 200
@@ -804,6 +807,150 @@ async def test_closed_undocumented_sessions_excludes_an_already_documented_sessi
     await _mark_documented(factory, session_id)
 
     assert await sessions.closed_undocumented_sessions() == []
+
+
+# ---------------------------------------------------------------------------
+# The second candidate set: a session that published somewhere but not everywhere
+# ---------------------------------------------------------------------------
+
+
+async def _configure_target(
+    factory: async_sessionmaker[AsyncSession],
+    name: str = "wiki",
+    enabled: bool = True,
+) -> int:
+    """One `guild_export_target` row, through the real store."""
+    store = ExportTargetStore(factory, KeyWrapper(b"m" * 32, "master-1"))
+    return await store.save(
+        GUILD, format="outline", name=name, target="col-1", config={}, enabled=enabled, now=T0
+    )
+
+
+async def _publish(
+    factory: async_sessionmaker[AsyncSession], session_id: int, target_id: int
+) -> None:
+    await SessionDocumentStore(factory).record(
+        session_id,
+        target_id=target_id,
+        provider="outline",
+        document_id="doc-1",
+        url="https://outline.example/doc/1",
+        now=T0,
+    )
+
+
+async def _finished_session(factory: async_sessionmaker[AsyncSession]) -> int:
+    """A closed session whose one job is done -- ready to be published."""
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    job_id = await _enqueue_job(sessions, jobs, session_id, ANNA)
+    await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await JobQueue(factory).complete(job_id, "hello")
+    return session_id
+
+
+async def test_a_documented_session_with_a_target_it_never_reached_is_a_candidate(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The case a second destination introduced. Outline succeeded, so the
+    session is `documented` and invisible to `closed_undocumented_sessions`
+    -- without this query the failed second export is never retried and the
+    guild is missing an artefact with nothing anywhere saying so.
+    """
+    sessions = SessionRepository(factory)
+    session_id = await _finished_session(factory)
+    await _configure_target(factory)
+    await _mark_documented(factory, session_id)
+
+    assert await sessions.sessions_with_unpublished_targets() == [session_id]
+
+
+async def test_a_session_that_reached_every_target_is_not_a_candidate(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    session_id = await _finished_session(factory)
+    target_id = await _configure_target(factory)
+    await _publish(factory, session_id, target_id)
+    await _mark_documented(factory, session_id)
+
+    assert await sessions.sessions_with_unpublished_targets() == []
+
+
+async def test_a_session_that_reached_one_of_two_targets_is_a_candidate(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    sessions = SessionRepository(factory)
+    session_id = await _finished_session(factory)
+    first = await _configure_target(factory, "wiki")
+    await _configure_target(factory, "archive")
+    await _publish(factory, session_id, first)
+    await _mark_documented(factory, session_id)
+
+    assert await sessions.sessions_with_unpublished_targets() == [session_id]
+
+
+async def test_a_disabled_target_is_not_something_a_session_still_owes(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Switching a destination off is an administrator saying "stop
+    publishing here". A sweep that kept bringing the session back for it
+    would be re-deciding that every five minutes.
+    """
+    sessions = SessionRepository(factory)
+    session_id = await _finished_session(factory)
+    await _configure_target(factory, "archive", enabled=False)
+    await _mark_documented(factory, session_id)
+
+    assert await sessions.sessions_with_unpublished_targets() == []
+
+
+async def test_a_session_still_being_transcribed_is_not_a_candidate(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """There is no transcript to publish yet, and offering it here would
+    have the sweep assemble a partial one every five minutes for as long
+    as the meeting's last job takes.
+    """
+    sessions = SessionRepository(factory)
+    jobs = JobRepository(factory)
+    session_id = await sessions.open_session(GUILD, CHANNEL, "meeting-raum", T0)
+    await _enqueue_job(sessions, jobs, session_id, ANNA)
+    await sessions.close_session(session_id, T0 + timedelta(hours=1), "empty")
+    await _configure_target(factory)
+
+    assert await sessions.sessions_with_unpublished_targets() == []
+
+
+async def test_a_guild_with_no_configured_targets_owes_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every guild running today. Their publishing is recorded on the
+    session row, and `closed_undocumented_sessions` is what retries it.
+    """
+    sessions = SessionRepository(factory)
+    session_id = await _finished_session(factory)
+    await _mark_documented(factory, session_id)
+
+    assert await sessions.sessions_with_unpublished_targets() == []
+
+
+async def test_another_guilds_targets_are_not_something_this_session_owes(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The join is on the session's own guild. Without that, one guild
+    configuring a destination would put every other guild's sessions back
+    in front of the sweep for ever.
+    """
+    sessions = SessionRepository(factory)
+    session_id = await _finished_session(factory)
+    await ExportTargetStore(factory, KeyWrapper(b"m" * 32, "master-1")).save(
+        GUILD + 1, format="outline", name="theirs", target="col-9", config={}, now=T0
+    )
+    await _mark_documented(factory, session_id)
+
+    assert await sessions.sessions_with_unpublished_targets() == []
 
 
 async def test_candidates_for_retention_returns_undeleted_jobs(

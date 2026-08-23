@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sturnus.console.adapters import (
     ConsoleLinkDirectory,
     ConsoleProfileDirectory,
+    ConsoleSessionDocuments,
     ConsoleSessionNaming,
     ConsoleStateStore,
     ConsoleTagWriter,
@@ -24,8 +25,10 @@ from sturnus.console.adapters import (
 )
 from sturnus.console.statistics import SessionName
 from sturnus.domain import settings
+from sturnus.infrastructure.crypto import KeyWrapper
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.export_targets import ExportTargetStore
 from sturnus.infrastructure.db.models import (
     Base,
     Session,
@@ -34,6 +37,7 @@ from sturnus.infrastructure.db.models import (
     TranscriptionJob,
 )
 from sturnus.infrastructure.db.repositories import AccountLinkRepository
+from sturnus.infrastructure.db.session_documents import SessionDocumentStore
 
 T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 ANNA, BEN = 100, 200
@@ -876,3 +880,93 @@ async def test_a_guilds_merge_gap_decides_where_the_paragraphs_break(
     # with each other anyway -- what this asserts is that a configured
     # value is read at all rather than silently defaulted.
     assert len(found.blocks) == 2
+
+
+# ---------------------------------------------------------------------------
+# The protocols a session produced, and the rule they sit behind
+# ---------------------------------------------------------------------------
+
+
+async def _publish(
+    factory: async_sessionmaker[AsyncSession],
+    session_id: int,
+    target_id: int,
+    provider: str = "markdown",
+) -> None:
+    await SessionDocumentStore(factory).record(
+        session_id,
+        target_id=target_id,
+        provider=provider,
+        document_id=f"protocols/{session_id}/{target_id}.md",
+        url=f"https://sturnus.example/api/sessions/{session_id}/documents/{target_id}",
+        now=T0,
+    )
+
+
+async def _target(factory: async_sessionmaker[AsyncSession], name: str = "archive") -> int:
+    return await ExportTargetStore(factory, KeyWrapper(b"m" * 32, "master-1")).save(
+        GUILD, format="markdown", name=name, target="protocols", config={}, now=T0
+    )
+
+
+async def test_a_sessions_protocols_read_back_in_publication_order(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA, BEN))
+    target_id = await _target(factory)
+    await _publish(factory, session_id, target_id)
+
+    found = await ConsoleSessionDocuments(factory).documents_of(session_id)
+
+    assert found is not None
+    assert [row.target_id for row in found] == [target_id]
+
+
+async def test_a_session_that_published_nothing_reads_back_an_empty_list(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Empty is a real answer and `None` means "no such session", and the
+    two must not collapse: a meeting still being transcribed would
+    otherwise 404 for the people who were in it. The participant rule is
+    the caller's `session_for` and is not asked here -- see
+    `sturnus.console.ports.SessionDocumentDirectory`.
+    """
+    session_id = await seed_session(factory, participants=(ANNA,))
+
+    assert await ConsoleSessionDocuments(factory).documents_of(session_id) == ()
+
+
+async def test_a_session_that_does_not_exist_produced_no_protocols(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    assert await ConsoleSessionDocuments(factory).documents_of(999) is None
+
+
+async def test_one_destination_is_reachable_by_its_own_id(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA,))
+    first, second = await _target(factory, "one"), await _target(factory, "two")
+    await _publish(factory, session_id, first)
+    await _publish(factory, session_id, second)
+
+    found = await ConsoleSessionDocuments(factory).document_of(session_id, second)
+
+    assert found is not None
+    assert found.target_id == second
+
+
+async def test_another_sessions_document_is_not_reachable_through_this_one(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The session is part of the lookup. A target id is a guild's, not a
+    session's, so the same one appears on every session that guild records
+    -- and the handler's `session_for` authorises the session in the path,
+    not the one the row happens to belong to.
+    """
+    mine = await seed_session(factory, participants=(ANNA,))
+    theirs = await seed_session(factory, participants=(BEN,))
+    target_id = await _target(factory)
+    await _publish(factory, theirs, target_id)
+
+    assert await ConsoleSessionDocuments(factory).document_of(mine, target_id) is None

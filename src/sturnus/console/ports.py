@@ -15,10 +15,10 @@ invitation for the next handler to reach for something it should not have.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, tzinfo
-from typing import Protocol
+from typing import Any, Protocol
 
 from sturnus.application.collection_mirror import MirroredCollection
 from sturnus.application.directory_mirror import (
@@ -35,6 +35,7 @@ from sturnus.console.statistics import (
     SessionTranscript,
     TagUse,
 )
+from sturnus.domain.exports import ExportTarget, SessionDocument
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 
@@ -237,6 +238,89 @@ class CollectionNames(Protocol):
     """
 
     async def mirrored(self, *, requested_by: int) -> CollectionListing | None: ...
+
+
+class ExportTargets(Protocol):
+    """A guild's publishing destinations, read and written by its administrators.
+
+    **No `requested_by` here, and that is the exception rather than the
+    rule.** Every other directory in this module carries the authorisation
+    inside the call, because the thing it returns is somebody's voice or
+    somebody's name and a handler that forgot the check would disclose it.
+    This one is guild *configuration*, and it is authorised exactly the way
+    `SettingsStore` is: `sturnus.console.routes_exports` asks
+    `AdminDirectory.is_admin` before it touches this port at all, in a
+    single guard every handler calls first. Following `SettingsStore`'s
+    shape rather than inventing a third pattern is what lets one store --
+    `sturnus.infrastructure.db.export_targets.ExportTargetStore` -- satisfy
+    it unchanged, so the API cannot drift from the rules the store enforces.
+
+    **`secret_for` is deliberately absent.** The store has it; this port
+    does not, so nothing reachable from an HTTP handler can call it. That
+    is the whole design of `ExportTarget`, restated at the layer where it
+    would be lost: the read model has nowhere to put a credential, and the
+    one method that could produce one is not in the console's hands.
+    """
+
+    async def all_for(self, guild_id: int) -> Sequence[ExportTarget]: ...
+
+    async def get(self, guild_id: int, target_id: int) -> ExportTarget | None: ...
+
+    async def save(
+        self,
+        guild_id: int,
+        *,
+        format: str,
+        name: str,
+        target: str,
+        config: Mapping[str, Any],
+        enabled: bool = True,
+        now: datetime,
+    ) -> int: ...
+
+    async def delete(self, guild_id: int, target_id: int) -> bool: ...
+
+    async def set_secret(
+        self, guild_id: int, target_id: int, secret: str | None, now: datetime
+    ) -> bool: ...
+
+
+class SessionDocumentDirectory(Protocol):
+    """What a session published, for somebody already entitled to it.
+
+    **The second port here that does not carry `requested_by`**, and it is
+    absent for exactly the reason `TranscriptReader`'s is: the rule that
+    governs a session's protocols is the rule that governs the session, so
+    it is `SessionReads.session_for` -- called first, in the handler, the
+    same call `/api/sessions/{id}` and `/api/sessions/{id}/transcript` are
+    both served from. Expressing it as a *second* `WHERE` on
+    `session_participant` would be a second place for the three answers to
+    diverge, and a protocol is the same meeting the transcript is.
+
+    The consequence is a pair of methods that must never be called without
+    that read having already succeeded. `sturnus.console.routes_documents`
+    is their only caller and says so at the call site.
+
+    `None` for a session that does not exist and for a destination this
+    session never reached. An empty sequence is a different answer and a
+    real one: a meeting still being transcribed, or a guild that has
+    configured nowhere to publish.
+    """
+
+    async def documents_of(self, session_id: int) -> Sequence[SessionDocument] | None: ...
+
+    async def document_of(self, session_id: int, target_id: int) -> SessionDocument | None: ...
+
+
+class DocumentArtefacts(Protocol):
+    """Where a stored protocol's bytes are read from. `S3DocumentStore`.
+
+    `KeyError` for an object that is not there, which is an ordinary
+    outcome rather than a fault: a re-export can move nothing, but a
+    destination removed from the bucket by hand leaves the row behind.
+    """
+
+    async def get(self, key: str) -> bytes: ...
 
 
 class AdminDirectory(Protocol):
