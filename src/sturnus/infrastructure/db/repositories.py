@@ -588,12 +588,19 @@ class JobRepository:
         Filters only by `audio_deleted_at`; the `retention_until` boundary
         is left for that pure function to check, so there is exactly one
         definition of it.
+
+        `spectrogram_key` rides along because the sweep deletes the
+        recording and its stored picture in one pass -- see
+        `sweep_expired_audio`. It is `None` for every job whose guild
+        never asked for spectrograms, which the sweep reads as "there is
+        no second object here".
         """
         async with self._session_factory() as session:
             rows = await session.execute(
                 select(
                     TranscriptionJob.id,
                     TranscriptionJob.s3_key,
+                    TranscriptionJob.spectrogram_key,
                     TranscriptionJob.retention_until,
                     TranscriptionJob.audio_deleted_at,
                 ).where(TranscriptionJob.audio_deleted_at.is_(None))
@@ -602,6 +609,7 @@ class JobRepository:
                 {
                     "id": row.id,
                     "s3_key": row.s3_key,
+                    "spectrogram_key": row.spectrogram_key,
                     "retention_until": row.retention_until,
                     "audio_deleted_at": row.audio_deleted_at,
                 }
@@ -609,11 +617,35 @@ class JobRepository:
             ]
 
     async def mark_audio_deleted(self, job_id: int, now: datetime) -> None:
+        """Stamps the deletion and clears the artefact's key in one statement.
+
+        The stamp is what makes a swept job unofferable; clearing
+        `spectrogram_key` is what stops the row from going on naming an
+        object the same sweep has just deleted. One `UPDATE`, because they
+        are one fact: this job's recording, and everything drawn from it,
+        is gone.
+        """
         async with self._session_factory() as session:
             await session.execute(
                 update(TranscriptionJob)
                 .where(TranscriptionJob.id == job_id)
-                .values(audio_deleted_at=now)
+                .values(audio_deleted_at=now, spectrogram_key=None)
+            )
+            await session.commit()
+
+    async def record_spectrogram(self, job_id: int, key: str) -> None:
+        """Writes down where this job's stored picture is going to be.
+
+        Called by the worker *before* the object is written, which is the
+        order `sturnus.application.worker.SpectrogramStore` explains: the
+        retention sweep deletes what this column names, so an artefact
+        this column does not name is an artefact nothing will ever delete.
+        """
+        async with self._session_factory() as session:
+            await session.execute(
+                update(TranscriptionJob)
+                .where(TranscriptionJob.id == job_id)
+                .values(spectrogram_key=key)
             )
             await session.commit()
 

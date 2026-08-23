@@ -505,6 +505,19 @@ class Track:
     s3_key: str
     encryption_key_id: str
     wrapped_data_key: bytes
+    #: Where this track's stored spectrogram is, or `None` for the tracks
+    #: that have none -- every job transcribed before its guild switched
+    #: `spectrograms_by_default` on, and every job of a guild that never
+    #: did. Optional here rather than a second lookup because the picture
+    #: is reached through the same authorisation as the audio and under
+    #: the same data key: a caller entitled to one is entitled to the
+    #: other, and a second query would be a second place to get that
+    #: wrong.
+    #:
+    #: A key here is a claim about the bucket, not a promise: the object
+    #: may be missing, and the reader draws the track itself when it is
+    #: (`sturnus.console.routes_audio.track_spectrogram`).
+    spectrogram_key: str | None = None
 
 
 @dataclass(frozen=True)

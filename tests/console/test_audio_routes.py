@@ -26,6 +26,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient
 from moto import mock_aws
 
+from sturnus.application.spectrogram import BINS, COLUMNS, Spectrogram, encode_artefact
 from sturnus.console.audio import AudioDelivery
 from sturnus.console.ports import (
     EncryptedAudioSource,
@@ -61,6 +62,11 @@ from tests.console.conftest import (
 
 SESSION_COOKIE = "sturnus_session"
 WRAPPED = b"wrapped-data-key"
+
+#: Where a stored spectrogram lives: beside the recording it was drawn
+#: from. Spelled out rather than derived from `S3_KEY`, so a change to the
+#: naming rule shows up here as a test somebody has to read.
+SPECTROGRAM_KEY = "sessions/4711/speakers/1.spectrogram.enc"
 
 #: Two chunks and a bit, so a range can start inside the third chunk and
 #: the "did not download the beginning" assertion has something to measure.
@@ -464,3 +470,190 @@ async def test_a_spectrogram_is_never_cached_by_anything_in_between(
     client = await signed_in(aiohttp_client, build(tracks, source))
     response = await client.get(spectrogram_url())
     assert response.headers["Cache-Control"] == "private, no-store"
+
+
+# ---------------------------------------------------------------------------
+# The picture the worker already drew
+#
+# A guild that switched `spectrograms_by_default` on has an artefact in the
+# bucket, and this endpoint prefers it. What must not change is anything
+# else: the same rule decides who may see it, decided again on this
+# request, and a track whose audio is gone has no picture either.
+# ---------------------------------------------------------------------------
+
+
+def _stored_artefact(sample_rate: int, tmp_path: Path) -> bytes:
+    """One artefact in the real on-disk format, sealed like the audio."""
+    cells = bytes(range(256)) * (COLUMNS * BINS // 256)
+    return sealed(
+        encode_artefact(
+            Spectrogram(
+                columns=COLUMNS,
+                bins=BINS,
+                sample_rate=sample_rate,
+                duration_seconds=61.5,
+                magnitudes=base64.b64encode(cells).decode("ascii"),
+            )
+        ),
+        tmp_path,
+    )
+
+
+@pytest.fixture
+def drawn() -> FakeTracks:
+    """Anna's track, with a spectrogram the worker stored beside it."""
+    return FakeTracks(
+        tracks={(SESSION, ANNA): Track(S3_KEY, KEY_ID, WRAPPED, spectrogram_key=SPECTROGRAM_KEY)},
+        participants={SESSION: {ANNA, BEN}},
+    )
+
+
+async def test_a_stored_picture_is_answered_without_reading_the_recording(
+    aiohttp_client: AiohttpClientFactory, drawn: FakeTracks, tmp_path: Path
+) -> None:
+    """The whole point of storing one: a view stops costing a full decrypt.
+
+    Asserted on which object was opened rather than on how long it took:
+    the saving is that the recording's body is never streamed at all, and
+    on a three-hour workshop that body is the entire cost. A reader that
+    drew the track anyway would name the recording's key here.
+    """
+    source = FakeAudioSource(
+        {
+            S3_KEY: sealed(_real_track(tmp_path), tmp_path),
+            SPECTROGRAM_KEY: _stored_artefact(TARGET_RATE, tmp_path),
+        }
+    )
+    client = await signed_in(aiohttp_client, build(drawn, source))
+
+    response = await client.get(spectrogram_url())
+
+    assert response.status == 200
+    body = await response.json()
+    assert body["duration_seconds"] == 61.5
+    assert body["sample_rate"] == TARGET_RATE
+    assert len(base64.b64decode(body["magnitudes"])) == BINS * COLUMNS
+    assert source.streamed_keys == [SPECTROGRAM_KEY]
+
+
+async def test_a_track_drawn_before_the_setting_was_on_is_still_answered(
+    aiohttp_client: AiohttpClientFactory, tracks: FakeTracks, tmp_path: Path
+) -> None:
+    """No backfill, and therefore no gap in the interface.
+
+    Every job transcribed before a guild switched the setting on has no
+    artefact and never will unless it is re-queued. The endpoint's
+    contract does not depend on that: it draws the track, exactly as it
+    did before artefacts existed.
+    """
+    source = FakeAudioSource({S3_KEY: sealed(_real_track(tmp_path), tmp_path)})
+    client = await signed_in(aiohttp_client, build(tracks, source))
+
+    response = await client.get(spectrogram_url())
+
+    assert response.status == 200
+    assert (await response.json())["duration_seconds"] == pytest.approx(3.0, abs=0.05)
+
+
+async def test_a_picture_that_is_missing_falls_back_to_drawing_the_track(
+    aiohttp_client: AiohttpClientFactory, drawn: FakeTracks, tmp_path: Path
+) -> None:
+    """A row naming an object that is not there is a possible state.
+
+    The worker writes the key down before it writes the object, on purpose
+    -- an artefact nothing names is one the retention sweep can never
+    delete -- so a failed upload leaves exactly this. It must cost a
+    recomputation and not a refusal.
+    """
+    source = FakeAudioSource({S3_KEY: sealed(_real_track(tmp_path), tmp_path)})
+    client = await signed_in(aiohttp_client, build(drawn, source))
+
+    response = await client.get(spectrogram_url())
+
+    assert response.status == 200
+    assert (await response.json())["duration_seconds"] == pytest.approx(3.0, abs=0.05)
+
+
+async def test_a_picture_this_build_cannot_read_falls_back_to_drawing_it(
+    aiohttp_client: AiohttpClientFactory, drawn: FakeTracks, tmp_path: Path
+) -> None:
+    """A stored artefact is not a recording: losing one loses nothing.
+
+    So an artefact that will not decode is answered by redrawing, where a
+    *recording* that will not decrypt is answered with an error -- the
+    recording is the only copy of what somebody said, and the picture is a
+    convenience the next line of the handler recreates.
+    """
+    source = FakeAudioSource(
+        {
+            S3_KEY: sealed(_real_track(tmp_path), tmp_path),
+            SPECTROGRAM_KEY: sealed(b'{"version": 1, "columns": 3}', tmp_path),
+        }
+    )
+    client = await signed_in(aiohttp_client, build(drawn, source))
+
+    response = await client.get(spectrogram_url())
+
+    assert response.status == 200
+    assert (await response.json())["duration_seconds"] == pytest.approx(3.0, abs=0.05)
+
+
+async def test_a_stranger_cannot_see_a_stored_picture_either(
+    aiohttp_client: AiohttpClientFactory, drawn: FakeTracks, tmp_path: Path
+) -> None:
+    """The saving is in the payload and must never reach the permission.
+
+    A cheap answer is exactly the kind of answer that grows a cache in
+    front of it, and the rule this endpoint enforces -- participants of
+    the session, nobody else -- is decided on every request against
+    `session_participant`, before anything looks in the bucket.
+    """
+    source = FakeAudioSource(
+        {
+            S3_KEY: sealed(_real_track(tmp_path), tmp_path),
+            SPECTROGRAM_KEY: _stored_artefact(TARGET_RATE, tmp_path),
+        }
+    )
+    client = await signed_in(aiohttp_client, build(drawn, source), as_user=999)
+
+    response = await client.get(spectrogram_url())
+
+    assert response.status == 404
+
+
+async def test_a_stored_picture_is_never_cached_by_anything_in_between(
+    aiohttp_client: AiohttpClientFactory, drawn: FakeTracks, tmp_path: Path
+) -> None:
+    """Same header whichever source answered. A shared cache holding this
+    one would hand somebody's voice activity to the next person through
+    the same proxy."""
+    source = FakeAudioSource(
+        {
+            S3_KEY: sealed(_real_track(tmp_path), tmp_path),
+            SPECTROGRAM_KEY: _stored_artefact(TARGET_RATE, tmp_path),
+        }
+    )
+    client = await signed_in(aiohttp_client, build(drawn, source))
+
+    response = await client.get(spectrogram_url())
+
+    assert response.headers["Cache-Control"] == "private, no-store"
+
+
+async def test_a_recording_that_is_gone_has_no_picture_either(
+    aiohttp_client: AiohttpClientFactory, drawn: FakeTracks, tmp_path: Path
+) -> None:
+    """After the sweep, the track is neither playable nor visualisable.
+
+    The sweep deletes both objects in one pass, so this state should not
+    outlive a sweep -- but it is reachable for as long as one runs, and it
+    is the state the whole retention rule is about. An artefact that
+    answered here would be a rendering of somebody's voice surviving the
+    deletion of the recording it was drawn from, reachable through the
+    console, which is precisely what storing one is not allowed to create.
+    """
+    source = FakeAudioSource({SPECTROGRAM_KEY: _stored_artefact(TARGET_RATE, tmp_path)})
+    client = await signed_in(aiohttp_client, build(drawn, source))
+
+    assert (await client.get(spectrogram_url())).status == 404
+    assert (await client.get(url())).status == 404

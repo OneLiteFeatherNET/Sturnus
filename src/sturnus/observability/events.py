@@ -145,6 +145,18 @@ class Event(StrEnum):
     SESSION_EXPORT_SKIPPED = "session.export_skipped"
     RETENTION_SWEPT = "retention.swept"
     RETENTION_FAILED = "retention.failed"
+    #: A guild that asked for `spectrograms_by_default` got one: the
+    #: worker drew this track's picture while it still held the plaintext
+    #: and stored it beside the recording. INFO rather than DEBUG because
+    #: it is the only line that says the bucket gained an object, and
+    #: "how much is this setting costing us" is an operator question with
+    #: no other answer.
+    SPECTROGRAM_STORED = "spectrogram.stored"
+    #: The picture could not be drawn or could not be stored. **WARNING,
+    #: not ERROR:** the transcription succeeded and is the valuable part,
+    #: and the console draws this track on demand exactly as it did before
+    #: the setting existed. What is lost is a saving, not a recording.
+    SPECTROGRAM_FAILED = "spectrogram.failed"
 
     # -- link ---------------------------------------------------------------
     LINK_STARTED = "link.started"
@@ -209,6 +221,13 @@ class Event(StrEnum):
     #: it will not decrypt -- which is either a truncated upload or a
     #: format that has drifted from its reader.
     CONSOLE_TRACK_UNREADABLE = "console.track_unreadable"
+    #: A stored spectrogram was named by the job and could not be used --
+    #: the object is gone, or it is not a picture this build draws. INFO,
+    #: because the request is *answered*: the reader falls back to drawing
+    #: the track itself, which is what every view cost before artefacts
+    #: existed. It is worth a line only because a burst of them means a
+    #: guild is paying for storage it is not getting a saving from.
+    CONSOLE_SPECTROGRAM_REDRAWN = "console.spectrogram_redrawn"
 
     #: An administrator changed a guild's runtime configuration from the
     #: web console. The only trace such a change leaves: a slash command

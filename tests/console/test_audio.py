@@ -28,12 +28,12 @@ import pytest
 
 from sturnus.console.audio import (
     ByteRange,
-    CorruptRecording,
     UnsatisfiableRange,
     parse_range,
     stored_length,
     stream_wav,
 )
+from sturnus.domain.errors import CorruptRecording
 from sturnus.infrastructure.audio import SOURCE_RATE, TARGET_RATE
 from sturnus.infrastructure.crypto import CHUNK_SIZE
 from sturnus.infrastructure.recording_adapters import FileAudioWriterFactory
@@ -250,9 +250,15 @@ async def test_a_truncated_recording_is_refused(track: bytes, tmp_path: Path) ->
 # The property the encryption scheme exists for
 # ---------------------------------------------------------------------------
 
+#: Every module a decrypted recording passes through on its way to a
+#: socket. `application/spectrogram.py` is on this list although it is not
+#: in the console package: it holds the transform the console's reader
+#: feeds plaintext into, and a module on the serving path is on the
+#: serving path wherever it happens to live.
+_SRC = Path(__file__).parent.parent.parent / "src" / "sturnus"
 _SERVING_PATH = (
-    Path(__file__).parent.parent.parent / "src" / "sturnus" / "console",
-    ("audio.py", "routes_audio.py", "spectrogram.py"),
+    (_SRC / "console", ("audio.py", "routes_audio.py", "spectrogram.py")),
+    (_SRC / "application", ("spectrogram.py",)),
 )
 
 _WRITES_TO_DISK = frozenset(
@@ -279,22 +285,22 @@ def test_nothing_on_the_serving_path_can_write_plaintext_to_disk() -> None:
     served, and it would do so invisibly. Reviewing for it once is not the
     same as being unable to do it.
     """
-    directory, names = _SERVING_PATH
     offenders: list[str] = []
-    for name in names:
-        tree = ast.parse((directory / name).read_text(encoding="utf-8"))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call):
-                continue
-            called = (
-                node.func.id
-                if isinstance(node.func, ast.Name)
-                else node.func.attr
-                if isinstance(node.func, ast.Attribute)
-                else None
-            )
-            if called in _WRITES_TO_DISK:
-                offenders.append(f"{name}:{node.lineno}: calls {called}()")
+    for directory, names in _SERVING_PATH:
+        for name in names:
+            tree = ast.parse((directory / name).read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else node.func.attr
+                    if isinstance(node.func, ast.Attribute)
+                    else None
+                )
+                if called in _WRITES_TO_DISK:
+                    offenders.append(f"{directory.name}/{name}:{node.lineno}: calls {called}()")
     assert not offenders, "\n".join(offenders)
 
 

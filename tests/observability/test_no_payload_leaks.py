@@ -41,6 +41,7 @@ from tests.application.test_worker import (
     FakeLinks,
     FakeQueue,
     FakeSessions,
+    FakeSpectrograms,
     FakeStore,
     exports,
     job,
@@ -107,6 +108,7 @@ async def test_the_worker_pipeline_logs_no_payload(tmp_path: Path, captured: io.
         jobs=FakeJobs(),
         links=FakeLinks(),
         config=FakeConfig(),
+        spectrograms=FakeSpectrograms(),
         work_dir=tmp_path,
         max_attempts=3,
     )
@@ -147,6 +149,7 @@ async def test_a_failing_job_logs_no_payload(tmp_path: Path, captured: io.String
         jobs=FakeJobs(),
         links=FakeLinks(),
         config=FakeConfig(),
+        spectrograms=FakeSpectrograms(),
         work_dir=tmp_path,
         max_attempts=3,
     )
