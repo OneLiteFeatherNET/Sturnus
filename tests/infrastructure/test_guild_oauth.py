@@ -227,3 +227,62 @@ async def test_deleting_a_client_frees_its_slug(store: GuildOAuthClientStore) ->
     assert await store.delete(GUILD) is False
     await save(store, OTHER_GUILD, "acme")
     assert await store.by_slug("acme") is not None
+
+
+async def test_a_secret_moved_the_other_way_between_guilds_does_not_decrypt_either(
+    store: GuildOAuthClientStore, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """The binding is symmetric, and a test that checked one direction
+    would pass against an implementation that bound only the row it
+    happened to read first.
+    """
+    await save(store, GUILD, "acme")
+    await save(store, OTHER_GUILD, "other")
+    await store.set_client_secret(OTHER_GUILD, "hunter2", T0)
+
+    async with sessions() as session:
+        stolen = await session.scalar(
+            select(GuildOAuthClient.wrapped_client_secret).where(
+                GuildOAuthClient.guild_id == OTHER_GUILD
+            )
+        )
+        await session.execute(
+            update(GuildOAuthClient)
+            .where(GuildOAuthClient.guild_id == GUILD)
+            .values(wrapped_client_secret=stolen, encryption_key_id="master-1")
+        )
+        await session.commit()
+
+    with pytest.raises(InvalidTag):
+        await store.client_secret_for(GUILD)
+
+
+async def test_an_oauth_secret_does_not_decrypt_as_an_export_secret(
+    store: GuildOAuthClientStore, sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """The purpose binding, in the direction the other test does not take.
+
+    The same guild owns both rows, so binding to the guild alone would
+    leave a client secret usable as a Confluence token and the other way
+    round. It is the client secret's turn to be the one that was moved.
+    """
+    targets = ExportTargetStore(sessions, KeyWrapper(MASTER, "master-1"))
+    target_id = await targets.save(
+        GUILD, format="confluence", name="Wiki", target="ENG", config={}, now=T0
+    )
+    await save(store, GUILD, "acme")
+    await store.set_client_secret(GUILD, "hunter2", T0)
+
+    async with sessions() as session:
+        stolen = await session.scalar(
+            select(GuildOAuthClient.wrapped_client_secret).where(GuildOAuthClient.guild_id == GUILD)
+        )
+        await session.execute(
+            update(GuildExportTarget)
+            .where(GuildExportTarget.id == target_id)
+            .values(wrapped_secret=stolen, encryption_key_id="master-1")
+        )
+        await session.commit()
+
+    with pytest.raises(InvalidTag):
+        await targets.secret_for(GUILD, target_id)

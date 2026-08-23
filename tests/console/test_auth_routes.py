@@ -30,6 +30,7 @@ from tests.console.conftest import (
     FakeLinks,
     FakeOAuth,
     FakeReads,
+    FakeSignInClients,
     FakeStates,
     FakeTracks,
     build_test_api,
@@ -330,3 +331,235 @@ async def test_an_expired_session_is_unauthorised_rather_than_a_server_error(
     expired = SessionCookie(SECRET, timedelta(seconds=-1)).issue(SignedSession(ANNA), now=T0)
     client.session.cookie_jar.update_cookies({SESSION_COOKIE: expired})
     assert (await client.get(path)).status == 401
+
+
+# ---------------------------------------------------------------------------
+# Signing in through a guild's own link
+# ---------------------------------------------------------------------------
+
+
+ACME, OTHER = 4711, 9911
+
+
+def guild_app(
+    guilds: dict[str, tuple[int, FakeOAuth]] | None = None,
+    environment: FakeOAuth | None = None,
+    states: FakeStates | None = None,
+    links: FakeLinks | None = None,
+) -> web.Application:
+    """An application whose sign-in can resolve a guild's own client."""
+    return build_test_api(
+        clients=FakeSignInClients(environment=environment or FakeOAuth(), guilds=guilds or {}),
+        states=states or FakeStates(),
+        links=links or FakeLinks(),
+        sessions=SessionCookie(SECRET, timedelta(hours=12)),
+        now=now_at(),
+    )
+
+
+def acme_oauth() -> FakeOAuth:
+    """A client recognisable in a `Location` header as not the default one."""
+    return FakeOAuth(base_url="https://outline.acme.example")
+
+
+async def test_a_guilds_link_redirects_to_that_guilds_provider(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The whole of 2.2 in one request.
+
+    `/api/auth/login` takes no parameters and reads no cookie, so the
+    slug in the URL is the only thing that can name a guild before the
+    round trip begins -- and here it does.
+    """
+    client = await aiohttp_client(guild_app(guilds={"acme": (ACME, acme_oauth())}))
+
+    response = await client.get("/api/auth/login?guild=acme", allow_redirects=False)
+
+    assert response.status == 302
+    assert response.headers["Location"].startswith("https://outline.acme.example/")
+
+
+async def test_a_guilds_sign_in_issues_a_state_that_names_the_guild(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The state is what selects the client for the code exchange.
+
+    Nothing else survives the round trip: the callback has no session to
+    read a guild from, which is the problem the guild-specific link
+    exists to solve.
+    """
+    states = FakeStates()
+    client = await aiohttp_client(guild_app(guilds={"acme": (ACME, acme_oauth())}, states=states))
+
+    await client.get("/api/auth/login?guild=acme", allow_redirects=False)
+
+    assert states.issued_for[states.issued[0]] == ACME
+
+
+async def test_a_sign_in_with_no_guild_behaves_exactly_as_it_did(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The compatibility promise 2.2 makes, pinned.
+
+    A deployment that never configures a per-guild client must behave
+    identically to v0.15.0: the environment-configured client, and a
+    state that names no guild.
+    """
+    states, environment = FakeStates(), FakeOAuth()
+    client = await aiohttp_client(
+        guild_app(guilds={"acme": (ACME, acme_oauth())}, environment=environment, states=states)
+    )
+
+    response = await client.get("/api/auth/login", allow_redirects=False)
+
+    assert response.status == 302
+    assert response.headers["Location"].startswith("https://outline.example/oauth/authorize")
+    assert environment.authorize_calls == states.issued
+    assert states.issued_for[states.issued[0]] is None
+
+
+async def test_an_unknown_slug_answers_exactly_as_a_misconfigured_one(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The property the owner chose this design to keep.
+
+    A slug that names nothing and a slug that names a guild whose client
+    cannot complete a sign-in must be one answer, byte for byte.
+    Otherwise anybody with a browser can walk a list of names and learn
+    which organisations use this service -- which is precisely what the
+    rejected alternative, a public list of guilds, would have done.
+    """
+    # `half-configured` is registered to no usable client, exactly as a
+    # guild whose secret has not been supplied yet resolves.
+    client = await aiohttp_client(guild_app(guilds={"acme": (ACME, acme_oauth())}))
+
+    unknown = await client.get("/api/auth/login?guild=no-such-guild", allow_redirects=False)
+    misconfigured = await client.get("/api/auth/login?guild=half-configured", allow_redirects=False)
+
+    assert unknown.status == misconfigured.status == 404
+    assert await unknown.json() == await misconfigured.json()
+    assert "location" not in {header.lower() for header in unknown.headers}
+
+
+@pytest.mark.parametrize(
+    "slug", ["API", "acme%2f..%2fx", "1289374650912837465", "api", "a", "acme--x"]
+)
+async def test_a_slug_that_is_not_a_slug_answers_the_same_404(
+    aiohttp_client: AiohttpClientFactory, slug: str
+) -> None:
+    """A refused shape must not be a different reply from a refused name.
+
+    A 400 for "that is not a valid slug" and a 404 for "no such slug"
+    would together tell an attacker which of the names they tried were
+    well-formed but unregistered, which is half the enumeration back.
+    """
+    client = await aiohttp_client(guild_app(guilds={"acme": (ACME, acme_oauth())}))
+    response = await client.get(f"/api/auth/login?guild={slug}", allow_redirects=False)
+    assert response.status == 404
+    assert await response.json() == {"error": "no such sign-in link"}
+
+
+async def test_the_refusal_reflects_nothing_of_what_was_asked_for(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The rule the whole of `sturnus.console.app` follows.
+
+    This endpoint is unauthenticated and takes a string straight out of a
+    URL; an error body that echoed it would be an XSS sink reachable by
+    anybody.
+    """
+    client = await aiohttp_client(guild_app())
+    response = await client.get(
+        "/api/auth/login?guild=%3Cscript%3Ealert(1)%3C/script%3E", allow_redirects=False
+    )
+    assert response.status == 404
+    assert "script" not in await response.text()
+
+
+async def test_the_state_and_not_the_callback_selects_the_client(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """A code is exchanged against the client the sign-in began with.
+
+    Two guilds are configured; the sign-in begins on one of them, and the
+    exchange must happen there. Nothing in the callback URL names a
+    guild, which is what stops a caller asking this process to spend one
+    guild's client secret on another guild's code.
+    """
+    acme, other = acme_oauth(), acme_oauth()
+    acme.identity = ExternalIdentity(ANNA_OUTLINE, "Anna")
+    states = FakeStates()
+    client = await aiohttp_client(
+        guild_app(guilds={"acme": (ACME, acme), "other": (OTHER, other)}, states=states)
+    )
+    await client.get("/api/auth/login?guild=acme", allow_redirects=False)
+
+    response = await client.get(
+        f"/api/auth/callback?code=abc&state={states.issued[0]}", allow_redirects=False
+    )
+
+    assert response.status == 302
+    assert acme.exchanges == ["abc"]
+    assert other.exchanges == []
+
+
+async def test_a_sign_in_with_no_guild_still_exchanges_against_the_environment(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    environment, acme = FakeOAuth(), acme_oauth()
+    states = FakeStates()
+    client = await aiohttp_client(
+        guild_app(guilds={"acme": (ACME, acme)}, environment=environment, states=states)
+    )
+    await client.get("/api/auth/login", allow_redirects=False)
+
+    await client.get(f"/api/auth/callback?code=abc&state={states.issued[0]}", allow_redirects=False)
+
+    assert environment.exchanges == ["abc"]
+    assert acme.exchanges == []
+
+
+async def test_a_callback_for_a_registration_that_went_away_mints_no_session(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """An administrator can delete a registration mid-login.
+
+    The state is valid and there is nothing to exchange with, so it
+    answers as an unknown sign-in attempt does -- and above all it does
+    not fall back to the environment-configured client, which would sign
+    somebody in through a client their guild deliberately replaced.
+    """
+    states = FakeStates()
+    clients = FakeSignInClients(guilds={"acme": (ACME, acme_oauth())})
+    app_with_removal = build_test_api(
+        clients=clients,
+        states=states,
+        sessions=SessionCookie(SECRET, timedelta(hours=12)),
+        now=now_at(),
+    )
+    client = await aiohttp_client(app_with_removal)
+    await client.get("/api/auth/login?guild=acme", allow_redirects=False)
+    clients.guilds.clear()
+
+    response = await client.get(
+        f"/api/auth/callback?code=abc&state={states.issued[0]}", allow_redirects=False
+    )
+
+    assert response.status == 400
+    assert SESSION_COOKIE not in response.cookies
+
+
+async def test_an_empty_guild_parameter_is_not_the_same_as_no_guild(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """`?guild=` asked for a guild and named none of them.
+
+    Treating it as "no guild" would sign somebody in against the
+    deployment's own client on a link that was meant to select a guild's
+    -- which is the one substitution this whole design exists to prevent.
+    It is refused like any other slug that resolves to nothing.
+    """
+    client = await aiohttp_client(guild_app(guilds={"acme": (ACME, acme_oauth())}))
+    response = await client.get("/api/auth/login?guild=", allow_redirects=False)
+    assert response.status == 404
+    assert await response.json() == {"error": "no such sign-in link"}

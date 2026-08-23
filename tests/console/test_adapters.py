@@ -8,12 +8,14 @@ these are the two directions neither of them had a reader for yet.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from urllib.parse import unquote
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.console.adapters import (
+    ConsoleGuildOAuthClients,
     ConsoleLinkDirectory,
     ConsoleProfileDirectory,
     ConsoleSessionDocuments,
@@ -22,14 +24,19 @@ from sturnus.console.adapters import (
     ConsoleTagWriter,
     ConsoleTrackDirectory,
     ConsoleTranscripts,
+    GuildSignInClients,
 )
+from sturnus.console.ports import ConsumedSignIn, OAuthClient
 from sturnus.console.statistics import SessionName
 from sturnus.domain import settings
+from sturnus.domain.oauth_clients import SlugUnavailable
 from sturnus.infrastructure.crypto import KeyWrapper
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.export_targets import ExportTargetStore
+from sturnus.infrastructure.db.guild_oauth import GuildOAuthClientStore
 from sturnus.infrastructure.db.models import (
+    AdminMember,
     Base,
     Session,
     SessionParticipant,
@@ -38,6 +45,7 @@ from sturnus.infrastructure.db.models import (
 )
 from sturnus.infrastructure.db.repositories import AccountLinkRepository
 from sturnus.infrastructure.db.session_documents import SessionDocumentStore
+from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 ANNA, BEN = 100, 200
@@ -65,14 +73,48 @@ async def test_an_issued_state_can_be_consumed_once(
 ) -> None:
     states = ConsoleStateStore(factory)
     await states.issue("abc", T0)
-    assert await states.consume("abc", T0) is True
-    assert await states.consume("abc", T0) is False
+    assert await states.consume("abc", T0) == ConsumedSignIn(guild_id=None)
+    assert await states.consume("abc", T0) is None
 
 
 async def test_a_state_that_was_never_issued_is_refused(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    assert await ConsoleStateStore(factory).consume("never-issued", T0) is False
+    assert await ConsoleStateStore(factory).consume("never-issued", T0) is None
+
+
+async def test_a_state_carries_the_guild_its_sign_in_began_against(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The state is what selects the client for the code exchange (2.2).
+
+    There is no session and no URL at the callback, so this row is the
+    only thing that survives the round trip -- and because it is a row
+    rather than process memory, the pod that serves the callback need not
+    be the one that issued the redirect.
+    """
+    states = ConsoleStateStore(factory)
+    await states.issue("abc", T0, GUILD)
+    consumed = await states.consume("abc", T0)
+    assert consumed is not None
+    assert consumed.guild_id == GUILD
+
+
+async def test_a_sign_in_with_no_guild_says_so_rather_than_saying_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`None` is a value here, not an absence.
+
+    It means the environment-configured client, which is the ordinary
+    sign-in and the one a deployment that configures no per-guild client
+    ever uses. The absence of a state is `None` of the whole result, so
+    the two are never the same answer.
+    """
+    states = ConsoleStateStore(factory)
+    await states.issue("abc", T0)
+    consumed = await states.consume("abc", T0)
+    assert consumed is not None
+    assert consumed.guild_id is None
 
 
 async def test_an_expired_state_is_refused(
@@ -85,7 +127,7 @@ async def test_an_expired_state_is_refused(
     """
     states = ConsoleStateStore(factory, ttl=timedelta(minutes=10))
     await states.issue("abc", T0)
-    assert await states.consume("abc", T0 + timedelta(minutes=11)) is False
+    assert await states.consume("abc", T0 + timedelta(minutes=11)) is None
 
 
 async def test_a_console_state_belongs_to_no_discord_user_yet(
@@ -970,3 +1012,329 @@ async def test_another_sessions_document_is_not_reachable_through_this_one(
     await _publish(factory, theirs, target_id)
 
     assert await ConsoleSessionDocuments(factory).document_of(mine, target_id) is None
+
+
+# ---------------------------------------------------------------------------
+# Which client a sign-in runs against
+# ---------------------------------------------------------------------------
+
+
+MASTER = b"m" * 32
+OTHER_GUILD = 9911
+FALLBACK_REDIRECT = "https://console.example/api/auth/callback"
+
+
+def signin_clients(
+    factory: async_sessionmaker[AsyncSession],
+    environment: OAuthClient | None = None,
+    key_id: str = "master-1",
+) -> GuildSignInClients:
+    return GuildSignInClients(
+        environment or StubOAuth(),
+        GuildOAuthClientStore(factory, KeyWrapper(MASTER, key_id)),
+        redirect_uri=FALLBACK_REDIRECT,
+    )
+
+
+class StubOAuth:
+    """The environment-configured client, recognisable by what it builds."""
+
+    def authorize_url(self, state: str) -> str:
+        return f"https://environment.example/oauth/authorize?state={state}"
+
+    async def identity_from_code(self, code: str) -> ExternalIdentity:  # pragma: no cover
+        del code
+        raise AssertionError("the environment client is not exchanged with in these tests")
+
+
+async def register(
+    factory: async_sessionmaker[AsyncSession],
+    guild_id: int,
+    slug: str,
+    *,
+    secret: str | None = "hunter2",
+    provider: str = "outline",
+    redirect_uri: str | None = None,
+    key_id: str = "master-1",
+) -> GuildOAuthClientStore:
+    store = GuildOAuthClientStore(factory, KeyWrapper(MASTER, key_id))
+    await store.save(
+        guild_id,
+        slug=slug,
+        provider=provider,
+        base_url="https://outline.acme.example",
+        client_id="acme-client",
+        redirect_uri=redirect_uri,
+        now=T0,
+    )
+    if secret is not None:
+        await store.set_client_secret(guild_id, secret, T0)
+    return store
+
+
+async def test_a_deployment_that_configured_nothing_signs_in_exactly_as_before(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The property 2.2 requires and a test pins: no guild, no change.
+
+    A sign-in with no guild resolves the environment-configured client,
+    and it does so without the per-guild table having anything in it.
+    """
+    clients = signin_clients(factory)
+    resolved = await clients.for_guild(None)
+    assert resolved is not None
+    assert resolved.authorize_url("s").startswith("https://environment.example/")
+
+
+async def test_a_registered_slug_resolves_to_that_guilds_client(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await register(factory, GUILD, "acme")
+    found = await signin_clients(factory).for_slug("acme")
+    assert found is not None
+    assert found.guild_id == GUILD
+    assert found.client.authorize_url("s").startswith("https://outline.acme.example/")
+
+
+async def test_the_guild_a_state_names_selects_the_same_client_again(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The callback has no URL to read a slug from; it has the state."""
+    await register(factory, GUILD, "acme")
+    resolved = await signin_clients(factory).for_guild(GUILD)
+    assert resolved is not None
+    assert resolved.authorize_url("s").startswith("https://outline.acme.example/")
+
+
+async def test_an_unknown_slug_and_a_half_configured_one_answer_alike(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The disclosure 2.2 chose this whole design to avoid.
+
+    A guild registered but never given a secret must be indistinguishable
+    from a guild that does not exist -- otherwise anybody with a browser
+    can walk a list of names and learn which organisations use this
+    service, signed in or not.
+    """
+    await register(factory, GUILD, "acme", secret=None)
+    clients = signin_clients(factory)
+    assert await clients.for_slug("acme") is None
+    assert await clients.for_slug("no-such-guild") is None
+
+
+async def test_a_provider_this_deployment_cannot_exchange_with_resolves_to_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A registration nothing here can complete is not half a sign-in."""
+    await register(factory, GUILD, "acme", provider="confluence")
+    assert await signin_clients(factory).for_slug("acme") is None
+
+
+async def test_a_slug_the_write_path_would_have_refused_is_never_looked_up(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """One rule, in one pure function, read from both ends.
+
+    A slug `is_valid_slug` refuses cannot be in the table, so the lookup
+    is a query that can only miss -- and skipping it keeps the shape rule
+    and the storage from ever disagreeing about what a slug is.
+    """
+    clients = signin_clients(factory)
+    for refused in ("API", "acme/../x", "1289374650912837465", "api"):
+        assert await clients.for_slug(refused) is None
+
+
+async def test_a_secret_this_process_cannot_unwrap_resolves_to_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A rotation that was not carried through is a configuration error.
+
+    It must not become a sign-in that half-works, and it must not be
+    distinguishable from an unknown slug from outside -- the operator
+    learns about it from the log line, which is where it belongs.
+    """
+    await register(factory, GUILD, "acme", key_id="master-1")
+    assert await signin_clients(factory, key_id="master-2").for_slug("acme") is None
+
+
+async def test_a_guild_that_named_no_callback_gets_this_deployments_own(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Null `redirect_uri` means "the one this deployment is configured
+    with", which is what nearly every guild will want."""
+    await register(factory, GUILD, "acme")
+    found = await signin_clients(factory).for_slug("acme")
+    assert found is not None
+    assert FALLBACK_REDIRECT in unquote(found.client.authorize_url("s"))
+
+
+async def test_a_guild_that_named_its_own_callback_keeps_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await register(factory, GUILD, "acme", redirect_uri="https://acme.example/back")
+    found = await signin_clients(factory).for_slug("acme")
+    assert found is not None
+    assert "https://acme.example/back" in unquote(found.client.authorize_url("s"))
+
+
+# ---------------------------------------------------------------------------
+# Editing a guild's registration, which only its administrators may do
+# ---------------------------------------------------------------------------
+
+
+async def admin_of(factory: async_sessionmaker[AsyncSession], guild_id: int, member: int) -> None:
+    async with factory() as session:
+        session.add(AdminMember(guild_id=guild_id, discord_user_id=member, synced_at=T0))
+        await session.commit()
+
+
+def crud(factory: async_sessionmaker[AsyncSession]) -> ConsoleGuildOAuthClients:
+    return ConsoleGuildOAuthClients(
+        GuildOAuthClientStore(factory, KeyWrapper(MASTER, "master-1")),
+        AdminMemberStore(factory),
+    )
+
+
+async def test_an_administrator_registers_their_guilds_client(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await admin_of(factory, GUILD, CARA)
+    saved = await crud(factory).save(
+        GUILD,
+        requested_by=CARA,
+        slug="acme",
+        provider="outline",
+        base_url="https://outline.acme.example",
+        client_id="acme-client",
+        redirect_uri=None,
+        now=T0,
+    )
+    assert saved is not None
+    assert saved.slug == "acme"
+    assert saved.has_secret is False
+
+
+async def test_an_administrator_of_another_guild_may_not_touch_this_registration(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Same rule the settings endpoints have: per guild, not in general."""
+    await admin_of(factory, OTHER_GUILD, CARA)
+    clients = crud(factory)
+    assert (
+        await clients.save(
+            GUILD,
+            requested_by=CARA,
+            slug="acme",
+            provider="outline",
+            base_url="https://outline.acme.example",
+            client_id="acme-client",
+            redirect_uri=None,
+            now=T0,
+        )
+        is None
+    )
+    assert await clients.for_guild(GUILD, requested_by=CARA) is None
+    assert await clients.delete(GUILD, requested_by=CARA) is False
+
+
+async def test_a_slug_another_guild_holds_is_refused_rather_than_stolen(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The unique constraint answers, not a check-then-write.
+
+    Checking first is a race between two administrators claiming one name
+    in the same second; the constraint is not.
+    """
+    await admin_of(factory, GUILD, CARA)
+    await admin_of(factory, OTHER_GUILD, CARA)
+    clients = crud(factory)
+    await clients.save(
+        GUILD,
+        requested_by=CARA,
+        slug="acme",
+        provider="outline",
+        base_url="https://outline.acme.example",
+        client_id="acme-client",
+        redirect_uri=None,
+        now=T0,
+    )
+    with pytest.raises(SlugUnavailable):
+        await clients.save(
+            OTHER_GUILD,
+            requested_by=CARA,
+            slug="acme",
+            provider="outline",
+            base_url="https://outline.other.example",
+            client_id="other-client",
+            redirect_uri=None,
+            now=T0,
+        )
+
+
+async def test_the_secret_goes_in_and_only_has_secret_comes_out(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """There is no method on this adapter that returns a secret.
+
+    Reading one is `GuildSignInClients`'s alone -- the object the sign-in
+    path holds and no route does.
+    """
+    await admin_of(factory, GUILD, CARA)
+    clients = crud(factory)
+    await clients.save(
+        GUILD,
+        requested_by=CARA,
+        slug="acme",
+        provider="outline",
+        base_url="https://outline.acme.example",
+        client_id="acme-client",
+        redirect_uri=None,
+        now=T0,
+    )
+
+    stored = await clients.set_secret(GUILD, "hunter2", requested_by=CARA, now=T0)
+
+    assert stored is not None
+    assert stored.has_secret is True
+    assert "hunter2" not in repr(stored)
+    assert not any("hunter2" in str(getattr(stored, field)) for field in stored.__slots__)
+
+
+async def test_clearing_the_secret_stops_that_guilds_link_working(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An administrator whose secret leaked wants it gone now.
+
+    Re-registering the whole client to achieve that would free the slug
+    in between, so the secret has its own write -- and a sign-in through
+    the link answers exactly as an unknown slug does the moment it is
+    cleared.
+    """
+    await admin_of(factory, GUILD, CARA)
+    await register(factory, GUILD, "acme")
+    assert await signin_clients(factory).for_slug("acme") is not None
+
+    cleared = await crud(factory).set_secret(GUILD, None, requested_by=CARA, now=T0)
+
+    assert cleared is not None
+    assert cleared.has_secret is False
+    assert await signin_clients(factory).for_slug("acme") is None
+
+
+async def test_setting_a_secret_on_a_guild_with_no_registration_says_so(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await admin_of(factory, GUILD, CARA)
+    assert await crud(factory).set_secret(GUILD, "hunter2", requested_by=CARA, now=T0) is None
+
+
+async def test_deleting_a_registration_frees_its_slug(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await admin_of(factory, GUILD, CARA)
+    await register(factory, GUILD, "acme")
+    clients = crud(factory)
+
+    assert await clients.delete(GUILD, requested_by=CARA) is True
+    assert await clients.delete(GUILD, requested_by=CARA) is False
+    assert await signin_clients(factory).for_slug("acme") is None
