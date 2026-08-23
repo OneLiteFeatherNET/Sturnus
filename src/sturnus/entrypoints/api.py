@@ -33,7 +33,7 @@ import signal
 from datetime import UTC, datetime, timedelta
 
 from aiohttp import web
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from sqlalchemy import inspect
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
@@ -44,6 +44,7 @@ from sturnus.console.adapters import (
     ConsoleGuildNames,
     ConsoleGuildOAuthClients,
     ConsoleGuildReports,
+    ConsoleGuildSetup,
     ConsoleLinkDirectory,
     ConsolePersonalConsents,
     ConsoleProfileDirectory,
@@ -61,6 +62,7 @@ from sturnus.console.app import build_api
 from sturnus.console.audio import AudioDelivery
 from sturnus.console.queries import ConsoleQueries
 from sturnus.console.session import SessionCookie
+from sturnus.domain.onboarding import invite_url
 from sturnus.infrastructure.crypto import KeyWrapper
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
@@ -75,12 +77,14 @@ from sturnus.infrastructure.db.models import (
     GuildExportTarget,
     GuildMember,
     GuildRole,
+    GuildSetupIntent,
     OutlineCollection,
     SessionDocument,
     UserPreference,
 )
 from sturnus.infrastructure.db.models import GuildOAuthClient as GuildOAuthClientRow
 from sturnus.infrastructure.db.preferences import PreferenceStore
+from sturnus.infrastructure.db.setup_intents import SetupIntentStore
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.objectstore import S3AudioStore, S3DocumentStore
 from sturnus.infrastructure.observability import init_sentry
@@ -133,6 +137,11 @@ _REQUIRED_TABLES = frozenset(
         # `guild_config` is on this list for.
         GuildExportTarget.__tablename__,
         SessionDocument.__tablename__,
+        # Where onboarding is written down. On the list for the same
+        # reason `guild_config` is: without it `/readyz` would pass while
+        # the first person trying to set a guild up got a 500 for their
+        # trouble.
+        GuildSetupIntent.__tablename__,
         "session",
         "session_participant",
         "transcription_job",
@@ -176,6 +185,35 @@ class ApiSettings(StrictSettings):
     master_key_id: str
     health_port: int = 8080
     console_origin: str = "https://sturnus.onelitefeather.dev"
+    #: This deployment's Discord application id, used for one thing: the
+    #: `bot`-scope invite link the console offers. Public by design -- it
+    #: appears in every invite URL ever clicked -- so it travels as plain
+    #: configuration and never through the Secret, and it is emphatically
+    #: not a token: it grants this process nothing (Spec 13.2).
+    #:
+    #: Optional, so a deployment that has not set it yet starts and serves
+    #: everything else; the invite endpoint then answers `url: null`,
+    #: which the console renders as "this deployment has no invite link
+    #: configured" rather than as an error.
+    discord_client_id: str | None = None
+
+    @field_validator("discord_client_id", mode="after")
+    @classmethod
+    def _client_id_is_a_snowflake(cls, value: str | None) -> str | None:
+        """Blank is absent; anything that is not digits fails at startup.
+
+        The alternative is a console that signs people in, offers an
+        invite button, and hands whoever clicks it a Discord page that
+        cannot say what application it is being asked to authorise.
+        Failing here names the variable while an operator is still looking
+        at the deployment.
+        """
+        if value is None or not value.strip():
+            return None
+        # Raises `ValueError` for anything that is not a snowflake, with
+        # the reason argued where the rule lives.
+        invite_url(value.strip())
+        return value.strip()
 
 
 async def _wait_for_schema(engine: AsyncEngine) -> None:
@@ -305,6 +343,8 @@ async def _run() -> None:
             settings.s3_secret_key.get_secret_value(),
         ),
         oauth_clients=ConsoleGuildOAuthClients(oauth_clients, admins),
+        setup=ConsoleGuildSetup(session_factory, admins, SetupIntentStore(session_factory)),
+        discord_client_id=settings.discord_client_id,
     )
 
     runner = web.AppRunner(app)

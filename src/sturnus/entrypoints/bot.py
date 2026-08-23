@@ -38,6 +38,7 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.db.setup_intents import SetupIntentStore
 from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
 from sturnus.infrastructure.discord.client import SturnusClient
 from sturnus.infrastructure.discord.link_cog import PROVIDER as OUTLINE_PROVIDER
@@ -204,6 +205,11 @@ async def _run() -> None:
     # snowflakes back, because `api` cannot ask what they are called
     # either. This is where the names come from.
     directory_mirror = DirectoryStore(session_factory)
+    # And the same arrangement run backwards. Every step of setting a
+    # guild up needs a Discord token, so the console writes down what
+    # should be true and the tick makes it true -- see
+    # `sturnus.infrastructure.discord.setup_apply`.
+    setup_intents = SetupIntentStore(session_factory)
     # `provider` fixed at construction: the bot only ever reads its own
     # Outline mapping back (`/link status`), never another provider's --
     # see `AccountLinkRepository`'s class docstring for why the read and
@@ -287,6 +293,7 @@ async def _run() -> None:
         config_store=config_store,
         admin_mirror=admin_mirror,
         directory_mirror=directory_mirror,
+        setup_intents=setup_intents,
         consent_repo=consent_repo,
         session_repo=session_repo,
         job_repo=traced_job_repo,

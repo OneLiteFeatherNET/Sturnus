@@ -389,7 +389,19 @@ api:
   # on either replica -- which is the property that makes more than one
   # replica possible at all.
   replicaCount: 2
-  env: {}
+  env:
+    # The Discord *application* id, and emphatically not the token: it is
+    # public by design -- it appears in every invite link ever clicked --
+    # so it belongs here rather than in the Secret, and it grants this
+    # process nothing. It is used for exactly one thing: building the
+    # `bot`-scope authorize URL the console offers, which is the one
+    # onboarding step that can be done from the web at all.
+    #
+    # Blank is "no invite link configured": the endpoint answers
+    # `url: null` and the console says so, rather than the deployment
+    # failing to start. Anything that is not a snowflake does fail at
+    # startup -- see `ApiSettings._client_id_is_a_snowflake`.
+    STURNUS_DISCORD_CLIENT_ID: ""
   # Writes nothing but Python/library scratch to /tmp under
   # readOnlyRootFilesystem. Decrypted audio never touches disk: it goes from
   # the chunk buffer to the socket, which is the property the whole

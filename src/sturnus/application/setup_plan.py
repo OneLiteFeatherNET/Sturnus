@@ -1,4 +1,4 @@
-"""The decisions behind `/setup`, separated from Discord (Spec 10.1).
+"""The decisions behind setting a guild up, separated from Discord (Spec 10.1).
 
 `/setup` exists so the six required configuration keys can be set from
 typed command parameters -- Discord renders native pickers for a channel
@@ -9,19 +9,30 @@ primary layer of the consent protection (Spec 3.1), and leaving that step
 to prose in an operations guide would put the one step nobody may get
 wrong into the hands of whoever reads the guide least carefully.
 
-A guild names a *list* of channels Sturnus may record in, so `/setup`
-**adds** the channel it was given to that list rather than replacing it.
+A guild names a *list* of channels Sturnus may record in, so setup
+**adds** the channels it was given to that list rather than replacing it.
 Setting up a second meeting room used to silently un-configure the first,
 which is the kind of failure nobody notices until the meeting that was
 supposed to be recorded was not. The permissions are then planned for
-*every* allowed channel, not only the one just named: a channel that is
+*every* allowed channel, not only the ones just named: a channel that is
 allowed but whose `@everyone` may still Speak is a hole in the consent
 protection whether or not this call is the one that added it.
+
+**One planner, two callers.** `/setup` is one of them;
+`sturnus.infrastructure.discord.setup_apply`, which applies what the
+console asked for through `guild_setup_intent`, is the other. A second
+implementation of the consent protection is the last thing this system
+should grow -- one that got either overwrite backwards would let somebody
+be recorded without having consented -- so the two callers differ only in
+where their arguments come from. That is what `added_channel_ids` being a
+tuple and the policy pair being optional are for: the slash command names
+one room and is always told the policy, the console names a list and is
+never told it.
 
 This module holds only the comparison between the desired state and what
 is already configured -- no Discord object reaches it, only the ids and
 permission facts already read off them. That is what makes it testable
-without a guild, and what makes the command safe to run twice: re-running
+without a guild, and what makes setup safe to run twice: re-running
 `plan_setup` against a correctly configured guild returns an empty plan,
 not a rewrite.
 """
@@ -33,12 +44,6 @@ from dataclasses import dataclass
 from typing import Literal
 
 from sturnus.domain import settings
-
-#: Required keys always supplied through `/setup`'s own parameters -- either
-#: written this call or already correct, so they are never reported missing.
-_ALWAYS_SUPPLIED: frozenset[str] = frozenset(
-    {settings.VOICE_CHANNEL_IDS, settings.POLICY_URL, settings.POLICY_VERSION}
-)
 
 
 @dataclass(frozen=True)
@@ -110,66 +115,91 @@ _DEFAULT_ROLE_NAME = "Sturnus Consent"
 
 def plan_setup(
     current: dict[str, str | None],
-    channel_id: int,
+    added_channel_ids: tuple[int, ...],
     stored_channel_ids: tuple[int, ...],
     channel_permissions: Sequence[ChannelPermissions],
     role_id: int | None,
     stored_role_valid: bool,
-    policy_url: str,
-    policy_version: str,
+    policy_url: str | None,
+    policy_version: str | None,
 ) -> SetupPlan:
-    """Computes what `/setup` still needs to do.
+    """Computes what setting this guild up still needs to do.
 
     `current` maps configuration keys to their stored value; a key absent
     from `current` means the caller has no information about it, and it is
     left out of `missing` rather than assumed unset -- `missing` reports
     only what the caller already knows (an explicit `None`) is still open.
-    A real caller (`SetupCog`) reads every required key before building
-    `current`, so in practice every gap does surface; this function itself
-    stays conservative about keys it was never told about.
+    Both real callers read every required key before building `current`,
+    so in practice every gap does surface; this function itself stays
+    conservative about keys it was never told about.
 
     `document_target` cannot be derived from anything Discord exposes -- it
     names an Outline collection -- so it is never guessed here. If the
     caller reports it unset, it is reported in `missing`, exactly like a
-    guild that has never run `/setup` at all.
+    guild that has never been set up at all.
 
     `stored_channel_ids` is what the guild already allows, read through
     `settings.recording_channel_ids` so the key this replaced still counts.
-    `channel_id` is **added** to it, never substituted for it: running
-    `/setup` for a second meeting room must not stop the first one being
+    `added_channel_ids` is **added** to it, never substituted for it:
+    setting up a second meeting room must not stop the first one being
     recorded. Removing one is `/config set voice_channel_ids`, which is why
     the resulting list is reported back rather than merely written.
 
+    A tuple rather than one id because the two callers ask differently:
+    `/setup` names one room, since Discord renders one channel picker per
+    parameter, and the console names the whole list a person ticked. Empty
+    is a legitimate ask from the console -- "leave the channels as they
+    are and fix the rest" -- and leaves the stored list untouched.
+
     `channel_permissions` describes the Speak overwrites of every allowed
-    channel the caller could resolve, the newly added one included. Every
-    allowed channel is planned for, not only the one this call named: a
+    channel the caller could resolve, the newly added ones included. Every
+    allowed channel is planned for, not only the ones this call named: a
     channel Sturnus may record in whose `@everyone` can still Speak is a
     hole in the consent protection regardless of which call added it.
 
-    `role_id` is the consent role explicitly supplied to `/setup`'s
-    `consent_role` parameter this call, or `None` if that argument was
-    omitted -- omitting it must never itself be destructive (Spec 10.1),
-    so it never means "create a new role" the way it once did. What
-    happens when it is omitted is governed by `stored_role_valid`: `True`
-    means `current[settings.CONSENT_ROLE_ID]` names a role the caller has
+    `role_id` is a consent role the caller resolved for this call -- the
+    slash command's `consent_role` parameter, or the role a console intent
+    named by name and that turned out to exist -- or `None` if there was
+    none. Omitting it must never itself be destructive (Spec 10.1), so it
+    never means "create a new role" the way it once did. What happens when
+    it is omitted is governed by `stored_role_valid`: `True` means
+    `current[settings.CONSENT_ROLE_ID]` names a role the caller has
     confirmed still exists in the guild, so it is kept as-is; `False` means
     there is nothing usable to keep, and a new role is requested. Discord
     role existence cannot be checked from here -- there is no guild object
     in this module -- so the caller resolves that before calling in.
+
+    `policy_url` and `policy_version` are what this call was *told* the
+    policy is, and `None` means it was told nothing. `/setup` always has
+    both, because they are required command parameters an administrator
+    typed. A console intent has neither: the console sets them on the
+    settings page, where they are ordinary keys, and an onboarding request
+    that carried them would be a second place to write the two values that
+    decide whose consent is still valid. `None` therefore writes nothing
+    and leaves the key to be reported in `missing` if the guild has not
+    set it -- which is the honest answer for a guild that cannot record
+    yet.
     """
     writes: dict[str, str] = {}
 
-    def _maybe_write(key: str, desired: str) -> None:
-        if current.get(key) != desired:
+    def _maybe_write(key: str, desired: str | None) -> None:
+        # `None` is "this caller was not told", never "clear it": nothing
+        # in setup removes a value, and a caller with no opinion about a
+        # key must leave what is stored alone.
+        if desired is not None and current.get(key) != desired:
             writes[key] = desired
 
-    channel_ids = tuple(sorted({*stored_channel_ids, channel_id}))
-    # The plural key, always -- `/setup` is one of the two commands that
-    # moves a guild off the singular one. The old row is left alone rather
-    # than deleted: it is read only when the plural key is unset, so from
-    # this write on it is inert, and removing it would be a second write
-    # nobody asked for.
-    _maybe_write(settings.VOICE_CHANNEL_IDS, settings.render_channel_ids(channel_ids))
+    channel_ids = tuple(sorted({*stored_channel_ids, *added_channel_ids}))
+    # The plural key, always -- setup is one of the two things that moves a
+    # guild off the singular one. The old row is left alone rather than
+    # deleted: it is read only when the plural key is unset, so from this
+    # write on it is inert, and removing it would be a second write nobody
+    # asked for. Skipped entirely for a guild that allows nothing and was
+    # given nothing, because `render_channel_ids(())` is the empty string
+    # and `ConfigStore.set` refuses it -- rightly, since "allowed to record
+    # nowhere" is what `/config clear` is for.
+    if channel_ids:
+        _maybe_write(settings.VOICE_CHANNEL_IDS, settings.render_channel_ids(channel_ids))
     _maybe_write(settings.POLICY_URL, policy_url)
     _maybe_write(settings.POLICY_VERSION, policy_version)
 
@@ -197,16 +227,28 @@ def plan_setup(
                 PermissionChange(channel.channel_id, "consent_role", allow_speak=True)
             )
 
+    # Required keys this call supplied itself: either written above or
+    # already correct, so neither is still open. Derived from what the
+    # caller was actually told rather than tabulated, because the two
+    # callers are told different things -- a console intent carries no
+    # policy, and a guild that is allowed to record nowhere and was named
+    # no channel genuinely is missing `voice_channel_ids`.
+    supplied = {
+        # Either already correct (`role_id` given, nothing to write), or a
+        # new role is about to be created and will get an id once it
+        # exists -- setup does not fabricate one in advance.
+        settings.CONSENT_ROLE_ID,
+    }
+    if channel_ids:
+        supplied.add(settings.VOICE_CHANNEL_IDS)
+    if policy_url is not None:
+        supplied.add(settings.POLICY_URL)
+    if policy_version is not None:
+        supplied.add(settings.POLICY_VERSION)
+
     missing: list[str] = []
     for key in sorted(settings.REQUIRED_KEYS):
-        if key in writes:
-            continue
-        if key == settings.CONSENT_ROLE_ID:
-            # Either already correct (role_id given, nothing to write), or a
-            # new role is about to be created and will get an id once it
-            # exists -- setup does not fabricate one in advance.
-            continue
-        if key in _ALWAYS_SUPPLIED:
+        if key in writes or key in supplied:
             continue
         if key in current and current[key] is None:
             missing.append(key)

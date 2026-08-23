@@ -36,7 +36,7 @@ def permissions(
 def plan(current: dict[str, str | None] | None = None, **kw: object) -> SetupPlan:
     defaults: dict[str, object] = {
         "current": current or {},
-        "channel_id": CHANNEL,
+        "added_channel_ids": (CHANNEL,),
         "stored_channel_ids": (),
         "channel_permissions": permissions(CHANNEL),
         "role_id": ROLE,
@@ -189,3 +189,97 @@ def test_an_explicitly_supplied_role_overrides_a_stored_one() -> None:
 def test_an_unchanged_value_is_not_rewritten() -> None:
     result = plan({settings.VOICE_CHANNEL_IDS: str(CHANNEL)}, stored_channel_ids=(CHANNEL,))
     assert settings.VOICE_CHANNEL_IDS not in result.writes
+
+
+# ---------------------------------------------------------------------------
+# The second caller: the console, through a setup intent
+# ---------------------------------------------------------------------------
+#
+# One planner, two callers. The console asks for the whole list at once
+# and is never told the policy, so the planner has to take both -- a
+# second implementation of the consent protection is the last thing this
+# system should grow.
+
+
+def test_a_whole_list_of_channels_can_be_added_at_once() -> None:
+    """What the console asks for: the rooms somebody ticked, not one room."""
+    result = plan(
+        None,
+        added_channel_ids=(CHANNEL, OTHER_CHANNEL),
+        channel_permissions=permissions(CHANNEL, OTHER_CHANNEL),
+    )
+    assert result.channel_ids == (CHANNEL, OTHER_CHANNEL)
+    assert result.writes[settings.VOICE_CHANNEL_IDS] == f"{CHANNEL},{OTHER_CHANNEL}"
+
+
+def test_naming_no_channel_leaves_the_stored_list_exactly_as_it_was() -> None:
+    """ "Fix the rest and leave the rooms alone" is a legitimate request.
+
+    It is also the only shape in which the consent protection can be
+    re-applied to a guild whose channels are already correct but whose
+    overwrites are not.
+    """
+    result = plan(
+        {settings.VOICE_CHANNEL_IDS: str(OTHER_CHANNEL)},
+        added_channel_ids=(),
+        stored_channel_ids=(OTHER_CHANNEL,),
+        channel_permissions=permissions(OTHER_CHANNEL),
+    )
+    assert result.channel_ids == (OTHER_CHANNEL,)
+    assert settings.VOICE_CHANNEL_IDS not in result.writes
+    assert [change.channel_id for change in result.permission_changes] == [
+        OTHER_CHANNEL,
+        OTHER_CHANNEL,
+    ]
+
+
+def test_a_guild_allowed_nowhere_and_given_nothing_is_told_the_key_is_missing() -> None:
+    """Never an empty write.
+
+    `render_channel_ids(())` is the empty string and `ConfigStore.set`
+    refuses it, rightly -- "allowed to record nowhere" is what
+    `/config clear` is for. So the key goes unwritten and is reported as
+    what it is: still open.
+    """
+    result = plan(
+        {settings.VOICE_CHANNEL_IDS: None},
+        added_channel_ids=(),
+        stored_channel_ids=(),
+        channel_permissions=[],
+    )
+    assert result.channel_ids == ()
+    assert settings.VOICE_CHANNEL_IDS not in result.writes
+    assert settings.VOICE_CHANNEL_IDS in result.missing
+
+
+def test_a_caller_that_was_told_no_policy_writes_none_and_overwrites_nothing() -> None:
+    """The console never carries the policy pair, and must not clear it.
+
+    `policy_version` decides whose consent is still valid. A setup
+    request that quietly rewrote it would invalidate every consent in the
+    guild as a side effect of somebody ticking a channel.
+    """
+    stored = {
+        settings.POLICY_URL: "https://example.org/policy",
+        settings.POLICY_VERSION: "2026-01-01",
+    }
+    result = plan(dict(stored), policy_url=None, policy_version=None)
+    assert settings.POLICY_URL not in result.writes
+    assert settings.POLICY_VERSION not in result.writes
+
+
+def test_a_policy_nobody_supplied_and_nobody_stored_is_reported_missing() -> None:
+    """The guild cannot record yet, and the answer has to say so.
+
+    `/setup` always supplies both from its own typed parameters, so it
+    never reaches this; a console intent never supplies either, so a guild
+    that never set them has to hear about it here rather than discover it
+    the first time nobody is recorded.
+    """
+    result = plan(
+        {settings.POLICY_URL: None, settings.POLICY_VERSION: None},
+        policy_url=None,
+        policy_version=None,
+    )
+    assert settings.POLICY_URL in result.missing
+    assert settings.POLICY_VERSION in result.missing
