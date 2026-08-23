@@ -299,7 +299,16 @@ class RecordingSink(voice_recv.AudioSink):
             # as before -- nothing is decoded and nothing is recorded.
             payload = data.opus or b""
             if self._video_probe.observe(ssrc, len(payload)):
-                record(VOICE_PACKETS, 1, outcome="video", guild_id=self._guild_id)
+                # Two outcomes, not one. `video` is "we do not keep video
+                # at all" -- a packet from a stream this connection did
+                # ask about. `video_no_consent` is a packet on a stream
+                # deliberately refused because that speaker's consent
+                # does not name video, which means Discord sent it
+                # unasked, and that is a fact about Discord worth a
+                # separate series rather than a line in a report nobody
+                # reads. Both are dropped here exactly as before.
+                outcome = "video_no_consent" if self._video_probe.is_refused(ssrc) else "video"
+                record(VOICE_PACKETS, 1, outcome=outcome, guild_id=self._guild_id)
                 return
             self._video_probe.note_unannounced()
 

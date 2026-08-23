@@ -125,6 +125,18 @@ _LITERALS = frozenset(
         "is_last",
         "listening",
         "missing",
+        #: What a consent covers -- `sturnus.domain.consent.ConsentScope`,
+        #: two literals from this repository's own source. Never the
+        #: policy document, never a URL: the scope is `audio` or
+        #: `audio_video` and nothing else can be written here.
+        "scope",
+        #: Whether a revocation named its own effective instant or took
+        #: the default of now. A boolean, and the one thing about a
+        #: console revocation that `consent.revoked_at` cannot recover:
+        #: an administrator back-dating a withdrawal to last March and
+        #: one clicking "withdraw" both leave a perfectly ordinary date
+        #: in the column, and only this field says which act it was.
+        "effective_at_given",
         #: A key of `sturnus.domain.settings` -- one of seventeen literals
         #: from this repository's own source, and checked against the
         #: registry before anything logs it. The *value* is not here and
@@ -274,7 +286,7 @@ _PAYLOAD_NAMES: Final[frozenset[str]] = frozenset(
 #: over Sturnus's own field names can see -- is scrubbed on its way to the
 #: formatter. Applying the payload half there too would redact the word
 #: after every "text:" and "body:" an English sentence contains, which is
-#: how a control earns itself a `# noqa`.
+#: how a control earns itself a suppression.
 #:
 #: Derived, not restated: `DENIED_NAMES` below is the union, so the static
 #: rule in `tests/test_logging_discipline.py` still sees one list and the

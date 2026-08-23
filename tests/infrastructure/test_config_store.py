@@ -154,3 +154,46 @@ async def test_the_transcription_prompt_is_a_key_an_administrator_can_set(
 ) -> None:
     await store.set(GUILD, settings.TRANSCRIPTION_PROMPT, "Nur eigene Wörter.", T0)
     assert await store.get(GUILD, settings.TRANSCRIPTION_PROMPT) == "Nur eigene Wörter."
+
+
+# ---------------------------------------------------------------------------
+# Boolean keys
+# ---------------------------------------------------------------------------
+
+
+async def test_a_boolean_key_accepts_the_two_spellings_it_names(store: ConfigStore) -> None:
+    await store.set(GUILD, settings.VIDEO_CONSENT_OFFERED, settings.TRUE, T0)
+    assert await store.get(GUILD, settings.VIDEO_CONSENT_OFFERED) == settings.TRUE
+
+    await store.set(GUILD, settings.VIDEO_CONSENT_OFFERED, settings.FALSE, T0)
+    assert await store.get(GUILD, settings.VIDEO_CONSENT_OFFERED) == settings.FALSE
+
+
+@pytest.mark.parametrize("value", ["yes", "1", "True", "off", ""])
+async def test_anything_else_is_refused_at_write_time(store: ConfigStore, value: str) -> None:
+    """Stronger than the integer case, not weaker.
+
+    A bad integer fails loudly on the read path. `settings.is_true` reads
+    anything it does not recognise as false, so an unvalidated `"yes"`
+    would fail nowhere at all -- it would quietly mean the opposite of
+    what the person who typed it meant, about whether a guild may offer
+    video consent.
+    """
+    with pytest.raises(ValueError):
+        await store.set(GUILD, settings.VIDEO_CONSENT_OFFERED, value, T0)
+
+
+async def test_a_guild_that_was_never_asked_does_not_offer_video_consent(
+    store: ConfigStore,
+) -> None:
+    """The default says the policy document has not been checked, which for
+    every guild nobody has asked is true. `true` as a default would assert
+    something about somebody else's wording."""
+    assert settings.is_true(await store.get(GUILD, settings.VIDEO_CONSENT_OFFERED)) is False
+
+
+async def test_clearing_it_puts_the_guild_back_to_not_offering_it(store: ConfigStore) -> None:
+    await store.set(GUILD, settings.VIDEO_CONSENT_OFFERED, settings.TRUE, T0)
+    await store.set(GUILD, settings.VIDEO_CONSENT_OFFERED, None, T0)
+
+    assert settings.is_true(await store.get(GUILD, settings.VIDEO_CONSENT_OFFERED)) is False

@@ -177,6 +177,23 @@ class Event(StrEnum):
     #: reaching for the same name is this feature working. `reason` says
     #: which of the two it was.
     CONSOLE_CONSENT_REVOKE_REFUSED = "console.consent_revoke_refused"
+    #: A person withdrew their **own** consent from the console. INFO
+    #: rather than WARNING, and the asymmetry with the line above it is
+    #: deliberate: nobody is acting on anybody else here, which is the
+    #: ordinary case the feature exists for. It carries `requested_by`
+    #: equal to `discord_user_id` anyway, so a query over both events
+    #: answers "who withdrew whose consent" without a row falling out of
+    #: it for lack of the field.
+    CONSOLE_CONSENT_SELF_REVOKED = "console.consent_self_revoked"
+    #: A person changed what their own consent covers -- `scope` names
+    #: what it covers now. A widening is a new `consent` row and a
+    #: narrowing modifies the existing one, so the table itself does not
+    #: record the two as the same kind of event; this line does.
+    CONSOLE_CONSENT_SCOPE_CHANGED = "console.consent_scope_changed"
+    #: A scope change that changed nothing. `reason` says why -- most
+    #: often `video_consent_offered` being false, which is the guild
+    #: saying its policy document does not name video.
+    CONSOLE_CONSENT_SCOPE_REFUSED = "console.consent_scope_refused"
 
     # -- cross-cutting ------------------------------------------------------
     PROCESS_STARTING = "process.starting"

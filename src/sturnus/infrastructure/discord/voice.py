@@ -78,7 +78,7 @@ from sturnus.infrastructure.discord.video_probe import VideoProbe
 from sturnus.infrastructure.discord.video_subscription import (
     VideoCapableVoiceClient,
     announce_video_capability,
-    request_all_video,
+    refuse_unnamed_video,
     request_video_streams,
 )
 from sturnus.infrastructure.telemetry import VOICE_PACKET_ERRORS, VOICE_PACKETS, record
@@ -163,6 +163,12 @@ class VoiceReceiveAdapter:
         self._queue: asyncio.Queue[CaptureMessage] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._guild_id: int | None = None
+        #: The role `join` read out of the guild's configuration. Kept so
+        #: the video path can apply Spec 3.1's first layer too: the sink
+        #: checks it per audio frame, and `_on_video_announced` has to
+        #: make the same check for itself because it runs on the event
+        #: loop, before any packet exists to check.
+        self._consent_role_id: int | None = None
         self._video_probe: VideoProbe | None = None
         self._stopping = False
         self._message_errors = RateLimiter(_MESSAGE_ERROR_LOG_EVERY)
@@ -211,6 +217,7 @@ class VoiceReceiveAdapter:
         self._voice_client = await channel.connect(cls=client_class)
 
         self._guild_id = channel.guild.id
+        self._consent_role_id = int(stored_role_id)
         self._stopping = False
         self._loop = asyncio.get_running_loop()
         self._queue = asyncio.Queue()
@@ -219,7 +226,7 @@ class VoiceReceiveAdapter:
         self._message_errors = RateLimiter(_MESSAGE_ERROR_LOG_EVERY)
         self._drain_task = asyncio.create_task(self._drain(self._queue))
         try:
-            self._start_listening(int(stored_role_id))
+            self._start_listening(self._consent_role_id)
         except Exception:
             # Connected but not listening is worse than not connected:
             # the bot would sit in the channel recording nothing.
@@ -262,6 +269,10 @@ class VoiceReceiveAdapter:
 
         self._queue = None
         self._loop = None
+        # Read afresh on the next `join`, from that guild's configuration.
+        # A stale role id here would be a video subscription decided
+        # against a role the guild no longer uses.
+        self._consent_role_id = None
         # The sink's `cleanup()` already reported and stopped it; dropping
         # the reference here keeps a finished capture's probe from being
         # written to by a late gateway event.
@@ -322,19 +333,30 @@ class VoiceReceiveAdapter:
         self._voice_client.listen(sink, after=self._on_listen_stopped)
 
     async def _ask_for_video(self) -> None:
-        """Asks Discord for video, and records that it asked.
+        """Declares this connection video-capable, and asks for nothing yet.
 
-        Three sends, in the order the protocol requires (see
+        Two sends, in the order the protocol requires (see
         `.video_subscription`): the `IDENTIFY` flag already went out with
         the handshake, then op 12 to declare SSRC ownership -- without
-        which video is refused outright -- then op 15 to say which streams
-        this connection wants.
+        which video is refused outright -- then op 15 carrying
+        ``{"any": 0}``.
 
-        The per-stream op 15 cannot be sent yet, because no SSRC is known
-        until the server announces one, so a listener sends it then.
-        Registered on the voice client rather than the sink: it has to run
-        on the event loop to touch the websocket, and the sink's listeners
-        run on the extension's own thread.
+        **That last one used to be ``{"any": 100}``, and the change is the
+        substance of the consent scope rather than a detail of it.** Video
+        is not recorded by this bot and this method does not make it
+        recordable; what it stops is asking Discord for the camera of
+        somebody who has not said yes. Those are different acts even
+        though the packets meet the same fate: a person's client can show
+        them that a stream is being consumed, and nothing about discarding
+        it afterwards reaches them. So nothing is subscribed to at connect
+        and every stream is asked for by name later, once the consent
+        behind the name has been read -- which is `_on_video_announced`,
+        because no SSRC exists to name until the server announces one.
+
+        The listener is registered on the voice client rather than the
+        sink: it has to run on the event loop to touch the websocket and
+        to await a consent lookup, and the sink's listeners run on the
+        extension's own thread.
 
         Every failure here is recorded and none of it raises. A capture
         that records audio correctly must not be lost because a diagnostic
@@ -344,19 +366,35 @@ class VoiceReceiveAdapter:
         if probe is None or client is None:
             return
         probe.note_request("op12-video", sent=await announce_video_capability(client))
-        probe.note_request("op15-any", sent=await request_all_video(client))
+        probe.note_request("op15-any-off", sent=await refuse_unnamed_video(client))
         client.add_listener(self._on_video_announced, name="on_voice_member_video")
 
     async def _on_video_announced(self, member: object, streams: object) -> None:
-        """Subscribes to the SSRCs Discord just named. Event loop.
+        """Subscribes to the SSRCs Discord just named -- if consent covers video.
 
-        Reads defensively: `voice_recv` is alpha, and an exception in a
-        listener it dispatched would be logged by the library and lose the
-        subscription silently. The probe records the outcome either way,
-        which is what makes "we asked" and "we never asked" different
-        lines in the log.
+        Event loop, which is what makes the consent read possible at all:
+        `ConsentCache` is async and the sink's listeners are not.
+
+        Both layers of Spec 3.1 apply here, the same two the sink applies
+        per audio frame. The role is read straight off the `Member` object
+        with no cache, because it can be taken away in Discord at any
+        moment; the stored record comes through `ConsentCache`, because it
+        is the layer that survives somebody with administrator permissions
+        bypassing the role. The record must additionally name
+        `ConsentScope.AUDIO_VIDEO` -- consenting to being recorded in a
+        meeting is not consenting to being watched, and a system that
+        conflated them would be answering a question nobody was asked.
+
+        A refusal is recorded on the probe rather than merely returning.
+        "Announced, never asked for" and "asked for, never delivered" are
+        the same zero in the packet counts and mean opposite things about
+        whether Discord sends a bot video at all; the sink reports packets
+        on a refused stream as `video_no_consent` for the same reason.
+
+        Reads defensively throughout: `voice_recv` is alpha, and an
+        exception in a listener it dispatched would be logged by the
+        library and lose the subscription silently.
         """
-        del member
         probe, client = self._video_probe, self._voice_client
         if probe is None or client is None:
             return
@@ -371,7 +409,44 @@ class VoiceReceiveAdapter:
             return
         if not ssrcs:
             return
+
+        if not await self._may_ask_for_video_of(member, streams):
+            probe.note_subscription(ssrcs, subscribed=False)
+            return
+
+        probe.note_subscription(ssrcs, subscribed=True)
         probe.note_request("op15-per-ssrc", sent=await request_video_streams(client, ssrcs))
+
+    async def _may_ask_for_video_of(self, member: object, streams: object) -> bool:
+        """Whether the person behind this announcement consented to video.
+
+        `False` for anybody this method cannot identify, and that is the
+        only safe direction: an announcement whose member cannot be read
+        is an announcement about a person whose consent cannot be read
+        either, and the answer to "we do not know" must be no. The library
+        carries the member on the payload as well as in the event
+        argument, so both are tried before giving up.
+        """
+        guild_id = self._guild_id
+        if guild_id is None:
+            return False
+        speaker = getattr(streams, "member", None) or member
+        discord_user_id = getattr(speaker, "id", None)
+        if not isinstance(discord_user_id, int):
+            return False
+        roles = getattr(speaker, "roles", None) or ()
+        has_consent_role = any(getattr(role, "id", None) == self._consent_role_id for role in roles)
+        try:
+            return await self._consent_cache.may_record_video(
+                guild_id, discord_user_id, has_consent_role
+            )
+        except Exception:
+            # A database that cannot be reached is not a yes. The audio
+            # path treats the same failure the same way one layer up, in
+            # `_record`; here there is no frame to drop, so the refusal is
+            # simply not sending the subscription.
+            log.debug("Could not read video consent; not subscribing", exc_info=True)
+            return False
 
     def _emit(self, message: CaptureMessage) -> None:
         """Hands one message to the event loop. Called from the extension's threads.

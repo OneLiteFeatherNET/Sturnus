@@ -42,6 +42,7 @@ from sturnus.console.ports import (
     GuildReports,
     LinkDirectory,
     OAuthClient,
+    PersonalConsents,
     PreferenceDirectory,
     ProfileDirectory,
     QueueControl,
@@ -55,6 +56,8 @@ from sturnus.console.routes_audio import AUDIO_DELIVERY
 from sturnus.console.routes_audio import register as register_audio
 from sturnus.console.routes_consent import CONSENT_DIRECTORY
 from sturnus.console.routes_consent import register as register_consent
+from sturnus.console.routes_consent_self import PERSONAL_CONSENTS
+from sturnus.console.routes_consent_self import register as register_consent_self
 from sturnus.console.routes_directory import COLLECTION_NAMES, GUILD_NAMES
 from sturnus.console.routes_directory import register as register_directory
 from sturnus.console.routes_me import PREFERENCES, PROFILE_DIRECTORY
@@ -270,6 +273,7 @@ def build_api(
     tags: TagWriter,
     queues: QueueOverview,
     consents: ConsentDirectory,
+    own_consents: PersonalConsents,
     reports: GuildReports,
     profile: ProfileDirectory,
     prefs: PreferenceDirectory,
@@ -303,6 +307,7 @@ def build_api(
     app[routes_tags.TAG_WRITER] = tags
     app[QUEUE_OVERVIEW] = queues
     app[CONSENT_DIRECTORY] = consents
+    app[PERSONAL_CONSENTS] = own_consents
     app[GUILD_REPORTS] = reports
     app[PROFILE_DIRECTORY] = profile
     app[PREFERENCES] = prefs
@@ -321,6 +326,7 @@ def build_api(
     register_audio(app)
     register_queue(app)
     register_consent(app)
+    register_consent_self(app)
     register_report(app)
     register_me(app)
     register_directory(app)

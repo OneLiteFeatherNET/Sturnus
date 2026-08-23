@@ -93,6 +93,13 @@ class AnnouncedStream:
     #: Packets seen on this SSRC, bucketed by size. Empty means the
     #: gateway announced a stream that never arrived.
     packet_sizes: Counter[str] = field(default_factory=Counter)
+    #: Whether this connection asked for the stream. `None` until the
+    #: consent behind it has been resolved, `False` for a speaker whose
+    #: consent does not name video. It is the difference between "we
+    #: asked and nothing came" and "we did not ask, on purpose", which
+    #: are the same zero in every other column here and mean opposite
+    #: things about whether video reaches a bot at all.
+    subscribed: bool | None = None
 
     @property
     def packets(self) -> int:
@@ -198,6 +205,41 @@ class VideoProbe:
             stream.packet_sizes[size_band(size)] += 1
             return True
 
+    def note_subscription(self, ssrcs: list[int], *, subscribed: bool) -> None:
+        """Records whether this connection asked for these streams.
+
+        Called from the event loop once the speaker's consent scope has
+        been read (`voice.VoiceReceiveAdapter._on_video_announced`). An
+        SSRC nobody announced is recorded anyway, as a stream with no
+        other detail, so a refusal is never lost to an ordering the
+        gateway chose.
+        """
+        with self._lock:
+            for ssrc in ssrcs:
+                stream = self._streams.get(ssrc)
+                if stream is None:
+                    stream = AnnouncedStream(
+                        ssrc=ssrc,
+                        discord_user_id=None,
+                        kind="?",
+                        active=False,
+                        resolution="?",
+                    )
+                    self._streams[ssrc] = stream
+                stream.subscribed = subscribed
+
+    def is_refused(self, ssrc: int) -> bool:
+        """Whether this stream was deliberately not asked for.
+
+        `False` for a stream that was asked for **and** for one nobody
+        has decided about yet: only an explicit refusal is a refusal, and
+        reporting an undecided stream as refused would put a consent
+        verdict in a metric that no consent produced.
+        """
+        with self._lock:
+            stream = self._streams.get(ssrc)
+            return stream is not None and stream.subscribed is False
+
     def note_unannounced(self) -> None:
         with self._lock:
             self.unannounced_packets += 1
@@ -217,9 +259,15 @@ class VideoProbe:
             requests = dict(self._requests)
 
         arrived = sum(1 for stream in streams if stream.packets)
+        # Counted and reported separately from everything else: a run in
+        # which every announced stream was refused looks exactly like a
+        # run in which Discord sent nothing, and only one of those is a
+        # finding about Discord.
+        refused = sum(1 for stream in streams if stream.subscribed is False)
         described = ", ".join(
             f"ssrc={stream.ssrc}/{stream.kind}"
             f"{'' if stream.active else '(inactive)'}"
+            f"{'' if stream.subscribed is not False else '(no video consent)'}"
             f"@{stream.resolution} user={stream.discord_user_id} "
             f"packets={stream.packets}"
             + (
@@ -230,14 +278,16 @@ class VideoProbe:
             for stream in streams[:MAX_DESCRIBED_STREAMS]
         )
         log.warning(
-            "video probe: asked for video with [%s] | %d stream(s) announced, %d delivered "
-            "any packet | %s | packets on unannounced ssrcs: %d || %s",
+            "video probe: asked for video with [%s] | %d stream(s) announced, %d refused for "
+            "lack of video consent, %d delivered any packet | %s | packets on unannounced "
+            "ssrcs: %d || %s",
             _describe_requests(requests),
             len(streams),
+            refused,
             arrived,
             described or "none",
             unannounced,
-            _verdict(requests, len(streams), arrived),
+            _verdict(requests, len(streams), arrived, refused),
         )
 
     def clear(self) -> None:
@@ -265,13 +315,20 @@ def _describe_requests(requests: dict[str, bool]) -> str:
     )
 
 
-def _verdict(requests: dict[str, bool], announced: int, arrived: int) -> str:
+def _verdict(requests: dict[str, bool], announced: int, arrived: int, refused: int) -> str:
     """One sentence naming what the numbers above decide.
 
-    Written out rather than left to the reader because the three outcomes
-    lead to three different projects, and the difference between them is
-    not obvious from two integers.
+    Written out rather than left to the reader because the outcomes lead
+    to different projects, and the difference between them is not obvious
+    from three integers.
     """
+    if not arrived and announced and refused == announced:
+        return (
+            "Every announced stream was refused because nobody in this session has "
+            "consented to video, so this run says nothing about whether Discord would "
+            "have sent it. A measurement needs a speaker whose consent scope is "
+            "audio_video in a guild with video_consent_offered turned on."
+        )
     if arrived:
         return (
             "Video packets are reaching this bot. Depacketisation, DAVE decryption for "

@@ -41,6 +41,7 @@ from tests.console.conftest import (
 )
 
 GRANTED = datetime(2026, 8, 1, 9, 0, 0, tzinfo=UTC)
+REVOKED_AT = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 
 
 def token(discord_user_id: int = ANNA) -> str:
@@ -72,6 +73,7 @@ def holder(**over: object) -> ConsentHolder:
         "revoked_at": None,
         "active": True,
         "recordings_with_audio": 3,
+        "scope": "audio",
     }
     base.update(over)
     return ConsentHolder(**base)  # type: ignore[arg-type]
@@ -248,13 +250,20 @@ async def test_the_listing_is_never_cached(
 async def test_an_administrator_may_withdraw_somebody_else_s_consent(
     aiohttp_client: AiohttpClientFactory,
 ) -> None:
-    consents = FakeConsents(outcome=RevocationOutcome(revoked=True, refusal=None))
+    consents = FakeConsents(
+        outcome=RevocationOutcome(revoked=True, refusal=None, effective_at=REVOKED_AT)
+    )
     client = await signed_in(aiohttp_client, build_test_api(consents=consents))
 
     response = await client.post(revoke_url())
 
     assert response.status == 200
-    assert (await response.json()) == {"revoked": True, "refusal": None}
+    assert (await response.json()) == {
+        "revoked": True,
+        "refusal": None,
+        "effective_at": REVOKED_AT.isoformat(),
+        "recordings_from_effective_at": 0,
+    }
 
 
 async def test_the_revocation_names_the_signed_in_administrator_as_the_actor(
@@ -407,3 +416,122 @@ async def test_a_refusal_nobody_was_entitled_to_ask_for_is_not_an_audit_line(
 
     assert not _events(caplog, Event.CONSOLE_CONSENT_REVOKED)
     assert not _events(caplog, Event.CONSOLE_CONSENT_REVOKE_REFUSED)
+
+
+# ---------------------------------------------------------------------------
+# The effective instant
+# ---------------------------------------------------------------------------
+
+
+def revoked() -> RevocationOutcome:
+    return RevocationOutcome(revoked=True, refusal=None, effective_at=REVOKED_AT)
+
+
+async def test_a_revocation_that_sends_no_body_still_works(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The compatibility promise, as a test.
+
+    `effective_at` is optional so that a console which has never heard of
+    it goes on working unchanged -- which is what "absent means now"
+    buys, and the reason it is not a required field with a sentinel.
+    """
+    consents = FakeConsents(outcome=revoked())
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    assert (await client.post(revoke_url())).status == 200
+    assert consents.effective_instants == [None]
+
+
+async def test_an_administrator_may_schedule_a_withdrawal_for_a_named_instant(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    consents = FakeConsents(outcome=revoked())
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(revoke_url(), json={"effective_at": "2026-09-30T23:59:00+00:00"})
+
+    assert response.status == 200
+    assert consents.effective_instants == [datetime(2026, 9, 30, 23, 59, tzinfo=UTC)]
+
+
+async def test_an_instant_with_an_offset_is_normalised_to_utc(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Every other time in this system is UTC. A `+02:00` that survived to
+    the column would be the only one that was not, and the comparison
+    against `granted_at` would be the first thing to notice."""
+    consents = FakeConsents(outcome=revoked())
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    await client.post(revoke_url(), json={"effective_at": "2026-09-30T12:00:00+02:00"})
+
+    assert consents.effective_instants == [datetime(2026, 9, 30, 10, 0, tzinfo=UTC)]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        # Naive: a different instant in every zone that reads it, and a
+        # revocation is not a thing to be approximately dated.
+        "2026-09-30T23:59:00",
+        "next tuesday",
+        "2026-13-45T00:00:00Z",
+        7,
+    ],
+)
+async def test_an_instant_that_names_no_moment_is_a_bad_request(
+    aiohttp_client: AiohttpClientFactory, value: object
+) -> None:
+    """400 rather than 409: a string that names no moment is a malformed
+    request, not a state that refuses one."""
+    consents = FakeConsents(outcome=revoked())
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(revoke_url(), json={"effective_at": value})
+
+    assert response.status == 400
+    assert consents.revoked == []
+
+
+async def test_a_backdated_revocation_reports_what_it_did_not_delete(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """`/audio purge` and the retention sweep remain the only two things
+    that delete audio. This number is what lets the console offer the
+    first of them rather than quietly taking it."""
+    consents = FakeConsents(
+        outcome=RevocationOutcome(
+            revoked=True,
+            refusal=None,
+            effective_at=REVOKED_AT,
+            recordings_from_effective_at=4,
+        )
+    )
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    body = await (await client.post(revoke_url())).json()
+
+    assert body["recordings_from_effective_at"] == 4
+    assert body["effective_at"] == REVOKED_AT.isoformat()
+
+
+async def test_the_audit_line_says_whether_the_instant_was_chosen(
+    aiohttp_client: AiohttpClientFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An administrator back-dating a withdrawal to last March is making a
+    claim about months of recordings that already exist; one clicking
+    "withdraw" is stopping something tomorrow. Both leave a perfectly
+    ordinary date in `revoked_at`, and by the time anybody reads the row
+    only this field can tell the two acts apart.
+    """
+    consents = FakeConsents(outcome=revoked())
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    with caplog.at_level(logging.INFO):
+        await client.post(revoke_url())
+        await client.post(revoke_url(), json={"effective_at": "2026-03-01T00:00:00+00:00"})
+
+    lines = _events(caplog, Event.CONSOLE_CONSENT_REVOKED)
+    assert [_fields(line)["effective_at_given"] for line in lines] == [False, True]

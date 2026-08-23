@@ -20,6 +20,7 @@ from discord.ext import voice_recv
 
 from sturnus.infrastructure.discord import video_subscription
 from sturnus.infrastructure.discord.video_subscription import (
+    DISABLED,
     HIGHEST_QUALITY,
     MEDIA_SINK_WANTS,
     VIDEO,
@@ -27,7 +28,7 @@ from sturnus.infrastructure.discord.video_subscription import (
     VideoCapableVoiceClient,
     VideoCapableVoiceWebSocket,
     announce_video_capability,
-    request_all_video,
+    refuse_unnamed_video,
     request_video_streams,
 )
 
@@ -222,16 +223,24 @@ async def test_op_12_is_not_sent_before_the_server_assigns_an_ssrc() -> None:
 
 
 @pytest.mark.asyncio
-async def test_op_15_asks_for_every_stream_at_the_highest_layer() -> None:
-    """Sent before any SSRC is known, so a share already running when the
-    bot joins is covered. The highest layer on purpose: the question is
-    whether anything arrives, and a low layer that happened to be dropped
-    would answer it wrongly."""
+async def test_the_connection_asks_for_no_stream_it_has_not_named() -> None:
+    """This used to be `{"any": 100}` -- give me everybody's camera.
+
+    Sent before any SSRC is known, which is exactly the moment at which
+    nothing is known about anybody's consent either, so the only honest
+    thing it can say is no. A stream is asked for by name afterwards and
+    only for a speaker whose consent scope covers video. `any` still
+    carries a value rather than being left out, because it governs the
+    streams this connection never names -- a share already running when
+    the bot joined is precisely such a stream, and silence there would
+    leave the server's default in charge of it.
+    """
     ws = FakeWebSocket()
 
-    assert await request_all_video(_client(ws)) is True
+    assert await refuse_unnamed_video(_client(ws)) is True
 
-    assert ws.sent == [{"op": MEDIA_SINK_WANTS, "d": {"any": HIGHEST_QUALITY}}]
+    assert ws.sent == [{"op": MEDIA_SINK_WANTS, "d": {"any": DISABLED}}]
+    assert DISABLED != HIGHEST_QUALITY
 
 
 @pytest.mark.asyncio
@@ -262,7 +271,7 @@ async def test_a_missing_websocket_is_reported_not_raised() -> None:
     """Reached from a gateway event handler mid-capture. An exception here
     would end a recording that was working, to answer a question nobody
     asked for."""
-    assert await request_all_video(_client(None)) is False
+    assert await refuse_unnamed_video(_client(None)) is False
 
 
 @pytest.mark.asyncio
@@ -274,4 +283,4 @@ async def test_a_websocket_that_refuses_the_payload_is_reported_not_raised() -> 
         async def send_as_json(self, _payload: dict[str, Any]) -> None:
             raise RuntimeError("closed")
 
-    assert await request_all_video(_client(Refusing())) is False
+    assert await refuse_unnamed_video(_client(Refusing())) is False

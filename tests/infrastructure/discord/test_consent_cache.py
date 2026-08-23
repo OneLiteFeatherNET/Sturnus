@@ -14,7 +14,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
-from sturnus.domain.consent import ConsentRecord
+from sturnus.domain.consent import ConsentRecord, ConsentScope
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.repositories import ConsentRepository
 from sturnus.infrastructure.discord.consent_cache import ConsentCache
@@ -120,3 +120,84 @@ async def test_different_users_are_cached_independently() -> None:
     assert await cache.may_record(GUILD_ID, USER_ID, has_consent_role=True) is True
     assert await cache.may_record(GUILD_ID, USER_ID + 1, has_consent_role=True) is False
     assert consent_repo.current.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# A scheduled revocation, and why no new machinery is needed for one
+# ---------------------------------------------------------------------------
+
+
+def _scheduled(revoked_at: datetime) -> ConsentRecord:
+    return ConsentRecord(granted_at=T0, revoked_at=revoked_at, policy_version=POLICY)
+
+
+async def test_a_withdrawal_dated_for_next_week_does_not_stop_recording_today() -> None:
+    cache, _, _ = _cache(FakeClock(T0), record=_scheduled(T0 + timedelta(days=7)))
+
+    assert await cache.may_record(GUILD_ID, USER_ID, has_consent_role=True) is True
+
+
+async def test_a_scheduled_withdrawal_takes_effect_without_a_second_database_read() -> None:
+    """The property that makes this feature free, stated as a test.
+
+    What is cached is the **record**, not a verdict, and the domain rule
+    runs against `clock.now()` on every call. So the moment the instant
+    passes, the answer changes -- on the very next packet, out of the
+    entry already in memory, with `current()` never called again. A cache
+    that had stored the boolean would have delivered the withdrawal up to
+    a whole TTL late and nothing would have said why.
+    """
+    clock = FakeClock(T0)
+    revoked_at = T0 + timedelta(seconds=2)
+    cache, current, _ = _cache(clock, record=_scheduled(revoked_at), ttl=timedelta(seconds=5))
+
+    assert await cache.may_record(GUILD_ID, USER_ID, has_consent_role=True) is True
+    clock.advance(timedelta(seconds=2))
+
+    assert await cache.may_record(GUILD_ID, USER_ID, has_consent_role=True) is False
+    # Still one read: the entry has not expired, and it did not need to.
+    assert current.await_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Video, which is asked for rather than recorded
+# ---------------------------------------------------------------------------
+
+
+def _wide(revoked_at: datetime | None = None) -> ConsentRecord:
+    return ConsentRecord(
+        granted_at=T0,
+        revoked_at=revoked_at,
+        policy_version=POLICY,
+        scope=ConsentScope.AUDIO_VIDEO,
+    )
+
+
+async def test_audio_consent_alone_does_not_permit_asking_for_video() -> None:
+    cache, _, _ = _cache(FakeClock(T0), record=_granted())
+
+    assert await cache.may_record(GUILD_ID, USER_ID, has_consent_role=True) is True
+    assert await cache.may_record_video(GUILD_ID, USER_ID, has_consent_role=True) is False
+
+
+async def test_a_record_naming_video_permits_asking_for_it() -> None:
+    cache, _, _ = _cache(FakeClock(T0), record=_wide())
+
+    assert await cache.may_record_video(GUILD_ID, USER_ID, has_consent_role=True) is True
+
+
+async def test_video_consent_ends_with_the_consent_it_is_part_of() -> None:
+    """Not a separate grant with a life of its own: a withdrawal ends both."""
+    cache, _, _ = _cache(FakeClock(T0 + timedelta(days=1)), record=_wide(revoked_at=T0))
+
+    assert await cache.may_record_video(GUILD_ID, USER_ID, has_consent_role=True) is False
+
+
+async def test_the_two_questions_share_one_cached_row() -> None:
+    """A speaker who talks and shares costs one read every five seconds, not two."""
+    cache, current, _ = _cache(FakeClock(T0), record=_wide())
+
+    await cache.may_record(GUILD_ID, USER_ID, has_consent_role=True)
+    await cache.may_record_video(GUILD_ID, USER_ID, has_consent_role=True)
+
+    assert current.await_count == 1

@@ -79,7 +79,8 @@ class ConsentCog(commands.GroupCog, name="consent", description="Manage recordin
 
         member = interaction.user
         record = await self._consent_repo.current(member.id, guild_id)
-        if not grant_needed(record, policy_version, self._has_role(member, role)):
+        has_role = self._has_role(member, role)
+        if not grant_needed(record, policy_version, has_role, self._clock.now()):
             await interaction.response.send_message(
                 "You have already consented under the current policy.", ephemeral=True
             )
@@ -115,7 +116,9 @@ class ConsentCog(commands.GroupCog, name="consent", description="Manage recordin
         record = await self._consent_repo.current(member.id, guild_id)
         has_role = self._has_role(member, role)
 
-        if policy_version is None or not revoke_needed(record, policy_version, has_role):
+        if policy_version is None or not revoke_needed(
+            record, policy_version, has_role, self._clock.now()
+        ):
             await interaction.response.send_message(
                 "There is no consent or role to withdraw.", ephemeral=True
             )
@@ -158,7 +161,10 @@ class ConsentCog(commands.GroupCog, name="consent", description="Manage recordin
         record: ConsentRecord | None = await self._consent_repo.current(member.id, guild_id)
         status = ConsentStatus(
             has_role=self._has_role(member, role),
-            consent_active=policy_version is not None and is_consent_active(record, policy_version),
+            consent_active=(
+                policy_version is not None
+                and is_consent_active(record, policy_version, self._clock.now())
+            ),
             policy_version=record.policy_version if record is not None else None,
             # Account linking is handled by a later task; not reported yet.
             linked=False,
