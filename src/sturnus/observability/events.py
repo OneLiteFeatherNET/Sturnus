@@ -291,6 +291,24 @@ class Event(StrEnum):
     #: saying its policy document does not name video.
     CONSOLE_CONSENT_SCOPE_REFUSED = "console.consent_scope_refused"
 
+    #: An administrator registered, changed or removed the OAuth client a
+    #: guild's own sign-in link runs against. **WARNING**, which is a
+    #: level above `console.setting_written` next door, because this is
+    #: the credential that decides *who gets a session at all*: whoever
+    #: controls the identity provider a slug points at controls who the
+    #: console believes is signing in. `outcome` says which act it was --
+    #: registering, setting or clearing the secret, or removing the
+    #: registration entirely.
+    #:
+    #: It names `guild_id` and `requested_by` and **neither half of the
+    #: credential**. The secret is obvious; the client id is left off for
+    #: a less obvious reason, which is that it is one half of a
+    #: credential pair and a retained, Grafana-readable log is not where
+    #: the other half's blast radius should be narrowed by one guess. It
+    #: is in the table, readable by an administrator of that guild
+    #: through the API, which is where it belongs.
+    CONSOLE_OAUTH_CLIENT_CHANGED = "console.oauth_client_changed"
+
     # -- cross-cutting ------------------------------------------------------
     PROCESS_STARTING = "process.starting"
     SHUTDOWN_BEGIN = "shutdown.begin"

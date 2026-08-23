@@ -19,6 +19,7 @@ own makes that unrepresentable rather than merely unlikely.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -26,6 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from sqlalchemy import Row, case, delete, distinct, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.sql import Subquery
 
@@ -47,10 +49,13 @@ from sturnus.console.ports import (
     CollectionListing,
     ConsentHolder,
     ConsentPage,
+    ConsumedSignIn,
     DownloadableTrack,
     GuildDirectory,
     GuildQueue,
     GuildRecording,
+    GuildSignIn,
+    OAuthClient,
     OwnConsent,
     PersonRevocation,
     QueuedSession,
@@ -74,6 +79,12 @@ from sturnus.domain.consent import (
     scope_of,
 )
 from sturnus.domain.exports import SessionDocument
+from sturnus.domain.oauth_clients import (
+    GuildOAuthClient,
+    SlugUnavailable,
+    is_valid_slug,
+)
+from sturnus.infrastructure.db.guild_oauth import GuildOAuthClientStore
 from sturnus.infrastructure.db.models import (
     AccountLink,
     AdminMember,
@@ -107,6 +118,10 @@ from sturnus.infrastructure.db.requeue import (
     load_session,
     load_status,
 )
+from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
+from sturnus.observability.events import Event, log_exception
+
+log = logging.getLogger(__name__)
 
 #: How long a sign-in may take. Ten minutes is a browser round trip
 #: through a login page with room for somebody to be interrupted, and it
@@ -131,29 +146,256 @@ class ConsoleStateStore:
         await self.issue(state, now)
         return state
 
-    async def issue(self, state: str, now: datetime) -> None:
+    async def issue(self, state: str, now: datetime, guild_id: int | None = None) -> None:
+        """Writes the state, and which guild's client the sign-in began against.
+
+        `None` is the ordinary case and means the environment-configured
+        client. The guild is stored rather than held in this process's
+        memory for the same reason the state is: the callback may be
+        served by a different pod than issued the redirect.
+        """
         async with self._session_factory() as session:
-            session.add(ConsoleState(state=state, created_at=now, expires_at=now + self._ttl))
+            session.add(
+                ConsoleState(
+                    state=state,
+                    created_at=now,
+                    expires_at=now + self._ttl,
+                    guild_id=guild_id,
+                )
+            )
             await session.commit()
 
-    async def consume(self, state: str, now: datetime) -> bool:
-        """Consumes the state, reporting whether it was valid.
+    async def consume(self, state: str, now: datetime) -> ConsumedSignIn | None:
+        """Consumes the state and answers what it says, or `None`.
 
         `DELETE ... RETURNING` in one statement, the same shape
         `LinkStateStore.consume` uses and for the same reason: two
         callbacks replaying the same state concurrently can never both
         succeed, because only the delete that actually removes the row
         gets a result back.
+
+        **The guild comes back out of the row rather than out of the
+        request**, which is what makes the state the thing that selects
+        the client for the code exchange: a callback cannot name a guild,
+        so it cannot ask this process to spend one guild's client secret
+        against another guild's provider.
         """
         async with self._session_factory() as session:
-            row = await session.execute(
-                delete(ConsoleState)
-                .where(ConsoleState.state == state, ConsoleState.expires_at > now)
-                .returning(ConsoleState.state)
-            )
-            consumed = row.scalar_one_or_none() is not None
+            row = (
+                await session.execute(
+                    delete(ConsoleState)
+                    .where(ConsoleState.state == state, ConsoleState.expires_at > now)
+                    .returning(ConsoleState.state, ConsoleState.guild_id)
+                )
+            ).first()
             await session.commit()
-            return consumed
+        return None if row is None else ConsumedSignIn(guild_id=row.guild_id)
+
+
+class GuildSignInClients:
+    """Resolves which OAuth client one sign-in runs against.
+
+    The concrete side of `SignInClients`, and the whole of §2.2's answer
+    to the chicken-and-egg problem: before the round trip the slug in the
+    URL names the guild, after it the state does, and a client is built
+    per sign-in from whichever of those was available.
+
+    **A client is built, not cached.** An `OutlineOAuth` holds a client
+    secret, and the alternative to constructing one per sign-in is a map
+    of guild id to live credential that has to be invalidated when an
+    administrator clears a secret -- and that goes on completing sign-ins
+    against a revoked credential for as long as it does not notice. The
+    cost is one indexed row read and one unwrap per redirect, which is
+    the cheapest half of a login.
+
+    **Everything unusable answers `None`, and they are one answer.** An
+    unknown slug, a provider this deployment cannot exchange with, a
+    registration whose secret was never set, and a secret wrapped by a
+    master key this process does not hold all resolve to nothing.
+    Distinguishing them would let anybody with a browser learn which
+    organisations use this service by walking a list of names -- which is
+    the disclosure the guild-specific-link design exists to avoid, and
+    the reason it was chosen over a public list of guilds.
+
+    **The Discord account-link flow is not served from here.** `api`
+    holds the master key and `link` does not; the chart's `_helpers.tpl`
+    refuses to render it onto that component. So `/link` stays on the
+    environment-configured client, and that asymmetry is the
+    architecture rather than an oversight in it: it is what keeps the
+    internet-facing link process unable to decrypt anything at all.
+    """
+
+    def __init__(
+        self,
+        environment: OAuthClient,
+        clients: GuildOAuthClientStore,
+        *,
+        redirect_uri: str,
+    ) -> None:
+        self._environment = environment
+        self._clients = clients
+        #: What a guild's registration means by leaving `redirect_uri`
+        #: null: this deployment's own console callback. Held here rather
+        #: than defaulted in the table so that changing where the console
+        #: lives is a configuration change and not a migration over every
+        #: guild that never varied it.
+        self._redirect_uri = redirect_uri
+
+    async def for_slug(self, slug: str) -> GuildSignIn | None:
+        """The client behind a sign-in link, or `None` if there is none to use.
+
+        The shape of the slug is checked before the table is, because
+        `is_valid_slug` is what the registration path enforced: a slug it
+        would have refused cannot be in the table, so asking is a query
+        that can only ever miss.
+        """
+        if not is_valid_slug(slug):
+            return None
+        registration = await self._clients.by_slug(slug)
+        if registration is None:
+            return None
+        client = await self._build(registration)
+        return None if client is None else GuildSignIn(registration.guild_id, client)
+
+    async def for_guild(self, guild_id: int | None) -> OAuthClient | None:
+        """The client a state names: this guild's, or the deployment's own.
+
+        `None` for the guild id is not a missing value -- it is the
+        ordinary sign-in, and it answers the environment-configured
+        client so that a deployment which has configured nothing per
+        guild behaves exactly as it did in v0.15.0.
+        """
+        if guild_id is None:
+            return self._environment
+        registration = await self._clients.for_guild(guild_id)
+        return None if registration is None else await self._build(registration)
+
+    async def _build(self, registration: GuildOAuthClient) -> OAuthClient | None:
+        """A usable client for this registration, or `None`.
+
+        Half a registration is a real state: registering the client and
+        supplying its secret are two steps, and an administrator is
+        expected to be between them for as long as it takes to copy a
+        value out of another screen. A sign-in during that window has
+        nothing to exchange with, so it resolves to nothing -- the same
+        answer an unknown slug gets.
+        """
+        if registration.provider != PROVIDER or not registration.has_secret:
+            return None
+        try:
+            secret = await self._clients.client_secret_for(registration.guild_id)
+        except ValueError as exc:
+            # A rotation that was not carried through: the row names a
+            # master key this process does not hold. Worth a line because
+            # a guild whose every sign-in fails here is an operator's
+            # problem and is invisible from the reply, which is
+            # indistinguishable from an unknown slug on purpose. Through
+            # `log_exception` so the store's message -- which names the
+            # two key ids -- travels as a type and fields rather than as
+            # text nobody scrubbed.
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.KEY_ID_MISMATCH,
+                "A guild sign-in client is wrapped by a master key this process does not hold",
+                exc,
+                guild_id=registration.guild_id,
+            )
+            return None
+        if secret is None:
+            return None
+        return OutlineOAuth(
+            base_url=registration.base_url,
+            client_id=registration.client_id,
+            client_secret=secret,
+            redirect_uri=registration.redirect_uri or self._redirect_uri,
+        )
+
+
+class ConsoleGuildOAuthClients:
+    """A guild's sign-in registration, for the administrators of that guild.
+
+    Authorisation lives here rather than in the handler, the arrangement
+    `ConsoleGuildNames` and `ConsoleQueueOverview` use: every method
+    names who is asking, and there is none that does not. A handler
+    cannot forget a check it never had the option of making.
+
+    **Not administering the guild and there being no registration are the
+    same answer**, so the routes can give both the same 404. That is
+    stricter than the settings endpoints, deliberately: whether a guild
+    has its own sign-in is the fact §2.2 keeps undiscoverable.
+
+    **This class cannot produce a secret.** It writes one and it reports
+    whether one is set; there is no method here that returns one and no
+    field on `GuildOAuthClient` to carry it. Reading a secret is
+    `GuildSignInClients`'s alone, which is the object the sign-in path
+    holds and no route does.
+    """
+
+    def __init__(self, clients: GuildOAuthClientStore, admins: AdminDirectory) -> None:
+        self._clients = clients
+        self._admins = admins
+
+    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildOAuthClient | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+        return await self._clients.for_guild(guild_id)
+
+    async def save(
+        self,
+        guild_id: int,
+        *,
+        requested_by: int,
+        slug: str,
+        provider: str,
+        base_url: str,
+        client_id: str,
+        redirect_uri: str | None,
+        now: datetime,
+    ) -> GuildOAuthClient | None:
+        """Registers or replaces, and answers with what is now stored.
+
+        The slug collision is caught rather than checked for. Checking
+        first is a race -- two administrators claiming one name in the
+        same second -- and the unique constraint is not; translating it
+        into `SlugUnavailable` is what keeps `sqlalchemy` out of the
+        route module that has to answer it.
+        """
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+        try:
+            await self._clients.save(
+                guild_id,
+                slug=slug,
+                provider=provider,
+                base_url=base_url,
+                client_id=client_id,
+                redirect_uri=redirect_uri,
+                now=now,
+            )
+        except IntegrityError as exc:
+            raise SlugUnavailable("this sign-in name belongs to another guild") from exc
+        return await self._clients.for_guild(guild_id)
+
+    async def set_secret(
+        self, guild_id: int, secret: str | None, *, requested_by: int, now: datetime
+    ) -> GuildOAuthClient | None:
+        """Stores or clears the secret, and answers with what can be read back.
+
+        Which is never the secret. The re-read is what makes that true by
+        construction rather than by care: there is no path here from the
+        value that came in to the value that goes out.
+        """
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+        if not await self._clients.set_client_secret(guild_id, secret, now):
+            return None
+        return await self._clients.for_guild(guild_id)
+
+    async def delete(self, guild_id: int, *, requested_by: int) -> bool:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return False
+        return await self._clients.delete(guild_id)
 
 
 class ConsoleLinkDirectory:

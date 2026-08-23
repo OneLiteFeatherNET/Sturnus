@@ -37,27 +37,106 @@ from sturnus.console.statistics import (
     TagUse,
 )
 from sturnus.domain.exports import ExportTarget, SessionDocument
+from sturnus.domain.oauth_clients import GuildOAuthClient
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 
 class OAuthClient(Protocol):
-    """The identity provider the console authenticates against."""
+    """The identity provider *one* sign-in authenticates against.
+
+    One client, not the deployment's client. Which one this is comes from
+    `SignInClients`, and the whole point of that indirection is that a
+    handler holding this protocol cannot tell -- and must not have to
+    know -- whether it is the environment-configured client or a guild's
+    own.
+    """
 
     def authorize_url(self, state: str) -> str: ...
 
     async def identity_from_code(self, code: str) -> ExternalIdentity: ...
 
 
+@dataclass(frozen=True)
+class GuildSignIn:
+    """A guild's own client, and the guild it belongs to, resolved from a slug.
+
+    The two travel together because the caller needs both and must not
+    derive one from the other: the client completes the round trip, and
+    the guild id is what goes into the state so the *callback* can select
+    the same client again. A resolver that answered only the client would
+    leave `ConsoleAuth` looking the guild up a second time from the slug,
+    which is a second lookup that can disagree with the first.
+    """
+
+    guild_id: int
+    client: OAuthClient
+
+
+class SignInClients(Protocol):
+    """Which OAuth client a sign-in runs against, asked twice per login.
+
+    This is the seam §2.2 asks for. `ConsoleAuth` used to hold one
+    `OAuthClient` for the life of the process, which made "this guild's
+    client" unrepresentable; it now holds this, and resolves a client per
+    sign-in from the only thing available at each end of the round trip.
+
+    **Before the redirect** the guild is in the URL, so `for_slug` is
+    asked. **After it** there is no URL and no session -- that is what
+    login is for -- so the guild comes back out of the state that was
+    issued, and `for_guild` is asked.
+
+    `for_slug` answers `None` for a slug that names no guild **and** for a
+    slug that names one whose client cannot complete a sign-in: an
+    unregistered provider, a secret that was never set, a secret this
+    process cannot unwrap. Those are one answer on purpose. Telling them
+    apart would let anybody with a browser walk a list of names and learn
+    which organisations use this service, which is the disclosure the
+    whole guild-specific-link design exists to avoid.
+
+    `for_guild(None)` is the environment-configured client and never
+    answers `None`: a deployment that has configured no per-guild client
+    at all behaves exactly as it did in v0.15.0. `for_guild(some_id)`
+    answers `None` under the same conditions `for_slug` does, which is
+    what happens when a guild's registration is deleted or unwrapped
+    while somebody is mid-login.
+    """
+
+    async def for_slug(self, slug: str) -> GuildSignIn | None: ...
+
+    async def for_guild(self, guild_id: int | None) -> OAuthClient | None: ...
+
+
+@dataclass(frozen=True)
+class ConsumedSignIn:
+    """What a valid state says about the login it was issued for.
+
+    Carries the guild rather than being a `bool`, because **the state is
+    what selects the client for the code exchange** (§2.2). `None` means
+    the sign-in was begun without a guild and belongs to the
+    environment-configured client -- a real value, and the ordinary one,
+    which is why the absence of a state is `None` *of this type* rather
+    than a `guild_id` of `None`.
+    """
+
+    guild_id: int | None
+
+
 class StateStore(Protocol):
-    """Single-use OAuth states, tying a callback to a login this server began."""
+    """Single-use OAuth states, tying a callback to a login this server began.
 
-    async def issue(self, state: str, now: datetime) -> None: ...
+    `issue` takes the guild the sign-in was begun for, or `None`. It is
+    stored rather than kept in this process's memory for the reason the
+    state itself is: the callback may be served by a different pod than
+    the redirect was.
+    """
 
-    #: `False` for a state that was never issued, has already been used, or
+    async def issue(self, state: str, now: datetime, guild_id: int | None = None) -> None: ...
+
+    #: `None` for a state that was never issued, has already been used, or
     #: has expired -- the caller treats all three identically, because from
     #: the outside they are the same event: this is not a callback for a
     #: login we started.
-    async def consume(self, state: str, now: datetime) -> bool: ...
+    async def consume(self, state: str, now: datetime) -> ConsumedSignIn | None: ...
 
 
 class LinkDirectory(Protocol):
@@ -1145,3 +1224,58 @@ class GuildReports(Protocol):
     """
 
     async def recording_of(self, guild_id: int, *, requested_by: int) -> GuildRecording | None: ...
+
+
+class GuildOAuthClients(Protocol):
+    """One guild's own sign-in client, if the person asking administers it.
+
+    The write side of what `SignInClients` reads. Two protocols rather
+    than one, because they are held by different code for different
+    reasons and one of them must never grow the other's methods: the
+    sign-in path resolves a *usable client* and never a registration, and
+    the settings path edits a registration and never obtains a client
+    that could complete an exchange.
+
+    `requested_by` is not optional and there is no method here without
+    it, for the reason `GuildNames`, `QueueOverview` and `GuildReports`
+    have none: the authorisation rule lives inside the call rather than
+    in a handler that could forget to apply it.
+
+    **`None` and `False` cover "no such guild", "you do not administer
+    it" and "there is no client configured" alike**, and the routes
+    answer all three with the same 404. This is stricter than the
+    settings endpoints next door, which answer 403 for a guild somebody
+    does not administer, and deliberately so: whether a guild has its own
+    sign-in configured is the fact §2.2 does not want discoverable, and a
+    refusal that distinguishes "not yours" from "not configured" is a
+    two-request oracle for it.
+
+    **No method here returns a secret**, and there is nowhere in
+    `GuildOAuthClient` to put one. `set_secret` is write-only and answers
+    with the registration as it now reads -- `has_secret`, never the
+    value.
+    """
+
+    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildOAuthClient | None: ...
+
+    #: Registers or replaces the registration, secret untouched. Raises
+    #: `SlugUnavailable` if the slug belongs to another guild.
+    async def save(
+        self,
+        guild_id: int,
+        *,
+        requested_by: int,
+        slug: str,
+        provider: str,
+        base_url: str,
+        client_id: str,
+        redirect_uri: str | None,
+        now: datetime,
+    ) -> GuildOAuthClient | None: ...
+
+    #: Stores the secret, or clears it when `secret` is `None`.
+    async def set_secret(
+        self, guild_id: int, secret: str | None, *, requested_by: int, now: datetime
+    ) -> GuildOAuthClient | None: ...
+
+    async def delete(self, guild_id: int, *, requested_by: int) -> bool: ...

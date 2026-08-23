@@ -2084,6 +2084,155 @@ nobody sizes anything on the migration's paragraph.
 the partial index that would fix it, and why the obvious cheaper fix
 (ordering by `status` first) must not be used.
 
+### 6.2.12 A guild's own sign-in link
+
+A guild may sign its people in against **its own Outline**, rather than
+against the one this deployment is configured with. That is the whole of
+§2.2 of the phase-two specification, and it exists because a deployment
+serving several organisations cannot ask them all to keep accounts in one
+Outline.
+
+**A deployment that configures none of this behaves exactly as it did
+before.** `/api/auth/login` with no `guild` parameter uses
+`STURNUS_OUTLINE_CLIENT_ID` / `STURNUS_OUTLINE_CLIENT_SECRET` and the
+`console_state` row it writes names no guild. Nothing below is required
+of anybody.
+
+#### The problem it solves, and why the link carries the guild
+
+`GET /api/auth/login` takes no parameters and reads no cookie — there is
+no session yet, that is what login is for. So to choose a guild's OAuth
+client it would need the guild; to learn the guild it would need an
+identity; and to get an identity it would already have had to choose a
+client. **The guild goes in the URL**, which is the only place it can be
+before the round trip starts:
+
+```
+https://sturnus.onelitefeather.dev/api/auth/login?guild=acme
+```
+
+The alternative — a page listing every guild Sturnus serves, so somebody
+could pick theirs — was rejected: it discloses which organisations use
+this service to anyone, signed in or not. **An administrator distributes
+their guild's link themselves.**
+
+#### What an administrator does, in order
+
+1. **Register an OAuth application in the guild's own Outline.** Its
+   redirect URI is this deployment's console callback — the same
+   `STURNUS_CONSOLE_REDIRECT_URI` value (§1.5), unless the guild has a
+   reason to use a different one.
+2. **Register the client**, without its secret:
+
+   ```
+   PUT /api/guilds/{guild_id}/oauth-client
+   {"slug": "acme",
+    "provider": "outline",
+    "base_url": "https://outline.acme.example",
+    "client_id": "...",
+    "redirect_uri": null}
+   ```
+
+   `redirect_uri: null` means "this deployment's own callback", which is
+   what nearly every guild wants.
+3. **Supply the secret**, which is a separate request and the only one
+   that ever carries a credential:
+
+   ```
+   PUT /api/guilds/{guild_id}/oauth-client/secret
+   {"client_secret": "..."}
+   ```
+4. **Hand out the link.** Until step 3 the guild's link answers exactly
+   as an unknown one does (see below), so the order matters.
+
+Only an administrator **of that guild** may do any of this. Every other
+request — a guild somebody does not administer, a guild that does not
+exist, a guild with no client configured — answers
+`404 {"error": "no sign-in configuration"}`, and they are deliberately
+one answer.
+
+#### The slug
+
+It is a public path segment that selects a credential, so its shape is
+fixed: **3–32 characters, lowercase ASCII letters, digits and hyphens,
+beginning with a letter, no leading, trailing or doubled hyphen**, and not
+one of the names this deployment reserves for itself (`api`, `auth`,
+`login`, `sign-in`, `static`, …). Beginning with a letter is what keeps a
+slug and a Discord snowflake from being confusable in a link somebody
+reads.
+
+Nothing is normalised: `Acme` is refused rather than lowercased, because
+a slug quietly rewritten on the way into the table is a slug the
+administrator does not recognise in the link they handed out.
+
+A slug already held by another guild, or one this deployment reserves,
+answers `409 {"error": "that sign-in name is not available"}` — the same
+reply either way, so which of the two it was cannot be read off the
+response.
+
+#### The secret never comes back
+
+`GET /api/guilds/{guild_id}/oauth-client` answers the slug, the provider,
+the base URL, the client id, the redirect URI and `has_secret`. **Never
+the secret**, not masked and not truncated. That is why this is not a
+`guild_config` key: the settings API renders every value it holds back to
+whichever administrator asks (§4.1), which is right for a setting and a
+disclosure for a credential.
+
+The stored secret is wrapped by the master key **and bound to the row it
+sits in** — to the guild and to the purpose, so a wrapped secret moved
+into another guild's row, or into that guild's export-target row, fails
+to authenticate rather than decrypting into somebody else's credential.
+
+`DELETE /api/guilds/{guild_id}/oauth-client/secret` clears the secret and
+leaves the registration in place, which is what to do when a secret
+leaks: the guild's link stops working immediately and nobody else can
+claim its slug in the meantime.
+
+#### Every refusal on the sign-in path is the same 404
+
+`/api/auth/login?guild=…` answers `404 {"error": "no such sign-in link"}`
+for **all** of:
+
+- no guild holds that slug,
+- the slug is not spelled like a slug at all,
+- a guild holds it but has no secret stored yet,
+- it is registered against a provider this deployment cannot exchange
+  with,
+- its secret is wrapped by a master key this process does not hold.
+
+That is the property the whole design exists to keep: an attacker walking
+a list of names must not be able to tell "no such organisation here" from
+"one, half-configured". The **operator's** way to tell them apart is the
+log, not the response — a rotation that was not carried through emits
+`key.id_mismatch` with the `guild_id` (§7).
+
+#### After a master-key rotation
+
+A guild's client secret is wrapped exactly like an audio data key, and
+its `encryption_key_id` names the master key that wrapped it. A rotation
+that leaves the old key behind makes that guild's link stop working —
+silently from the outside, loudly in the log. Re-supplying the secret
+through step 3 above re-wraps it under the current key.
+
+#### It is the console sign-in only, and that is not an oversight
+
+**The Discord account-link flow (`/link`) stays on the
+environment-configured client, permanently.** `api` holds the master key
+and `link` does not — `charts/sturnus/templates/_helpers.tpl` refuses to
+render it onto that component at all (§1.4) — so `link` cannot unwrap a
+guild's secret and must not be given the ability to. That asymmetry is
+the architecture rather than a gap in it: it is what keeps the
+internet-facing link process unable to decrypt anything.
+
+#### Every change is audited
+
+Registering, changing, or removing a guild's OAuth client, and setting or
+clearing its secret, each emit `console.oauth_client_changed` at
+**WARNING** with `guild_id`, `requested_by` and an `outcome` of
+`registered`, `secret_set`, `secret_cleared` or `removed`. Neither half
+of the credential is on the line — not the secret, and not the client id.
+
 ### 6.3 Listening to a recording by hand
 
 Every automated check this system has can describe a track — its level,
