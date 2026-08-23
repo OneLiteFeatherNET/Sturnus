@@ -1190,8 +1190,17 @@ class SturnusClient(commands.Bot):
 
         On the same tick as `_mirror_administrators`, and for the same
         reasons: every gateway read behind it is a cache lookup rather
-        than an API call, so it costs nothing to run every ten seconds and
-        needs no rate-limit budget.
+        than an API call, so it needs no rate-limit budget of its own.
+
+        That accounts for the Discord side only, and the Discord side was
+        never the expensive one. A ten-second sweep is affordable here
+        because `DirectoryStore` compares before it writes: three indexed
+        reads of this guild's own rows per tick, and a statement only when
+        something actually moved. Written unconditionally, the same
+        cadence would restamp every channel and every role of every guild
+        every ten seconds, in tables that change a handful of times a
+        year. See `sturnus.infrastructure.db.directory` for what that
+        would have cost and what the read costs instead.
 
         A separate method rather than a second write inside that one,
         because the two mirrors carry different weight. `admin_member`

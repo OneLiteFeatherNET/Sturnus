@@ -390,13 +390,31 @@ reads them.**
 - `worker` writes `outline_collection`, on an hourly sweep. A collection
   list changes a handful of times a year and nothing is waiting on it.
 
+**The Discord side of that cadence is free; the database side is not, and
+that is where the design actually pays.** A ten-second sweep that wrote
+unconditionally would restamp every channel and every role of every guild
+on every tick — fifty guilds of forty channels and thirty roles is ~3,500
+row versions every ten seconds, some thirty million dead tuples a day, and
+the autovacuum churn and index bloat behind them, in tables whose contents
+change a handful of times a year. So `DirectoryStore` compares before it
+writes and issues no statement when nothing moved. That trades the writes
+for one indexed read per table per guild per tick: tens of rows out of
+shared buffers, no WAL, no dead tuples, no row locks — real, ongoing, and
+several orders of magnitude cheaper than the writes it replaces. The
+cadence is therefore chosen for freshness, and the write volume is
+governed by how often Discord actually changes rather than by how often we
+look.
+
 Every mirrored row carries `synced_at`, and every write is a full
 replacement scoped to its guild: something deleted upstream must stop
 being offered, and a mirror that only ever grows would go on offering a
-channel nobody can join. Two failure modes are kept apart deliberately —
-a guild the bot cannot currently see, and an Outline that cannot be
-reached, both leave the previous mirror standing rather than emptying it.
-"We could not look" is not "there is nothing there".
+channel nobody can join. Because an unchanged sweep writes nothing,
+`synced_at` records when a row last *changed* rather than when it was last
+confirmed; the staleness bound is the sweep interval, which is a property
+of the sweep and not of a row. Two failure modes are kept apart
+deliberately — a guild the bot cannot currently see, and an Outline that
+cannot be reached, both leave the previous mirror standing rather than
+emptying it. "We could not look" is not "there is nothing there".
 
 A name the mirror does not hold is shown as an id. That is the intended
 fallback, not a gap: it is exactly what the console does today for

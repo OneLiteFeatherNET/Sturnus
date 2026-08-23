@@ -11,7 +11,9 @@ sweep never touches another's rows.
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+from sqlalchemy.orm import InstrumentedAttribute
 
 from sturnus.application.directory_mirror import (
     TEXT,
@@ -21,7 +23,7 @@ from sturnus.application.directory_mirror import (
     MirroredRole,
 )
 from sturnus.infrastructure.db.directory import DirectoryStore
-from sturnus.infrastructure.db.models import Base
+from sturnus.infrastructure.db.models import Base, GuildChannel, GuildMember, GuildRole
 
 GUILD, OTHER_GUILD = 1, 2
 ANNA, BEN = 100, 200
@@ -47,6 +49,22 @@ def _role(role_id: int, name: str, position: int = 0) -> MirroredRole:
 
 def _member(discord_user_id: int, display_name: str) -> MirroredMember:
     return MirroredMember(discord_user_id=discord_user_id, display_name=display_name)
+
+
+async def _stamps(url: str, column: InstrumentedAttribute[datetime]) -> list[datetime]:
+    """Every `synced_at` in one mirrored table, oldest first.
+
+    The only way to see from outside whether a sweep wrote anything: a
+    row rewritten with the values it already had is indistinguishable
+    through `channels_for` and yet costs Postgres a new row version.
+    """
+    engine = create_async_engine(url)
+    try:
+        async with engine.connect() as conn:
+            rows = await conn.execute(select(column).order_by(column))
+            return list(rows.scalars().all())
+    finally:
+        await engine.dispose()
 
 
 async def test_a_guild_nothing_has_swept_yet_offers_nothing(store: DirectoryStore) -> None:
@@ -184,3 +202,79 @@ async def test_the_same_id_twice_in_one_sweep_does_not_abort_it(store: Directory
     """
     await store.replace_members(GUILD, [_member(ANNA, "Anna"), _member(ANNA, "Anna")], T0)
     assert await store.members_for(GUILD) == [_member(ANNA, "Anna")]
+
+
+async def test_a_sweep_that_found_nothing_new_writes_nothing(
+    store: DirectoryStore, clean_database: str
+) -> None:
+    """The operational point of the whole store, and the reason it reads
+    before it writes.
+
+    This sweep runs every ten seconds, for every guild, forever, against
+    tables whose contents change a handful of times a year. An
+    unconditional `ON CONFLICT DO UPDATE` that only ever restamps
+    `synced_at` still writes a new row version per row per tick -- for
+    fifty guilds of forty channels and thirty roles that is millions of
+    dead tuples a day, and sustained autovacuum and index bloat, for data
+    nobody is reading. `synced_at` standing still is what says no
+    statement was issued.
+    """
+    await store.replace_channels(GUILD, [_channel(10, "meeting", VOICE, 3)], T0)
+    await store.replace_roles(GUILD, [_role(50, "recorded", 7)], T0)
+    await store.replace_members(GUILD, [_member(ANNA, "Anna")], T0)
+
+    await store.replace_channels(GUILD, [_channel(10, "meeting", VOICE, 3)], T1)
+    await store.replace_roles(GUILD, [_role(50, "recorded", 7)], T1)
+    await store.replace_members(GUILD, [_member(ANNA, "Anna")], T1)
+
+    assert await _stamps(clean_database, GuildChannel.synced_at) == [T0]
+    assert await _stamps(clean_database, GuildRole.synced_at) == [T0]
+    assert await _stamps(clean_database, GuildMember.synced_at) == [T0]
+
+
+async def test_a_sweep_that_found_a_rename_writes_it(
+    store: DirectoryStore, clean_database: str
+) -> None:
+    """The other half: writing only on change must not become writing
+    only sometimes. A rename is the ordinary case this mirror exists for.
+    """
+    await store.replace_channels(GUILD, [_channel(10, "meeting")], T0)
+    await store.replace_channels(GUILD, [_channel(10, "weekly")], T1)
+    assert await store.channels_for(GUILD) == [_channel(10, "weekly")]
+    assert await _stamps(clean_database, GuildChannel.synced_at) == [T1]
+
+
+async def test_a_channel_that_only_moved_is_still_written(
+    store: DirectoryStore, clean_database: str
+) -> None:
+    """`position` is mirrored so the picker looks like the server it
+    configures, so a channel dragged up the sidebar is a real change even
+    though its name and id did not move. Comparing on identity alone
+    would freeze the order at whatever it was on the first sweep.
+    """
+    await store.replace_channels(GUILD, [_channel(10, "meeting", VOICE, 3)], T0)
+    await store.replace_channels(GUILD, [_channel(10, "meeting", VOICE, 1)], T1)
+    assert await store.channels_for(GUILD) == [_channel(10, "meeting", VOICE, 1)]
+    assert await _stamps(clean_database, GuildChannel.synced_at) == [T1]
+
+
+async def test_a_role_that_only_moved_is_still_written(
+    store: DirectoryStore, clean_database: str
+) -> None:
+    await store.replace_roles(GUILD, [_role(50, "recorded", 7)], T0)
+    await store.replace_roles(GUILD, [_role(50, "recorded", 2)], T1)
+    assert await store.roles_for(GUILD) == [_role(50, "recorded", 2)]
+    assert await _stamps(clean_database, GuildRole.synced_at) == [T1]
+
+
+async def test_a_departure_is_written_even_though_nobody_was_added(
+    store: DirectoryStore, clean_database: str
+) -> None:
+    """Comparing sets rather than counting them: somebody who revoked
+    their consent leaves a strictly smaller membership, and a comparison
+    that only looked for new names would keep naming them.
+    """
+    await store.replace_members(GUILD, [_member(ANNA, "Anna"), _member(BEN, "Ben")], T0)
+    await store.replace_members(GUILD, [_member(ANNA, "Anna")], T1)
+    assert await store.members_for(GUILD) == [_member(ANNA, "Anna")]
+    assert await _stamps(clean_database, GuildMember.synced_at) == [T1]
