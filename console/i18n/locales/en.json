@@ -1,0 +1,37 @@
+{
+  "common": {
+    "brand": "Sturnus"
+  },
+  "nav": {
+    "sections": "Sections",
+    "toggle": "Toggle navigation labels",
+    "userView": "User View",
+    "adminView": "Admin View",
+    "dashboard": "Dashboard",
+    "recordings": "Recordings",
+    "calendar": "Calendar",
+    "botSettings": "Bot Settings",
+    "userSettings": "User Settings",
+    "queue": "Queue",
+    "reporting": "Reporting"
+  },
+  "auth": {
+    "signIn": "Sign in",
+    "signOut": "Sign out",
+    "signInWithOutline": "Sign in with Outline",
+    "tagline": "Meeting protocols, and the recordings behind them.",
+    "notLinkedHeading": "Your account is not linked yet.",
+    "notLinkedBody": "Run {command} in Discord, then sign in again. The console finds your recordings by your Discord account, and the link is what connects the two."
+  },
+  "error": {
+    "notFoundHeading": "That page does not exist",
+    "notFoundDetail": "The address is wrong, or the page has moved.",
+    "unreachableHeading": "Sturnus is not answering",
+    "unreachableDetail": "The console reached the browser but could not reach the service behind it. This is not a sign-in problem — signing in again will not help. It usually means the service is restarting, and usually resolves within a minute.",
+    "genericHeading": "Something went wrong",
+    "genericDetail": "The console could not load this page. Trying again is worth one attempt; if it keeps happening, the service is likely unwell rather than the page.",
+    "retry": "Try again",
+    "goToSignIn": "Go to sign-in",
+    "status": "Status {code}"
+  }
+}

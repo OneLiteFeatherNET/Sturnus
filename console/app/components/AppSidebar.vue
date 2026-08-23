@@ -31,13 +31,13 @@ const visible = computed(() => visibleSections(session.value))
     class="flex shrink-0 flex-col gap-1 border-r p-3 transition-[width] duration-200"
     :class="collapsed ? 'w-16' : 'w-16 sm:w-56'"
     :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
-    aria-label="Sections"
+    :aria-label="$t('nav.sections')"
   >
     <div
       v-for="(section, index) in visible"
-      :key="section.label"
+      :key="section.labelKey"
       role="group"
-      :aria-label="section.label"
+      :aria-label="$t(section.labelKey)"
       class="flex flex-col gap-1"
     >
       <!-- A rule instead of a heading when collapsed. The heading text
@@ -53,15 +53,15 @@ const visible = computed(() => visibleSections(session.value))
         class="px-3 pt-3 pb-1 text-xs font-semibold uppercase tracking-wider"
         :style="{ color: 'var(--text-muted)' }"
       >
-        {{ section.label }}
+        {{ $t(section.labelKey) }}
       </h2>
 
       <NuxtLink
         v-for="entry in section.entries"
         :key="entry.to"
         :to="entry.to"
-        :title="entry.label"
-        :aria-label="entry.label"
+        :title="$t(entry.labelKey)"
+        :aria-label="$t(entry.labelKey)"
         class="flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
         active-class="bg-[var(--surface-raised)] text-[var(--action)]"
       >
@@ -74,7 +74,7 @@ const visible = computed(() => visibleSections(session.value))
              The entries keep their `aria-label` and `title`, so this is the
              same mode the burger already produces rather than a rail that
              announces nothing. -->
-        <span v-if="!collapsed" class="hidden truncate sm:inline">{{ entry.label }}</span>
+        <span v-if="!collapsed" class="hidden truncate sm:inline">{{ $t(entry.labelKey) }}</span>
       </NuxtLink>
     </div>
   </nav>

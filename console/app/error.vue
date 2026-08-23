@@ -14,12 +14,32 @@
  * cost of that correctness is that a console whose API is down renders an
  * error rather than a login form -- so the error had better say which,
  * and offer the thing that might actually help.
+ *
+ * **This is the one page that does not simply call `$t`.** Every other
+ * page in the console can assume its locale file loaded, because a page
+ * whose assets did not load is a page nobody is looking at -- they are
+ * looking at this one. Locale messages are lazily fetched, so the failure
+ * that brings somebody here can be the same failure that leaves this page
+ * with no German and no English: `$t('error.unreachableHeading')` would
+ * then render the string `error.unreachableHeading` at somebody who is
+ * already confused. So each sentence carries its English text here in the
+ * source and treats the translation as an improvement on it. See
+ * `~/utils/i18nFallback`.
  */
 import type { NuxtError } from '#app'
+import { translateOr, type Translate } from '~/utils/i18nFallback'
 
 const props = defineProps<{ error: NuxtError }>()
 
-useHead({ title: 'Something went wrong' })
+// Guarded, because `useI18n` throws rather than returns null when the i18n
+// plugin is not installed at all -- and "the plugin did not install" is
+// precisely one of the disasters this page renders for.
+let translate: Translate | null = null
+try {
+  translate = useI18n().t as Translate
+} catch {
+  translate = null
+}
 
 // `ApiError` sets status 0 when the request never got a response: a
 // network failure, a DNS failure, a tunnel that is down. Distinguishable
@@ -29,23 +49,52 @@ const unreachable = computed(() => String(props.error?.message ?? '').includes('
 const notFound = computed(() => props.error?.statusCode === 404)
 
 const heading = computed(() => {
-  if (notFound.value) return 'That page does not exist'
-  if (unreachable.value) return 'Sturnus is not answering'
-  return 'Something went wrong'
+  if (notFound.value) {
+    return translateOr(translate, 'error.notFoundHeading', 'That page does not exist')
+  }
+  if (unreachable.value) {
+    return translateOr(translate, 'error.unreachableHeading', 'Sturnus is not answering')
+  }
+  return translateOr(translate, 'error.genericHeading', 'Something went wrong')
 })
 
 const detail = computed(() => {
   if (notFound.value) {
-    return 'The address is wrong, or the page has moved.'
+    return translateOr(
+      translate,
+      'error.notFoundDetail',
+      'The address is wrong, or the page has moved.',
+    )
   }
   if (unreachable.value) {
-    return 'The console reached the browser but could not reach the service behind it. '
+    return translateOr(
+      translate,
+      'error.unreachableDetail',
+      'The console reached the browser but could not reach the service behind it. '
       + 'This is not a sign-in problem — signing in again will not help. It usually means '
-      + 'the service is restarting, and usually resolves within a minute.'
+      + 'the service is restarting, and usually resolves within a minute.',
+    )
   }
-  return 'The console could not load this page. Trying again is worth one attempt; '
-    + 'if it keeps happening, the service is likely unwell rather than the page.'
+  return translateOr(
+    translate,
+    'error.genericDetail',
+    'The console could not load this page. Trying again is worth one attempt; '
+    + 'if it keeps happening, the service is likely unwell rather than the page.',
+  )
 })
+
+const retry = computed(() => translateOr(translate, 'error.retry', 'Try again'))
+const goToSignIn = computed(() => translateOr(translate, 'error.goToSignIn', 'Go to sign-in'))
+const status = computed(() =>
+  translateOr(translate, 'error.status', `Status ${props.error?.statusCode}`, {
+    code: props.error?.statusCode,
+  }),
+)
+
+// The tab says which failure this is, rather than always saying the generic
+// one: somebody with four tabs open looking for the broken one should not
+// have to click through four identical titles.
+useHead({ title: heading })
 </script>
 
 <template>
@@ -73,7 +122,7 @@ const detail = computed(() => {
           }"
           @click="clearError({ redirect: '/' })"
         >
-          Try again
+          {{ retry }}
         </button>
         <!-- Offered second, and only as a link: on an unreachable API this
              will not help, and a page that leads with it would be telling
@@ -83,12 +132,12 @@ const detail = computed(() => {
           class="rounded-lg px-4 py-2 text-sm transition-colors hover:bg-[var(--surface-raised)]"
           :style="{ color: 'var(--text-muted)' }"
         >
-          Go to sign-in
+          {{ goToSignIn }}
         </NuxtLink>
       </div>
 
       <p v-if="error?.statusCode" class="mt-6 text-xs" :style="{ color: 'var(--text-muted)' }">
-        Status {{ error.statusCode }}
+        {{ status }}
       </p>
     </div>
   </div>
