@@ -9,17 +9,19 @@
 import { describe, expect, it } from 'vitest'
 
 import {
-  INTENSITY_LABELS,
+  INTENSITY_LABEL_KEYS,
   INTENSITY_THRESHOLDS_SECONDS,
-  WEEKDAY_LABELS,
+  WEEKDAY_INSTANTS,
   buildYearGrid,
+  dayInstant,
   describeCell,
-  formatIsoDate,
   intensityFor,
   monthColumns,
   shiftWithinYear,
   type CalendarDay,
 } from '../app/utils/heatmap'
+
+const DAY_MS = 86_400_000
 
 /** A day the API would have returned, with everything but the date defaulted. */
 function day(date: string, over: Partial<CalendarDay> = {}): CalendarDay {
@@ -136,33 +138,38 @@ describe('building the year grid', () => {
   })
 
   it('names the seven rows so the grid says which day a row is', () => {
-    expect(WEEKDAY_LABELS).toEqual([
-      'Monday',
-      'Tuesday',
-      'Wednesday',
-      'Thursday',
-      'Friday',
-      'Saturday',
-      'Sunday',
-    ])
+    // Instants rather than seven English words: `Intl` names the weekday in
+    // whichever language is reading, and the shortened form the grid has
+    // room for is its business too rather than `"Monday".slice(0, 3)`.
+    // Which week these belong to is arbitrary; that the first is a Monday
+    // in UTC, and that each is one day after the last, is not.
+    expect(WEEKDAY_INSTANTS).toHaveLength(7)
+    expect(WEEKDAY_INSTANTS[0]!.getUTCDay()).toBe(1)
+    for (let row = 1; row < WEEKDAY_INSTANTS.length; row += 1) {
+      expect(WEEKDAY_INSTANTS[row]!.getTime() - WEEKDAY_INSTANTS[row - 1]!.getTime()).toBe(DAY_MS)
+    }
   })
 })
 
 describe('the month headings above the grid', () => {
   it('names all twelve months of the year', () => {
-    expect(monthColumns(buildYearGrid(2026, [])).map((m) => m.label)).toEqual([
-      'Jan',
-      'Feb',
-      'Mar',
-      'Apr',
-      'May',
-      'Jun',
-      'Jul',
-      'Aug',
-      'Sep',
-      'Oct',
-      'Nov',
-      'Dec',
+    // Each heading is the month's own first UTC instant, for the
+    // `shortMonth` format to name -- the three English letters this module
+    // used to keep a table of were three letters no German reader could be
+    // shown.
+    expect(monthColumns(buildYearGrid(2026, [])).map((m) => m.at.toISOString())).toEqual([
+      '2026-01-01T00:00:00.000Z',
+      '2026-02-01T00:00:00.000Z',
+      '2026-03-01T00:00:00.000Z',
+      '2026-04-01T00:00:00.000Z',
+      '2026-05-01T00:00:00.000Z',
+      '2026-06-01T00:00:00.000Z',
+      '2026-07-01T00:00:00.000Z',
+      '2026-08-01T00:00:00.000Z',
+      '2026-09-01T00:00:00.000Z',
+      '2026-10-01T00:00:00.000Z',
+      '2026-11-01T00:00:00.000Z',
+      '2026-12-01T00:00:00.000Z',
     ])
   })
 
@@ -211,52 +218,110 @@ describe('mapping a duration to an intensity', () => {
     // indistinguishable -- which would make the scale decorative rather
     // than readable.
     expect(INTENSITY_THRESHOLDS_SECONDS).toEqual([1800, 7200, 14400])
-    expect(INTENSITY_LABELS).toHaveLength(4 + 1)
+    expect(INTENSITY_LABEL_KEYS).toHaveLength(4 + 1)
   })
 
   it('has a word for every step, because colour cannot be the only channel', () => {
-    for (const label of INTENSITY_LABELS) {
-      expect(label.trim()).not.toBe('')
+    // A key per step rather than the five English adjectives these used to
+    // be: a colour channel replaced by a word only some of the readership
+    // can read is not much of a replacement.
+    expect(INTENSITY_LABEL_KEYS).toEqual([
+      'calendar.intensityNone',
+      'calendar.intensityLight',
+      'calendar.intensityModerate',
+      'calendar.intensityHeavy',
+      'calendar.intensityBusiest',
+    ])
+  })
+
+  it('has a step key for every intensity a day can reach', () => {
+    // The scale and the words have to end at the same place: a day that
+    // reached a step with no key would render an accessible name with a
+    // hole in it.
+    for (const seconds of [0, 300, 1800, 7200, 14400, 999999]) {
+      expect(INTENSITY_LABEL_KEYS[intensityFor(seconds)]).toBeDefined()
     }
   })
 })
 
 describe('describing a cell', () => {
   it('reads the date without a timezone shifting it', () => {
-    // Formatting from the string rather than from a parsed Date: a browser
-    // west of Greenwich would turn a parsed 2026-08-21 into 20 August.
-    expect(formatIsoDate('2026-08-21')).toBe('21 August 2026')
+    // Built with `Date.UTC` from the parts rather than parsed and read back
+    // with local getters: a browser west of Greenwich would turn a parsed
+    // 2026-08-21 into 20 August, which is the class of bug this whole
+    // module is careful about.
+    expect(dayInstant('2026-08-21').toISOString()).toBe('2026-08-21T00:00:00.000Z')
   })
 
   it('names the day, the count, the length, the people and the step', () => {
+    // Nested messages rather than one glued-together sentence: German can
+    // rewrite `cellRecorded` from scratch and still be handed the same four
+    // decided values in whatever order it wants them.
     const weeks = buildYearGrid(2026, [
       day('2026-08-21', { sessions: 3, total_duration_seconds: 4320, participants: 5 }),
     ])
     const cell = datedCells(weeks).find((c) => c.date === '2026-08-21')!
-    expect(describeCell(cell)).toBe(
-      'Friday, 21 August 2026 (UTC): 3 sessions, 1 h 12 min, 5 people. Activity: moderate (2 of 4).',
-    )
+    expect(describeCell(cell)).toEqual({
+      key: 'calendar.cellRecorded',
+      params: {
+        date: { at: dayInstant('2026-08-21'), format: 'fullDate' },
+        sessions: { key: 'calendar.sessionCount', params: { count: 3 } },
+        duration: { key: 'common.durationHoursMinutes', params: { hours: 1, minutes: 12 } },
+        people: { key: 'calendar.personCount', params: { count: 5 } },
+        activity: {
+          key: 'calendar.activityStep',
+          params: {
+            step: { key: 'calendar.intensityModerate' },
+            index: 2,
+            max: 4,
+          },
+        },
+      },
+    })
   })
 
   it('says plainly that nothing was recorded, rather than saying zero of everything', () => {
     const cell = datedCells(buildYearGrid(2026, [])).find((c) => c.date === '2026-01-01')!
-    expect(describeCell(cell)).toBe('Thursday, 1 January 2026 (UTC): no recordings.')
+    expect(describeCell(cell)).toEqual({
+      key: 'calendar.cellNothing',
+      params: { date: { at: dayInstant('2026-01-01'), format: 'fullDate' } },
+    })
   })
 
-  it('counts one session and one person in the singular', () => {
+  it('hands the counts over as quantities, so a locale can put them in the singular', () => {
+    // A day with one session and one person. The module says how many there
+    // were and names the param `count`; whether that becomes "1 session" or
+    // "1 Sitzung" is the locale file's, because English and German do not
+    // agree about plurals often enough for an `if` here to be safe.
     const weeks = buildYearGrid(2026, [
       day('2026-03-02', { sessions: 1, total_duration_seconds: 600, participants: 1 }),
     ])
     const cell = datedCells(weeks).find((c) => c.date === '2026-03-02')!
-    expect(describeCell(cell)).toBe(
-      'Monday, 2 March 2026 (UTC): 1 session, 10 min, 1 person. Activity: light (1 of 4).',
-    )
+    expect(describeCell(cell)).toEqual({
+      key: 'calendar.cellRecorded',
+      params: {
+        date: { at: dayInstant('2026-03-02'), format: 'fullDate' },
+        sessions: { key: 'calendar.sessionCount', params: { count: 1 } },
+        duration: { key: 'common.durationMinutes', params: { count: 10 } },
+        people: { key: 'calendar.personCount', params: { count: 1 } },
+        activity: {
+          key: 'calendar.activityStep',
+          params: {
+            step: { key: 'calendar.intensityLight' },
+            index: 1,
+            max: 4,
+          },
+        },
+      },
+    })
   })
 
   it('says nothing for a padding cell, which stands for no day at all', () => {
+    // `null` rather than an empty message: there is no day to name, and a
+    // key saying "no day" would be a sentence nobody can ever read.
     const blank = buildYearGrid(2026, [])[0]![0]!
     expect(blank.date).toBeNull()
-    expect(describeCell(blank)).toBe('')
+    expect(describeCell(blank)).toBeNull()
   })
 })
 

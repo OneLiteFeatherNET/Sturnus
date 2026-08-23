@@ -7,10 +7,13 @@
  * like, which clock a timestamp is shown in, whether a zero is a fact or
  * an absence -- and a decision embedded in a template can only be tested
  * by rendering one.
+ *
+ * Nothing here writes a sentence any more. Every label and every caveat is
+ * a {@link Message}: a key and, where the sentence counts something, the
+ * numbers it counts. `i18n/README.md` has the rule and `utils/message.ts`
+ * has the shape.
  */
-
-/** The one thing that means "there is no figure here". Never "0". */
-const NOTHING = '—'
+import { NOT_MEASURED, type Instant, type Message } from './message'
 
 /**
  * A session the dashboard points at.
@@ -47,27 +50,40 @@ export interface DashboardSummary {
   first_session: SessionPointer | null
 }
 
-/** One figure on the dashboard: a label, what it says, and any caveat. */
+/**
+ * One figure on the dashboard: a label, what it says, and any caveat.
+ *
+ * `value` is a bare number where the figure is a count -- so that the
+ * locale writes it, and a German reader gets `48.213` rather than a figure
+ * that reads to them as forty-eight point two. It is a message where the
+ * figure is a length, and `null` where there is no figure at all: a
+ * distinction that used to be an em dash written into a string here, where
+ * nothing downstream could tell it from a value.
+ */
 export interface Figure {
   key: string
-  label: string
-  value: string
+  /** A translation key, resolved by whoever renders this. Named `…Key` so
+   *  that nothing puts it on screen by mistake. */
+  labelKey: string
+  value: Message | number | null
   /** The line under the figure, or null when it needs no caveat. */
-  note: string | null
+  note: Message | null
 }
 
-/** One session, already rendered. */
+/** One session, already decided on. */
 export interface SessionDescription {
   id: string
-  channel: string
-  when: string
-  duration: string
+  /** The channel's own name needs no translating; a channel with no name
+   *  left does. */
+  channel: string | Message
+  when: Instant | null
+  duration: Message | null
 }
 
 /** A named session worth pointing at. */
 export interface SessionHighlight {
   key: string
-  label: string
+  labelKey: string
   session: SessionDescription
 }
 
@@ -78,10 +94,6 @@ function usable(value: number | null | undefined): value is number {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0
 }
 
-function plural(count: number, singular: string): string {
-  return count === 1 ? singular : `${singular}s`
-}
-
 /**
  * A duration a person can compare to another one.
  *
@@ -90,49 +102,85 @@ function plural(count: number, singular: string): string {
  * that would read as zero are dropped, and hours keep counting past
  * twenty-four rather than rolling into days -- "1 d 6 h" makes somebody do
  * arithmetic before they can compare it to last month's thirty.
+ *
+ * `null` for a figure that cannot be true, so that the absence travels as
+ * an absence rather than as an em dash inside a string.
+ *
+ * Named `figureDuration` rather than `formatDuration`: that name existed in
+ * two modules at once, Nuxt's auto-import picked one by file order, and the
+ * warning it printed said which one it had dropped and nothing about what
+ * that would look like on screen.
  */
-export function formatDuration(seconds: number | null | undefined): string {
-  if (!usable(seconds)) return NOTHING
+export function figureDuration(seconds: number | null | undefined): Message | null {
+  if (!usable(seconds)) return null
 
   const total = Math.round(seconds)
   const hours = Math.floor(total / 3600)
   const minutes = Math.floor((total % 3600) / 60)
   const rest = total % 60
 
-  if (hours > 0) return minutes > 0 ? `${hours} h ${minutes} min` : `${hours} h`
-  if (minutes > 0) return rest > 0 ? `${minutes} min ${rest} s` : `${minutes} min`
-  return `${rest} s`
+  if (hours > 0) {
+    return minutes > 0
+      ? { key: 'common.durationHoursMinutes', params: { hours, minutes } }
+      : { key: 'common.durationHours', params: { count: hours } }
+  }
+  if (minutes > 0) {
+    return rest > 0
+      ? { key: 'common.durationMinutesSeconds', params: { minutes, seconds: rest } }
+      : { key: 'common.durationMinutes', params: { count: minutes } }
+  }
+  return { key: 'common.durationSeconds', params: { count: rest } }
 }
+
+/**
+ * A count the locale will write.
+ *
+ * This used to group the digits by hand, with a comment explaining that
+ * `Intl.NumberFormat` formats for the runtime's locale and would render
+ * `48,213` on the server and `48.213` in a browser set to German. The
+ * mismatch was real; the conclusion -- "the console's own text is English;
+ * its numbers should be too" -- has stopped being true. The locale is now
+ * chosen rather than resolved, and it is the same on both sides, so the
+ * grouping can be the reader's. It happens in `useSay`, and this returns
+ * the number itself so that nothing between here and the screen has to
+ * agree with it about separators.
+ */
+export function figureCount(value: number | null | undefined): number | null {
+  if (!usable(value)) return null
+  return Math.round(value)
+}
+
+/* -------------------------------------------------------------------- */
+/* The English renderers the untranslated pages still read                */
+/* -------------------------------------------------------------------- */
 
 /**
  * A count, grouped so it can be read without counting digits.
  *
- * Grouped by hand rather than through `Intl.NumberFormat`, because that
- * formats for the runtime's locale: the same figure would render as
- * `48,213` during the server render and `48.213` in a browser set to
- * German, which Vue reports as a hydration mismatch and the reader sees as
- * a flicker. The console's own text is English; its numbers should be too.
+ * **English, and knowingly so.** `~/utils/queue` and `~/utils/consents`
+ * still build English sentences by hand, because the three pages they serve
+ * -- Queue, User Settings and Bot Settings -- are being rewritten in three
+ * other pull requests and translating them here would collide with all
+ * three. This is what those two modules call, and it keeps the behaviour
+ * they were written against: grouped with commas, and an em dash rather
+ * than a zero for a figure that cannot be true. It goes when the last of
+ * those pages is translated; `figureCount` is what everything else uses.
  */
 export function formatCount(value: number | null | undefined): string {
-  if (!usable(value)) return NOTHING
+  if (!usable(value)) return NOT_MEASURED
   return Math.round(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ',')
 }
 
-/**
- * A moment, in UTC, saying so.
- *
- * The viewer's own zone would be friendlier and is not available: the
- * server render has no idea what it is, so the two renders would disagree
- * and hydration would rewrite every timestamp on the page. Naming the zone
- * is the honest half of that trade -- an unlabelled time in a zone that is
- * not yours is worse than a labelled one.
- */
+/** Month names for {@link formatMoment}, and for nothing else. Every other
+ *  month on screen is now `Intl`'s, through a named datetime format. */
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
 
+/** A moment in UTC, in English. The other half of what the untranslated
+ *  admin pages read; see {@link formatCount}. */
 export function formatMoment(iso: string | null | undefined): string {
-  if (!iso) return NOTHING
+  if (!iso) return NOT_MEASURED
   const at = new Date(iso)
-  if (Number.isNaN(at.getTime())) return NOTHING
+  if (Number.isNaN(at.getTime())) return NOT_MEASURED
 
   const day = at.getUTCDate()
   const month = MONTHS[at.getUTCMonth()]
@@ -143,17 +191,40 @@ export function formatMoment(iso: string | null | undefined): string {
 }
 
 /**
+ * A moment, in UTC, saying so.
+ *
+ * The viewer's own zone would be friendlier and is not available: the
+ * server render has no idea what it is, so the two renders would disagree
+ * and hydration would rewrite every timestamp on the page. Naming the zone
+ * is the honest half of that trade -- an unlabelled time in a zone that is
+ * not yours is worse than a labelled one, and the `utcMoment` format says
+ * so in whichever language is reading it.
+ */
+export function figureMoment(iso: string | null | undefined): Instant | null {
+  if (!iso) return null
+  const at = new Date(iso)
+  if (Number.isNaN(at.getTime())) return null
+  return { at, format: 'utcMoment' }
+}
+
+/**
  * What to call the channel a session happened in.
  *
  * The id in full when there is no name -- a channel deleted since the
  * meeting has none to fetch, and a shortened snowflake identifies nothing
  * and cannot be searched for. Wide on a phone; the template wraps it.
+ *
+ * Not exported. `~/utils/recordings` exports a `channelLabel` of its own,
+ * and for as long as both were exported Nuxt auto-imported one of them into
+ * every component and dropped the other by file order.
  */
-export function channelLabel(pointer: SessionPointer): string {
-  return pointer.channel_name ? `#${pointer.channel_name}` : `Channel ${pointer.channel_id}`
+function channelOf(pointer: SessionPointer): string | Message {
+  return pointer.channel_name
+    ? `#${pointer.channel_name}`
+    : { key: 'recordings.channelById', params: { id: pointer.channel_id } }
 }
 
-/** One session, rendered. Null in, null out: a highlight the endpoint had
+/** One session, decided on. Null in, null out: a highlight the endpoint had
  *  no session for is one the page should leave out entirely. */
 export function describeSession(
   pointer: SessionPointer | null | undefined,
@@ -161,9 +232,9 @@ export function describeSession(
   if (!pointer) return null
   return {
     id: pointer.id,
-    channel: channelLabel(pointer),
-    when: formatMoment(pointer.started_at),
-    duration: formatDuration(pointer.duration_seconds),
+    channel: channelOf(pointer),
+    when: figureMoment(pointer.started_at),
+    duration: figureDuration(pointer.duration_seconds),
   }
 }
 
@@ -178,19 +249,16 @@ export function describeSession(
 export function speechNote(
   totalSeconds: number | null | undefined,
   unmeasuredTracks: number,
-): string | null {
+): Message | null {
   const skipped = usable(unmeasuredTracks) ? Math.round(unmeasuredTracks) : 0
 
   if (!usable(totalSeconds)) {
-    if (skipped > 0) {
-      return `None of your ${formatCount(skipped)} ${plural(skipped, 'track')} were measured; they predate the measurement.`
-    }
-    return 'Nothing has been measured yet.'
+    if (skipped > 0) return { key: 'dashboard.speechNothingMeasured', params: { count: skipped } }
+    return { key: 'dashboard.speechNothingYet' }
   }
 
   if (skipped === 0) return null
-  const verb = skipped === 1 ? 'is' : 'are'
-  return `${formatCount(skipped)} ${plural(skipped, 'track')} recorded before Sturnus measured speech ${verb} not counted.`
+  return { key: 'dashboard.speechSkipped', params: { count: skipped } }
 }
 
 /**
@@ -206,34 +274,34 @@ export function summaryFigures(summary: DashboardSummary): Figure[] {
   return [
     {
       key: 'speech',
-      label: 'Time you have spoken',
-      value: formatDuration(summary.total_speech_seconds),
+      labelKey: 'dashboard.speechLabel',
+      value: figureDuration(summary.total_speech_seconds),
       note: speechNote(summary.total_speech_seconds, summary.unmeasured_tracks),
     },
     {
       key: 'sessions',
-      label: 'Sessions attended',
-      value: formatCount(summary.sessions_attended),
+      labelKey: 'dashboard.sessionsLabel',
+      value: figureCount(summary.sessions_attended),
       note: null,
     },
     {
       key: 'protocols',
-      label: 'Sessions with a protocol',
-      value: formatCount(summary.sessions_with_protocol),
+      labelKey: 'dashboard.protocolsLabel',
+      value: figureCount(summary.sessions_with_protocol),
       // The denominator belongs next to the numerator. Nine protocols is
       // most of a busy month or a third of a busier one.
-      note: attended > 0 ? `of ${formatCount(attended)} ${plural(attended, 'session')} attended` : null,
+      note: attended > 0 ? { key: 'dashboard.protocolsNote', params: { count: attended } } : null,
     },
     {
       key: 'people',
-      label: 'People you have spoken with',
-      value: formatCount(summary.people_spoken_with),
+      labelKey: 'dashboard.peopleLabel',
+      value: figureCount(summary.people_spoken_with),
       note: null,
     },
     {
       key: 'words',
-      label: 'Words transcribed',
-      value: formatCount(summary.words_transcribed),
+      labelKey: 'dashboard.wordsLabel',
+      value: figureCount(summary.words_transcribed),
       note: null,
     },
   ]
@@ -246,15 +314,19 @@ export function summaryFigures(summary: DashboardSummary): Figure[] {
  * rather than as absent, so a missing pointer produces no card at all.
  */
 export function sessionHighlights(summary: DashboardSummary): SessionHighlight[] {
-  const candidates: { key: string, label: string, pointer: SessionPointer | null }[] = [
-    { key: 'most_recent', label: 'Most recent', pointer: summary.most_recent_session },
-    { key: 'longest', label: 'Longest', pointer: summary.longest_session },
-    { key: 'first', label: 'First', pointer: summary.first_session },
+  const candidates: { key: string, labelKey: string, pointer: SessionPointer | null }[] = [
+    {
+      key: 'most_recent',
+      labelKey: 'dashboard.highlightMostRecent',
+      pointer: summary.most_recent_session,
+    },
+    { key: 'longest', labelKey: 'dashboard.highlightLongest', pointer: summary.longest_session },
+    { key: 'first', labelKey: 'dashboard.highlightFirst', pointer: summary.first_session },
   ]
 
-  return candidates.flatMap(({ key, label, pointer }) => {
+  return candidates.flatMap(({ key, labelKey, pointer }) => {
     const session = describeSession(pointer)
-    return session ? [{ key, label, session }] : []
+    return session ? [{ key, labelKey, session }] : []
   })
 }
 
@@ -305,17 +377,22 @@ export function failureStatus(failure: unknown): number | null {
  * into the page would publish an internal hostname to anybody who happened
  * to load a failing dashboard. The status is the part that tells somebody
  * what to do next anyway.
+ *
+ * The status travels into the sentence as a string. It is a number without
+ * being a quantity, and `useSay` writes quantities in the locale's grouping
+ * -- which would turn a hypothetical 1000 into `1,000` and a German
+ * reader's `1.000`.
  */
-export function describeFailure(failure: unknown): string {
+export function describeFailure(failure: unknown): Message {
   const code = failureStatus(failure)
 
-  if (code === 401 || code === 403) return 'Your session is no longer valid.'
+  if (code === 401 || code === 403) return { key: 'dashboard.failureSession' }
   // The console and the API ship as two images and can be deployed apart.
   // A bare 404 would send somebody looking for a fault in their own
   // account rather than in a version skew.
-  if (code === 404) return 'This API has no dashboard yet; it is older than this console.'
-  if (code === null) return 'The API could not be reached.'
-  return `The API answered ${code} and could not produce your figures.`
+  if (code === 404) return { key: 'dashboard.failureNoDashboard' }
+  if (code === null) return { key: 'dashboard.failureUnreachable' }
+  return { key: 'dashboard.failureStatus', params: { code: String(code) } }
 }
 
 /**

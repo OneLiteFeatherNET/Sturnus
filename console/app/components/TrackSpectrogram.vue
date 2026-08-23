@@ -52,6 +52,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{ seek: [seconds: number] }>()
 
+const say = useSay()
 const api = useApi()
 const canvas = ref<HTMLCanvasElement | null>(null)
 const picture = ref<SpectrogramResponse | null>(null)
@@ -219,8 +220,8 @@ function onKey(event: KeyboardEvent) {
     >
       {{
         status === 'loading'
-          ? 'Drawing this track…'
-          : 'Show spectrogram — see where the speech is without listening'
+          ? $t('recordings.spectrogramDrawing')
+          : $t('recordings.spectrogramShow')
       }}
     </button>
 
@@ -229,14 +230,14 @@ function onKey(event: KeyboardEvent) {
       class="rounded-lg border border-dashed px-3 py-3 text-center text-xs"
       :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
     >
-      <p>This track could not be drawn. The audio above is unaffected.</p>
+      <p>{{ $t('recordings.spectrogramFailed') }}</p>
       <button
         type="button"
         class="mt-1 rounded-lg px-2 py-1 font-medium underline transition-colors hover:bg-[var(--surface-raised)]"
         :style="{ color: 'var(--action)' }"
         @click="retry()"
       >
-        Try again
+        {{ $t('error.retry') }}
       </button>
     </div>
 
@@ -251,12 +252,17 @@ function onKey(event: KeyboardEvent) {
         :style="{ background: 'var(--surface-sunken)', outlineColor: 'var(--action)' }"
         role="slider"
         tabindex="0"
-        aria-label="Position in this track"
+        :aria-label="$t('recordings.positionInTrack')"
         aria-orientation="horizontal"
         aria-valuemin="0"
         :aria-valuemax="Math.round(picture?.duration_seconds ?? 0)"
         :aria-valuenow="Math.round(at)"
-        :aria-valuetext="`${formatSeconds(at)} of ${formatSeconds(picture?.duration_seconds ?? 0)}`"
+        :aria-valuetext="
+          $t('recordings.positionValue', {
+            at: formatSeconds(at),
+            total: formatSeconds(picture?.duration_seconds ?? 0),
+          })
+        "
         @click="onClick"
         @keydown="onKey"
       >
@@ -287,8 +293,7 @@ function onKey(event: KeyboardEvent) {
       </div>
 
       <p class="text-[10px]" :style="{ color: 'var(--text-muted)' }">
-        Frequency runs bottom to top, 0 to {{ topFrequency }} kHz. Speech is the banded region
-        low down; a flat picture is a track with nothing on it.
+        {{ say({ key: 'recordings.frequencyNote', params: { top: topFrequency } }) }}
       </p>
     </template>
   </div>

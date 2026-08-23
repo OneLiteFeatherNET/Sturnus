@@ -21,10 +21,8 @@
  */
 import {
   audioUrl,
-  formatCount,
   formatMeasurement,
   formatSeconds,
-  formatShare,
   sessionLength,
   speechShare,
   trackLabel,
@@ -119,6 +117,18 @@ function onVolume(event: Event) {
 
 const scrubMax = computed(() => Math.max(1, state.value.duration ?? longest.value))
 const remaining = computed(() => Math.max(0, scrubMax.value - state.value.position))
+
+const say = useSay()
+
+/** How much of a track was speech, as the locale writes a percentage.
+ *  German puts a space before the sign and English does not, so the
+ *  `percent` number format decides rather than a `%` glued on in a
+ *  module. */
+const { n } = useI18n()
+function share(track: RecordedSession['tracks'][number]): string {
+  const measured = speechShare(track)
+  return measured === null ? say(null) : n(measured, 'percent')
+}
 </script>
 
 <template>
@@ -128,7 +138,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
         type="button"
         class="flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-[var(--surface)] transition-opacity hover:opacity-85"
         :style="{ background: 'var(--action)' }"
-        :aria-label="state.playing ? 'Pause every track' : 'Play every track'"
+        :aria-label="state.playing ? $t('recordings.pauseAll') : $t('recordings.playAll')"
         @click="transport.toggle()"
       >
         <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
@@ -149,7 +159,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
         :style="{ background: 'var(--surface-sunken)' }"
         :max="scrubMax"
         :value="state.position"
-        aria-label="Position in the recording"
+        :aria-label="$t('recordings.positionInRecording')"
         @input="onScrub"
       >
 
@@ -158,7 +168,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
       </span>
 
       <label class="flex shrink-0 items-center gap-2 text-sm" :style="{ color: 'var(--text-muted)' }">
-        <span class="sr-only">Volume</span>
+        <span class="sr-only">{{ $t('recordings.volume') }}</span>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
           <path d="M4 9v6h4l5 4V5L8 9H4Zm12.5 3a4.5 4.5 0 0 0-2.5-4v8a4.5 4.5 0 0 0 2.5-4Z" />
         </svg>
@@ -181,7 +191,7 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
         :style="{ color: 'var(--text-muted)' }"
         @click="transport.clearSolo()"
       >
-        Hear everyone
+        {{ $t('recordings.hearEveryone') }}
       </button>
     </div>
 
@@ -214,7 +224,11 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
             class="rounded-full px-2 py-0.5 text-xs"
             :style="{ background: 'var(--surface-sunken)', color: 'var(--text-muted)' }"
           >
-            {{ state.muted.includes(track.discord_user_id) ? 'muted' : 'silenced by solo' }}
+            {{
+              state.muted.includes(track.discord_user_id)
+                ? $t('recordings.muted')
+                : $t('recordings.silencedBySolo')
+            }}
           </span>
 
           <span
@@ -222,14 +236,14 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
             class="text-xs"
             :style="{ color: 'var(--danger)' }"
           >
-            Audio unavailable
+            {{ $t('recordings.audioUnavailable') }}
           </span>
           <span
             v-else-if="loading[track.discord_user_id]"
             class="text-xs"
             :style="{ color: 'var(--text-muted)' }"
           >
-            Loading…
+            {{ $t('recordings.trackLoading') }}
           </span>
 
           <div class="flex shrink-0 items-center gap-1">
@@ -242,10 +256,10 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
                   : { background: 'var(--surface)', color: 'var(--text-muted)' }
               "
               :aria-pressed="state.soloed.includes(track.discord_user_id)"
-              :aria-label="`Hear ${trackLabel(track)} alone`"
+              :aria-label="$t('recordings.hearAlone', { name: trackLabel(track) })"
               @click="transport.toggleSolo(track.discord_user_id)"
             >
-              Solo
+              {{ $t('recordings.solo') }}
             </button>
             <button
               type="button"
@@ -256,30 +270,30 @@ const remaining = computed(() => Math.max(0, scrubMax.value - state.value.positi
                   : { background: 'var(--surface)', color: 'var(--text-muted)' }
               "
               :aria-pressed="state.muted.includes(track.discord_user_id)"
-              :aria-label="`Mute ${trackLabel(track)}`"
+              :aria-label="$t('recordings.muteSpeaker', { name: trackLabel(track) })"
               @click="transport.toggleMute(track.discord_user_id)"
             >
-              Mute
+              {{ $t('recordings.mute') }}
             </button>
           </div>
         </div>
 
         <dl class="mt-2 flex flex-wrap gap-x-6 gap-y-1 text-xs" :style="{ color: 'var(--text-muted)' }">
           <div class="flex gap-1">
-            <dt>Audio</dt>
+            <dt>{{ $t('recordings.audioLabel') }}</dt>
             <dd class="tabular-nums">{{ formatMeasurement(track.audio_seconds) }}</dd>
           </div>
           <div class="flex gap-1">
-            <dt>Speech</dt>
+            <dt>{{ $t('recordings.speechLabel') }}</dt>
             <dd class="tabular-nums">{{ formatMeasurement(track.speech_seconds) }}</dd>
           </div>
           <div class="flex gap-1">
-            <dt>Segments</dt>
-            <dd class="tabular-nums">{{ formatCount(track.segment_count) }}</dd>
+            <dt>{{ $t('recordings.segmentsLabel') }}</dt>
+            <dd class="tabular-nums">{{ say(track.segment_count) }}</dd>
           </div>
           <div class="flex gap-1">
-            <dt>Share</dt>
-            <dd class="tabular-nums">{{ formatShare(speechShare(track)) }}</dd>
+            <dt>{{ $t('recordings.shareLabel') }}</dt>
+            <dd class="tabular-nums">{{ share(track) }}</dd>
           </div>
         </dl>
 

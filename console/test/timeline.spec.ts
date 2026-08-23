@@ -145,7 +145,10 @@ describe('labelling a bar', () => {
     const [bar] = layOutDay('2026-08-21', [
       session('2026-08-21T09:00:00Z', { channel_name: null, channel_id: '900000000000000001' }),
     ])
-    expect(bar!.channel).toBe('Channel 900000000000000001')
+    expect(bar!.channel).toEqual({
+      key: 'recordings.channelById',
+      params: { id: '900000000000000001' },
+    })
   })
 
   it('carries a snowflake through as the string it arrived as', () => {
@@ -160,7 +163,10 @@ describe('labelling a bar', () => {
       }),
     ])
     expect(bar!.id).toBe('1408284735632900103')
-    expect(bar!.channel).toBe('Channel 1408284735632900104')
+    expect(bar!.channel).toEqual({
+      key: 'recordings.channelById',
+      params: { id: '1408284735632900104' },
+    })
   })
 })
 

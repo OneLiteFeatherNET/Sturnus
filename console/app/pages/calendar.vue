@@ -21,7 +21,10 @@
 import type { CalendarDay } from '~/utils/heatmap'
 import type { DaySession } from '~/utils/timeline'
 
-useHead({ title: 'Calendar' })
+const { t } = useI18n()
+const say = useSay()
+
+useHead({ title: () => t('nav.calendar') })
 
 interface CalendarYearResponse {
   year: number
@@ -103,6 +106,24 @@ const yearIsEmpty = computed(() => yearStatus.value === 'success' && days.value.
 const recordedDays = computed(() => days.value.length)
 const totalSessions = computed(() => days.value.reduce((sum, day) => sum + day.sessions, 0))
 
+/**
+ * How much the year holds, in one sentence.
+ *
+ * Two counts in one sentence, and each of them pluralises on its own -- a
+ * message can only choose its form from one number, so the two noun phrases
+ * are messages of their own and the sentence has a hole for each. That is
+ * not the concatenation this convention forbids: the sentence is still one
+ * whole string in the locale file, and German is free to put the days
+ * before the sessions if it wants to.
+ */
+const yearSummary = computed(() => ({
+  key: 'calendar.yearSummary',
+  params: {
+    sessions: { key: 'calendar.sessionCount', params: { count: totalSessions.value } },
+    days: { key: 'calendar.dayCount', params: { count: recordedDays.value } },
+  },
+}))
+
 function step(delta: number) {
   const next = year.value + delta
   if (next < EARLIEST_YEAR || next > thisYear.value) return
@@ -120,9 +141,9 @@ async function select(date: string) {
 
 <template>
   <div>
-    <h1 class="mb-1 text-2xl font-semibold">Calendar</h1>
+    <h1 class="mb-1 text-2xl font-semibold">{{ $t('nav.calendar') }}</h1>
     <p class="mb-6 text-sm" :style="{ color: 'var(--text-muted)' }">
-      Every day Sturnus recorded a meeting, and what happened on it.
+      {{ $t('calendar.intro') }}
     </p>
 
     <div class="mb-4 flex flex-wrap items-center gap-3">
@@ -132,7 +153,7 @@ async function select(date: string) {
           class="rounded-lg border px-2.5 py-1.5 text-sm transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-40"
           :style="{ borderColor: 'var(--border)' }"
           :disabled="year <= EARLIEST_YEAR"
-          :aria-label="`Show ${year - 1}`"
+          :aria-label="$t('calendar.showYear', { year: String(year - 1) })"
           @click="step(-1)"
         >
           &lsaquo;
@@ -143,7 +164,7 @@ async function select(date: string) {
           class="rounded-lg border px-2.5 py-1.5 text-sm transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-40"
           :style="{ borderColor: 'var(--border)' }"
           :disabled="year >= thisYear"
-          :aria-label="`Show ${year + 1}`"
+          :aria-label="$t('calendar.showYear', { year: String(year + 1) })"
           @click="step(1)"
         >
           &rsaquo;
@@ -154,8 +175,7 @@ async function select(date: string) {
         class="text-sm"
         :style="{ color: 'var(--text-muted)' }"
       >
-        {{ totalSessions }} session{{ totalSessions === 1 ? '' : 's' }} across
-        {{ recordedDays }} day{{ recordedDays === 1 ? '' : 's' }}.
+        {{ say(yearSummary) }}
       </p>
     </div>
 
@@ -182,9 +202,11 @@ async function select(date: string) {
       </div>
 
       <div v-else-if="yearError">
-        <p class="text-sm font-medium">The calendar for {{ year }} could not be loaded.</p>
+        <p class="text-sm font-medium">
+          {{ $t('calendar.yearFailedHeading', { year: String(year) }) }}
+        </p>
         <p class="mt-1 mb-3 text-sm" :style="{ color: 'var(--text-muted)' }">
-          The API answered with an error. Nothing has been lost -- this view only reads.
+          {{ $t('calendar.yearFailedDetail') }}
         </p>
         <button
           type="button"
@@ -192,19 +214,33 @@ async function select(date: string) {
           :style="{ borderColor: 'var(--border)' }"
           @click="refreshYear()"
         >
-          Try again
+          {{ $t('error.retry') }}
         </button>
       </div>
 
       <!-- An empty year says so, and says what would fill it. A grid of 365
            blank squares with no caption reads as a broken page. -->
       <div v-else-if="yearIsEmpty">
-        <p class="text-sm font-medium">Nothing was recorded in {{ year }}.</p>
+        <p class="text-sm font-medium">
+          {{ $t('calendar.emptyYearHeading', { year: String(year) }) }}
+        </p>
+        <!-- The two endings are a value inside one sentence rather than
+             two fragments after it. Which of them applies is this page's
+             decision; where in the sentence it lands is the language's. -->
         <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-          A cell appears here for every day Sturnus joined a Discord voice channel and recorded a
-          meeting. Invite the bot to a channel and start a session, or
-          <template v-if="year > EARLIEST_YEAR">use the arrows above to look at another year.</template>
-          <template v-else>wait for the first meeting to be recorded.</template>
+          {{
+            say({
+              key: 'calendar.emptyYearDetail',
+              params: {
+                then: {
+                  key:
+                    year > EARLIEST_YEAR
+                      ? 'calendar.emptyYearOtherYears'
+                      : 'calendar.emptyYearWait',
+                },
+              },
+            })
+          }}
         </p>
       </div>
 
@@ -251,7 +287,7 @@ async function select(date: string) {
         />
       </div>
       <p v-else-if="dayError" class="text-sm">
-        The sessions for {{ selected }} could not be loaded.
+        {{ $t('calendar.dayFailed', { date: selected }) }}
       </p>
       <CalendarDayTimeline
         v-else-if="dayData"

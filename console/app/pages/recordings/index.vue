@@ -51,7 +51,10 @@ import {
 } from '~/utils/recordingFilters'
 import type { RecordedSession, SessionsResponse } from '~/utils/recordings'
 
-useHead({ title: 'Recordings' })
+const { t } = useI18n()
+const say = useSay()
+
+useHead({ title: () => t('nav.recordings') })
 
 const route = useRoute()
 const api = useApi()
@@ -136,14 +139,11 @@ onMounted(() => {
 <template>
   <div class="mx-auto flex max-w-5xl flex-col gap-4">
     <header>
-      <h1 class="text-2xl font-semibold">Recordings</h1>
+      <h1 class="text-2xl font-semibold">{{ $t('nav.recordings') }}</h1>
       <!-- Rule six of this page: say whose voices these are. The listener
            is about to hear colleagues, not a file. -->
       <p class="mt-2 max-w-3xl text-sm" :style="{ color: 'var(--text-muted)' }">
-        These are the meetings you were in. Sturnus records one track per speaker who consented
-        before the recording began, and nobody else — anyone in the channel who did not consent is
-        listed but has no audio here. This is the material each protocol was transcribed from, so
-        when a protocol reads wrong, this is where the answer is.
+        {{ $t('recordings.intro') }}
       </p>
     </header>
 
@@ -158,9 +158,9 @@ onMounted(() => {
       class="rounded-2xl border p-6"
       :style="{ borderColor: 'var(--danger)' }"
     >
-      <p class="text-sm font-medium">Your sessions could not be loaded.</p>
+      <p class="text-sm font-medium">{{ $t('recordings.failedHeading') }}</p>
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-        Nothing was lost; the recordings are on the server either way.
+        {{ $t('recordings.failedDetail') }}
       </p>
       <button
         type="button"
@@ -169,7 +169,7 @@ onMounted(() => {
         :disabled="refreshing"
         @click="refresh()"
       >
-        {{ refreshing ? 'Trying again…' : 'Try again' }}
+        {{ refreshing ? $t('recordings.retrying') : $t('error.retry') }}
       </button>
     </div>
 
@@ -212,9 +212,9 @@ onMounted(() => {
       class="rounded-2xl border p-6"
       :style="{ borderColor: 'var(--border)' }"
     >
-      <p class="text-sm font-medium">There is nothing on this page.</p>
+      <p class="text-sm font-medium">{{ $t('recordings.pastEndHeading') }}</p>
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-        You have {{ total }} recordings, and this page is past the end of them.
+        {{ say({ key: 'recordings.pastEndDetail', params: { count: total } }) }}
       </p>
       <!-- Keeps the filter and drops only the page: somebody who paged
            past the end of a search wants the first page of that search,
@@ -224,7 +224,7 @@ onMounted(() => {
         class="mt-3 inline-block rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
         :style="{ color: 'var(--action)' }"
       >
-        Back to the first page
+        {{ $t('recordings.backToFirstPage') }}
       </NuxtLink>
     </div>
 
@@ -236,16 +236,16 @@ onMounted(() => {
       class="rounded-2xl border p-6"
       :style="{ borderColor: 'var(--border)' }"
     >
-      <p class="text-sm font-medium">Nothing matched what you asked for.</p>
+      <p class="text-sm font-medium">{{ $t('recordings.noMatchHeading') }}</p>
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-        Your recordings are all still there — this search just does not describe any of them.
+        {{ $t('recordings.noMatchDetail') }}
       </p>
       <NuxtLink
         to="/recordings"
         class="mt-3 inline-block rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
         :style="{ color: 'var(--action)' }"
       >
-        Show all recordings
+        {{ $t('recordings.showAll') }}
       </NuxtLink>
     </div>
 
@@ -254,7 +254,7 @@ onMounted(() => {
       class="rounded-2xl border p-6 text-sm"
       :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
     >
-      No recordings yet. A session appears here once Sturnus has been in a voice channel with you.
+      {{ $t('recordings.emptyList') }}
     </p>
 
     <template v-else>
@@ -267,7 +267,7 @@ onMounted(() => {
         role="status"
         aria-live="polite"
       >
-        {{ summary }}
+        {{ say(summary) }}
       </p>
 
       <!-- A list, and said to be one: ten bare articles give assistive

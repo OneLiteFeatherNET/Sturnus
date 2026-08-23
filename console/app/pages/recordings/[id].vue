@@ -39,6 +39,9 @@ import {
 } from '~/utils/recordings'
 import { ApiError } from '~/utils/apiError'
 
+const { t } = useI18n()
+const say = useSay()
+
 const route = useRoute()
 const api = useApi()
 const id = computed(() => String(route.params.id ?? ''))
@@ -58,7 +61,9 @@ const length = computed(() => (session.value ? sessionLength(session.value) : nu
 const missing = computed(() => error.value instanceof ApiError && error.value.status === 404)
 
 useHead(() => ({
-  title: session.value ? `${channelLabel(session.value)} — Recording` : 'Recording',
+  title: session.value
+    ? t('recordings.headTitle', { channel: say(channelLabel(session.value)) })
+    : t('recordings.one'),
 }))
 
 const timeZone = ref('UTC')
@@ -133,7 +138,7 @@ const others = computed(() => session.value?.other_participants ?? [])
       class="text-sm transition-colors hover:underline"
       :style="{ color: 'var(--text-muted)' }"
     >
-      ← All recordings
+      {{ $t('recordings.backToAll') }}
     </NuxtLink>
 
     <!-- Three blocks, in the three sizes this page is: the metadata card,
@@ -165,11 +170,9 @@ const others = computed(() => session.value?.other_participants ?? [])
       class="rounded-2xl border p-6"
       :style="{ borderColor: 'var(--border)' }"
     >
-      <p class="text-sm font-medium">There is no recording here.</p>
+      <p class="text-sm font-medium">{{ $t('recordings.missingHeading') }}</p>
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-        Either it never existed, or it belongs to a session you were not in. Sturnus does not say
-        which — the existence of a meeting you were not part of is not something a link should be
-        able to confirm.
+        {{ $t('recordings.missingDetail') }}
       </p>
     </div>
 
@@ -178,9 +181,9 @@ const others = computed(() => session.value?.other_participants ?? [])
       class="rounded-2xl border p-6"
       :style="{ borderColor: 'var(--danger)' }"
     >
-      <p class="text-sm font-medium">This recording could not be loaded.</p>
+      <p class="text-sm font-medium">{{ $t('recordings.oneFailedHeading') }}</p>
       <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-        Nothing was lost; the recording is on the server either way.
+        {{ $t('recordings.oneFailedDetail') }}
       </p>
       <!-- Disabled rather than replaced while the retry runs: the button
            that started it is the one that would vanish, and a control
@@ -193,7 +196,7 @@ const others = computed(() => session.value?.other_participants ?? [])
         :disabled="status === 'pending'"
         @click="refresh()"
       >
-        {{ status === 'pending' ? 'Trying again…' : 'Try again' }}
+        {{ status === 'pending' ? $t('recordings.retrying') : $t('error.retry') }}
       </button>
     </div>
 
@@ -204,36 +207,36 @@ const others = computed(() => session.value?.other_participants ?? [])
         :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
       >
         <h1 class="flex flex-wrap items-center gap-2 text-2xl font-semibold">
-          <span>{{ channelLabel(session) }}</span>
+          <span>{{ say(channelLabel(session)) }}</span>
           <span
             v-if="isInProgress(session)"
             class="rounded-full px-2 py-0.5 text-xs font-medium"
             :style="{ background: 'var(--positive)', color: 'var(--positive-contrast)' }"
           >
-            Recording now
+            {{ $t('recordings.recordingNow') }}
           </span>
         </h1>
 
         <dl class="mt-4 grid grid-cols-2 gap-x-6 gap-y-3 text-sm sm:grid-cols-4">
           <div>
-            <dt :style="{ color: 'var(--text-muted)' }">Started</dt>
+            <dt :style="{ color: 'var(--text-muted)' }">{{ $t('recordings.startedLabel') }}</dt>
             <dd class="mt-0.5 tabular-nums">{{ formatTimestamp(session.started_at, timeZone) }}</dd>
           </div>
           <div>
-            <dt :style="{ color: 'var(--text-muted)' }">Ended</dt>
+            <dt :style="{ color: 'var(--text-muted)' }">{{ $t('recordings.endedLabel') }}</dt>
             <dd class="mt-0.5 tabular-nums">
-              {{ session.ended_at ? formatTimestamp(session.ended_at, timeZone) : '—' }}
+              {{ session.ended_at ? formatTimestamp(session.ended_at, timeZone) : NOT_MEASURED }}
             </dd>
           </div>
           <div>
-            <dt :style="{ color: 'var(--text-muted)' }">Length</dt>
+            <dt :style="{ color: 'var(--text-muted)' }">{{ $t('recordings.lengthLabel') }}</dt>
             <dd class="mt-0.5 tabular-nums">
-              {{ length !== null ? formatSeconds(length) : 'unknown' }}
+              {{ length !== null ? formatSeconds(length) : $t('recordings.lengthNotKnown') }}
             </dd>
           </div>
           <div>
-            <dt :style="{ color: 'var(--text-muted)' }">Recorded speakers</dt>
-            <dd class="mt-0.5 tabular-nums">{{ session.tracks.length }}</dd>
+            <dt :style="{ color: 'var(--text-muted)' }">{{ $t('recordings.speakersLabel') }}</dt>
+            <dd class="mt-0.5 tabular-nums">{{ $n(session.tracks.length) }}</dd>
           </div>
         </dl>
 
@@ -246,10 +249,10 @@ const others = computed(() => session.value?.other_participants ?? [])
             class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
             :style="{ color: 'var(--action)' }"
           >
-            Open the protocol ↗
+            {{ $t('recordings.openProtocol') }}
           </a>
           <span v-else class="text-sm" :style="{ color: 'var(--text-muted)' }">
-            No protocol was written for this session.
+            {{ $t('recordings.noProtocolWritten') }}
           </span>
         </div>
 
@@ -258,8 +261,11 @@ const others = computed(() => session.value?.other_participants ?? [])
              "who else was there" is a fact about the meeting and their
              absence from the audio is the point. -->
         <p v-if="others.length > 0" class="mt-4 text-sm" :style="{ color: 'var(--text-muted)' }">
-          Also in the channel, without a recording:
-          {{ others.map((person) => person.display_name).join(', ') }}
+          {{
+            $t('recordings.alsoInChannelUnrecorded', {
+              people: others.map((person) => person.display_name).join(', '),
+            })
+          }}
         </p>
       </header>
 
@@ -274,11 +280,9 @@ const others = computed(() => session.value?.other_participants ?? [])
         class="rounded-2xl border p-5"
         :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
       >
-        <h2 class="text-base font-semibold">The whole meeting</h2>
+        <h2 class="text-base font-semibold">{{ $t('recordings.wholeMeetingHeading') }}</h2>
         <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-          Every speaker on one transport, which is the only way a conversation makes sense. Solo
-          and mute turn tracks down rather than stopping them, so unmuting lands you where
-          everybody else already is.
+          {{ $t('recordings.wholeMeetingNote') }}
         </p>
         <MultiTrackPlayer :session="session" />
       </section>
@@ -293,10 +297,9 @@ const others = computed(() => session.value?.other_participants ?? [])
         class="rounded-2xl border p-5"
         :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
       >
-        <h2 class="text-base font-semibold">Each track on its own</h2>
+        <h2 class="text-base font-semibold">{{ $t('recordings.eachTrackHeading') }}</h2>
         <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-          For when the question is what one person said rather than what was discussed. Each
-          player is independent of the transport above and of every other track here.
+          {{ $t('recordings.eachTrackNote') }}
         </p>
 
         <p
@@ -304,7 +307,7 @@ const others = computed(() => session.value?.other_participants ?? [])
           class="mt-4 rounded-lg border border-dashed p-4 text-sm"
           :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
         >
-          Nobody in this session had consented before it began, so there is no audio.
+          {{ $t('recordings.noAudio') }}
         </p>
 
         <ul v-else class="mt-4 flex flex-col gap-4">
@@ -331,7 +334,7 @@ const others = computed(() => session.value?.other_participants ?? [])
               class="mt-3 w-full"
               controls
               preload="none"
-              :aria-label="`${trackLabel(track)} on their own`"
+              :aria-label="$t('recordings.trackAlone', { name: trackLabel(track) })"
               @timeupdate="onTime(track.discord_user_id, $event)"
             />
 

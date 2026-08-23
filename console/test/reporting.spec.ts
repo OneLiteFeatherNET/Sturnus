@@ -8,10 +8,18 @@
  * speaking time is a total of, whether an empty report is a fault -- and a
  * decision embedded in a template can only be tested by rendering one.
  *
- * The wording is asserted here on purpose, and heavily. Four of this
- * page's figures are misreadable in a specific direction, and a test that
- * only checked the numbers would let the sentence that prevents each
- * misreading quietly drop out:
+ * The module no longer writes sentences, so most of what follows asserts on
+ * a key and the params that go into it -- both halves, because the params
+ * are the decision as much as the key is: the count that chooses "the other
+ * one was" over "the other four were" is chosen here and spelled out in the
+ * locale file.
+ *
+ * The wording is still asserted, in the few places where the wording is the
+ * point. Four of this page's figures are misreadable in a specific
+ * direction, and a test that only checked which key was chosen would let
+ * the sentence that prevents each misreading quietly drop out of
+ * `en.json` -- where it now lives, and where nothing else in this suite
+ * looks at it:
  *
  * - `speech_seconds` is a sum over a nullable column, so a server with
  *   many unmeasured tracks looks quiet when it was merely unmeasured.
@@ -28,14 +36,23 @@
  * or ranks a person, because this report is about a server and a
  * per-person readout of attendance and speaking time is a works-council
  * matter rather than a console feature.
+ *
+ * `en.json` is read from disk, the way `i18n.spec.ts` reads it: what ships
+ * is the file, so the file is what is checked. No Vue application and no
+ * i18n instance -- a locale file is data, and so is everything this module
+ * returns.
  */
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
 import { describe, expect, it } from 'vitest'
 
 import {
-  REPORT_EMPTY_NOTE,
+  REPORT_EMPTY_HEADING_KEY,
+  REPORT_EMPTY_NOTE_KEY,
   REPORT_MIN_BAR_EXTENT,
   REPORT_MONTH_FILL_LIMIT,
-  REPORT_SCOPE_NOTE,
+  REPORT_SCOPE_NOTE_KEY,
   describeReportError,
   isReportEmpty,
   parseGuildReport,
@@ -43,7 +60,6 @@ import {
   reportDocumentedLine,
   reportDocumentedShare,
   reportHeadlineFigures,
-  reportMonthLabel,
   reportMonthRows,
   reportMonthsNote,
   reportOpenSessionsLine,
@@ -56,6 +72,10 @@ import {
   type GuildReport,
   type ReportMonth,
 } from '../app/utils/reporting'
+
+/* -------------------------------------------------------------------- */
+/* The fixtures                                                          */
+/* -------------------------------------------------------------------- */
 
 /** A server that has recorded a good deal and has nothing odd about it, so
  *  each test states only the one property it is actually about. */
@@ -113,20 +133,90 @@ function failure(status: number) {
   return { status, path: '/guilds/4711/report' }
 }
 
-/** Every sentence this module can produce for one report, so a test can
- *  assert on what none of them says. */
-function everySentence(value: GuildReport): string {
-  return [
-    ...reportHeadlineFigures(value).map((figure) => `${figure.label} ${figure.value} ${figure.note}`),
-    ...reportShapeFigures(value).map((figure) => `${figure.label} ${figure.value} ${figure.note}`),
-    ...reportCaveats(value).map((caveat) => `${caveat.label} ${caveat.text}`),
-    ...reportMonthRows(value).map((row) => row.detail),
-    reportMonthsNote(value),
-    reportSpanLine(value),
-    REPORT_SCOPE_NOTE,
-    REPORT_EMPTY_NOTE,
-  ].join(' ')
+/** An instant as this module hands one on: which moment, and which of
+ *  `i18n.config.ts`'s formats is to write it. */
+function instant(iso: string) {
+  return { at: new Date(iso), format: 'utcMoment' }
 }
+
+/** A `YYYY-MM` key as the UTC instant its month begins at -- which is what
+ *  replaced the table of English month names this module used to keep. */
+function monthInstant(key: string) {
+  return {
+    at: new Date(Date.UTC(Number(key.slice(0, 4)), Number(key.slice(5, 7)) - 1, 1)),
+    format: 'monthYear',
+  }
+}
+
+/* -------------------------------------------------------------------- */
+/* The English behind a key                                              */
+/* -------------------------------------------------------------------- */
+
+/** Every leaf of `en.json`, as `namespace.name` -> the sentence. */
+function flatten(node: unknown, prefix = ''): Record<string, string> {
+  const flat: Record<string, string> = {}
+  for (const [name, value] of Object.entries(node as Record<string, unknown>)) {
+    const key = prefix ? `${prefix}.${name}` : name
+    if (value !== null && typeof value === 'object') Object.assign(flat, flatten(value, key))
+    else flat[key] = String(value)
+  }
+  return flat
+}
+
+// Resolved from the working directory rather than from `import.meta.url`:
+// the tests run under happy-dom, where `import.meta.url` is not a `file:`
+// URL and `fileURLToPath` refuses it. Same reasoning as `i18n.spec.ts`.
+const EN = flatten(
+  JSON.parse(readFileSync(resolve(process.cwd(), 'i18n/locales/en.json'), 'utf8')),
+)
+
+/** What a key says in English, and a failure rather than a blank for a key
+ *  no locale file carries -- a key nobody added renders on the page as
+ *  itself, which is a bug the reader cannot act on. */
+function sentence(key: string): string {
+  const said = EN[key]
+  if (said === undefined) throw new Error(`no English for ${key}`)
+  return said
+}
+
+/** Every key in a message, its nested messages included. An instant has no
+ *  key and contributes none. */
+function keysOf(value: unknown, into: string[]): string[] {
+  if (value === null || typeof value !== 'object') return into
+  const message = value as { key?: unknown, params?: Record<string, unknown> }
+  if (typeof message.key === 'string') into.push(message.key)
+  for (const param of Object.values(message.params ?? {})) keysOf(param, into)
+  return into
+}
+
+/** Every key this module can reach for one report: labels, figures, notes,
+ *  caveats, rows and the two standing sentences. */
+function everyKey(value: GuildReport): string[] {
+  const keys: string[] = [REPORT_SCOPE_NOTE_KEY, REPORT_EMPTY_HEADING_KEY, REPORT_EMPTY_NOTE_KEY]
+  for (const figure of [...reportHeadlineFigures(value), ...reportShapeFigures(value)]) {
+    keys.push(figure.labelKey)
+    keysOf(figure.value, keys)
+    for (const note of figure.note) keysOf(note, keys)
+  }
+  for (const caveat of reportCaveats(value)) {
+    keys.push(caveat.labelKey)
+    for (const line of caveat.text) keysOf(line, keys)
+  }
+  for (const row of reportMonthRows(value)) keysOf(row.detail, keys)
+  for (const line of reportMonthsNote(value)) keysOf(line, keys)
+  keysOf(reportSpanLine(value), keys)
+  return keys
+}
+
+/** Every sentence this module can produce for one report, in English, so a
+ *  test can assert on what none of them says. */
+function everySentence(value: GuildReport): string {
+  return everyKey(value).map(sentence).join(' ')
+}
+
+/* -------------------------------------------------------------------- */
+/* The tests                                                             */
+/* -------------------------------------------------------------------- */
 
 describe('reading the report payload', () => {
   it('reads the whole envelope the endpoint sends', () => {
@@ -203,9 +293,9 @@ describe('reading the report payload', () => {
   })
 
   it('drops a month it cannot place on a calendar', () => {
-    // A malformed month cannot be ordered or labelled, and would anchor
-    // the gap filling at an arbitrary point in history -- turning one bad
-    // string into a thousand rows of zeros.
+    // A malformed month cannot be ordered or turned into an instant, and
+    // would anchor the gap filling at an arbitrary point in history --
+    // turning one bad string into a thousand rows of zeros.
     const parsed = parseGuildReport({
       months: [
         { month: 'last winter', sessions: 3 },
@@ -239,32 +329,56 @@ describe('reading the report payload', () => {
 describe('the headline figures', () => {
   it('leads with the meetings and says what span they cover', () => {
     const figures = reportHeadlineFigures(report())
-    expect(figures.map((figure) => figure.label)).toEqual([
-      'Meetings recorded',
-      'Meetings written up',
-      'Time recorded',
-      'Time spoken',
+    // Keys, and named `labelKey` so that nothing puts one on screen by
+    // mistake.
+    expect(figures.map((figure) => figure.labelKey)).toEqual([
+      'admin.reporting.sessionsLabel',
+      'admin.reporting.documentedLabel',
+      'admin.reporting.recordedLabel',
+      'admin.reporting.speechLabel',
     ])
-    expect(figures[0]!.value).toBe('42')
-    expect(figures[0]!.note).toContain('4 Nov 2025, 09:00 UTC')
-    expect(figures[0]!.note).toContain('21 Aug 2026, 12:00 UTC')
+    // A bare number rather than a written one: the locale groups it, so a
+    // German reader gets their own separators without this module knowing
+    // which they are.
+    expect(figures[0]!.value).toBe(42)
+    expect(figures[0]!.note).toEqual([
+      {
+        key: 'admin.reporting.spanBetween',
+        params: {
+          from: instant('2025-11-04T09:00:00+00:00'),
+          to: instant('2026-08-21T12:00:00+00:00'),
+        },
+      },
+    ])
   })
 
   it('renders a missing total as an absence rather than as no time at all', () => {
+    // `null` is what the em dash used to be, and is the better shape for
+    // it: a dash was a value as far as everything downstream could tell,
+    // so nothing could tell an absence from a figure without comparing
+    // against a glyph. The tone is what colours it now.
     const figures = reportHeadlineFigures(report({ recorded_seconds: null, speech_seconds: null }))
     const recorded = figures.find((figure) => figure.key === 'recorded')!
-    expect(recorded.value).toBe('—')
+    expect(recorded.value).toBeNull()
     expect(recorded.tone).toBe('absent')
   })
 
+  it('writes a total as a length rather than as a pile of seconds', () => {
+    const recorded = reportHeadlineFigures(report({ recorded_seconds: 151200 })).find(
+      (figure) => figure.key === 'recorded',
+    )!
+    expect(recorded.value).toEqual({ key: 'common.durationHours', params: { count: 42 } })
+    expect(recorded.tone).toBe('plain')
+  })
+
   it('groups the shape of a meeting apart from how much has happened', () => {
-    expect(reportShapeFigures(report()).map((figure) => figure.label)).toEqual([
-      'Typical meeting',
-      'Longest meeting',
-      'People per meeting',
-      'Largest meeting',
-      'People recorded',
-      'Still recording',
+    expect(reportShapeFigures(report()).map((figure) => figure.labelKey)).toEqual([
+      'admin.reporting.averageDurationLabel',
+      'admin.reporting.longestDurationLabel',
+      'admin.reporting.averageParticipantsLabel',
+      'admin.reporting.largestMeetingLabel',
+      'admin.reporting.participantsLabel',
+      'admin.reporting.openLabel',
     ])
   })
 
@@ -273,10 +387,13 @@ describe('the headline figures', () => {
       reportShapeFigures(report({ average_participants: value })).find(
         (figure) => figure.key === 'average-participants',
       )!.value
-    expect(perMeeting(3.84)).toBe('3.8')
-    // A whole number is not a measurement to a tenth, and "4.0" claims it
-    // is.
-    expect(perMeeting(4)).toBe('4')
+    // Rounded here, because a mean of 4.25 people is a precision the
+    // payload does not have. The trailing `.0` that used to be trimmed by
+    // hand goes on its own now: a number carries no trailing zero, and the
+    // locale's number format writes no digit nobody asked for -- so German
+    // gets its comma with it.
+    expect(perMeeting(3.84)).toBe(3.8)
+    expect(perMeeting(4)).toBe(4)
   })
 })
 
@@ -293,21 +410,42 @@ describe('a figure that is missing rather than zero', () => {
         largest_meeting: null,
       }),
     )
-    for (const key of ['average-duration', 'longest-duration', 'average-participants', 'largest-meeting']) {
-      const figure = figures.find((candidate) => candidate.key === key)!
-      expect(figure.value).toBe('—')
-      expect(figure.tone).toBe('absent')
-      expect(figure.note).toContain('No meeting in this server has finished')
-      expect(figure.note).toContain('not a figure of zero')
+    const reasons: Record<string, string> = {
+      'average-duration': 'admin.reporting.absentAverageDuration',
+      'longest-duration': 'admin.reporting.absentLongestDuration',
+      'average-participants': 'admin.reporting.absentAverageParticipants',
+      'largest-meeting': 'admin.reporting.absentLargestMeeting',
     }
+    for (const [key, reason] of Object.entries(reasons)) {
+      const figure = figures.find((candidate) => candidate.key === key)!
+      expect(figure.value).toBeNull()
+      expect(figure.tone).toBe('absent')
+      // Two sentences rather than one: the second is the same for all four
+      // and is a key of its own, so that four copies of it cannot drift
+      // apart one edit at a time.
+      expect(figure.note).toEqual([{ key: reason }, { key: 'admin.reporting.absentNotZero' }])
+    }
+    expect(sentence('admin.reporting.absentNotZero')).toContain('not a figure of zero')
   })
 
   it('never leaves a missing figure without the sentence that explains it', () => {
-    // An em dash with nothing beside it reads as "still loading", which is
-    // the one thing this page is not doing.
-    for (const figure of [...reportHeadlineFigures(emptyReport()), ...reportShapeFigures(emptyReport())]) {
-      expect(figure.note?.trim()).not.toBe('')
-      expect(figure.note).not.toBeNull()
+    // An absent figure with nothing beside it reads as "still loading",
+    // which is the one thing this page is not doing.
+    for (const figure of [
+      ...reportHeadlineFigures(emptyReport()),
+      ...reportShapeFigures(emptyReport()),
+    ]) {
+      expect(figure.note.length).toBeGreaterThan(0)
+      for (const line of figure.note) expect(line.key).not.toBe('')
+    }
+  })
+
+  it('names only keys the locale file actually carries', () => {
+    // A key nothing translated renders on the page as itself, which is a
+    // bug the reader can see and cannot act on. `sentence` throws for a key
+    // `en.json` has never heard of.
+    for (const key of everyKey(report({ months: [month({ month: '2026-01' })] }))) {
+      expect(() => sentence(key)).not.toThrow()
     }
   })
 })
@@ -315,17 +453,31 @@ describe('a figure that is missing rather than zero', () => {
 describe('how the documented rate reads', () => {
   it('says how many of this server’s meetings reached a protocol, and how many did not', () => {
     // A rate on its own is read as a property of the software; this is a
-    // property of what happened here, so it is written as "n of m".
-    const line = reportDocumentedLine(report({ sessions: 42, documented: 38 }))
-    expect(line).toContain('38 of the 42 meetings recorded in this server reached a protocol')
-    expect(line).toContain('90 %')
-    expect(line).toContain('The other 4 were recorded and never written up')
+    // property of what happened here, so it is written as "n of m". The
+    // count that governs the verb is the number *missing* -- "the other one
+    // was" against "the other four were" -- and the rest are values beside
+    // it.
+    expect(reportDocumentedLine(report({ sessions: 42, documented: 38 }))).toEqual([
+      {
+        key: 'admin.reporting.documentedPartial',
+        params: { count: 4, documented: 38, sessions: 42, share: 90 },
+      },
+    ])
+  })
+
+  it('counts a single meeting left unwritten in the singular', () => {
+    expect(reportDocumentedLine(report({ sessions: 42, documented: 41 }))).toEqual([
+      {
+        key: 'admin.reporting.documentedPartial',
+        params: { count: 1, documented: 41, sessions: 42, share: 98 },
+      },
+    ])
   })
 
   it('says so plainly when every meeting was written up', () => {
-    expect(reportDocumentedLine(report({ sessions: 42, documented: 42 }))).toContain(
-      'Every one of the 42 meetings recorded in this server reached a protocol',
-    )
+    expect(reportDocumentedLine(report({ sessions: 42, documented: 42 }))).toEqual([
+      { key: 'admin.reporting.documentedAll', params: { count: 42 } },
+    ])
   })
 
   it('never rounds an incomplete rate up to all of them', () => {
@@ -342,15 +494,26 @@ describe('how the documented rate reads', () => {
 
   it('has no rate at all for a server that has recorded nothing', () => {
     expect(reportDocumentedShare(emptyReport())).toBeNull()
-    expect(reportDocumentedLine(emptyReport())).toContain('nothing to write up')
+    expect(reportDocumentedLine(emptyReport())).toEqual([
+      { key: 'admin.reporting.documentedNothing' },
+    ])
   })
 
   it('does not count a meeting still recording as a failure to write one up', () => {
     // A meeting that has not ended cannot have been written up, and
     // blaming the pipeline for the clock is the wrong reading of the same
-    // two numbers.
-    const line = reportDocumentedLine(report({ sessions: 42, documented: 38, open_sessions: 1 }))
-    expect(line).toContain('1 meeting is still recording and cannot have been written up yet')
+    // two numbers. A sentence of its own rather than one glued to the end
+    // of the previous one: whether German wants it first is not this
+    // module's to decide.
+    expect(reportDocumentedLine(report({ sessions: 42, documented: 38, open_sessions: 1 }))).toEqual(
+      [
+        {
+          key: 'admin.reporting.documentedPartial',
+          params: { count: 4, documented: 38, sessions: 42, share: 90 },
+        },
+        { key: 'admin.reporting.documentedOpen', params: { count: 1 } },
+      ],
+    )
   })
 })
 
@@ -358,19 +521,23 @@ describe('the meetings still open', () => {
   it('says nothing is open rather than letting the figure vanish', () => {
     // A figure that appears only when it is bad news is a figure whose
     // absence has to be interpreted.
-    expect(reportOpenSessionsLine(report({ open_sessions: 0 }))).toContain(
-      'Nothing is being recorded in this server right now',
-    )
+    expect(reportOpenSessionsLine(report({ open_sessions: 0 }))).toEqual([
+      { key: 'admin.reporting.openNone' },
+    ])
   })
 
   it('names the second reading of an open session', () => {
     // One meeting open for ten minutes is a meeting; one open since
     // Tuesday is a session that never closed, and the number alone cannot
     // tell them apart.
-    const line = reportOpenSessionsLine(report({ open_sessions: 1 }))
-    expect(line).toContain('1 meeting in this server has no end time yet')
-    expect(line).toContain('a session that never closed')
-    expect(line).toContain('a session open for days is the second')
+    expect(reportOpenSessionsLine(report({ open_sessions: 1 }))).toEqual([
+      { key: 'admin.reporting.openSome', params: { count: 1 } },
+      { key: 'admin.reporting.openAmbiguous' },
+    ])
+    expect(sentence('admin.reporting.openAmbiguous')).toContain('a session that never closed')
+    expect(sentence('admin.reporting.openAmbiguous')).toContain(
+      'a session open for days is the second',
+    )
   })
 
   it('marks an open session as worth a second look', () => {
@@ -383,11 +550,15 @@ describe('the meetings still open', () => {
   it('says the recorded total leaves the open meetings out', () => {
     // `recorded_seconds` excludes them deliberately, and a total whose
     // exclusions go unmentioned is a total whose scope the reader has to
-    // infer from its own silence.
-    expect(reportRecordedLine(report({ open_sessions: 2 }))).toContain(
-      'The 2 meetings still recording are not in it',
-    )
-    expect(reportRecordedLine(report({ open_sessions: 0 }))).toContain('all of which have ended')
+    // infer from its own silence. Said whether or not anything is open.
+    expect(reportRecordedLine(report({ open_sessions: 2 }))).toEqual([
+      { key: 'admin.reporting.recordedScope' },
+      { key: 'admin.reporting.recordedOpenExcluded', params: { count: 2 } },
+    ])
+    expect(reportRecordedLine(report({ open_sessions: 0 }))).toEqual([
+      { key: 'admin.reporting.recordedAllEnded' },
+    ])
+    expect(sentence('admin.reporting.recordedAllEnded')).toContain('all of which have ended')
   })
 })
 
@@ -397,32 +568,42 @@ describe('what the speaking time is a total of', () => {
     // a SUM over a nullable column and skips the nulls in silence, so a
     // small figure under a large recorded total reads as "these meetings
     // were quiet" to anybody not told otherwise.
-    const caveat = reportSpeechCaveat(report({ tracks: 160, unmeasured_tracks: 7 }))
-    expect(caveat).toContain('7 of the 160 recorded tracks in this server were never measured')
-    expect(caveat).toContain('a sum skips them in silence')
-    expect(caveat).toContain('the total for the other 153 tracks only')
-    expect(caveat).toContain('it describes part of what was recorded')
-    expect(caveat).toContain('It does not mean this server was quiet.')
+    //
+    // The count that governs the verb is the unmeasured one -- "one was
+    // never measured" against "seven were" -- and the total is a value
+    // alongside it.
+    expect(reportSpeechCaveat(report({ tracks: 160, unmeasured_tracks: 7 }))).toEqual([
+      { key: 'admin.reporting.speechPartlyMeasured', params: { count: 7, tracks: 160 } },
+      { key: 'admin.reporting.speechPartlyMeasuredTotal', params: { count: 153 } },
+      { key: 'admin.reporting.speechNotQuiet' },
+    ])
+    // The one sentence on this page that exists to rule out a specific
+    // wrong reading. It is worth checking that it still says it.
+    expect(sentence('admin.reporting.speechNotQuiet')).toBe(
+      'It does not mean this server was quiet.',
+    )
   })
 
   it('says a total covers everything when it does', () => {
-    const caveat = reportSpeechCaveat(report({ tracks: 160, unmeasured_tracks: 0 }))
-    expect(caveat).toContain('Every one of the 160 recorded tracks')
-    expect(caveat).toContain('covers all of what was recorded')
+    expect(reportSpeechCaveat(report({ tracks: 160, unmeasured_tracks: 0 }))).toEqual([
+      { key: 'admin.reporting.speechAllMeasured', params: { count: 160 } },
+    ])
   })
 
   it('says a measurement was never taken when none of it was', () => {
     // Zero measured tracks is not a silent server; it is a server whose
     // recordings predate the columns that hold the figure.
-    const caveat = reportSpeechCaveat(report({ tracks: 160, unmeasured_tracks: 160 }))
-    expect(caveat).toContain('None of the 160 recorded tracks')
-    expect(caveat).toContain('a measurement that was never taken, not as a server that was quiet')
+    expect(reportSpeechCaveat(report({ tracks: 160, unmeasured_tracks: 160 }))).toEqual([
+      { key: 'admin.reporting.speechNoneMeasured', params: { count: 160 } },
+    ])
+    expect(sentence('admin.reporting.speechNoneMeasured')).toContain(
+      'a measurement that was never taken, not as a server that was quiet',
+    )
   })
 
   it('says there is nothing to measure when nothing was recorded', () => {
-    const caveat = reportSpeechCaveat(emptyReport())
-    expect(caveat).toContain('No audio has been recorded in this server')
-    expect(caveat).toContain('missing rather than zero')
+    expect(reportSpeechCaveat(emptyReport())).toEqual([{ key: 'admin.reporting.speechNoTracks' }])
+    expect(sentence('admin.reporting.speechNoTracks')).toContain('missing rather than zero')
   })
 
   it('carries the caveat with the figure, not only in a panel', () => {
@@ -431,21 +612,27 @@ describe('what the speaking time is a total of', () => {
     const speech = reportHeadlineFigures(report({ tracks: 160, unmeasured_tracks: 7 })).find(
       (figure) => figure.key === 'speech',
     )!
-    expect(speech.note).toContain('It does not mean this server was quiet.')
+    expect(speech.note).toContainEqual({ key: 'admin.reporting.speechNotQuiet' })
   })
 })
 
 describe('which calendar the months were cut in', () => {
   it('names the zone rather than letting the reader assume theirs', () => {
-    const note = reportTimezoneNote(report({ timezone: 'Europe/Berlin' }))
-    expect(note).toContain('cut in Europe/Berlin')
-    expect(note).toContain('not in UTC and not in yours')
+    // An IANA zone name is not a word in any language -- `Europe/Berlin` is
+    // `Europe/Berlin` -- so it travels as the string it is, into a hole the
+    // sentence keeps for it.
+    expect(reportTimezoneNote(report({ timezone: 'Europe/Berlin' }))).toEqual({
+      key: 'admin.reporting.timezoneKnown',
+      params: { zone: 'Europe/Berlin' },
+    })
+    expect(sentence('admin.reporting.timezoneKnown')).toContain('{zone}')
+    expect(sentence('admin.reporting.timezoneKnown')).toContain('not in UTC and not in yours')
   })
 
   it('says why the server does not bucket by UTC', () => {
     // A meeting at 00:30 belongs to the month the people in it think it
-    // does.
-    expect(reportTimezoneNote(report())).toContain(
+    // does. The reason is the sentence's, so it is checked in the sentence.
+    expect(sentence('admin.reporting.timezoneKnown')).toContain(
       'A meeting that begins at 00:30 belongs to the month the people in it think it does',
     )
   })
@@ -454,42 +641,94 @@ describe('which calendar the months were cut in', () => {
     // A page rendered on a server cannot know the reader's zone, so the
     // timestamps stay in UTC while the months do not. Two clocks on one
     // page is a seam worth naming.
-    expect(reportTimezoneNote(report())).toContain('written in UTC all the same')
+    expect(sentence('admin.reporting.timezoneKnown')).toContain('written in UTC all the same')
   })
 
   it('reports the uncertainty when the API named no zone at all', () => {
-    const note = reportTimezoneNote(report({ timezone: '' }))
-    expect(note).toContain('did not say which calendar')
-    expect(note).toContain('do not assume it is yours')
+    expect(reportTimezoneNote(report({ timezone: '' }))).toEqual({
+      key: 'admin.reporting.timezoneUnknown',
+    })
+    expect(sentence('admin.reporting.timezoneUnknown')).toContain('did not say which calendar')
+    expect(sentence('admin.reporting.timezoneUnknown')).toContain('do not assume it is yours')
   })
 
   it('puts both caveats where the figures are, in a fixed order', () => {
     expect(reportCaveats(report()).map((caveat) => caveat.key)).toEqual(['speech', 'timezone'])
+    expect(reportCaveats(report()).map((caveat) => caveat.labelKey)).toEqual([
+      'admin.reporting.caveatSpeechLabel',
+      'admin.reporting.caveatTimezoneLabel',
+    ])
   })
 })
 
 describe('the span the report covers', () => {
   it('writes both ends in UTC and says which zone that is', () => {
-    expect(reportSpanLine(report())).toBe(
-      'Everything recorded in this server between 4 Nov 2025, 09:00 UTC and 21 Aug 2026, 12:00 UTC.',
-    )
+    // The zone is named by the `utcMoment` format rather than by this
+    // module, which is what lets it be named in whichever language is
+    // reading without two instants being written twice.
+    expect(reportSpanLine(report())).toEqual({
+      key: 'admin.reporting.spanBetween',
+      params: {
+        from: instant('2025-11-04T09:00:00+00:00'),
+        to: instant('2026-08-21T12:00:00+00:00'),
+      },
+    })
   })
 
   it('says there is no span rather than printing a dash for one', () => {
-    expect(reportSpanLine(emptyReport())).toContain('covers no time at all')
+    expect(reportSpanLine(emptyReport())).toEqual({ key: 'admin.reporting.spanNothing' })
   })
 
   it('reads a single meeting as one meeting, not as a range of no length', () => {
-    const line = reportSpanLine(
-      report({ first_session_at: '2026-08-21T12:00:00+00:00', last_session_at: '2026-08-21T12:00:00+00:00' }),
-    )
-    expect(line).toBe('One meeting, recorded 21 Aug 2026, 12:00 UTC.')
+    expect(
+      reportSpanLine(
+        report({
+          first_session_at: '2026-08-21T12:00:00+00:00',
+          last_session_at: '2026-08-21T12:00:00+00:00',
+        }),
+      ),
+    ).toEqual({
+      key: 'admin.reporting.spanOne',
+      params: { at: instant('2026-08-21T12:00:00+00:00') },
+    })
   })
 
   it('says so when only one end of the span is known', () => {
-    const line = reportSpanLine(report({ last_session_at: null }))
-    expect(line).toContain('Only one end of the span is known')
-    expect(line).toContain('4 Nov 2025, 09:00 UTC')
+    // Each end can be missing on its own, and each case gets its own
+    // sentence rather than an em dash standing in for half a range.
+    expect(reportSpanLine(report({ last_session_at: null }))).toEqual({
+      key: 'admin.reporting.spanPartial',
+      params: { at: instant('2025-11-04T09:00:00+00:00') },
+    })
+    expect(reportSpanLine(report({ first_session_at: null }))).toEqual({
+      key: 'admin.reporting.spanPartial',
+      params: { at: instant('2026-08-21T12:00:00+00:00') },
+    })
+  })
+
+  it('treats a date nothing can read as the absence it is', () => {
+    // `parseGuildReport` keeps any non-empty string here, because an id and
+    // an instant are both text on the wire and it does not parse either.
+    // So an unreadable date reaches this function, and it used to reach the
+    // sentence as an em dash -- "recorded —", a glyph standing where a time
+    // should be. An instant nobody can read is not a date, so the end it
+    // was going to describe is simply not known.
+    expect(
+      reportSpanLine(report({ first_session_at: 'not a date', last_session_at: null })),
+    ).toEqual({ key: 'admin.reporting.spanUnreadable' })
+  })
+
+  it('still gives the end it can read when only the other one is unreadable', () => {
+    // Better than the em dash this replaced in a second way: half a span is
+    // half a span whether the other end is missing or merely unreadable.
+    expect(
+      reportSpanLine(
+        report({ first_session_at: 'not a date', last_session_at: '2026-08-21T12:00:00+00:00' }),
+      ),
+    ).toEqual({
+      key: 'admin.reporting.spanPartial',
+      params: { at: instant('2026-08-21T12:00:00+00:00') },
+    })
   })
 })
 
@@ -516,7 +755,11 @@ describe('the months, and the gaps between them', () => {
     expect(rows.filter((row) => row.silent)).toHaveLength(7)
     expect(rows[1]!.silent).toBe(true)
     expect(rows[1]!.sessions).toBe(0)
-    expect(rows[1]!.detail).toBe('April 2026: nothing was recorded in this server.')
+    expect(rows[1]!.recorded).toBeNull()
+    expect(rows[1]!.detail).toEqual({
+      key: 'admin.reporting.monthSilent',
+      params: { month: monthInstant('2026-04') },
+    })
   })
 
   it('invents no months before the first or after the last', () => {
@@ -528,16 +771,20 @@ describe('the months, and the gaps between them', () => {
 
   it('has no rows at all for a server with no months', () => {
     expect(reportMonthRows(emptyReport())).toEqual([])
-    expect(reportMonthsNote(emptyReport())).toContain('No month in this server has any recording')
+    expect(reportMonthsNote(emptyReport())).toEqual([{ key: 'admin.reporting.monthsNothing' }])
   })
 
   it('says what it did about the gaps, either way', () => {
     const filled = report({ months: [month({ month: '2026-03' }), month({ month: '2026-06' })] })
-    expect(reportMonthsNote(filled)).toContain(
-      'The 2 months in which nothing was recorded are listed with a zero rather than left out',
-    )
+    expect(reportMonthsNote(filled)).toEqual([
+      { key: 'admin.reporting.monthsOldestFirst' },
+      { key: 'admin.reporting.monthsSomeSilent', params: { count: 2 } },
+    ])
     const solid = report({ months: [month({ month: '2026-03' }), month({ month: '2026-04' })] })
-    expect(reportMonthsNote(solid)).toContain('Something was recorded in each of them')
+    expect(reportMonthsNote(solid)).toEqual([
+      { key: 'admin.reporting.monthsOldestFirst' },
+      { key: 'admin.reporting.monthsAllBusy' },
+    ])
   })
 
   it('stops filling a span too long to list, and says it stopped', () => {
@@ -549,10 +796,17 @@ describe('the months, and the gaps between them', () => {
       months: [month({ month: '2010-01' }), month({ month: '2026-08' })],
     })
     expect(reportMonthRows(far)).toHaveLength(2)
-    const note = reportMonthsNote(far)
-    expect(note).toContain('Only the months in which something was recorded are listed')
-    expect(note).toContain(`more than ${REPORT_MONTH_FILL_LIMIT / 12} years`)
-    expect(note).toContain('not necessarily neighbouring months')
+    // The limit travels as the years it is, so the sentence can say it
+    // without this module knowing the word for "years".
+    expect(reportMonthsNote(far)).toEqual([
+      {
+        key: 'admin.reporting.monthsTooLong',
+        params: { years: REPORT_MONTH_FILL_LIMIT / 12 },
+      },
+    ])
+    expect(sentence('admin.reporting.monthsTooLong')).toContain(
+      'not necessarily neighbouring months',
+    )
   })
 
   it('scales the bars against the busiest month, and never to nothing', () => {
@@ -580,13 +834,55 @@ describe('the months, and the gaps between them', () => {
   })
 
   it('gives every row a sentence for somebody who cannot see the bar', () => {
-    // A bar with no text is a bar only its author can read.
+    // A bar with no text is a bar only its author can read. The month, the
+    // count and the length are three holes in one sentence rather than
+    // three fragments glued together -- German is free to move them.
     const rows = reportMonthRows(
       report({
         months: [month({ month: '2026-08', sessions: 5, recorded_seconds: 18000, documented: 5 })],
       }),
     )
-    expect(rows[0]!.detail).toBe('August 2026: 5 meetings, 5 h recorded, 5 written up.')
+    expect(rows[0]!.recorded).toEqual({ key: 'common.durationHours', params: { count: 5 } })
+    expect(rows[0]!.detail).toEqual({
+      key: 'admin.reporting.monthDetail',
+      params: {
+        month: monthInstant('2026-08'),
+        count: 5,
+        recorded: { key: 'common.durationHours', params: { count: 5 } },
+        documented: 5,
+      },
+    })
+  })
+
+  it('says a month has no length rather than reading an em dash out loud', () => {
+    // The column shows the em dash, and there it is legible: the eye reads
+    // it against the numbers above and below. Dropped into the middle of a
+    // sentence it is a glyph standing where a length should be, and the
+    // reader listening to this page -- the one this sentence exists for --
+    // hears nothing at all. So the absence gets its own sentence.
+    const rows = reportMonthRows(
+      report({
+        months: [month({ month: '2026-08', sessions: 3, recorded_seconds: null, documented: 1 })],
+      }),
+    )
+    expect(rows[0]!.recorded).toBeNull()
+    expect(rows[0]!.detail).toEqual({
+      key: 'admin.reporting.monthDetailUnmeasured',
+      params: { month: monthInstant('2026-08'), count: 3, documented: 1 },
+    })
+  })
+
+  it('names a month by the instant it begins at rather than by its key', () => {
+    // This replaces a table of English month names kept in the module. The
+    // names are `Intl`'s now, through the `monthYear` format, which is
+    // pinned to UTC -- so the first of August cannot slide back into July
+    // on the way to the screen.
+    const rows = reportMonthRows(report({ months: [month({ month: '2026-08' })] }))
+    expect(rows[0]!.at).toEqual(new Date('2026-08-01T00:00:00.000Z'))
+    // The raw key stays too: it is unique across the rows, which is what
+    // keys a `v-for` safely, and it is what a reader matches against the
+    // payload.
+    expect(rows[0]!.month).toBe('2026-08')
   })
 
   it('does not describe a month the API sent as empty the way it describes one it skipped', () => {
@@ -601,7 +897,15 @@ describe('the months, and the gaps between them', () => {
       }),
     )
     expect(rows[0]!.silent).toBe(false)
-    expect(rows[0]!.detail).toContain('0 meetings')
+    expect(rows[0]!.detail).toEqual({
+      key: 'admin.reporting.monthDetail',
+      params: {
+        month: monthInstant('2026-01'),
+        count: 0,
+        recorded: { key: 'common.durationSeconds', params: { count: 0 } },
+        documented: 0,
+      },
+    })
   })
 
   it('keys every row uniquely, so a duplicate month cannot render twice', () => {
@@ -610,17 +914,6 @@ describe('the months, and the gaps between them', () => {
     )
     expect(rows).toHaveLength(1)
     expect(rows[0]!.sessions).toBe(9)
-  })
-
-  it('names a month in full rather than by its key', () => {
-    expect(reportMonthLabel('2026-08')).toBe('August 2026')
-    expect(reportMonthLabel('2025-11')).toBe('November 2025')
-  })
-
-  it('hands back a month key it cannot read rather than a blank', () => {
-    // A raw key is at least something the reader can match against the
-    // payload.
-    expect(reportMonthLabel('whenever')).toBe('whenever')
   })
 })
 
@@ -645,9 +938,14 @@ describe('a server with nothing to report', () => {
   })
 
   it('says so in a sentence rather than in a wall of dashes', () => {
-    expect(REPORT_EMPTY_NOTE).toContain('shows no figures rather than a grid of zeros')
-    expect(REPORT_EMPTY_NOTE).toContain('a zero would be a measurement')
-    expect(REPORT_EMPTY_NOTE).toContain('Once a meeting happens')
+    // A key rather than a sentence now, so the empty state can be read in
+    // German too -- but the sentence behind it still has to say the three
+    // things it was written to say.
+    expect(REPORT_EMPTY_HEADING_KEY).toBe('admin.reporting.emptyHeading')
+    expect(REPORT_EMPTY_NOTE_KEY).toBe('admin.reporting.emptyNote')
+    expect(sentence(REPORT_EMPTY_NOTE_KEY)).toContain('shows no figures rather than a grid of zeros')
+    expect(sentence(REPORT_EMPTY_NOTE_KEY)).toContain('a zero would be a measurement')
+    expect(sentence(REPORT_EMPTY_NOTE_KEY)).toContain('Once a meeting happens')
   })
 })
 
@@ -656,27 +954,43 @@ describe('what this report is not about', () => {
     // A per-person readout of meeting attendance and speaking time is a
     // means of monitoring conduct and performance at work, which is a
     // works-council matter rather than a console feature. The payload
-    // carries no names and no ids; the framing has to match.
-    expect(REPORT_SCOPE_NOTE).toContain('about the server as a whole and never about the people in it')
-    expect(REPORT_SCOPE_NOTE).toContain('no per-person breakdown behind it')
-    expect(REPORT_SCOPE_NOTE).toContain('Counts of people are counts, and stop there.')
+    // carries no names and no ids; the framing has to match, in both
+    // languages.
+    expect(REPORT_SCOPE_NOTE_KEY).toBe('admin.reporting.scopeNote')
+    expect(sentence(REPORT_SCOPE_NOTE_KEY)).toContain(
+      'about the server as a whole and never about the people in it',
+    )
+    expect(sentence(REPORT_SCOPE_NOTE_KEY)).toContain('no per-person breakdown behind it')
+    expect(sentence(REPORT_SCOPE_NOTE_KEY)).toContain('Counts of people are counts, and stop there.')
   })
 
   it('describes the participant count as a count and nothing more', () => {
     const people = reportShapeFigures(report()).find((figure) => figure.key === 'participants')!
-    expect(people.value).toBe('12')
-    expect(people.note).toContain('A count and nothing else')
-    expect(people.note).toContain('does not send this page their names')
+    expect(people.value).toBe(12)
+    expect(people.note).toEqual([{ key: 'admin.reporting.participantsNote' }])
+    expect(sentence('admin.reporting.participantsNote')).toContain('A count and nothing else')
+    expect(sentence('admin.reporting.participantsNote')).toContain(
+      'does not send this page their names',
+    )
   })
 
   it('never hints that a per-person readout is on its way', () => {
-    // Every sentence this module can produce, checked at once: an
-    // interface that promises a breakdown is as much a promise as one that
-    // ships it.
+    // Every sentence this module can reach for one report, resolved through
+    // `en.json` and checked at once: an interface that promises a breakdown
+    // is as much a promise as one that ships it. Checked in English because
+    // English is the source of truth -- a German sentence is a translation
+    // of one of these, and `i18n.spec.ts` is what keeps the two in step.
     const prose = everySentence(
       report({ months: [month({ month: '2026-01' }), month({ month: '2026-03' })], open_sessions: 1 }),
     )
-    for (const forbidden of [' soon', 'coming', 'per person', 'per-person breakdown of', 'who spoke most', 'top speaker']) {
+    for (const forbidden of [
+      ' soon',
+      'coming',
+      'per person',
+      'per-person breakdown of',
+      'who spoke most',
+      'top speaker',
+    ]) {
       expect(prose.toLowerCase()).not.toContain(forbidden.toLowerCase())
     }
   })
@@ -684,35 +998,50 @@ describe('what this report is not about', () => {
 
 describe('when the API says no', () => {
   it('says a session has ended rather than that the server is gone', () => {
-    expect(describeReportError(failure(401))).toContain('Sign in again')
+    expect(describeReportError(failure(401))).toEqual({ key: 'admin.reporting.errorSession' })
   })
 
   it('names what an administrator is when it refuses one who is not', () => {
-    expect(describeReportError(failure(403))).toContain('admin_role_id')
+    expect(describeReportError(failure(403))).toEqual({ key: 'admin.reporting.errorNotAdmin' })
+    // The setting is a field in a config file and is spelled the same in
+    // every language, so the sentence that names it has to keep it.
+    expect(sentence('admin.reporting.errorNotAdmin')).toContain('admin_role_id')
   })
 
   it('covers both readings of a 404 without guessing which', () => {
     // The API answers 404 both for a server that does not exist and for
     // one the caller does not administer, on purpose: it will not confirm
     // the existence of a server to somebody with no business there.
-    const message = describeReportError(failure(404))
-    expect(message).toContain('does not know this server, or you no longer administer it')
-    expect(message).toContain('answers the same way to both')
+    expect(describeReportError(failure(404))).toEqual({
+      key: 'admin.reporting.errorUnknownGuild',
+    })
+    expect(sentence('admin.reporting.errorUnknownGuild')).toContain(
+      'does not know this server, or you no longer administer it',
+    )
+    expect(sentence('admin.reporting.errorUnknownGuild')).toContain('answers the same way to both')
   })
 
   it('separates a refusal from never having reached the API at all', () => {
     // `ApiError` uses 0 for "never got a response", which must not read as
     // an answer from the API.
-    expect(describeReportError(failure(0))).toContain('Could not reach the API')
-    expect(describeReportError(null)).toContain('Could not reach the API')
+    expect(describeReportError(failure(0))).toEqual({ key: 'admin.reporting.errorUnreachable' })
+    expect(describeReportError(null)).toEqual({ key: 'admin.reporting.errorUnreachable' })
   })
 
   it('names an unexpected status rather than inventing a reason for it', () => {
-    expect(describeReportError(failure(503))).toContain('Sturnus answered 503')
-    expect(describeReportError(failure(503))).toContain('Nothing is known about why')
+    // The status travels as a string. It is a number without being a
+    // quantity, and a quantity would be written in the locale's grouping --
+    // there is no such status as 1,000, and none as 1.000 either.
+    expect(describeReportError(failure(503))).toEqual({
+      key: 'admin.reporting.errorStatus',
+      params: { status: '503' },
+    })
+    expect(sentence('admin.reporting.errorStatus')).toContain('Nothing is known about why')
   })
 
   it('reads a raw fetch failure’s statusCode as well as an ApiError’s status', () => {
-    expect(describeReportError({ statusCode: 403 })).toContain('admin_role_id')
+    expect(describeReportError({ statusCode: 403 })).toEqual({
+      key: 'admin.reporting.errorNotAdmin',
+    })
   })
 })

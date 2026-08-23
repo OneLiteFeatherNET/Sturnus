@@ -40,6 +40,8 @@ const props = defineProps<{
 
 const emit = defineEmits<{ apply: [filters: RecordingFilters] }>()
 
+const say = useSay()
+
 /** A working copy, so that typing does not navigate on every keystroke.
  *  Reset whenever the URL changes under us — a back button that left the
  *  boxes showing the previous filter would describe a list nobody is
@@ -63,7 +65,23 @@ const { data: tagData } = await useAsyncData('recording-tags', () =>
 const offered = computed(() => tagData.value?.tags ?? [])
 
 const active = computed(() => hasActiveFilters(props.filters))
-const described = computed(() => activeFilterLabels(props.filters))
+
+/**
+ * Why this list is shorter than the reader's history.
+ *
+ * One sentence with two holes in it -- how many, and what was narrowed --
+ * rather than a count with phrases stuck on the end. The phrases are joined
+ * with commas here because a list of phrases is a list in both languages;
+ * where they go in the sentence is the locale file's to say, and German
+ * puts them after the verb where English does not.
+ */
+const summary = computed(() => ({
+  key: 'recordings.filterSummary',
+  params: {
+    count: props.total,
+    what: activeFilterLabels(props.filters).map(say).join(', '),
+  },
+}))
 
 const searchId = useId()
 const fromId = useId()
@@ -94,17 +112,19 @@ function clear() {
     :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
     aria-labelledby="recordings-filter-heading"
   >
-    <h2 id="recordings-filter-heading" class="sr-only">Find a recording</h2>
+    <h2 id="recordings-filter-heading" class="sr-only">{{ $t('recordings.filterHeading') }}</h2>
 
     <form class="flex flex-col gap-3" @submit.prevent="submit()">
       <div class="flex flex-wrap items-end gap-3">
         <div class="min-w-56 flex-1">
-          <label class="block text-xs font-medium" :for="searchId">Search</label>
+          <label class="block text-xs font-medium" :for="searchId">
+            {{ $t('recordings.searchLabel') }}
+          </label>
           <input
             :id="searchId"
             v-model="draft.q"
             type="search"
-            placeholder="channel, who was there, or one of your tags"
+            :placeholder="$t('recordings.searchPlaceholder')"
             class="mt-1 w-full rounded-lg border px-3 py-1.5 text-sm"
             :style="{
               borderColor: 'var(--control-border)',
@@ -115,7 +135,9 @@ function clear() {
         </div>
 
         <div>
-          <label class="block text-xs font-medium" :for="fromId">From</label>
+          <label class="block text-xs font-medium" :for="fromId">
+            {{ $t('recordings.fromLabel') }}
+          </label>
           <input
             :id="fromId"
             v-model="draft.from"
@@ -130,7 +152,9 @@ function clear() {
         </div>
 
         <div>
-          <label class="block text-xs font-medium" :for="toId">To</label>
+          <label class="block text-xs font-medium" :for="toId">
+            {{ $t('recordings.toLabel') }}
+          </label>
           <input
             :id="toId"
             v-model="draft.to"
@@ -145,7 +169,9 @@ function clear() {
         </div>
 
         <div>
-          <label class="block text-xs font-medium" :for="protocolId">Protocol</label>
+          <label class="block text-xs font-medium" :for="protocolId">
+            {{ $t('recordings.protocolLabel') }}
+          </label>
           <select
             :id="protocolId"
             v-model="draft.protocol"
@@ -156,11 +182,11 @@ function clear() {
               color: 'var(--text)',
             }"
           >
-            <option value="">Either</option>
-            <option value="with">Written</option>
+            <option value="">{{ $t('recordings.protocolEither') }}</option>
+            <option value="with">{{ $t('recordings.protocolWritten') }}</option>
             <!-- How you find the meeting whose document never got
                  written, which is the reason this control exists. -->
-            <option value="without">Not written</option>
+            <option value="without">{{ $t('recordings.protocolNotWritten') }}</option>
           </select>
         </div>
 
@@ -169,7 +195,7 @@ function clear() {
           class="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
           :style="{ borderColor: 'var(--control-border)', color: 'var(--text)' }"
         >
-          Search
+          {{ $t('recordings.searchButton') }}
         </button>
       </div>
 
@@ -177,13 +203,13 @@ function clear() {
            it finds a phrase somebody said in a meeting — which it does
            not, and must not. -->
       <p class="text-xs" :style="{ color: 'var(--text-muted)' }">
-        Searches the channel name, who was in the meeting, and your own tags. It does not search
-        what was said: a transcript is everybody else's words, and they consented to a protocol
-        being written from them, not to being searchable.
+        {{ $t('recordings.searchScopeNote') }}
       </p>
 
       <ul v-if="offered.length > 0" class="flex flex-wrap items-center gap-1.5">
-        <li class="text-xs" :style="{ color: 'var(--text-muted)' }">Your tags:</li>
+        <li class="text-xs" :style="{ color: 'var(--text-muted)' }">
+          {{ $t('recordings.yourTagsLabel') }}
+        </li>
         <li v-for="use in offered" :key="use.tag">
           <button
             type="button"
@@ -195,7 +221,7 @@ function clear() {
             :aria-pressed="filters.tags.includes(use.tag)"
             @click="toggle(use.tag)"
           >
-            {{ use.tag }} · {{ use.sessions }}
+            {{ use.tag }} · {{ $n(use.sessions) }}
           </button>
         </li>
       </ul>
@@ -205,17 +231,14 @@ function clear() {
          is filtered without saying so is one people report as having lost
          their meetings. -->
     <p v-if="active" class="mt-3 flex flex-wrap items-center gap-2 text-xs">
-      <span :style="{ color: 'var(--text-muted)' }">
-        Showing {{ total }} {{ total === 1 ? 'recording' : 'recordings' }}
-        {{ described.join(', ') }}.
-      </span>
+      <span :style="{ color: 'var(--text-muted)' }">{{ say(summary) }}</span>
       <button
         type="button"
         class="rounded-lg px-2 py-0.5 font-medium underline transition-colors hover:bg-[var(--surface-raised)]"
         :style="{ color: 'var(--text)' }"
         @click="clear()"
       >
-        Clear
+        {{ $t('recordings.clearFilters') }}
       </button>
     </p>
   </section>

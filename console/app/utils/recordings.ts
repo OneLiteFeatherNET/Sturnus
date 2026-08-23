@@ -5,7 +5,15 @@
  * distinction this module exists to keep -- a measurement of zero against a
  * measurement that was never taken -- is a decision about honesty, and a
  * decision embedded in a template can only be checked by rendering one.
+ *
+ * Where something here is a sentence rather than a measurement it comes
+ * back as a {@link Message} -- a key and its values -- and the template
+ * turns it into words. `i18n/README.md` has the rule. The clock-shaped
+ * numbers below are *not* sentences and stay strings: `12:34` is the same
+ * in every language this console speaks, and assembling it by hand is what
+ * keeps a track's length agreeing with the position under the playhead.
  */
+import { NOT_MEASURED, type Message } from './message'
 
 /** Every id here is a string. A Discord snowflake exceeds JavaScript's safe
  *  integer range, where a JSON number silently loses its last digits and
@@ -66,15 +74,6 @@ export interface SessionsResponse {
   offset: number
 }
 
-/**
- * What is shown where there is no answer.
- *
- * An em dash rather than "0", "n/a" or an empty cell: it reads as an
- * absence at a glance, lines up in a column of numbers, and cannot be
- * mistaken for a measurement.
- */
-export const NOT_MEASURED = '—'
-
 /** A length as a clock, with an hours field only when there are hours. */
 export function formatSeconds(total: number): string {
   // Down, never to the nearest: a track of 59.9 seconds has not reached a
@@ -94,11 +93,14 @@ export function formatMeasurement(seconds: number | null | undefined): string {
   return formatSeconds(seconds)
 }
 
-/** A count, or the fact that none was taken. */
-export function formatCount(count: number | null | undefined): string {
-  if (count === null || count === undefined) return NOT_MEASURED
-  return String(count)
-}
+/*
+ * A count used to be rendered here too, as `String(count)` or an em dash.
+ * Both halves have moved: `useSay` writes a bare number in the locale's
+ * grouping and an absent one as the em dash, so a segment count reaches the
+ * screen through the same path as every other figure. The function also
+ * shared a name with `~/utils/format`'s, which Nuxt resolved by file order
+ * and a build warning nobody was reading.
+ */
 
 /**
  * How much of a track was speech, between 0 and 1, or `null` for unknown.
@@ -118,10 +120,13 @@ export function speechShare(track: SessionTrack): number | null {
   return Math.min(1, Math.max(0, speech / audio))
 }
 
-export function formatShare(share: number | null): string {
-  if (share === null) return NOT_MEASURED
-  return `${Math.round(share * 100)}%`
-}
+/*
+ * The share used to be rendered here as `45%`. It is a number, and German
+ * writes it `45 %` -- with the space -- so it is now handed to the
+ * `percent` number format in `i18n/i18n.config.ts` rather than glued to a
+ * sign here. `speechShare` above already says everything this module has to
+ * decide about it: how much, or that nobody can say.
+ */
 
 /**
  * What to call a speaker.
@@ -135,10 +140,18 @@ export function trackLabel(track: SessionTrack): string {
   return name ? name : track.discord_user_id
 }
 
-/** What to call the channel it happened in. */
-export function channelLabel(session: RecordedSession): string {
+/**
+ * What to call the channel it happened in.
+ *
+ * A name is somebody's own word for their channel and is not translated --
+ * it comes back as the string it is. A channel with no name left has to be
+ * called something, and "Channel" is a word: that half is a key.
+ */
+export function channelLabel(session: RecordedSession): string | Message {
   const name = session.channel_name?.trim()
-  return name ? `#${name}` : `Channel ${session.channel_id}`
+  return name
+    ? `#${name}`
+    : { key: 'recordings.channelById', params: { id: session.channel_id } }
 }
 
 function instantOf(value: string | null): number | null {

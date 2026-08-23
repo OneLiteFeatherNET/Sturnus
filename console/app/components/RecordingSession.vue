@@ -28,6 +28,8 @@ const props = defineProps<{
 
 defineEmits<{ toggle: [] }>()
 
+const say = useSay()
+
 const length = computed(() => sessionLength(props.session))
 const panelId = computed(() => `session-${props.session.id}`)
 const speakers = computed(() => props.session.tracks.map(trackLabel))
@@ -48,19 +50,19 @@ const others = computed(() =>
     <div class="flex flex-wrap items-start gap-4 p-4">
       <div class="min-w-0 flex-1 sm:min-w-56">
         <h2 class="flex flex-wrap items-center gap-2 text-base font-semibold">
-          <span>{{ channelLabel(session) }}</span>
+          <span>{{ say(channelLabel(session)) }}</span>
           <span
             v-if="isInProgress(session)"
             class="rounded-full px-2 py-0.5 text-xs font-medium"
             :style="{ background: 'var(--positive)', color: 'var(--positive-contrast)' }"
           >
-            Recording now
+            {{ $t('recordings.recordingNow') }}
           </span>
         </h2>
         <p class="mt-1 text-sm tabular-nums" :style="{ color: 'var(--text-muted)' }">
           {{ formatTimestamp(session.started_at, timeZone) }}
           <span v-if="length !== null"> · {{ formatSeconds(length) }}</span>
-          <span v-else> · length unknown</span>
+          <span v-else> · {{ $t('common.durationUnknown') }}</span>
         </p>
       </div>
 
@@ -85,14 +87,14 @@ const others = computed(() =>
               d="M14 3h7v7h-2V6.4l-8.3 8.3-1.4-1.4L17.6 5H14V3ZM5 5h5v2H6v11h11v-4h2v6H5V5Z"
             />
           </svg>
-          Protocol
+          {{ $t('recordings.protocolLabel') }}
         </a>
         <span
           v-else
           class="rounded-lg px-3 py-1.5 text-sm"
           :style="{ color: 'var(--text-muted)' }"
         >
-          No protocol
+          {{ $t('recordings.noProtocol') }}
         </span>
 
         <button
@@ -103,7 +105,7 @@ const others = computed(() =>
           :aria-controls="panelId"
           @click="$emit('toggle')"
         >
-          {{ open ? 'Close' : 'Listen' }}
+          {{ open ? $t('recordings.close') : $t('recordings.listen') }}
         </button>
 
         <!-- The canonical address of this recording. The row above plays
@@ -116,21 +118,21 @@ const others = computed(() =>
           class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
           :style="{ color: 'var(--action)' }"
         >
-          Open
+          {{ $t('recordings.open') }}
         </NuxtLink>
       </div>
     </div>
 
     <div class="border-t px-4 py-3 text-sm" :style="{ borderColor: 'var(--border)' }">
       <p v-if="speakers.length > 0">
-        <span :style="{ color: 'var(--text-muted)' }">Recorded:</span>
+        <span :style="{ color: 'var(--text-muted)' }">{{ $t('recordings.recordedLabel') }}</span>
         {{ speakers.join(', ') }}
       </p>
       <p v-else :style="{ color: 'var(--text-muted)' }">
-        Nobody in this session consented to being recorded, so it has no tracks.
+        {{ $t('recordings.nobodyConsented') }}
       </p>
       <p v-if="session.other_participants.length > 0" class="mt-1">
-        <span :style="{ color: 'var(--text-muted)' }">Also in the channel, not recorded:</span>
+        <span :style="{ color: 'var(--text-muted)' }">{{ $t('recordings.alsoInChannel') }}</span>
         {{ others }}
       </p>
       <!-- The reader's own labels, read-only here. A list is for finding
@@ -155,7 +157,7 @@ const others = computed(() =>
         class="mt-4 rounded-xl border p-4 text-sm"
         :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
       >
-        There is nothing to play: no track was written for this session.
+        {{ $t('recordings.nothingToPlay') }}
       </p>
     </div>
   </article>

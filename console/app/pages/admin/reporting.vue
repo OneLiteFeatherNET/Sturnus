@@ -39,9 +39,9 @@
  *   whole of the refresh policy.
  */
 import {
-  REPORT_EMPTY_HEADING,
-  REPORT_EMPTY_NOTE,
-  REPORT_SCOPE_NOTE,
+  REPORT_EMPTY_HEADING_KEY,
+  REPORT_EMPTY_NOTE_KEY,
+  REPORT_SCOPE_NOTE_KEY,
   type GuildReport,
   describeReportError,
   isReportEmpty,
@@ -61,8 +61,12 @@ import {
   readSelectedGuild,
   writeSelectedGuild,
 } from '~/utils/settings'
+import type { Message } from '~/utils/message'
 
-useHead({ title: 'Reporting' })
+const { t } = useI18n()
+const say = useSay()
+
+useHead({ title: () => t('nav.reporting') })
 
 const api = useApi()
 
@@ -124,8 +128,15 @@ const headline = computed(() => (report.value ? reportHeadlineFigures(report.val
 const shape = computed(() => (report.value ? reportShapeFigures(report.value) : []))
 const caveats = computed(() => (report.value ? reportCaveats(report.value) : []))
 const months = computed(() => (report.value ? reportMonthRows(report.value) : []))
-const monthsNote = computed(() => (report.value ? reportMonthsNote(report.value) : ''))
-const span = computed(() => (report.value ? reportSpanLine(report.value) : ''))
+const monthsNote = computed(() => (report.value ? reportMonthsNote(report.value) : []))
+const span = computed(() => (report.value ? reportSpanLine(report.value) : null))
+
+/** A run of decided sentences, spoken. They arrive as a list rather than as
+ *  one string so that nothing in `~/utils/reporting` has to decide what
+ *  order two sentences go in; here they are simply read out in turn. */
+function sentences(said: readonly Message[]): string {
+  return said.map((one) => say(one)).join(' ')
+}
 const empty = computed(() => Boolean(report.value && isReportEmpty(report.value)))
 
 /** Whether a re-read is in flight. `useAsyncData`'s own status settles
@@ -157,10 +168,9 @@ const TONE_COLOUR: Record<string, string> = {
 
 <template>
   <div class="mx-auto max-w-5xl">
-    <h1 class="mb-1 text-2xl font-semibold">Reporting</h1>
+    <h1 class="mb-1 text-2xl font-semibold">{{ $t('nav.reporting') }}</h1>
     <p class="mb-6 text-sm" :style="{ color: 'var(--text-muted)' }">
-      How one Discord server uses Sturnus: how many meetings it has recorded, how long they ran, how
-      many of them were written up, and how that has changed month by month.
+      {{ $t('admin.reporting.intro') }}
     </p>
 
     <p
@@ -168,7 +178,7 @@ const TONE_COLOUR: Record<string, string> = {
       class="rounded-xl border p-4 text-sm"
       :style="{ borderColor: 'var(--color-brand-red)', background: 'var(--surface)' }"
     >
-      {{ describeReportError(guildError) }}
+      {{ say(describeReportError(guildError)) }}
     </p>
 
     <!-- Somebody who administers nothing gets the reason and the way in,
@@ -178,17 +188,23 @@ const TONE_COLOUR: Record<string, string> = {
       class="rounded-xl border p-6"
       :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
     >
-      <h2 class="mb-2 text-base font-semibold">There is nothing here for you yet</h2>
+      <h2 class="mb-2 text-base font-semibold">{{ $t('admin.reporting.noGuildsHeading') }}</h2>
       <p class="mb-3 text-sm" :style="{ color: 'var(--text-muted)' }">
-        This section reports how one Discord server uses Sturnus, and it is open to the
-        administrators of a server where Sturnus is running. You administer none of them right now.
+        {{ $t('admin.reporting.noGuildsBody') }}
       </p>
-      <p class="text-sm" :style="{ color: 'var(--text-muted)' }">
-        Administrators are the members holding the Discord role that server names in its
-        <code class="rounded bg-[var(--surface-raised)] px-1 font-mono">admin_role_id</code>
-        setting. Somebody who already has it can grant you that role — Sturnus mirrors the
-        membership from Discord, so the change reaches this console on its own.
-      </p>
+      <!-- `i18n-t` rather than the sentence split around the `<code>`:
+           where in the sentence the setting's name sits is a property of
+           the language, and splitting here would fix it at English. -->
+      <i18n-t
+        keypath="admin.reporting.noGuildsRole"
+        tag="p"
+        class="text-sm"
+        :style="{ color: 'var(--text-muted)' }"
+      >
+        <template #setting>
+          <code class="rounded bg-[var(--surface-raised)] px-1 font-mono">admin_role_id</code>
+        </template>
+      </i18n-t>
     </section>
 
     <template v-else>
@@ -206,7 +222,7 @@ const TONE_COLOUR: Record<string, string> = {
           :style="{ color: 'var(--text-muted)' }"
           for="guild-switcher"
         >
-          Which server
+          {{ $t('admin.reporting.whichServer') }}
         </label>
         <select
           v-if="guilds.length > 1"
@@ -225,11 +241,13 @@ const TONE_COLOUR: Record<string, string> = {
           </option>
         </select>
         <p v-else class="text-sm">
-          <span :style="{ color: 'var(--text-muted)' }">Showing</span>
-          <span class="ml-1 font-medium">{{ currentGuild ? guildLabel(currentGuild) : '—' }}</span>
+          <span :style="{ color: 'var(--text-muted)' }">{{ $t('admin.reporting.showing') }}</span>
+          <span class="ml-1 font-medium">
+            {{ currentGuild ? guildLabel(currentGuild) : NOT_MEASURED }}
+          </span>
         </p>
         <p v-if="currentGuild" class="mt-2 text-xs" :style="{ color: 'var(--text-muted)' }">
-          Guild ID
+          {{ $t('admin.reporting.guildId') }}
           <code class="rounded bg-[var(--surface-raised)] px-1 font-mono">{{ currentGuild.id }}</code>
         </p>
       </section>
@@ -239,12 +257,12 @@ const TONE_COLOUR: Record<string, string> = {
         class="mb-6 rounded-xl border p-4 text-sm"
         :style="{ borderColor: 'var(--color-brand-red)', background: 'var(--surface)' }"
       >
-        {{ describeReportError(reportError) }}
+        {{ say(describeReportError(reportError)) }}
       </p>
 
       <template v-else>
         <p v-if="reportStatus === 'pending'" class="text-sm" :style="{ color: 'var(--text-muted)' }">
-          Reading this server's figures…
+          {{ $t('admin.reporting.loadingFigures') }}
         </p>
 
         <template v-else-if="report">
@@ -260,7 +278,7 @@ const TONE_COLOUR: Record<string, string> = {
               color: 'var(--text-muted)',
             }"
           >
-            {{ REPORT_SCOPE_NOTE }}
+            {{ $t(REPORT_SCOPE_NOTE_KEY) }}
           </p>
 
           <!-- A server that has recorded nothing gets a sentence. A grid
@@ -275,15 +293,15 @@ const TONE_COLOUR: Record<string, string> = {
             <div class="mb-4 flex justify-center">
               <SturnusMark :size="48" />
             </div>
-            <h2 class="mb-2 text-lg font-medium">{{ REPORT_EMPTY_HEADING }}</h2>
+            <h2 class="mb-2 text-lg font-medium">{{ $t(REPORT_EMPTY_HEADING_KEY) }}</h2>
             <p class="mx-auto max-w-lg text-sm" :style="{ color: 'var(--text-muted)' }">
-              {{ REPORT_EMPTY_NOTE }}
+              {{ $t(REPORT_EMPTY_NOTE_KEY) }}
             </p>
           </section>
 
           <template v-else>
             <div class="mb-4 flex flex-wrap items-baseline justify-between gap-3">
-              <p class="text-xs" :style="{ color: 'var(--text-muted)' }">{{ span }}</p>
+              <p class="text-xs" :style="{ color: 'var(--text-muted)' }">{{ say(span) }}</p>
               <!-- The whole of the refresh policy. Nothing on this page
                    changes minute to minute, so it does not poll: a report
                    left open overnight must not re-read a server's whole
@@ -296,7 +314,7 @@ const TONE_COLOUR: Record<string, string> = {
                 :disabled="refreshing"
                 @click="refreshNow()"
               >
-                {{ refreshing ? 'Reading…' : 'Refresh' }}
+                {{ refreshing ? $t('admin.reporting.reading') : $t('admin.reporting.refresh') }}
               </button>
             </div>
 
@@ -311,16 +329,20 @@ const TONE_COLOUR: Record<string, string> = {
                 :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
               >
                 <dt class="text-sm font-medium" :style="{ color: 'var(--text-muted)' }">
-                  {{ figure.label }}
+                  {{ $t(figure.labelKey) }}
                 </dt>
                 <dd
                   class="mt-2 text-3xl font-semibold tracking-tight tabular-nums"
                   :style="{ color: TONE_COLOUR[figure.tone] }"
                 >
-                  {{ figure.value }}
+                  {{ say(figure.value) }}
                 </dd>
-                <dd v-if="figure.note" class="mt-2 text-xs" :style="{ color: 'var(--text-muted)' }">
-                  {{ figure.note }}
+                <dd
+                  v-if="figure.note.length"
+                  class="mt-2 text-xs"
+                  :style="{ color: 'var(--text-muted)' }"
+                >
+                  {{ sentences(figure.note) }}
                 </dd>
               </div>
             </dl>
@@ -333,10 +355,9 @@ const TONE_COLOUR: Record<string, string> = {
               class="mb-8 rounded-xl border p-4"
               :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
             >
-              <h2 class="mb-1 text-sm font-semibold">What a meeting here looks like</h2>
+              <h2 class="mb-1 text-sm font-semibold">{{ $t('admin.reporting.shapeHeading') }}</h2>
               <p class="mb-4 text-xs" :style="{ color: 'var(--text-muted)' }">
-                Averages over the meetings that have finished. A figure shown as an em dash is
-                missing rather than zero, and says underneath why there is none.
+                {{ $t('admin.reporting.shapeNote') }}
               </p>
               <dl class="grid grid-cols-2 gap-4 sm:grid-cols-3">
                 <div v-for="figure in shape" :key="figure.key">
@@ -344,16 +365,20 @@ const TONE_COLOUR: Record<string, string> = {
                     class="text-xs font-medium tracking-wide uppercase"
                     :style="{ color: 'var(--text-muted)' }"
                   >
-                    {{ figure.label }}
+                    {{ $t(figure.labelKey) }}
                   </dt>
                   <dd
                     class="text-2xl font-semibold tabular-nums"
                     :style="{ color: TONE_COLOUR[figure.tone] }"
                   >
-                    {{ figure.value }}
+                    {{ say(figure.value) }}
                   </dd>
-                  <dd v-if="figure.note" class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
-                    {{ figure.note }}
+                  <dd
+                    v-if="figure.note.length"
+                    class="mt-1 text-xs"
+                    :style="{ color: 'var(--text-muted)' }"
+                  >
+                    {{ sentences(figure.note) }}
                   </dd>
                 </div>
               </dl>
@@ -365,29 +390,31 @@ const TONE_COLOUR: Record<string, string> = {
                  glance at, and the numbers beside it are what anybody
                  would actually quote. -->
             <section v-if="months.length" class="mb-8">
-              <h2 class="mb-1 text-sm font-semibold">Month by month</h2>
-              <p class="mb-3 text-xs" :style="{ color: 'var(--text-muted)' }">{{ monthsNote }}</p>
+              <h2 class="mb-1 text-sm font-semibold">{{ $t('admin.reporting.monthsHeading') }}</h2>
+              <p class="mb-3 text-xs" :style="{ color: 'var(--text-muted)' }">
+                {{ sentences(monthsNote) }}
+              </p>
 
               <!-- Wide on a phone; the wrapper scrolls rather than the
                    page, so the rest of the page keeps its width. -->
               <div class="overflow-x-auto">
                 <table class="w-full min-w-[34rem] border-collapse text-sm">
                   <caption class="sr-only">
-                    Meetings recorded in this server by month, oldest first
+                    {{ $t('admin.reporting.tableCaption') }}
                   </caption>
                   <thead>
                     <tr :style="{ color: 'var(--text-muted)' }">
                       <th scope="col" class="py-2 pr-4 text-left text-xs font-medium tracking-wide uppercase">
-                        Month
+                        {{ $t('admin.reporting.columnMonth') }}
                       </th>
                       <th scope="col" class="py-2 pr-4 text-left text-xs font-medium tracking-wide uppercase">
-                        Meetings
+                        {{ $t('admin.reporting.columnMeetings') }}
                       </th>
                       <th scope="col" class="py-2 pr-4 text-right text-xs font-medium tracking-wide uppercase">
-                        Recorded
+                        {{ $t('admin.reporting.columnRecorded') }}
                       </th>
                       <th scope="col" class="py-2 text-right text-xs font-medium tracking-wide uppercase">
-                        Written up
+                        {{ $t('admin.reporting.columnDocumented') }}
                       </th>
                     </tr>
                   </thead>
@@ -403,14 +430,14 @@ const TONE_COLOUR: Record<string, string> = {
                         class="py-2 pr-4 text-left font-medium whitespace-nowrap"
                         :style="{ color: row.silent ? 'var(--text-muted)' : 'var(--text)' }"
                       >
-                        {{ row.label }}
+                        {{ $d(row.at, 'monthYear') }}
                       </th>
                       <td class="py-2 pr-4">
                         <!-- The row said in full for a reader who is not
                              looking at the bar, and hidden from the eye
                              that is: the bar and the three columns beside
                              it already say the same thing. -->
-                        <span class="sr-only">{{ row.detail }}</span>
+                        <span class="sr-only">{{ say(row.detail) }}</span>
                         <span aria-hidden="true" class="flex items-center gap-2">
                           <span
                             class="h-2 flex-1 overflow-hidden rounded-full"
@@ -430,7 +457,7 @@ const TONE_COLOUR: Record<string, string> = {
                             class="w-10 shrink-0 text-right tabular-nums"
                             :style="{ color: row.silent ? 'var(--text-muted)' : 'var(--text)' }"
                           >
-                            {{ row.sessions }}
+                            {{ $n(row.sessions) }}
                           </span>
                         </span>
                       </td>
@@ -438,10 +465,10 @@ const TONE_COLOUR: Record<string, string> = {
                         class="py-2 pr-4 text-right tabular-nums"
                         :style="{ color: 'var(--text-muted)' }"
                       >
-                        {{ row.recorded }}
+                        {{ say(row.recorded) }}
                       </td>
                       <td class="py-2 text-right tabular-nums" :style="{ color: 'var(--text-muted)' }">
-                        {{ row.documented }}
+                        {{ $n(row.documented) }}
                       </td>
                     </tr>
                   </tbody>
@@ -457,12 +484,12 @@ const TONE_COLOUR: Record<string, string> = {
               class="rounded-xl border p-4"
               :style="{ borderColor: 'var(--color-brand-yellow)', background: 'var(--surface)' }"
             >
-              <h2 class="mb-3 text-sm font-semibold">Before you quote any of this</h2>
+              <h2 class="mb-3 text-sm font-semibold">{{ $t('admin.reporting.caveatsHeading') }}</h2>
               <dl class="flex flex-col gap-4">
                 <div v-for="caveat in caveats" :key="caveat.key">
-                  <dt class="text-sm font-medium">{{ caveat.label }}</dt>
+                  <dt class="text-sm font-medium">{{ $t(caveat.labelKey) }}</dt>
                   <dd class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
-                    {{ caveat.text }}
+                    {{ sentences(caveat.text) }}
                   </dd>
                 </div>
               </dl>

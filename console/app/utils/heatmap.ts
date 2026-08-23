@@ -24,7 +24,8 @@
  * (`~/utils/timeline`) is where local clock time comes back, because a
  * session carries an instant that can honestly be converted.
  */
-import { formatDuration } from './duration'
+import { durationMessage } from './duration'
+import type { Message } from './message'
 
 /** One day as `GET /api/calendar?year=` returns it. */
 export interface CalendarDay {
@@ -45,55 +46,32 @@ export interface HeatmapCell {
   sessions: number
   totalDurationSeconds: number
   participants: number
-  /** An index into {@link INTENSITY_LABELS}; 0 means nothing was recorded. */
+  /** An index into {@link INTENSITY_LABEL_KEYS}; 0 means nothing was
+   *  recorded. */
   intensity: number
 }
 
 /** Seven cells, Monday first. One column of the grid. */
 export type HeatmapWeek = HeatmapCell[]
 
-/** The rows of the grid, in order. Monday first, because the console's
- *  readers run their meetings on weekdays and a week that ends at the
- *  weekend keeps those five together. */
-export const WEEKDAY_LABELS: readonly string[] = [
-  'Monday',
-  'Tuesday',
-  'Wednesday',
-  'Thursday',
-  'Friday',
-  'Saturday',
-  'Sunday',
-]
-
-const MONTH_NAMES: readonly string[] = [
-  'January',
-  'February',
-  'March',
-  'April',
-  'May',
-  'June',
-  'July',
-  'August',
-  'September',
-  'October',
-  'November',
-  'December',
-]
-
-const MONTH_SHORT: readonly string[] = [
-  'Jan',
-  'Feb',
-  'Mar',
-  'Apr',
-  'May',
-  'Jun',
-  'Jul',
-  'Aug',
-  'Sep',
-  'Oct',
-  'Nov',
-  'Dec',
-]
+/**
+ * One instant per row of the grid, Monday first.
+ *
+ * Monday first because the console's readers run their meetings on weekdays
+ * and a week that ends at the weekend keeps those five together.
+ *
+ * These are *instants*, not names. The row headings used to be seven
+ * English words written out here, which is seven words no reader of any
+ * other language could ever have been shown -- and the shortened form the
+ * grid actually has room for was `"Monday".slice(0, 3)`, which is a
+ * sentence in English about English. A date whose weekday is the one wanted
+ * costs nothing and lets `Intl` answer in whichever language is asking:
+ * "Monday"/"Mon" or "Montag"/"Mo". The week chosen is an arbitrary one that
+ * begins on a Monday; nothing about it is on screen but the weekday.
+ */
+export const WEEKDAY_INSTANTS: readonly Date[] = Array.from({ length: 7 }, (_, index) =>
+  new Date(Date.UTC(2024, 0, 1 + index)),
+)
 
 /**
  * Where one intensity step ends and the next begins, in seconds of total
@@ -115,13 +93,18 @@ export const INTENSITY_THRESHOLDS_SECONDS: readonly number[] = [1800, 7200, 1440
  * on a dim laptop screen in sunlight may not read at all. Every cell's
  * accessible name and tooltip names its step in words, so the grid is
  * legible with the colour thrown away entirely.
+ *
+ * Words in whichever language the reader chose, which is why these are keys
+ * rather than the five English adjectives they used to be. A colour channel
+ * replaced by a word only nine tenths of the readership can read is not
+ * much of a replacement.
  */
-export const INTENSITY_LABELS: readonly string[] = [
-  'none',
-  'light',
-  'moderate',
-  'heavy',
-  'busiest',
+export const INTENSITY_LABEL_KEYS: readonly string[] = [
+  'calendar.intensityNone',
+  'calendar.intensityLight',
+  'calendar.intensityModerate',
+  'calendar.intensityHeavy',
+  'calendar.intensityBusiest',
 ]
 
 /** The step a day's total recording falls into. */
@@ -196,7 +179,10 @@ export function buildYearGrid(year: number, days: readonly CalendarDay[]): Heatm
 
 /** A month heading and how many week-columns it sits above. */
 export interface MonthColumn {
-  label: string
+  /** The month itself, as its first UTC instant, for the `shortMonth`
+   *  format to name. It used to be the three English letters this module
+   *  kept a table of. */
+  at: Date
   /** Number of consecutive columns, so the heading can be a `colspan`. */
   span: number
 }
@@ -209,21 +195,22 @@ export interface MonthColumn {
  * would put "Feb" above a column that is six days of January.
  */
 export function monthColumns(weeks: readonly HeatmapWeek[]): MonthColumn[] {
-  const columns: { month: number; label: string; span: number }[] = []
+  const columns: { month: number; at: Date; span: number }[] = []
 
   for (const week of weeks) {
     const firstDated = week.find((cell) => cell.date !== null)
     if (!firstDated?.date) continue
+    const year = Number(firstDated.date.slice(0, 4))
     const month = Number(firstDated.date.slice(5, 7))
     const previous = columns[columns.length - 1]
     if (previous && previous.month === month) {
       previous.span += 1
     } else {
-      columns.push({ month, label: MONTH_SHORT[month - 1]!, span: 1 })
+      columns.push({ month, at: new Date(Date.UTC(year, month - 1, 1)), span: 1 })
     }
   }
 
-  return columns.map(({ label, span }) => ({ label, span }))
+  return columns.map(({ at, span }) => ({ at, span }))
 }
 
 /**
@@ -243,40 +230,56 @@ export function shiftWithinYear(date: string, deltaDays: number, year: number): 
 }
 
 /**
- * `2026-08-21` as `21 August 2026`.
+ * `2026-08-21` as the UTC instant that day begins at.
  *
- * Formatted from the string rather than from a parsed `Date`: parsing
- * `2026-08-21` and reading it back with local getters turns it into
- * 20 August for anybody west of Greenwich, which is exactly the class of
- * bug this whole module is careful about.
+ * Built with `Date.UTC` from the parts rather than by parsing and reading
+ * back with local getters, which turns `2026-08-21` into 20 August for
+ * anybody west of Greenwich -- exactly the class of bug this whole module
+ * is careful about. Every datetime format that renders one of these is
+ * pinned to UTC for the second half of the same reason.
+ *
+ * This replaces `formatIsoDate` and `weekdayOf`, which wrote out `21 August
+ * 2026` and `Friday` from tables of English words kept in this file. The
+ * words are `Intl`'s now; what is left here is the only part that was ever
+ * a decision -- which instant a UTC day is.
  */
-export function formatIsoDate(date: string): string {
+export function dayInstant(date: string): Date {
   const [year, month, day] = date.split('-')
-  return `${Number(day)} ${MONTH_NAMES[Number(month) - 1]} ${year}`
-}
-
-/** The weekday name of a UTC day. */
-export function weekdayOf(date: string): string {
-  const index = (new Date(`${date}T00:00:00Z`).getUTCDay() + 6) % 7
-  return WEEKDAY_LABELS[index]!
+  return new Date(Date.UTC(Number(year), Number(month) - 1, Number(day)))
 }
 
 /**
  * The sentence a cell says -- as its accessible name, and as its tooltip.
  *
- * One string for both, on purpose. A tooltip a screen reader never reaches
+ * One message for both, on purpose. A tooltip a screen reader never reaches
  * and a label a sighted viewer never sees would drift apart within a
  * release, and then the grid would be telling two different stories.
+ *
+ * `null` for a padding square, which stands for no day at all. It has no
+ * name because there is nothing to name; nothing renders one either, and a
+ * key saying "no day" would be a sentence nobody can ever read.
  */
-export function describeCell(cell: HeatmapCell): string {
-  if (!cell.date) return ''
+export function describeCell(cell: HeatmapCell): Message | null {
+  if (!cell.date) return null
 
-  const when = `${weekdayOf(cell.date)}, ${formatIsoDate(cell.date)} (UTC)`
-  if (cell.sessions === 0) return `${when}: no recordings.`
+  const date = { at: dayInstant(cell.date), format: 'fullDate' }
+  if (cell.sessions === 0) return { key: 'calendar.cellNothing', params: { date } }
 
-  const sessions = `${cell.sessions} session${cell.sessions === 1 ? '' : 's'}`
-  const people = `${cell.participants} ${cell.participants === 1 ? 'person' : 'people'}`
-  const step = `${INTENSITY_LABELS[cell.intensity]} (${cell.intensity} of ${INTENSITY_LABELS.length - 1})`
-
-  return `${when}: ${sessions}, ${formatDuration(cell.totalDurationSeconds)}, ${people}. Activity: ${step}.`
+  return {
+    key: 'calendar.cellRecorded',
+    params: {
+      date,
+      sessions: { key: 'calendar.sessionCount', params: { count: cell.sessions } },
+      duration: durationMessage(cell.totalDurationSeconds),
+      people: { key: 'calendar.personCount', params: { count: cell.participants } },
+      activity: {
+        key: 'calendar.activityStep',
+        params: {
+          step: { key: INTENSITY_LABEL_KEYS[cell.intensity]! },
+          index: cell.intensity,
+          max: INTENSITY_LABEL_KEYS.length - 1,
+        },
+      },
+    },
+  }
 }

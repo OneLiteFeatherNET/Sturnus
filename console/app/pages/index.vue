@@ -8,9 +8,11 @@
  * showed a grid of zeros to somebody who has never been in a recorded
  * meeting would look broken rather than empty.
  *
- * Every figure on it is formatted by `~/utils/format`, where the decisions
- * -- an unmeasured total is an em dash and never a zero, a skipped track
- * is always confessed -- have tests and no framework around them.
+ * Every figure on it is decided by `~/utils/format`, where the decisions
+ * -- an unmeasured total is an absence and never a zero, a skipped track
+ * is always confessed -- have tests and no framework around them. What
+ * comes back from there is a key and its numbers; `say` turns one into a
+ * sentence, and it is the only thing on this page that knows a language.
  */
 import {
   describeFailure,
@@ -22,7 +24,10 @@ import {
   type DashboardSummary,
 } from '~/utils/format'
 
-useHead({ title: 'Dashboard' })
+const { t } = useI18n()
+const say = useSay()
+
+useHead({ title: () => t('nav.dashboard') })
 
 const session = useSession()
 const api = useApi()
@@ -45,11 +50,13 @@ const { data, status, error, refresh } = useAsyncData<DashboardSummary>(
       // for a different job -- turning that into a Nuxt error with a
       // status code, so a failed dashboard renders as the failure it is
       // rather than as an empty page.
-      throw createError({
-        statusCode: failureStatus(cause) ?? undefined,
-        statusMessage: 'The dashboard could not be loaded.',
-        message: describeFailure(cause),
-      })
+      //
+      // The status is all it carries. It used to carry an English sentence
+      // as well, which the template then rendered: an error object is not
+      // a place a translation can live, and the status is what
+      // `describeFailure` reads anyway -- from this error just as readily
+      // as from the one it wraps.
+      throw createError({ statusCode: failureStatus(cause) ?? undefined })
     }
   },
   { lazy: true },
@@ -61,12 +68,10 @@ const highlights = computed(() => (data.value ? sessionHighlights(data.value) : 
 const nothingRecorded = computed(() => Boolean(data.value && hasNothingRecorded(data.value)))
 
 // What to say about a failure, and what to offer in response, are both
-// decisions and both live in `~/utils/format`. The message rendered here is
-// the sanitised one thrown above; `describeFailure` stands in only if
-// something else ever throws here without one.
-const failure = computed(() =>
-  error.value ? error.value.message || describeFailure(error.value) : null,
-)
+// decisions and both live in `~/utils/format`. The error that reaches here
+// is the one thrown above, which carries the status and nothing else --
+// which is all `describeFailure` ever read.
+const failure = computed(() => (error.value ? describeFailure(error.value) : null))
 // A refused session is not worth a retry button: pressing it goes round a
 // loop that cannot succeed until somebody signs in again.
 const failedSession = computed(() => isSessionFailure(error.value))
@@ -79,10 +84,12 @@ const rest = computed(() => figures.value.slice(1))
 
 <template>
   <div class="mx-auto max-w-5xl">
-    <h1 class="mb-1 text-2xl font-semibold">Welcome</h1>
+    <h1 class="mb-1 text-2xl font-semibold">{{ $t('dashboard.welcome') }}</h1>
     <p class="mb-8 text-sm" :style="{ color: 'var(--text-muted)' }">
-      Everything Sturnus has recorded of you, across every meeting.
-      <span v-if="session" class="whitespace-nowrap">Discord {{ session.discord_user_id }}.</span>
+      {{ $t('dashboard.intro') }}
+      <span v-if="session" class="whitespace-nowrap">
+        {{ $t('dashboard.discordAccount', { id: session.discord_user_id }) }}
+      </span>
     </p>
 
     <!-- Loading. A skeleton of the shape that is coming, not a spinner:
@@ -111,10 +118,9 @@ const rest = computed(() => figures.value.slice(1))
       class="rounded-2xl border p-6"
       :style="{ borderColor: 'var(--danger)', background: 'var(--surface)' }"
     >
-      <h2 class="mb-2 text-base font-medium">Your figures could not be loaded.</h2>
+      <h2 class="mb-2 text-base font-medium">{{ $t('dashboard.failedHeading') }}</h2>
       <p class="mb-4 text-sm" :style="{ color: 'var(--text-muted)' }">
-        {{ failure }} Nothing is lost -- this page only reads, and the recordings behind it are
-        unaffected.
+        {{ say({ key: 'dashboard.failedDetail', params: { reason: failure ?? '' } }) }}
       </p>
       <NuxtLink
         v-if="failedSession"
@@ -122,7 +128,7 @@ const rest = computed(() => figures.value.slice(1))
         class="inline-block rounded-lg border px-4 py-2 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
         :style="{ borderColor: 'var(--border)' }"
       >
-        Sign in again
+        {{ $t('dashboard.signInAgain') }}
       </NuxtLink>
       <button
         v-else
@@ -131,7 +137,7 @@ const rest = computed(() => figures.value.slice(1))
         :style="{ borderColor: 'var(--border)' }"
         @click="refresh()"
       >
-        Try again
+        {{ $t('error.retry') }}
       </button>
     </div>
 
@@ -144,11 +150,9 @@ const rest = computed(() => figures.value.slice(1))
       <div class="mb-4 flex justify-center">
         <SturnusMark :size="48" />
       </div>
-      <h2 class="mb-2 text-lg font-medium">Sturnus has not recorded you yet.</h2>
+      <h2 class="mb-2 text-lg font-medium">{{ $t('dashboard.emptyHeading') }}</h2>
       <p class="mx-auto max-w-md text-sm" :style="{ color: 'var(--text-muted)' }">
-        Join a voice channel Sturnus is recording. Once the meeting ends it transcribes what was
-        said, writes the protocol into Outline, and this page fills in: how long you spoke, who
-        you spoke with, and which meetings produced a protocol you were part of.
+        {{ $t('dashboard.emptyNote') }}
       </p>
     </div>
 
@@ -169,13 +173,13 @@ const rest = computed(() => figures.value.slice(1))
         />
         <div class="p-6">
           <h2 class="text-sm font-medium" :style="{ color: 'var(--text-muted)' }">
-            {{ lead.label }}
+            {{ $t(lead.labelKey) }}
           </h2>
           <p class="mt-2 text-4xl font-semibold tracking-tight tabular-nums sm:text-5xl">
-            {{ lead.value }}
+            {{ say(lead.value) }}
           </p>
           <p v-if="lead.note" class="mt-3 text-sm" :style="{ color: 'var(--text-muted)' }">
-            {{ lead.note }}
+            {{ say(lead.note) }}
           </p>
         </div>
       </section>
@@ -188,20 +192,20 @@ const rest = computed(() => figures.value.slice(1))
           :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
         >
           <dt class="text-sm font-medium" :style="{ color: 'var(--text-muted)' }">
-            {{ figure.label }}
+            {{ $t(figure.labelKey) }}
           </dt>
           <dd class="mt-2 text-2xl font-semibold tracking-tight tabular-nums sm:text-3xl">
-            {{ figure.value }}
+            {{ say(figure.value) }}
           </dd>
           <p v-if="figure.note" class="mt-2 text-xs" :style="{ color: 'var(--text-muted)' }">
-            {{ figure.note }}
+            {{ say(figure.note) }}
           </p>
         </div>
       </dl>
 
       <section v-if="highlights.length" class="mt-8">
         <h2 class="mb-3 text-sm font-medium" :style="{ color: 'var(--text-muted)' }">
-          Sessions worth remembering
+          {{ $t('dashboard.highlightsHeading') }}
         </h2>
         <ul class="grid grid-cols-1 gap-4 sm:grid-cols-3">
           <li
@@ -214,14 +218,14 @@ const rest = computed(() => figures.value.slice(1))
               class="text-xs font-medium tracking-wide uppercase"
               :style="{ color: 'var(--action)' }"
             >
-              {{ highlight.label }}
+              {{ $t(highlight.labelKey) }}
             </p>
-            <p class="mt-2 font-medium break-words">{{ highlight.session.channel }}</p>
+            <p class="mt-2 font-medium break-words">{{ say(highlight.session.channel) }}</p>
             <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-              {{ highlight.session.when }}
+              {{ say(highlight.session.when) }}
             </p>
             <p class="mt-1 text-sm tabular-nums" :style="{ color: 'var(--text-muted)' }">
-              {{ highlight.session.duration }}
+              {{ say(highlight.session.duration) }}
             </p>
           </li>
         </ul>

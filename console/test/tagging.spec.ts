@@ -99,7 +99,13 @@ describe('predicting what the API would refuse', () => {
   })
 
   it('says a label is too long before spending a round trip on it', () => {
-    expect(tagRefusal([], 'x'.repeat(TAG_MAX_CHARS + 1))).toContain(String(TAG_MAX_CHARS))
+    // The limit travels with the refusal rather than being written into
+    // the sentence here, so the number a reader is told is the same
+    // constant the API enforces, in whichever language they are told it.
+    expect(tagRefusal([], 'x'.repeat(TAG_MAX_CHARS + 1))).toEqual({
+      key: 'recordings.tagTooLong',
+      params: { count: TAG_MAX_CHARS },
+    })
   })
 
   it('accepts a label of exactly the greatest allowed length', () => {
@@ -108,14 +114,17 @@ describe('predicting what the API would refuse', () => {
 
   it('says when a recording is already carrying as many labels as it may', () => {
     const full = Array.from({ length: TAG_MAX_PER_RECORDING }, (_, index) => `tag-${index}`)
-    expect(tagRefusal(full, 'retro')).toContain(String(TAG_MAX_PER_RECORDING))
+    expect(tagRefusal(full, 'retro')).toEqual({
+      key: 'recordings.tagTooMany',
+      params: { count: TAG_MAX_PER_RECORDING },
+    })
   })
 
   it('lets a label that is already on a full recording pass the ceiling', () => {
     // It adds nothing, so it cannot push the set over — the answer is
     // "you already have that", not "you have too many".
     const full = Array.from({ length: TAG_MAX_PER_RECORDING }, (_, index) => `tag-${index}`)
-    expect(tagRefusal(full, 'tag-0')).toBe('That tag is already on this recording.')
+    expect(tagRefusal(full, 'tag-0')).toEqual({ key: 'recordings.tagAlreadyHeld' })
   })
 
   it('says nothing about an empty box, which is not an attempt at anything', () => {
@@ -133,10 +142,12 @@ describe('saying that a write failed', () => {
   it('distinguishes a server that was never reached from one that refused', () => {
     // Zero is not a status any server sends, which is the point: "could
     // not reach the API" and "the API said no" need different words.
-    expect(tagWriteFailed(0)).not.toBe(tagWriteFailed(500))
+    expect(tagWriteFailed(0)).toEqual({ key: 'recordings.tagSaveUnreachable' })
+    expect(tagWriteFailed(500)).toEqual({ key: 'recordings.tagSaveFailed' })
+    expect(tagWriteFailed(0)).not.toEqual(tagWriteFailed(500))
   })
 
   it('says a recording is no longer theirs rather than that something broke', () => {
-    expect(tagWriteFailed(404)).toContain('no longer yours')
+    expect(tagWriteFailed(404)).toEqual({ key: 'recordings.tagSaveGone' })
   })
 })

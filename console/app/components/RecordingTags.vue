@@ -24,6 +24,7 @@
  * does not have.
  */
 import { ApiError } from '~/utils/apiError'
+import type { Message } from '~/utils/message'
 import {
   TAG_MAX_CHARS,
   TAG_MAX_PER_RECORDING,
@@ -42,6 +43,7 @@ const props = defineProps<{
 }>()
 
 const api = useApi()
+const say = useSay()
 
 const held = ref<string[]>([...props.tags])
 // The session can be refetched under us — a navigation to another
@@ -56,7 +58,10 @@ watch(
 
 const typed = ref('')
 const saving = ref(false)
-const message = ref<string | null>(null)
+/** What the live region says next. A key and its values rather than a
+ *  sentence: every one of these comes from `~/utils/tagging`, which decides
+ *  what happened and leaves the wording to whoever is reading. */
+const message = ref<Message | null>(null)
 const input = ref<HTMLInputElement | null>(null)
 // A generated id rather than a fixed one: two of these on one page would
 // otherwise share an id, and a `<label for>` pointing at two elements
@@ -67,7 +72,7 @@ const hintId = `${inputId}-hint`
 /** Where the ceiling is announced before somebody hits it. */
 const remaining = computed(() => TAG_MAX_PER_RECORDING - held.value.length)
 
-async function store(next: string[], announcement: string) {
+async function store(next: string[], announcement: Message) {
   const before = [...held.value]
   // Optimistic: the chip is on screen before the request leaves. A tag
   // editor that waits for a round trip per chip is one people click twice.
@@ -99,7 +104,7 @@ async function add() {
   const next = tagsWith(held.value, typed.value)
   if (next === null) return
   typed.value = ''
-  await store(next, 'Tag added.')
+  await store(next, { key: 'recordings.tagAdded' })
 }
 
 async function remove(tag: string) {
@@ -107,7 +112,7 @@ async function remove(tag: string) {
   // to be removed is the one holding focus, and a control that unmounts
   // itself drops the caller to the top of the document.
   input.value?.focus()
-  await store(tagsWithout(held.value, tag), 'Tag removed.')
+  await store(tagsWithout(held.value, tag), { key: 'recordings.tagRemoved' })
 }
 </script>
 
@@ -116,10 +121,9 @@ async function remove(tag: string) {
     class="rounded-2xl border p-5"
     :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
   >
-    <h2 class="text-base font-semibold">Your tags</h2>
+    <h2 class="text-base font-semibold">{{ $t('recordings.tagsHeading') }}</h2>
     <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-      Labels you put on this recording so you can find it again. Only you can see them — everybody
-      else who was in this meeting has their own, and neither of you sees the other's.
+      {{ $t('recordings.tagsNote') }}
     </p>
 
     <ul v-if="held.length > 0" class="mt-4 flex flex-wrap gap-2">
@@ -135,7 +139,7 @@ async function remove(tag: string) {
           class="rounded-full px-1.5 py-0.5 text-xs transition-colors hover:bg-[var(--surface-sunken)] disabled:opacity-60"
           :style="{ color: 'var(--text-muted)' }"
           :disabled="saving"
-          :aria-label="`Remove the tag ${tag}`"
+          :aria-label="$t('recordings.removeTag', { tag })"
           @click="remove(tag)"
         >
           ✕
@@ -143,12 +147,12 @@ async function remove(tag: string) {
       </li>
     </ul>
     <p v-else class="mt-4 text-sm" :style="{ color: 'var(--text-muted)' }">
-      This recording has no tags yet.
+      {{ $t('recordings.noTags') }}
     </p>
 
     <form class="mt-4 flex flex-wrap items-start gap-2" @submit.prevent="add()">
       <div class="min-w-48 flex-1">
-        <label class="sr-only" :for="inputId">Add a tag to this recording</label>
+        <label class="sr-only" :for="inputId">{{ $t('recordings.addTagLabel') }}</label>
         <input
           :id="inputId"
           ref="input"
@@ -157,7 +161,7 @@ async function remove(tag: string) {
           :maxlength="TAG_MAX_CHARS"
           :disabled="saving"
           :aria-describedby="hintId"
-          placeholder="retro, kunde onelitefeather"
+          :placeholder="$t('recordings.tagPlaceholder')"
           class="w-full rounded-lg border px-3 py-1.5 text-sm"
           :style="{
             borderColor: 'var(--control-border)',
@@ -166,8 +170,12 @@ async function remove(tag: string) {
           }"
         >
         <p :id="hintId" class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
-          Separate several with commas. {{ remaining }} of
-          {{ TAG_MAX_PER_RECORDING }} left on this recording.
+          {{
+            say({
+              key: 'recordings.tagHint',
+              params: { left: remaining, max: TAG_MAX_PER_RECORDING },
+            })
+          }}
         </p>
       </div>
       <!-- Never removed while it works, only disabled: a control that
@@ -179,7 +187,7 @@ async function remove(tag: string) {
         :style="{ color: 'var(--action)' }"
         :disabled="saving || typed.trim().length === 0"
       >
-        {{ saving ? 'Saving…' : 'Add' }}
+        {{ saving ? $t('recordings.tagSaving') : $t('recordings.tagAdd') }}
       </button>
     </form>
 
@@ -192,7 +200,7 @@ async function remove(tag: string) {
       role="status"
       aria-live="polite"
     >
-      {{ message }}
+      {{ message ? say(message) : '' }}
     </p>
   </section>
 </template>
