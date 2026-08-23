@@ -111,6 +111,11 @@ class FakeSessions:
 
     def __init__(self) -> None:
         self.opened: list[int] = []
+        #: What each session row was opened *against*. The channel name is
+        #: resolved by the client and written into the protocol header the
+        #: worker later renders, so it is the only place a stale cached
+        #: name becomes visible.
+        self.opened_channels: list[tuple[int, str | None]] = []
         self.keys: dict[int, tuple[str, bytes]] = {}
         self.closed: list[tuple[int, str]] = []
         self.silent_audio: list[tuple[int, int, datetime]] = []
@@ -123,6 +128,7 @@ class FakeSessions:
         sid = self._next
         self._next += 1
         self.opened.append(sid)
+        self.opened_channels.append((_channel_id, _channel_name))
         self._participants[sid] = set()
         return sid
 
@@ -762,6 +768,47 @@ async def test_an_unparseable_value_neither_raises_nor_un_configures_a_guild(
     store.write(GUILD_ID, settings.IDLE_TIMEOUT_MINUTES, "5")
     await client._tick_all(clock.now())
     assert client._guilds[GUILD_ID].config.timeouts.idle_timeout_minutes == 5
+
+
+async def test_a_role_only_change_still_refreshes_the_cached_channel_name(
+    tmp_path: Path,
+) -> None:
+    """A rename in Discord is picked up by the next reconcile, as it was.
+
+    `RecordingService` caches the channel *name* -- the worker writes the
+    protocol header and holds no Discord connection, so only the client
+    can resolve it -- and nothing invalidates that cache when somebody
+    renames the room. A reconcile is the moment it is refreshed, and the
+    single-channel `_retarget` refreshed it on every identity change.
+
+    Once the configuration named a list, `_retarget` only re-read the name
+    when the served channel had stopped being allowed. So a guild that
+    renamed its recording channel and then changed `consent_role_id` kept
+    the old name for the life of the process, and every protocol header
+    after that named a room that no longer exists under that name.
+    """
+    clock = FakeClock(T0)
+    sessions = FakeSessions()
+    store = _configured_store()
+    client = _client(clock, config_store=store, sessions=sessions, recording_dir=tmp_path)
+    channel = _voice_channel(CHANNEL_ID, members=[])
+    channel.name = "General"
+    guild = _guild(GUILD_ID, channel)
+    _in_guild(client, guild)
+
+    await client.reconcile_guild(GUILD_ID)
+
+    # The room is renamed, and separately the guild moves to a different
+    # consent role. The allowed channels did not change at all.
+    renamed = _voice_channel(CHANNEL_ID, members=[_member(ANNA, guild, role_ids=[NEW_ROLE_ID])])
+    renamed.name = "Standup"
+    guild.get_channel.return_value = renamed
+    store.write(GUILD_ID, settings.CONSENT_ROLE_ID, str(NEW_ROLE_ID))
+
+    result = await client.reconcile_guild(GUILD_ID)
+
+    assert result.action is ReconfigureAction.RETARGET
+    assert sessions.opened_channels == [(CHANNEL_ID, "Standup")]
 
 
 CLIENT_LOGGER = "sturnus.infrastructure.discord.client"

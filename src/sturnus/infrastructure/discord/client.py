@@ -829,7 +829,9 @@ class SturnusClient(commands.Bot):
         `_sync_participants` decides it, from the headcounts, on the same
         call -- so a list change and an ordinary voice-state update reach
         exactly the same rule, and there is no second place where a
-        channel gets chosen.
+        channel gets chosen. What *is* decided here is the cached channel
+        name, which `retarget` re-reads unconditionally: a reconcile is
+        the only moment this process asks Discord what the room is called.
 
         Then the same headcount `_build` takes, for the same reason and
         with the same consequence if it is skipped: after a retarget the
@@ -838,13 +840,23 @@ class SturnusClient(commands.Bot):
         new consent role), and none of them will emit a voice-state update
         merely because the configuration changed underneath them.
         """
-        if recording.channel_id not in desired.channel_ids:
+        target = recording.channel_id
+        if target not in desired.channel_ids:
             await recording.voice.leave()
             # The service must not be left naming a channel the guild no
             # longer allows: if nobody is in any of them, nothing else
             # would move it before the next session opened against it.
-            fallback = desired.channel_ids[0]
-            recording.service.retarget(fallback, self._channel_name(guild_id, fallback))
+            target = desired.channel_ids[0]
+        # Unconditional, including when the served channel is unchanged.
+        # `retarget` also refreshes the cached channel *name*, and nothing
+        # else in the process ever does: `RecordingService` holds the name
+        # for the worker, which has no Discord connection to resolve one,
+        # and a rename in Discord emits no event this bot acts on. A
+        # reconcile is the moment it is re-read -- so a guild that renamed
+        # its room and then changed only `consent_role_id` would otherwise
+        # keep the old name for the life of the process, and head every
+        # protocol from then on with a room that no longer exists under it.
+        recording.service.retarget(target, self._channel_name(guild_id, target))
         recording.config = desired
         recording.pending = None
         await self._sync_participants(self.get_guild(guild_id), recording)
