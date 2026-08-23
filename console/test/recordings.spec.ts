@@ -11,6 +11,7 @@ import { describe, expect, it } from 'vitest'
 import {
   audioUrl,
   channelLabel,
+  channelNaming,
   decodeMagnitudes,
   formatMeasurement,
   formatSeconds,
@@ -18,6 +19,7 @@ import {
   hasProtocol,
   isInProgress,
   isQueueBusy,
+  NAMED_SPEAKERS,
   queueProgress,
   queueSpeakerLabel,
   queueStatusPath,
@@ -29,7 +31,9 @@ import {
   SEEK_STRIDE_SECONDS,
   sessionLength,
   spectrogramUrl,
+  speakerSummary,
   speechShare,
+  stampParts,
   trackCoverage,
   trackLabel,
   type RecordedSession,
@@ -172,6 +176,109 @@ describe('naming a speaker and a channel', () => {
       key: 'recordings.channelById',
       params: { id: '9870' },
     })
+  })
+})
+
+describe('how a row is headed', () => {
+  it('heads a named channel with the name, and has no id to add', () => {
+    expect(channelNaming(session({ channel_name: 'standup' }))).toEqual({
+      named: true,
+      heading: '#standup',
+      id: null,
+    })
+  })
+
+  it('never heads a row with a Discord id', () => {
+    // The whole point. `channelLabel` answers "Channel 9870…", and
+    // eighteen digits set as a heading read as the meeting's name --
+    // nobody has a meeting called that, and a column of them cannot be
+    // scanned.
+    const naming = channelNaming(session({ channel_name: null, channel_id: '987000000000000002' }))
+    expect(naming.heading).toEqual({ key: 'recordings.channelUnnamed' })
+    expect(naming.named).toBe(false)
+  })
+
+  it('keeps the id, underneath, for whoever has to debug it', () => {
+    // It is the only handle anybody has on a channel that has left the
+    // guild. Demoted, not dropped.
+    expect(channelNaming(session({ channel_name: null, channel_id: '9870' })).id).toBe('9870')
+  })
+
+  it('treats a name of nothing but spaces as no name', () => {
+    expect(channelNaming(session({ channel_name: '   ' })).named).toBe(false)
+  })
+})
+
+describe('the day and the clock, kept apart', () => {
+  it('splits an instant into the day a list is scanned by and the time under it', () => {
+    expect(stampParts('2026-08-21T14:05:09Z', 'UTC')).toEqual({
+      day: '2026-08-21',
+      time: '14:05',
+    })
+  })
+
+  it('writes both in the zone it was handed', () => {
+    expect(stampParts('2026-08-21T23:30:00Z', 'Europe/Berlin')).toEqual({
+      day: '2026-08-22',
+      time: '01:30',
+    })
+  })
+
+  it('offers no clock at all for an instant it cannot read', () => {
+    // An em dash with a plausible time beside it would be worse than no
+    // time: it reads as a measurement.
+    expect(stampParts('not a date', 'UTC')).toEqual({ day: '—', time: '' })
+  })
+
+  it('still assembles the string the rest of the console prints', () => {
+    // `formatTimestamp` is now two halves joined. A page that lost the
+    // join would show a date with the time missing and look correct.
+    expect(formatTimestamp('2026-08-21T14:05:09Z', 'UTC')).toBe('2026-08-21 14:05')
+  })
+
+  it('joins nothing onto an unreadable instant', () => {
+    expect(formatTimestamp('not a date', 'UTC')).toBe('—')
+  })
+})
+
+describe('who a row says was recorded', () => {
+  const speakers = (...names: string[]) =>
+    session({ tracks: names.map((name) => track({ display_name: name })) })
+
+  it('names everybody while they fit, and does not make a sentence of it', () => {
+    // A list of names is a list in both languages, so it comes back as
+    // the string it is -- the same reasoning `channelLabel` gives.
+    expect(speakerSummary(speakers('Ada', 'Bo'))).toBe('Ada, Bo')
+  })
+
+  it('names as many as it promised and counts the rest', () => {
+    expect(speakerSummary(speakers('Ada', 'Bo', 'Cy', 'Di', 'Ed'))).toEqual({
+      key: 'recordings.rowSpeakersMore',
+      params: { names: 'Ada, Bo, Cy', count: 2 },
+    })
+  })
+
+  it('does not start counting one speaker over the limit as "and 0 more"', () => {
+    expect(speakerSummary(speakers('Ada', 'Bo', 'Cy'))).toBe('Ada, Bo, Cy')
+  })
+
+  it('says a session nobody consented to is that, rather than saying nothing', () => {
+    // A blank where the names go reads as a rendering fault. This is the
+    // one fact about the people that stays in the list rather than moving
+    // to the recording's own page.
+    expect(speakerSummary(session({ tracks: [] }))).toEqual({ key: 'recordings.rowNobody' })
+  })
+
+  it('falls back to the account id of a speaker who has no name left', () => {
+    expect(
+      speakerSummary(session({ tracks: [track({ display_name: null, discord_user_id: '3080' })] })),
+    ).toBe('3080')
+  })
+
+  it('names three before it counts', () => {
+    // Named rather than inlined, because the row's layout depends on it:
+    // three names is what stays on one line at 360 px.
+    expect(NAMED_SPEAKERS).toBe(3)
   })
 })
 

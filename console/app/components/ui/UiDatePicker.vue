@@ -20,31 +20,45 @@
  * The fake to avoid was never the native input; it was the *text* input
  * pretending to be one.
  *
+ * **Two things it can be choosing, and the difference is the API's.** A
+ * withdrawal is a moment and needs its offset. A recordings filter is a
+ * pair of *inclusive calendar days* — `sturnus.console.filters` says so
+ * and parses them with `date.fromisoformat` — and a day has no offset to
+ * carry. `granularity="day"` is that: a native `date` field, a value that
+ * is the day itself, and no note underneath, because the note exists to
+ * show an offset and there is none. It also removes a hydration hazard
+ * the instant shape has on a *linkable* filter: the offset is the
+ * browser's, a server has a different one, and the two renders would
+ * disagree on the very links this page exists to make shareable.
+ *
  * Everything the calendar decides — the six-week grid, what an arrow key
- * does to a date, where a month boundary falls — is `~/utils/uiDatePicker`
- * and is tested without a document.
+ * does to a date, where a month boundary falls — and everything that
+ * differs between the two shapes is `~/utils/uiDatePicker`, tested
+ * without a document.
  */
 import { useDismissable } from '~/composables/useDismissable'
 import { WEEKDAY_INSTANTS } from '~/utils/heatmap'
 import {
   type Day,
+  type Granularity,
   clampDay,
-  dayOfLocal,
-  describeChoice,
-  instantFrom,
-  localFrom,
   monthGrid,
   monthInstant,
   monthOf,
   moveDay,
+  shapeOf,
   shiftMonth,
-  withDay,
 } from '~/utils/uiDatePicker'
 
 const props = withDefaults(
   defineProps<{
-    /** An ISO-8601 instant with an offset, or `null`. */
+    /** An ISO-8601 instant with an offset, or a `YYYY-MM-DD` day when
+     *  `granularity` says so, or `null`. */
     modelValue?: string | null
+    /** Whether this control is choosing a moment or a day. A filter over
+     *  inclusive calendar days is not a moment, and saying it is puts an
+     *  offset on screen that no request carries. */
+    granularity?: Granularity
     label?: string
     /** Bounds, as UTC calendar days. */
     min?: Day | null
@@ -54,6 +68,7 @@ const props = withDefaults(
   }>(),
   {
     modelValue: null,
+    granularity: 'instant',
     label: undefined,
     min: null,
     max: null,
@@ -70,10 +85,14 @@ const base = useId()
 const fieldId = `${base}-field`
 const gridId = `${base}-grid`
 
-/** The wall-clock value the reader is editing. The instant is derived from
+/** What differs between choosing a moment and choosing a day, in one
+ *  object. Everything below asks it rather than testing the prop. */
+const shape = computed(() => shapeOf(props.granularity))
+
+/** The field value the reader is editing. The model value is derived from
  *  it; the reverse would mean re-deriving a wall clock on every keystroke
  *  and fighting the caret. */
-const local = ref(props.modelValue ? (localFrom(props.modelValue) ?? '') : '')
+const local = ref(shape.value.toField(props.modelValue))
 const open = ref(false)
 
 /** Which day the calendar's keyboard cursor is on. Not the chosen day: a
@@ -81,7 +100,7 @@ const open = ref(false)
  *  listbox before pressing Enter. */
 const today = new Date()
 const todayDay = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
-const cursor = ref<Day>(dayOfLocal(local.value) ?? todayDay)
+const cursor = ref<Day>(shape.value.dayOf(local.value) ?? todayDay)
 const month = ref(monthOf(cursor.value))
 
 const { root, trigger, returnFocus } = useDismissable(open, () => {
@@ -91,21 +110,21 @@ const { root, trigger, returnFocus } = useDismissable(open, () => {
 watch(
   () => props.modelValue,
   (value) => {
-    const next = value ? (localFrom(value) ?? '') : ''
+    const next = shape.value.toField(value)
     if (next !== local.value) local.value = next
   },
 )
 
-/** One place emits, and it emits an instant or nothing. A half-typed value
- *  is `null` rather than a naive string: the API answers 400 to those, and
- *  a control that sends one has turned a typo into a server error. */
+/** One place emits, and it emits a whole value or nothing. A half-typed
+ *  one is `null` rather than a naive string: the API answers 400 to those,
+ *  and a control that sends one has turned a typo into a server error. */
 function publish() {
-  emit('update:modelValue', local.value.trim() === '' ? null : instantFrom(local.value))
+  emit('update:modelValue', shape.value.toModel(local.value))
 }
 
 function onTyped(value: string) {
   local.value = value
-  const day = dayOfLocal(value)
+  const day = shape.value.dayOf(value)
   if (day) {
     cursor.value = day
     month.value = monthOf(day)
@@ -114,7 +133,7 @@ function onTyped(value: string) {
 }
 
 function choose(day: Day) {
-  local.value = withDay(local.value, day)
+  local.value = shape.value.onDay(local.value, day)
   cursor.value = day
   publish()
   open.value = false
@@ -124,7 +143,7 @@ function choose(day: Day) {
 function openCalendar() {
   open.value = !open.value
   if (!open.value) return
-  cursor.value = clampDay(dayOfLocal(local.value) ?? todayDay, props.min, props.max)
+  cursor.value = clampDay(shape.value.dayOf(local.value) ?? todayDay, props.min, props.max)
   month.value = monthOf(cursor.value)
   void nextTick(focusCursor)
 }
@@ -159,7 +178,7 @@ function onGridKeydown(event: KeyboardEvent) {
   void nextTick(focusCursor)
 }
 
-const chosenDay = computed(() => dayOfLocal(local.value))
+const chosenDay = computed(() => shape.value.dayOf(local.value))
 const weeks = computed(() =>
   monthGrid(month.value, {
     chosen: chosenDay.value,
@@ -168,7 +187,7 @@ const weeks = computed(() =>
     max: props.max,
   }),
 )
-const note = computed(() => describeChoice(local.value))
+const note = computed(() => shape.value.note(local.value))
 </script>
 
 <template>
@@ -176,10 +195,10 @@ const note = computed(() => describeChoice(local.value))
     <div class="flex items-center gap-2">
       <input
         :id="fieldId"
-        type="datetime-local"
+        :type="shape.inputType"
         :value="local"
         :aria-label="label"
-        :aria-describedby="`${base}-note`"
+        :aria-describedby="note ? `${base}-note` : undefined"
         :aria-invalid="invalid ? 'true' : undefined"
         :disabled="disabled"
         class="min-w-0 flex-1 rounded-lg border px-3 py-2 text-sm"
@@ -210,8 +229,11 @@ const note = computed(() => describeChoice(local.value))
     </div>
 
     <!-- The instant itself, quoted. This control's entire reason to exist
-         is the offset, so the offset is on screen rather than implied. -->
-    <p :id="`${base}-note`" class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
+         is the offset, so the offset is on screen rather than implied.
+         A day has no offset and therefore no note: repeating the field
+         back under the field is chrome, and a filter bar carrying two of
+         them is a filter bar nobody reads the rest of. -->
+    <p v-if="note" :id="`${base}-note`" class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
       {{ say(note) }}
     </p>
 

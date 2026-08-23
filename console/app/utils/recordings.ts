@@ -154,6 +154,43 @@ export function channelLabel(session: RecordedSession): string | Message {
     : { key: 'recordings.channelById', params: { id: session.channel_id } }
 }
 
+/**
+ * The same question, answered for a row that has to be *scanned*.
+ *
+ * `channelLabel` answers "Channel 1240377558927872021" when the name has
+ * gone, and that string is the complaint this exists for: eighteen digits
+ * set as the heading of a row reads as the meeting's name. Nobody has a
+ * meeting called that. A column of them is unscannable — the digits are
+ * all the same shape, they are long enough to crowd out the date, and a
+ * reader's eye stops at each one to check whether it means anything.
+ *
+ * So an unresolved channel is presented as **an absence, not a name**: the
+ * heading says there is no name, in the muted role and in the same weight
+ * as the rest of the row, and the id goes underneath as a subordinate
+ * line. That is the treatment `UiSelect` already gives a snowflake through
+ * its `detail` slot, for the same reason.
+ *
+ * The id is kept rather than dropped. It is the only handle anybody
+ * debugging a channel that vanished from the guild actually has, and
+ * hiding it would trade one person's confusion for another's.
+ */
+export interface ChannelNaming {
+  /** Whether the guild's own word for the channel is still known. */
+  named: boolean
+  /** The row's heading. A name is somebody's own word and is not
+   *  translated; the absence of one is a sentence and so is a key. */
+  heading: string | Message
+  /** The Discord id, to be set underneath — never as the heading, and
+   *  `null` whenever the name says everything. */
+  id: string | null
+}
+
+export function channelNaming(session: RecordedSession): ChannelNaming {
+  const name = session.channel_name?.trim()
+  if (name) return { named: true, heading: `#${name}`, id: null }
+  return { named: false, heading: { key: 'recordings.channelUnnamed' }, id: session.channel_id }
+}
+
 function instantOf(value: string | null): number | null {
   if (!value) return null
   const parsed = Date.parse(value)
@@ -189,6 +226,48 @@ export function hasProtocol(session: RecordedSession): boolean {
 }
 
 /**
+ * How many speakers a row names before it starts counting them.
+ *
+ * Three. Two meetings in the same channel on the same afternoon are told
+ * apart by who was in them, so the names have to be there; a row that
+ * spelled out eleven of them would wrap to three lines and cost the list
+ * the density this whole page is about. Three names is enough to
+ * recognise a meeting and short enough to stay on one line at 360 px.
+ */
+export const NAMED_SPEAKERS = 3
+
+/**
+ * Who is on this recording, in as many words as a row can spare.
+ *
+ * Three shapes rather than one sentence with holes in it, because "0
+ * speakers and 0 others" is not a sentence anybody wants read out — the
+ * same reasoning `describeChips` gives.
+ *
+ * The names are the **recorded** speakers and not everybody who was in the
+ * channel. This list indexes voices: the people with no audio are a fact
+ * about one session rather than a way of telling two apart, and they are
+ * on the recording's own page where there is room to say why they are not
+ * here. The one case that stays is a session with no tracks at all, which
+ * is a surprise worth meeting in the list rather than after a click.
+ */
+export function speakerSummary(
+  session: RecordedSession,
+  limit: number = NAMED_SPEAKERS,
+): string | Message {
+  const speakers = session.tracks.map(trackLabel)
+  if (speakers.length === 0) return { key: 'recordings.rowNobody' }
+  const named = speakers.slice(0, limit).join(', ')
+  // Names are people's own, and a list of them is a list in both
+  // languages -- so where they all fit, the answer is not a sentence and
+  // has no key, exactly as `channelLabel` returns a channel's own name.
+  if (speakers.length <= limit) return named
+  return {
+    key: 'recordings.rowSpeakersMore',
+    params: { names: named, count: speakers.length - limit },
+  }
+}
+
+/**
  * An instant, written in a named zone.
  *
  * The zone is a parameter and not an ambient default on purpose. The
@@ -205,17 +284,46 @@ export function hasProtocol(session: RecordedSession): boolean {
  * ship.
  */
 export function formatTimestamp(iso: string, timeZone: string): string {
+  const { day, time } = stampParts(iso, timeZone)
+  return time === '' ? day : `${day} ${time}`
+}
+
+/**
+ * The same instant, with the day and the clock kept apart.
+ *
+ * A list sorted by date is scanned down its left edge, and what the eye is
+ * looking for there is the *day*. Setting `2026-08-21 14:30` as one string
+ * makes the reader parse eleven characters of it to find the two that
+ * matter, in every row. Two lines — the day, and the time under it in the
+ * muted role — puts a column of identically-shaped days under each other
+ * and lets the clock recede to where it belongs.
+ *
+ * An unreadable instant is one em dash and no time at all, rather than an
+ * em dash with a plausible clock beside it.
+ */
+export interface Stamp {
+  day: string
+  /** Empty when there is no instant to take one from. */
+  time: string
+}
+
+export function stampParts(iso: string, timeZone: string): Stamp {
   const instant = instantOf(iso)
-  if (instant === null) return NOT_MEASURED
+  if (instant === null) return { day: NOT_MEASURED, time: '' }
   const date = new Date(instant)
   try {
-    return assemble(date, timeZone)
+    return split(date, timeZone)
   } catch {
     // A zone the runtime will not accept. `resolvedOptions().timeZone` has
     // returned surprises before, and a page that throws while formatting a
     // date shows nothing at all.
-    return assemble(date, 'UTC')
+    return split(date, 'UTC')
   }
+}
+
+function split(date: Date, timeZone: string): Stamp {
+  const [day = NOT_MEASURED, time = ''] = assemble(date, timeZone).split(' ')
+  return { day, time }
 }
 
 function assemble(date: Date, timeZone: string): string {

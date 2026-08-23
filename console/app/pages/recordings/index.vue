@@ -1,15 +1,23 @@
 <script setup lang="ts">
 /**
- * A page of the meetings this person was in, and a player for each.
+ * A page of the meetings this person was in, as a list you can scan.
  *
- * The list is the cheap part -- one call, metadata only. Audio is loaded
- * for the session that is open and no other; a page of ten sessions would
- * otherwise pull hundreds of megabytes for somebody who came to click one
- * protocol link.
+ * **Nothing plays here.** A row used to expand in place and mount a
+ * multi-track player, which made every row a container for a player, a
+ * metadata block and three buttons — and made the list a worse list in
+ * order to be a mediocre player. Audio, spectrograms, per-track
+ * transports and the protocol link all live on the recording's own page,
+ * where there is room for them. What is left here is the one job a list
+ * has: telling a hundred meetings apart well enough to open the right
+ * one. `RecordingRow` argues the cut.
  *
- * One session is open at a time. Two multi-track players running at once
- * would be two meetings talking over each other through the same speakers,
- * which is precisely the thing this recording format exists to avoid.
+ * **Rows, not cards.** The owner asked for leaner cards; the leanest card
+ * is a row. A card is a container, and a container is the right shape for
+ * something with parts — this has none any more. One bordered surface
+ * with hairline dividers puts a hundred meetings under each other with
+ * their dates in a column, which is how a list is read.
+ *
+ * The list is the cheap part -- one call, metadata only.
  *
  * **A page, and the page number is in the URL.** This used to be the whole
  * history: somebody who has been in three hundred meetings was served
@@ -102,20 +110,6 @@ const beyondTheEnd = computed(() => isPastTheEnd(total.value, sessions.value.len
 const loadingFirst = computed(() => status.value === 'pending' && data.value === undefined)
 const refreshing = computed(() => status.value === 'pending')
 
-const openId = ref<string | null>(null)
-
-function toggle(id: string) {
-  openId.value = openId.value === id ? null : id
-}
-
-// Turning a page ends whatever was playing, because the article holding
-// the player is about to be replaced by a different meeting's. Clearing
-// it here rather than letting the `v-if` do it silently keeps the state
-// and the screen agreeing.
-watch([page, filters], () => {
-  openId.value = null
-})
-
 /**
  * The zone timestamps are written in.
  *
@@ -183,22 +177,27 @@ onMounted(() => {
          screen reader is told alongside `aria-busy` -- and because "your
          sessions are loading" is more use than a shape nobody can see.
 
-         Four rows rather than the twenty a full page holds. A list
+         Six rows rather than the twenty a full page holds. A list
          skeleton cannot reserve a height it does not know, and twenty
-         cards of grey for somebody who has been in three meetings is a
-         worse lie than four. -->
+         rows of grey for somebody who has been in three meetings is a
+         worse lie than six. Six now rather than the four this held when
+         a row was a card: a row is about half the height, so six of them
+         reserve roughly what four cards did. -->
     <div v-else-if="loadingFirst" aria-busy="true" class="flex flex-col gap-4">
       <p class="sr-only">{{ $t('recordings.loadingList') }}</p>
       <div
         class="h-5 w-64 max-w-full animate-pulse rounded motion-reduce:animate-none"
         :style="{ background: 'var(--surface)' }"
       />
-      <ul class="flex flex-col gap-4">
+      <ul
+        class="overflow-hidden rounded-2xl border"
+        :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+      >
         <li
-          v-for="n in 4"
+          v-for="n in 6"
           :key="n"
-          class="h-[124px] animate-pulse rounded-2xl border motion-reduce:animate-none"
-          :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+          class="h-[76px] animate-pulse border-t first:border-t-0 motion-reduce:animate-none"
+          :style="{ borderColor: 'var(--border)' }"
         />
       </ul>
     </div>
@@ -270,16 +269,26 @@ onMounted(() => {
         {{ say(summary) }}
       </p>
 
-      <!-- A list, and said to be one: ten bare articles give assistive
-           technology no count and no way to step between them. -->
-      <ul class="flex flex-col gap-4" :aria-busy="refreshing">
-        <li v-for="session in sessions" :key="session.id">
-          <RecordingSession
-            :session="session"
-            :open="openId === session.id"
-            :time-zone="timeZone"
-            @toggle="toggle(session.id)"
-          />
+      <!-- A list, and said to be one: twenty bare articles give assistive
+           technology no count and no way to step between them.
+
+           One surface with hairline rules rather than twenty cards with
+           gaps between them. Twenty rounded borders and nineteen gaps is
+           twenty separate objects to look at; a ruled list is one object
+           with twenty lines in it, which is what a reader comparing dates
+           down a column is actually doing. -->
+      <ul
+        class="overflow-hidden rounded-2xl border"
+        :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+        :aria-busy="refreshing"
+      >
+        <li
+          v-for="session in sessions"
+          :key="session.id"
+          class="border-t first:border-t-0"
+          :style="{ borderColor: 'var(--border)' }"
+        >
+          <RecordingRow :session="session" :time-zone="timeZone" />
         </li>
       </ul>
 

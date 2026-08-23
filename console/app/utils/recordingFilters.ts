@@ -22,6 +22,7 @@
  * that promises more than the API will do.
  */
 import type { Message } from './message'
+import type { ChipValue } from './uiChipInput'
 
 /** What the API calls things, so the two spellings live in one place. */
 const TEXT = 'q'
@@ -138,16 +139,36 @@ export function hasActiveFilters(filters: RecordingFilters): boolean {
 }
 
 /**
- * The filter after a chip is pressed.
+ * The filter as one field holding tags and words at once.
  *
- * Pressing a chip that is already on takes it off, because a chip that
- * can only be added is a filter somebody has to edit the URL to escape.
+ * The bar used to narrow by tag through a row of toggle buttons and by
+ * text through a box beside them — two mechanisms for one question, and
+ * the question people actually ask is `#standup #migration the bit where
+ * the database fell over`. `UiChipInput` is that field, and this is the
+ * translation between it and the filter, in both directions.
+ *
+ * The line between a chip and free text is kept where the control keeps
+ * it — in the value — so nothing here parses a tag back out of a
+ * sentence, and nobody ends up with a tag called "the".
  */
-export function toggledTag(filters: RecordingFilters, tag: string): RecordingFilters {
-  const tags = filters.tags.includes(tag)
-    ? filters.tags.filter((held) => held !== tag)
-    : [...filters.tags, tag].sort()
-  return { ...filters, tags }
+export function chipsFromFilters(filters: RecordingFilters): ChipValue {
+  return { chips: [...filters.tags], text: filters.q }
+}
+
+/**
+ * The filter that field describes.
+ *
+ * Text that was typed and never committed is taken as the search rather
+ * than discarded or promoted. Discarding it loses a search somebody wrote;
+ * promoting it invents a tag they did not ask for — and since the API
+ * matches free text against the reader's own tags as well, a word left
+ * uncommitted still finds what they meant.
+ */
+export function filtersFromChips(
+  filters: RecordingFilters,
+  value: ChipValue,
+): RecordingFilters {
+  return { ...filters, tags: [...value.chips], q: value.text.trim() }
 }
 
 /**

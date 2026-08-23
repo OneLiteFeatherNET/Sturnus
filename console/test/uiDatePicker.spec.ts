@@ -29,6 +29,7 @@ import {
   monthOf,
   moveDay,
   offsetOfLocal,
+  shapeOf,
   shiftMonth,
   withDay,
 } from '../app/utils/uiDatePicker'
@@ -277,5 +278,90 @@ describe('the bounds', () => {
 
   it('do nothing when there are none', () => {
     expect(clampDay('2026-08-15', null, null)).toBe('2026-08-15')
+  })
+})
+
+/**
+ * The two things this control can be choosing.
+ *
+ * A withdrawal is a moment and needs its offset. A recordings filter is a
+ * pair of *inclusive calendar days* -- `sturnus.console.filters` says so
+ * and reads them with `date.fromisoformat` -- and a day has no offset to
+ * carry. The strategy is here rather than as a ternary at each of the six
+ * places the component touches its value, and what is worth pinning is
+ * that neither shape leaks into the other: a day that grew an offset
+ * would be a request the API refuses, and an instant that lost one would
+ * be a 400.
+ */
+describe('choosing a moment', () => {
+  const shape = shapeOf('instant')
+
+  it('is typed into the field the browser knows how to step', () => {
+    expect(shape.inputType).toBe('datetime-local')
+  })
+
+  it('emits an instant carrying its offset, never a naive one', () => {
+    const emitted = shape.toModel('2026-08-21T14:30') ?? ''
+    expect(emitted).toMatch(/^2026-08-21T14:30:00[+-]\d{2}:\d{2}$/)
+  })
+
+  it('emits nothing at all for a field that is not a moment yet', () => {
+    expect(shape.toModel('')).toBeNull()
+    expect(shape.toModel('2026-02-30T10:00')).toBeNull()
+  })
+
+  it('says what it is about to send, because the offset is the point', () => {
+    expect(shape.note('2026-08-21T14:30')?.key).toBe('ui.datePicker.sends')
+  })
+
+  it('keeps the time when the calendar moves the day', () => {
+    expect(shape.onDay('2026-08-21T14:30', '2026-09-02')).toBe('2026-09-02T14:30')
+  })
+})
+
+describe('choosing a day', () => {
+  const shape = shapeOf('day')
+
+  it('is typed into a date field, which has no time to leave empty', () => {
+    expect(shape.inputType).toBe('date')
+  })
+
+  it('emits the day itself, with nothing attached to it', () => {
+    // An offset here would claim a precision `?from=2026-08-21` does not
+    // have -- and, being the browser's, would differ from the one a server
+    // render attached, on exactly the filtered links this is for.
+    expect(shape.toModel('2026-08-21')).toBe('2026-08-21')
+  })
+
+  it('emits nothing for a day that does not exist', () => {
+    // Reachable from a hand-edited URL, and `Date` rolls it into March
+    // rather than refusing it.
+    expect(shape.toModel('2026-02-30')).toBeNull()
+    expect(shape.toModel('')).toBeNull()
+  })
+
+  it('shows nothing for a model value that is not a day', () => {
+    expect(shape.toField('2026-08-21T14:30:00+02:00')).toBe('')
+    expect(shape.toField(null)).toBe('')
+  })
+
+  it('shows a day it was given', () => {
+    expect(shape.toField(' 2026-08-21 ')).toBe('2026-08-21')
+  })
+
+  it('opens the calendar on the day it holds', () => {
+    expect(shape.dayOf('2026-08-21')).toBe('2026-08-21')
+  })
+
+  it('replaces the day outright, because there is nothing else to keep', () => {
+    expect(shape.onDay('2026-08-21', '2026-09-02')).toBe('2026-09-02')
+  })
+
+  it('adds no note, because a day has no offset to explain', () => {
+    // "Sent as 2026-08-21" under a field reading 2026-08-21 is a line of
+    // chrome that says nothing, and a filter bar carrying two of them is
+    // one nobody reads the rest of.
+    expect(shape.note('2026-08-21')).toBeNull()
+    expect(shape.note('')).toBeNull()
   })
 })

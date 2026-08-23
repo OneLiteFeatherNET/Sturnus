@@ -323,6 +323,34 @@ describe('UiDatePicker', () => {
       .filter((button) => button.attributes('disabled') === undefined)
     expect(usable).toHaveLength(11)
   })
+
+  it('typed as a day, offers a date field and emits the day itself', async () => {
+    const picker = render(UiDatePicker, { granularity: 'day', label: 'From' })
+    await picker.get('input[type="date"]').setValue('2026-08-21')
+    expect(picker.emitted('update:modelValue')!.at(-1)).toEqual(['2026-08-21'])
+  })
+
+  it('typed as a day, says nothing underneath about an offset it is not sending', async () => {
+    // The note exists to show the offset about to be attached. A filter
+    // over inclusive calendar days attaches none, and a bar carrying two
+    // notes claiming otherwise is a bar nobody reads the rest of.
+    const picker = render(UiDatePicker, { granularity: 'day', modelValue: '2026-08-21' })
+    await nextTick()
+    expect(picker.text()).not.toContain('Sent as')
+    expect(picker.get('input[type="date"]').attributes('aria-describedby')).toBeUndefined()
+  })
+
+  it('typed as a day, still picks one out of the calendar', async () => {
+    const picker = render(UiDatePicker, { granularity: 'day', modelValue: '2026-08-21' })
+    await picker.get('button[aria-expanded]').trigger('click')
+    await nextTick()
+    await picker.get('tbody').trigger('keydown', { key: 'ArrowRight' })
+    await nextTick()
+    await picker.get('tbody').trigger('keydown', { key: 'Enter' })
+    // A day and nothing else: no `T`, no offset, nothing for the API to
+    // refuse.
+    expect(picker.emitted('update:modelValue')!.at(-1)).toEqual(['2026-08-22'])
+  })
 })
 
 /* ==================================================================== */
