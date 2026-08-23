@@ -76,12 +76,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.application.collection_mirror import CollectionSource, sweep_outline_collections
-from sturnus.application.documents import DocumentSink
+from sturnus.application.exporting import ExportPorts
 from sturnus.application.retention import sweep_expired_audio
 from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.config import StrictSettings
 from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.export_targets import ExportTargetStore
 from sturnus.infrastructure.db.models import Session, SessionParticipant, TranscriptionJob
 from sturnus.infrastructure.db.outline_collections import OutlineCollectionStore
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, JobQueue
@@ -90,9 +91,11 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.db.session_documents import SessionDocumentStore
 from sturnus.infrastructure.documents.outline import OutlineSink
+from sturnus.infrastructure.documents.sinks import DocumentSinks
 from sturnus.infrastructure.health import ReadinessState, start_health_server
-from sturnus.infrastructure.objectstore import S3AudioStore
+from sturnus.infrastructure.objectstore import S3AudioStore, S3DocumentStore
 from sturnus.infrastructure.observability import init_sentry
 from sturnus.infrastructure.telemetry import (
     JOB_OUTCOME,
@@ -230,6 +233,13 @@ class WorkerSettings(StrictSettings):
     # `DEFAULT_LEASE_SECONDS` for why this default is as generous as it is.
     job_lease_seconds: float = DEFAULT_LEASE_SECONDS
     health_port: int = 8080
+    #: Where an object-store artefact's link points. The worker never
+    #: serves that link -- the console API does -- but it is the worker
+    #: that writes it, into `session.document_url` and from there into a
+    #: Discord message that outlives every deploy. The same default as
+    #: `sturnus.entrypoints.api.ApiSettings.console_origin`, and the two
+    #: have to agree or a protocol's link goes nowhere.
+    console_origin: str = "https://sturnus.onelitefeather.dev"
 
 
 class _DownloadableAudioStore(S3AudioStore):
@@ -327,6 +337,9 @@ class _WorkerSessionStore:
 
     async def closed_undocumented_sessions(self) -> list[int]:
         return await self._sessions.closed_undocumented_sessions()
+
+    async def sessions_with_unpublished_targets(self) -> list[int]:
+        return await self._sessions.sessions_with_unpublished_targets()
 
     async def detected_language(self, session_id: int, user_id: int) -> str | None:
         async with self._session_factory() as session:
@@ -429,10 +442,12 @@ async def _retention_sweep_loop(
 
 
 async def _document_retry_loop(
-    # The narrow port, not the concrete `OutlineSink`: `_run` passes a
-    # `TracedDocumentSink` wrapping it, and `retry_pending_documents` only
-    # ever calls `create`.
-    documents: DocumentSink,
+    # The bundle, not a single sink: the sweep resolves a guild's
+    # destinations itself and may publish to several. `_run` builds it
+    # around the `TracedDocumentSink` wrapping `OutlineSink`, and
+    # `retry_pending_documents` only ever calls `create` on whatever comes
+    # back from the registry.
+    exports: ExportPorts,
     sessions: _WorkerSessionStore,
     jobs: JobRepository,
     links: AccountLinkRepository,
@@ -440,14 +455,15 @@ async def _document_retry_loop(
     template_source: str,
     stop: asyncio.Event,
 ) -> None:
-    """Periodically retries document creation for closed, undocumented
-    sessions (Defect 4) on `_DOCUMENT_RETRY_INTERVAL_SECONDS`. See
-    `sturnus.application.worker.retry_pending_documents`'s docstring for
-    why a session can need this at all.
+    """Periodically retries publication for sessions whose protocol did not
+    reach every destination (Defect 4) on `_DOCUMENT_RETRY_INTERVAL_SECONDS`.
+    See `sturnus.application.worker.retry_pending_documents`'s docstring for
+    why a session can need this at all, and for why a retry publishes only
+    what failed rather than everything again.
     """
     while not stop.is_set():
         try:
-            await retry_pending_documents(documents, sessions, jobs, links, config, template_source)
+            await retry_pending_documents(exports, sessions, jobs, links, config, template_source)
         except Exception as exc:
             log_exception(
                 log,
@@ -529,9 +545,30 @@ async def _run() -> None:
     crypto = _KeyWrapperDecryptor(
         base64.b64decode(settings.master_key.get_secret_value()), settings.master_key_id
     )
+    # The same master key, as a wrapper rather than as a decryptor: an
+    # export destination's credential is wrapped under it, bound to the
+    # guild and to the purpose (`sturnus.infrastructure.crypto.
+    # secret_context`). `ExportTargetStore` needs it to be constructed at
+    # all, even though this process only ever reads a target's
+    # configuration and never its secret today -- the Outline sink runs on
+    # one service token for the whole deployment, and the per-target
+    # credential is what a Confluence sink will read.
+    keys = KeyWrapper(
+        base64.b64decode(settings.master_key.get_secret_value()), settings.master_key_id
+    )
     documents = OutlineSink(
         base_url=settings.outline_base_url,
         api_token=settings.outline_service_key.get_secret_value(),
+    )
+    # The same bucket the recordings are in, through a class that reads and
+    # writes whole small objects rather than streaming large encrypted ones
+    # -- see `sturnus.infrastructure.objectstore`, which keeps the two
+    # apart on purpose.
+    document_objects = S3DocumentStore(
+        settings.s3_endpoint,
+        settings.s3_bucket,
+        settings.s3_access_key.get_secret_value(),
+        settings.s3_secret_key.get_secret_value(),
     )
 
     # Tracing is applied here, on the way into `process_one`, and nowhere
@@ -545,6 +582,19 @@ async def _run() -> None:
     traced_store = TracedAudioDownloader(store)
     traced_crypto = TracedDecryptor(crypto)
     traced_documents = TracedDocumentSink(documents)
+    # The one place a sink family becomes an adapter. `console_origin` is
+    # here because an object-store artefact's URL has to point at the
+    # console route that authorises it rather than at the bucket -- see
+    # `sturnus.infrastructure.documents.sinks`.
+    exports = ExportPorts(
+        sinks=DocumentSinks(
+            outline=traced_documents,
+            objects=document_objects,
+            console_origin=settings.console_origin,
+        ),
+        targets=ExportTargetStore(session_factory, keys),
+        documents=SessionDocumentStore(session_factory),
+    )
     sessions = _WorkerSessionStore(session_factory)
     jobs = JobRepository(session_factory)
     # No fixed provider: `document_provider` is per-guild configuration
@@ -615,9 +665,7 @@ async def _run() -> None:
         # second path to the same `DocumentSink.create`, and a histogram
         # that covered only one of them would understate how often document
         # creation is actually attempted.
-        _document_retry_loop(
-            traced_documents, sessions, jobs, links, config_store, template_source, stop
-        )
+        _document_retry_loop(exports, sessions, jobs, links, config_store, template_source, stop)
     )
 
     log_event(
@@ -667,7 +715,7 @@ async def _run() -> None:
                         engine=traced_engine,
                         store=traced_store,
                         crypto=traced_crypto,
-                        documents=traced_documents,
+                        exports=exports,
                         sessions=sessions,
                         jobs=jobs,
                         links=links,

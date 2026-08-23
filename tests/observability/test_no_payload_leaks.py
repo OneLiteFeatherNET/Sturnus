@@ -42,6 +42,7 @@ from tests.application.test_worker import (
     FakeQueue,
     FakeSessions,
     FakeStore,
+    exports,
     job,
 )
 
@@ -101,7 +102,7 @@ async def test_the_worker_pipeline_logs_no_payload(tmp_path: Path, captured: io.
         engine=FakeEngine(TRANSCRIPT_CANARY),
         store=FakeStore(),
         crypto=FakeCrypto(),
-        documents=FakeDocuments(),
+        exports=exports(FakeDocuments()),
         sessions=sessions,
         jobs=FakeJobs(),
         links=FakeLinks(),
@@ -141,7 +142,7 @@ async def test_a_failing_job_logs_no_payload(tmp_path: Path, captured: io.String
         engine=ExplodingEngine(),  # type: ignore[arg-type]
         store=FakeStore(),
         crypto=FakeCrypto(),
-        documents=FakeDocuments(),
+        exports=exports(FakeDocuments()),
         sessions=FakeSessions(),
         jobs=FakeJobs(),
         links=FakeLinks(),

@@ -59,6 +59,27 @@ def _build_environment() -> SandboxedEnvironment:
     return env
 
 
+def _build_html_environment() -> SandboxedEnvironment:
+    """The same engine with the opposite escaping, for an HTML destination.
+
+    Two things here are the whole point of having a second environment
+    rather than a second template on the first one.
+
+    `autoescape=True`: every value drawn from the transcript is escaped as
+    HTML on its way into the output, so a display name of
+    `<script>alert(1)</script>` reaches the page as text.
+
+    **No `md` filter.** It is not merely unused here -- it is absent, so a
+    template that reaches for it fails to render rather than quietly
+    emitting `escape_markdown`'s backslashes into a document where nothing
+    ever removes them again. The registry
+    (`sturnus.application.export_formats`) is what pairs each template with
+    the environment that is right for it; this is the half of that pairing
+    that cannot be got wrong silently.
+    """
+    return SandboxedEnvironment(autoescape=True, trim_blocks=True, lstrip_blocks=True)
+
+
 class _BlockContext(TypedDict):
     time: str
     speaker: SpeakerIdentity
@@ -112,21 +133,19 @@ class ChannelRef:
         return self.name if self.name else str(self.channel_id)
 
 
-def render_transcript(
+def transcript_context(
     transcript: Transcript,
-    template_source: str,
     tz: tzinfo,
     channel: ChannelRef | None = None,
-) -> str:
-    """Renders `transcript` through `template_source`, localised to `tz`.
+) -> dict[str, object]:
+    """Everything a document template may read, localised to `tz`.
 
-    The timezone is a parameter rather than a constant: a protocol read by
-    people in one place should carry local times, and hardcoding UTC would
-    make every timestamp subtly wrong for its readers -- wrong in a way that
-    does not look wrong, since any hour reads as a plausible meeting time.
-
-    `channel` is optional so a caller that cannot resolve it still gets a
-    protocol; the template simply omits the heading.
+    Extracted from `render_transcript` when a second output *shape* -- HTML
+    -- arrived. The two differ in exactly one thing, the escaping, and
+    nothing else about a protocol changes with its destination: the same
+    participants, the same blocks, the same local times. Building the
+    context once is what keeps that true, rather than leaving a second copy
+    to drift into rendering a different meeting.
     """
     blocks: list[_BlockContext] = [
         {
@@ -138,19 +157,70 @@ def render_transcript(
     ]
     local_start = transcript.session_started_at.astimezone(tz)
     duration = transcript.session_ended_at - transcript.session_started_at
-    template = _build_environment().from_string(template_source)
-    return template.render(
-        participants=transcript.participants,
-        blocks=blocks,
-        channel=channel,
+    return {
+        "participants": transcript.participants,
+        "blocks": blocks,
+        "channel": channel,
         # Outline renders `mention://date/<YYYY-MM-DD>` as a date chip
         # (MentionType.Date). Date only: the version deployed here parses no
         # time component, so an ISO datetime would degrade to a plain link.
-        date_iso=local_start.strftime("%Y-%m-%d"),
-        date_label=local_start.strftime("%d.%m.%Y"),
-        started=local_start.strftime("%H:%M"),
-        duration_minutes=max(1, round(duration.total_seconds() / 60)),
-    )
+        "date_iso": local_start.strftime("%Y-%m-%d"),
+        "date_label": local_start.strftime("%d.%m.%Y"),
+        "started": local_start.strftime("%H:%M"),
+        "duration_minutes": max(1, round(duration.total_seconds() / 60)),
+        # Only a standalone document needs its own title inside its body;
+        # the Outline template does not read this, because Outline stores
+        # the title as a field of its own. It is in the context rather than
+        # a parameter of the HTML renderer alone so there is one definition
+        # of what a protocol is called (`document_title`) and one context
+        # every template is rendered against.
+        "title": document_title(transcript, tz),
+    }
+
+
+def render_transcript(
+    transcript: Transcript,
+    template_source: str,
+    tz: tzinfo,
+    channel: ChannelRef | None = None,
+) -> str:
+    """Renders `transcript` through `template_source` as Markdown.
+
+    The timezone is a parameter rather than a constant: a protocol read by
+    people in one place should carry local times, and hardcoding UTC would
+    make every timestamp subtly wrong for its readers -- wrong in a way that
+    does not look wrong, since any hour reads as a plausible meeting time.
+
+    `channel` is optional so a caller that cannot resolve it still gets a
+    protocol; the template simply omits the heading.
+
+    **Markdown, and only Markdown.** The environment escapes through the
+    `md` filter and autoescapes nothing, so handing this function an HTML
+    template would produce a page that renders a hostile display name as
+    markup. `render_html` is the other half of that pair; which one a
+    destination gets is `sturnus.application.export_formats`' decision.
+    """
+    template = _build_environment().from_string(template_source)
+    return template.render(**transcript_context(transcript, tz, channel))
+
+
+def render_html(
+    transcript: Transcript,
+    template_source: str,
+    tz: tzinfo,
+    channel: ChannelRef | None = None,
+) -> str:
+    """The same protocol, rendered as HTML with HTML escaping.
+
+    Deliberately not `render_transcript` with a different template.
+    `escape_markdown` answers `<script>` with a backslash in front of
+    nothing -- every character of the tag survives -- so a Markdown-escaped
+    HTML document is an XSS sink that looks escaped. The escaping is a
+    property of the *environment*, and that is what differs here; see
+    `_build_html_environment`.
+    """
+    template = _build_html_environment().from_string(template_source)
+    return template.render(**transcript_context(transcript, tz, channel))
 
 
 def document_title(transcript: Transcript, tz: tzinfo) -> str:

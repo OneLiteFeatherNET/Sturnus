@@ -60,9 +60,13 @@ to prevent.
 Once a session's last job completes, `process_one` calls
 `sturnus.application.assembly.assemble` to merge *every* participant's
 stored transcript -- not just the job that happened to finish last -- into
-one chronological `Transcript`, then renders it through
-`sturnus.application.documents.render_transcript`/`document_title` before
-handing the result to `documents.create`. `assemble` needs a `SessionReader`
+one chronological `Transcript`, and hands it to
+`sturnus.application.exporting.publish_session`, which renders it once per
+format and writes it to every destination the guild has enabled. **Where a
+protocol goes, in what shape, and what happens when one destination fails
+are that module's decisions, not this one's**; what stays here is the
+assembly that produces the transcript and the session bookkeeping that
+follows a successful publish. `assemble` needs a `SessionReader`
 (`session_bounds`, `participant_names`, `audio_epoch`), a `JobReader`
 (`transcripts_for`), and a `LinkReader` (`external_identity`). `SessionStore`
 below is widened to be structurally a `SessionReader` as well as its
@@ -78,11 +82,12 @@ it: `transcription_language`, `transcription_prompt`, `document_target`,
 (Spec 11) that this one process cannot resolve until a session -- and
 therefore its guild -- is in hand. The first two are read in `process_one`
 itself, just before the engine is called; the last three inside
-`_create_session_document`. None of them is read once at process start,
-because one worker serves every guild. `sturnus.application.assembly.
-BoundLinks` adapts one call's resolved provider back down to the plain
-`LinkReader` shape `assemble` itself calls, so `assemble` stays ignorant
-of configuration entirely.
+`_create_session_document`, alongside the guild's `guild_export_target`
+rows, which are what `document_target` is now only the fallback for. None
+of them is read once at process start, because one worker serves every
+guild. `sturnus.application.assembly.BoundLinks` adapts one call's
+resolved provider back down to the plain `LinkReader` shape `assemble`
+itself calls, so `assemble` stays ignorant of configuration entirely.
 """
 
 from __future__ import annotations
@@ -106,12 +111,13 @@ from sturnus.application.assembly import (
     merge_gap_from,
     serialize_transcript,
 )
-from sturnus.application.documents import (
-    ChannelRef,
-    CreatedDocument,
-    DocumentSink,
-    document_title,
-    render_transcript,
+from sturnus.application.documents import ChannelRef
+from sturnus.application.export_formats import OUTLINE, RenderRequest, format_named
+from sturnus.application.exporting import (
+    Destination,
+    ExportPorts,
+    destinations_for,
+    publish_session,
 )
 from sturnus.application.transcription import TranscriptionEngine
 from sturnus.domain import settings as domain_settings
@@ -263,6 +269,24 @@ class SessionStore(Protocol):
         """
         ...
 
+    async def sessions_with_unpublished_targets(self) -> list[int]:
+        """Sessions that reached some destinations of their guild but not all.
+
+        The candidate set a second destination made necessary. A session
+        whose primary destination succeeded is `documented` and therefore
+        invisible to `closed_undocumented_sessions` -- so a Markdown export
+        that failed beside a successful Outline document would never be
+        retried, and the guild would be missing an artefact with nothing
+        anywhere saying so.
+
+        Answering it needs both `guild_export_target` and
+        `session_document`, which is why it is the store's question rather
+        than one this module could derive: "every enabled target of this
+        session's guild that has no row for this session" is one statement
+        in SQL and three round trips per session otherwise.
+        """
+        ...
+
 
 class _ClaimedJobShape(Protocol):
     """The attributes `process_one` reads off whatever `Queue.claim` returns.
@@ -368,60 +392,107 @@ async def _guild_timezone(config: ConfigReader, guild: int) -> tzinfo:
         return UTC
 
 
+async def _legacy_destination(
+    config: ConfigReader, session_id: int, guild: int
+) -> Destination | None:
+    """The single Outline destination a guild's `guild_config` describes.
+
+    What every guild running today is configured with, and what they keep:
+    there is no migration that moves `document_target` into
+    `guild_export_target`, so a guild with no rows in that table publishes
+    exactly where it always did. See
+    `sturnus.application.exporting.destinations_for` -- this is its
+    `fallback`, used only when the table has nothing for the guild.
+
+    `None` for a guild that never set `document_target`. It used to raise,
+    which was right when it was the only destination there could be and is
+    wrong now: a guild that configured a destination in the table and never
+    touched the legacy key must not have its publish fail on the absence of
+    a setting it deliberately does not use. The caller reports "nowhere to
+    publish" once, having seen both.
+    """
+    target = await config.get(guild, domain_settings.DOCUMENT_TARGET)
+    if target is None:
+        return None
+    provider = await config.get(guild, domain_settings.DOCUMENT_PROVIDER)
+    # `DEFAULTS` supplies "outline" when a guild never set this explicitly
+    # (see `ConfigReader`'s docstring) -- unlike `document_target`, this
+    # key always resolves to a value.
+    assert provider is not None
+    entry = format_named(OUTLINE)
+    # The registry always holds `outline`; it is the entry the rest of this
+    # system was built around. Asserting keeps the signature honest instead
+    # of widening it for a case that cannot happen.
+    assert entry is not None
+    return Destination(
+        session_id=session_id,
+        target_id=None,
+        format=entry,
+        target=target,
+        # The configured `document_provider` verbatim, not the format name:
+        # this is what `session.document_provider` has always been written
+        # with, and nothing about an existing guild's rows changes here.
+        provider=provider,
+    )
+
+
 async def _create_session_document(
-    documents: DocumentSink,
+    exports: ExportPorts,
     sessions: SessionStore,
     jobs: JobReader,
     links: LinkRepository,
     config: ConfigReader,
     session_id: int,
     template_source: str,
+    now: datetime,
 ) -> None:
-    """Assembles, renders, and creates the document for a session's last job.
+    """Assembles the transcript and publishes it to every destination.
 
     Calls `sturnus.application.assembly.assemble` to merge every
     participant's stored transcript -- not just the job that happened to
-    complete the session -- into one chronological `Transcript`, then
-    renders it through `render_transcript`/`document_title`. Both are
-    localised to UTC: no timezone configuration exists anywhere in this
-    codebase yet (`sturnus.entrypoints.worker.WorkerSettings` has no such
-    field), so this keeps the same UTC anchor the previous, single-speaker
-    version of this function already used rather than inventing one.
+    complete the session -- into one chronological `Transcript`, then hands
+    it to `sturnus.application.exporting.publish_session`. Rendering, the
+    choice of destinations, the survival of one that fails and the
+    de-duplication that keeps a retry from republishing what worked are all
+    that module's; what is left here is the assembly and the session
+    bookkeeping that follows.
 
-    Also resolves three guild-scoped settings (Spec 11) here, at
-    document-creation time, rather than once at process start -- the
-    worker serves every guild from one process and cannot know which
-    guild's values apply until a session, and therefore its guild, is
-    known:
+    Resolves the guild-scoped settings (Spec 11) here, at publication time,
+    rather than once at process start -- the worker serves every guild from
+    one process and cannot know which guild's values apply until a session,
+    and therefore its guild, is known:
 
-    - `document_target`: where `documents.create` writes the document (an
-      Outline collection id today). Required, with no default -- a guild
-      that never configured it has nothing to create a document *into*, so
-      this raises rather than guessing. The caller's own retry path
-      (`process_one`'s document-creation handler, `retry_pending_documents`)
-      already treats any non-`PermanentDocumentError` failure here as
-      transient and tries again later, which is exactly right for "an
-      administrator has not configured this yet" -- unlike a rejected
-      token or a deleted collection, this can and does resolve itself.
+    - the guild's `guild_export_target` rows: where the protocol goes, and
+      in what shape. A guild with none falls back to `document_target`.
     - `document_provider`: which provider's account-link mapping a
-      speaker's external identity is read from, via `BoundLinks`.
+      speaker's external identity is read from, via `BoundLinks`. Still
+      guild configuration and still one per session, because it decides how
+      a *speaker* is identified in the transcript rather than where the
+      transcript is sent -- one transcript is assembled and every
+      destination receives the same people.
     - `merge_gap_seconds`: how long a pause may be before one speaker's
       blocks split, forwarded to `assemble`.
+
+    `session.document_url` is stamped from the primary destination alone,
+    which is what keeps the announcement path and everything else already
+    reading a session working unchanged.
     """
     guild = await sessions.guild_id(session_id)
 
-    target = await config.get(guild, domain_settings.DOCUMENT_TARGET)
-    if target is None:
-        raise RuntimeError(
-            f"guild {guild} has no {domain_settings.DOCUMENT_TARGET!r} configured; "
-            "cannot create a document until an administrator sets it"
-        )
-
     provider = await config.get(guild, domain_settings.DOCUMENT_PROVIDER)
-    # `DEFAULTS` supplies "outline" when a guild never set this explicitly
-    # (see `ConfigReader`'s docstring) -- unlike `document_target`, this
-    # key always resolves to a value.
     assert provider is not None
+
+    destinations = destinations_for(
+        session_id,
+        await exports.targets.enabled_for(guild),
+        await _legacy_destination(config, session_id, guild),
+    )
+    if not destinations:
+        raise RuntimeError(
+            f"guild {guild} has no enabled export target and no "
+            f"{domain_settings.DOCUMENT_TARGET!r} configured; cannot publish a protocol "
+            "until an administrator configures a destination"
+        )
 
     merge_gap = merge_gap_from(await config.get(guild, domain_settings.MERGE_GAP_SECONDS))
 
@@ -433,42 +504,39 @@ async def _create_session_document(
     # depend on a local offset -- and only the rendering is localised.
     tz = await _guild_timezone(config, guild)
     ref_guild, ref_channel, ref_name = await sessions.channel_ref(session_id)
-    channel = ChannelRef(ref_guild, ref_channel, ref_name)
-    body = render_transcript(transcript, template_source, tz, channel)
-    title = document_title(transcript, tz)
-    try:
-        created: CreatedDocument = await documents.create(title, body, target)
-    except Exception as exc:
-        # Recognised by class name, not by `except PermanentDocumentError`:
-        # that type lives in `sturnus.infrastructure.documents.outline`,
-        # which this module must never import (see the module docstring).
-        if type(exc).__name__ != "PermanentDocumentError":
-            raise
-        # ERROR, not WARNING: a permanent rejection is the end of the road
-        # for this session's document. No sweep will fix it, so it needs a
-        # human -- unlike every other document failure here, which
-        # `retry_pending_documents` picks up on its own schedule.
-        log_event(
-            log,
-            logging.ERROR,
-            Event.SESSION_DOCUMENT_REJECTED,
-            "Document sink permanently rejected creation; no retry will succeed",
-            session_id=session_id,
-        )
+    report = await publish_session(
+        session_id,
+        destinations,
+        RenderRequest(
+            transcript=transcript,
+            tz=tz,
+            channel=ChannelRef(ref_guild, ref_channel, ref_name),
+            outline_template=template_source,
+        ),
+        exports,
+        now,
+    )
+    if report.primary is None:
         return
-    await sessions.mark_documented(session_id, created.id, created.url, provider)
+    await sessions.mark_documented(
+        session_id,
+        report.primary.document.id,
+        report.primary.document.url,
+        report.primary.destination.provider,
+    )
     log_event(
         log,
         logging.INFO,
         Event.SESSION_DOCUMENT_CREATED,
-        "Created the session protocol document",
+        "Published the session protocol",
         session_id=session_id,
-        document_id=created.id,
-        provider=provider,
-        collection_id=target,
+        document_id=report.primary.document.id,
+        provider=report.primary.destination.provider,
+        count=len(destinations),
+        failed=report.failed,
+        skipped=report.skipped,
         participants=len(transcript.participants),
         blocks=len(transcript.blocks),
-        body_bytes=len(body.encode("utf-8")),
     )
 
 
@@ -477,7 +545,7 @@ async def process_one(
     engine: TranscriptionEngine,
     store: AudioDownloader,
     crypto: Decryptor,
-    documents: DocumentSink,
+    exports: ExportPorts,
     sessions: SessionStore,
     jobs: JobReader,
     links: LinkRepository,
@@ -485,6 +553,7 @@ async def process_one(
     work_dir: Path,
     max_attempts: int,
     template_source: str = _FALLBACK_TEMPLATE,
+    now: datetime | None = None,
 ) -> bool:
     """Processes one claimed job end to end. Returns `False` if the queue was empty.
 
@@ -500,8 +569,10 @@ async def process_one(
        and why it is that way round).
     5. Store the transcript on the job; ask whether it was the session's last.
     6. If it was: assemble every participant's stored transcript into one
-       document (`_create_session_document`, `sturnus.application.assembly.
-       assemble`) and mark the session documented.
+       transcript (`_create_session_document`, `sturnus.application.
+       assembly.assemble`), publish it to every destination the guild has
+       enabled (`sturnus.application.exporting.publish_session`), and mark
+       the session documented from the primary one.
     7. Every temporary file made in steps 2-3 is removed in a `finally`, so
        a failure anywhere above never leaves decrypted speech on disk. The
        audio object in S3 is left alone deliberately -- see the module
@@ -510,7 +581,13 @@ async def process_one(
     `jobs` and `links` are only ever read from in step 6, but are accepted
     as parameters up front (rather than constructed lazily) so every
     collaborator `process_one` needs is visible in its signature, matching
-    `sessions`/`documents`/`queue` and the rest.
+    `sessions`/`exports`/`queue` and the rest.
+
+    `now` is the instant a published destination is recorded with, and
+    defaults to the clock rather than being required: this function is
+    already called from a loop that has no clock of its own, and a caller
+    that pins it (every test of this function) gets a deterministic
+    `session_document.created_at`.
 
     **Error handling (Defect 4).** Steps 2-5 are wrapped in a `try`/`except`
     that routes *any* failure -- a failed S3 download, a decrypt error, a
@@ -523,13 +600,15 @@ async def process_one(
     selects `pending` jobs -- see `sturnus.infrastructure.db.queue.JobQueue`
     for the lease that also reclaims a job stranded this way).
 
-    Step 6 (document creation) is deliberately handled by a *separate*
+    Step 6 (publication) is deliberately handled by a *separate*
     `try`/`except`, outside the one above: by the time it runs, `queue.
     complete` has already succeeded and the job is `done` -- calling
     `queue.fail` on it would incorrectly return an already-transcribed job
-    to the queue for no reason. A transient document-sink failure here is
-    instead only logged; `retry_pending_documents` is what actually retries
-    document creation, on its own schedule, independent of any one job.
+    to the queue for no reason. A transient sink failure here is instead
+    only logged; `retry_pending_documents` is what actually retries
+    publication, on its own schedule, independent of any one job -- and it
+    retries only the destinations that failed, never the ones that
+    succeeded.
     """
     claimed = await queue.claim()
     if claimed is None:
@@ -696,7 +775,14 @@ async def process_one(
     if is_last:
         try:
             await _create_session_document(
-                documents, sessions, jobs, links, config, job.session_id, template_source
+                exports,
+                sessions,
+                jobs,
+                links,
+                config,
+                job.session_id,
+                template_source,
+                now or datetime.now(UTC),
             )
         except Exception as exc:
             # The job itself already completed successfully -- see this
@@ -723,14 +809,15 @@ async def process_one(
 
 
 async def retry_pending_documents(
-    documents: DocumentSink,
+    exports: ExportPorts,
     sessions: SessionStore,
     jobs: JobReader,
     links: LinkRepository,
     config: ConfigReader,
     template_source: str = _FALLBACK_TEMPLATE,
+    now: datetime | None = None,
 ) -> None:
-    """Retries document creation for closed sessions that never got documented.
+    """Retries publication for sessions whose protocol did not reach everywhere.
 
     `_create_session_document` (called from `process_one`, above) only
     ever fires once, off the one job that happens to complete a session
@@ -745,15 +832,50 @@ async def retry_pending_documents(
     `close_session` commits reports "not last" at that moment, and nothing
     else would ever revisit it without this sweep.
 
+    **Two candidate sets, because a session can now be half-published.**
+    `closed_undocumented_sessions` is the original one: nothing reached
+    the primary destination, so the session never became `documented`. It
+    misses the case a second destination introduced -- Outline succeeded,
+    the session *is* `documented`, and the Markdown export failed.
+    `sessions_with_unpublished_targets` is that case, and without it a
+    failed secondary would never be retried at all. The two are unioned
+    rather than merged into one query because they are two different
+    questions about a session, and a session that answers both must still
+    be published exactly once per sweep.
+
+    **A retry publishes only what failed.** `publish_session` skips every
+    destination already in `session_document`, which is what keeps a
+    destination that stays down from reprinting the Outline document every
+    five minutes -- a hundred real documents in somebody's wiki by
+    lunchtime, none of them removable by anything in this system.
+
     Survives its own errors per session, same as `process_one` does for
-    document creation: one session still failing (Outline still down, or
-    a rejection that never becomes `PermanentDocumentError`) must not stop
+    publication: one session still failing (Outline still down, or a
+    rejection that never becomes `PermanentDocumentError`) must not stop
     every other session in the same sweep from being tried.
     """
-    for session_id in await sessions.closed_undocumented_sessions():
+    stamp = now or datetime.now(UTC)
+    # `dict.fromkeys` rather than a set: a session that answers both
+    # queries must be published once, and the sweep's order should stay
+    # the order the database reported rather than a hash order that
+    # changes between runs.
+    pending = dict.fromkeys(
+        [
+            *await sessions.closed_undocumented_sessions(),
+            *await sessions.sessions_with_unpublished_targets(),
+        ]
+    )
+    for session_id in pending:
         try:
             await _create_session_document(
-                documents, sessions, jobs, links, config, session_id, template_source
+                exports,
+                sessions,
+                jobs,
+                links,
+                config,
+                session_id,
+                template_source,
+                stamp,
             )
         except Exception as exc:
             log_exception(

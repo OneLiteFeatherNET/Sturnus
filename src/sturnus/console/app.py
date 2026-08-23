@@ -26,7 +26,7 @@ from datetime import datetime
 
 from aiohttp import web
 
-from sturnus.console import routes_recording, routes_settings, routes_tags
+from sturnus.console import routes_exports, routes_recording, routes_settings, routes_tags
 from sturnus.console.audio import AudioDelivery
 from sturnus.console.auth import (
     ConsoleAuth,
@@ -38,6 +38,8 @@ from sturnus.console.ports import (
     AdminDirectory,
     CollectionNames,
     ConsentDirectory,
+    DocumentArtefacts,
+    ExportTargets,
     GuildNames,
     GuildReports,
     LinkDirectory,
@@ -47,6 +49,7 @@ from sturnus.console.ports import (
     ProfileDirectory,
     QueueControl,
     QueueOverview,
+    SessionDocumentDirectory,
     SessionNaming,
     SessionReads,
     SettingsStore,
@@ -62,6 +65,8 @@ from sturnus.console.routes_consent_self import PERSONAL_CONSENTS
 from sturnus.console.routes_consent_self import register as register_consent_self
 from sturnus.console.routes_directory import COLLECTION_NAMES, GUILD_NAMES
 from sturnus.console.routes_directory import register as register_directory
+from sturnus.console.routes_documents import DOCUMENT_ARTEFACTS, SESSION_DOCUMENTS
+from sturnus.console.routes_documents import register as register_documents
 from sturnus.console.routes_me import PREFERENCES, PROFILE_DIRECTORY
 from sturnus.console.routes_me import register as register_me
 from sturnus.console.routes_queue import QUEUE_CONTROL, QUEUE_OVERVIEW
@@ -283,6 +288,9 @@ def build_api(
     collections: CollectionNames,
     transcripts: TranscriptReader,
     naming: SessionNaming,
+    exports: ExportTargets,
+    documents: SessionDocumentDirectory,
+    artefacts: DocumentArtefacts,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
 
@@ -319,6 +327,9 @@ def build_api(
     app[COLLECTION_NAMES] = collections
     app[routes_recording.TRANSCRIPTS] = transcripts
     app[routes_recording.SESSION_NAMING] = naming
+    app[routes_exports.EXPORT_TARGETS] = exports
+    app[SESSION_DOCUMENTS] = documents
+    app[DOCUMENT_ARTEFACTS] = artefacts
     app.add_routes(
         [
             web.get("/healthz", healthz),
@@ -339,4 +350,6 @@ def build_api(
     routes_settings.register(app)
     routes_tags.register(app)
     routes_recording.register(app)
+    routes_exports.register(app)
+    register_documents(app)
     return app

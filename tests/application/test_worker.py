@@ -16,10 +16,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sturnus.application.documents import CreatedDocument
+from sturnus.application.documents import CreatedDocument, DocumentSink
+from sturnus.application.exporting import Destination, ExportPorts
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
 from sturnus.application.worker import process_one, retry_pending_documents
 from sturnus.domain import settings as domain_settings
+from sturnus.domain.exports import ExportTarget, SessionDocument
 from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 from sturnus.infrastructure.db.queue import ClaimedJob
 from sturnus.infrastructure.documents.outline import PermanentDocumentError
@@ -195,6 +197,10 @@ class FakeSessions:
         #: What `closed_undocumented_sessions` reports -- empty by default,
         #: since most tests never exercise `retry_pending_documents`.
         self.pending_retry: list[int] = []
+        #: The second candidate set the sweep reads -- sessions that
+        #: published somewhere but not everywhere. Empty by default for
+        #: the same reason `pending_retry` is.
+        self.pending_targets: list[int] = []
         #: What `guild_id` reports for every session id -- matches
         #: `FakeConfig`'s default guild (module-level `GUILD`), so
         #: guild-scoped configuration resolves the same way in both fakes
@@ -221,6 +227,9 @@ class FakeSessions:
 
     async def closed_undocumented_sessions(self) -> list[int]:
         return self.pending_retry
+
+    async def sessions_with_unpublished_targets(self) -> list[int]:
+        return self.pending_targets
 
     async def channel_ref(self, _session_id: int) -> tuple[int, int, str | None]:
         return (self.guild, 4711, "meeting-raum")
@@ -307,6 +316,67 @@ def guild_config(extra: dict[str, str] | None = None) -> FakeConfig:
     return FakeConfig(values)
 
 
+class FakeExportTargets:
+    """A guild with nothing in `guild_export_target`.
+
+    The default for every test in this file, and deliberately so: that is
+    the state of every guild running today, and what these tests pin is
+    that such a guild still publishes exactly where it always did --
+    through `document_target`, to the one sink, recorded on the session
+    row. The several-destinations behaviour has a file of its own
+    (`tests/application/test_exporting.py`), where it can be tested without
+    a queue and a transcription engine in the way.
+    """
+
+    async def enabled_for(self, _guild_id: int) -> list[ExportTarget]:
+        return []
+
+
+class FakeSessionDocuments:
+    """`session_document`, which the legacy destination never writes to."""
+
+    def __init__(self) -> None:
+        self.recorded: list[tuple[int, int, str, str, str, datetime]] = []
+
+    async def for_session(self, _session_id: int) -> list[SessionDocument]:
+        return []
+
+    async def record(
+        self,
+        session_id: int,
+        *,
+        target_id: int,
+        provider: str,
+        document_id: str,
+        url: str,
+        now: datetime,
+    ) -> None:
+        self.recorded.append((session_id, target_id, provider, document_id, url, now))
+
+
+class OneSink:
+    """Answers the same sink for every destination.
+
+    Which is what a guild with one destination has, and what `documents`
+    meant when it was a parameter of `process_one` in its own right.
+    """
+
+    def __init__(self, sink: DocumentSink) -> None:
+        self.sink = sink
+
+    def sink_for(self, _destination: Destination) -> DocumentSink:
+        return self.sink
+
+
+def exports(documents: DocumentSink) -> ExportPorts:
+    """The publishing collaborators, around one sink and an empty table."""
+    return ExportPorts(
+        sinks=OneSink(documents),
+        targets=FakeExportTargets(),
+        documents=FakeSessionDocuments(),
+    )
+
+
 def job(job_id: int = 1, session_id: int = 1, user_id: int = 100) -> ClaimedJob:
     return ClaimedJob(
         id=job_id,
@@ -326,7 +396,7 @@ def run(tmp_path: Path, **kw: Any) -> dict[str, Any]:
         "engine": kw.get("engine") or FakeEngine(),
         "store": kw.get("store") or FakeStore(),
         "crypto": kw.get("crypto") or FakeCrypto(),
-        "documents": kw.get("documents") or FakeDocuments(),
+        "exports": kw.get("exports") or exports(kw.get("documents") or FakeDocuments()),
         "sessions": kw.get("sessions") or FakeSessions(),
         "jobs": kw.get("jobs") or FakeJobs(),
         "links": kw.get("links") or FakeLinks(),
@@ -842,7 +912,7 @@ async def test_retry_pending_documents_retries_closed_undocumented_sessions() ->
             )
         }
     )
-    await retry_pending_documents(documents, sessions, jobs, FakeLinks(), FakeConfig())
+    await retry_pending_documents(exports(documents), sessions, jobs, FakeLinks(), FakeConfig())
     assert len(documents.created) == 1
     assert "hello again" in documents.created[0][1]
     assert sessions.documented == [(1, "https://outline.example/doc/1", "outline")]
@@ -859,13 +929,15 @@ async def test_retry_pending_documents_survives_one_sessions_failure() -> None:
         {100: TranscriptionResult(segments=(TranscribedSegment(0.0, 1.0, "hi"),), language="de")}
     )
     # must not raise
-    await retry_pending_documents(documents, sessions, jobs, FakeLinks(), FakeConfig())
+    await retry_pending_documents(exports(documents), sessions, jobs, FakeLinks(), FakeConfig())
     assert documents.calls == 2  # both sessions were attempted despite failing
 
 
 async def test_retry_pending_documents_does_nothing_when_nothing_is_pending() -> None:
     documents = FakeDocuments()
-    await retry_pending_documents(documents, FakeSessions(), FakeJobs(), FakeLinks(), FakeConfig())
+    await retry_pending_documents(
+        exports(documents), FakeSessions(), FakeJobs(), FakeLinks(), FakeConfig()
+    )
     assert documents.created == []
 
 
@@ -990,7 +1062,7 @@ async def test_a_finished_job_records_what_its_recording_is(tmp_path: Path) -> N
         engine=FakeEngine(),
         store=FakeStore(),
         crypto=WritesARealWav(sample_rate=16_000, channels=1),
-        documents=FakeDocuments(),
+        exports=exports(FakeDocuments()),
         sessions=FakeSessions(),
         jobs=FakeJobs(),
         links=FakeLinks(),
@@ -1017,7 +1089,7 @@ async def test_the_size_recorded_is_the_stored_object_and_not_the_plaintext(tmp_
         engine=FakeEngine(),
         store=FakeStore(),
         crypto=WritesARealWav(frames=8_000),
-        documents=FakeDocuments(),
+        exports=exports(FakeDocuments()),
         sessions=FakeSessions(),
         jobs=FakeJobs(),
         links=FakeLinks(),
@@ -1048,7 +1120,7 @@ async def test_a_recording_whose_header_cannot_be_read_records_nothing(tmp_path:
         store=FakeStore(),
         # Writes `b"RIFFdecoded"`, which is not a WAV.
         crypto=FakeCrypto(),
-        documents=FakeDocuments(),
+        exports=exports(FakeDocuments()),
         sessions=FakeSessions(),
         jobs=FakeJobs(),
         links=FakeLinks(),
@@ -1072,7 +1144,7 @@ async def test_a_stereo_recording_is_recorded_as_stereo(tmp_path: Path) -> None:
         engine=FakeEngine(),
         store=FakeStore(),
         crypto=WritesARealWav(sample_rate=48_000, channels=2),
-        documents=FakeDocuments(),
+        exports=exports(FakeDocuments()),
         sessions=FakeSessions(),
         jobs=FakeJobs(),
         links=FakeLinks(),
@@ -1096,7 +1168,7 @@ async def test_a_failed_transcription_records_nothing_about_the_file(tmp_path: P
         engine=FakeEngine(fail=True),
         store=FakeStore(),
         crypto=WritesARealWav(),
-        documents=FakeDocuments(),
+        exports=exports(FakeDocuments()),
         sessions=FakeSessions(),
         jobs=FakeJobs(),
         links=FakeLinks(),
@@ -1107,3 +1179,145 @@ async def test_a_failed_transcription_records_nothing_about_the_file(tmp_path: P
 
     assert queue.failed
     assert queue.recorded == []
+
+
+# ---------------------------------------------------------------------------
+# Several destinations, reached through the whole worker
+# ---------------------------------------------------------------------------
+
+
+class ConfiguredTargets:
+    """A guild with rows in `guild_export_target`."""
+
+    def __init__(self, targets: list[ExportTarget]) -> None:
+        self._targets = targets
+
+    async def enabled_for(self, _guild_id: int) -> list[ExportTarget]:
+        return self._targets
+
+
+class RecordingSinks:
+    """One sink per destination, so a test can see which got what."""
+
+    def __init__(self, sinks: dict[int | None, FakeDocuments]) -> None:
+        self._sinks = sinks
+
+    def sink_for(self, place: Destination) -> DocumentSink | None:
+        return self._sinks.get(place.target_id)
+
+
+def export_target(target_id: int, format: str, where: str, name: str) -> ExportTarget:
+    return ExportTarget(
+        id=target_id,
+        guild_id=GUILD,
+        format=format,
+        name=name,
+        target=where,
+        config={},
+        has_secret=False,
+        enabled=True,
+        created_at=T0,
+        updated_at=T0,
+    )
+
+
+async def test_a_configured_target_is_published_to_instead_of_document_target(
+    tmp_path: Path,
+) -> None:
+    """`guild_export_target` is what an administrator configured through
+    the console; `document_target` is what was there before it existed. A
+    guild that has said where its protocols go must not also get a document
+    in the old collection.
+    """
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    configured = FakeDocuments()
+    records = FakeSessionDocuments()
+    await process_one(
+        **run(
+            tmp_path,
+            queue=queue,
+            exports=ExportPorts(
+                sinks=RecordingSinks({7: configured}),
+                targets=ConfiguredTargets([export_target(7, "outline", "col-configured", "wiki")]),
+                documents=records,
+            ),
+        )
+    )
+    assert configured.targets == ["col-configured"]
+    assert [(row[0], row[1], row[2]) for row in records.recorded] == [(1, 7, "outline")]
+
+
+async def test_two_destinations_both_receive_the_session_protocol(tmp_path: Path) -> None:
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    wiki, archive = FakeDocuments(), FakeDocuments()
+    sessions = FakeSessions()
+    await process_one(
+        **run(
+            tmp_path,
+            queue=queue,
+            sessions=sessions,
+            exports=ExportPorts(
+                sinks=RecordingSinks({1: wiki, 2: archive}),
+                targets=ConfiguredTargets(
+                    [
+                        export_target(1, "outline", "col-1", "wiki"),
+                        export_target(2, "markdown", "protocols", "archive"),
+                    ]
+                ),
+                documents=FakeSessionDocuments(),
+            ),
+        )
+    )
+    assert len(wiki.created) == 1
+    assert len(archive.created) == 1
+    # The oldest target is the primary, and it is what the announcement
+    # path reads off the session row.
+    assert sessions.documented == [(1, "https://outline.example/doc/1", "outline")]
+
+
+async def test_a_session_publishing_nowhere_at_all_is_left_for_the_sweep(
+    tmp_path: Path,
+) -> None:
+    """A guild with no target row and no `document_target`. The job itself
+    is done and must not be requeued; the session stays undocumented, which
+    is exactly what the sweep looks for.
+    """
+    queue = FakeQueue([job()])
+    queue.last_is_final = True
+    sessions = FakeSessions()
+    config = FakeConfig({(GUILD, domain_settings.DOCUMENT_PROVIDER): "outline"})
+    done = await process_one(**run(tmp_path, queue=queue, sessions=sessions, config=config))
+    assert done is True
+    assert queue.failed == []
+    assert sessions.documented == []
+
+
+async def test_the_retry_sweep_also_picks_up_a_session_that_published_only_partly() -> None:
+    """Outline succeeded, so the session is `documented` and invisible to
+    `closed_undocumented_sessions`. Without the second candidate set the
+    failed Markdown export would never be retried at all.
+    """
+    sessions = FakeSessions()
+    sessions.pending_targets = [3]
+    documents = FakeDocuments()
+    await retry_pending_documents(
+        exports(documents), sessions, FakeJobs(), FakeLinks(), FakeConfig()
+    )
+    assert len(documents.created) == 1
+
+
+async def test_a_session_in_both_candidate_sets_is_published_once() -> None:
+    """A session can answer both questions at once, and publishing it twice
+    in one sweep would be the duplicate this whole mechanism exists to
+    prevent.
+    """
+    sessions = FakeSessions()
+    sessions.pending_retry = [3]
+    sessions.pending_targets = [3]
+    documents = FakeDocuments()
+    await retry_pending_documents(
+        exports(documents), sessions, FakeJobs(), FakeLinks(), FakeConfig()
+    )
+    assert len(documents.created) == 1

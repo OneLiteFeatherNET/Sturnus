@@ -48,6 +48,7 @@ from sturnus.console.adapters import (
     ConsoleProfileDirectory,
     ConsoleQueueControl,
     ConsoleQueueOverview,
+    ConsoleSessionDocuments,
     ConsoleSessionNaming,
     ConsoleStateStore,
     ConsoleTagWriter,
@@ -61,20 +62,23 @@ from sturnus.console.session import SessionCookie
 from sturnus.infrastructure.crypto import KeyWrapper
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.export_targets import ExportTargetStore
 from sturnus.infrastructure.db.models import (
     AccountLink,
     AdminMember,
     ConsoleState,
     GuildChannel,
     GuildConfig,
+    GuildExportTarget,
     GuildMember,
     GuildRole,
     OutlineCollection,
+    SessionDocument,
     UserPreference,
 )
 from sturnus.infrastructure.db.preferences import PreferenceStore
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
-from sturnus.infrastructure.objectstore import S3AudioStore
+from sturnus.infrastructure.objectstore import S3AudioStore, S3DocumentStore
 from sturnus.infrastructure.observability import init_sentry
 from sturnus.infrastructure.telemetry import init_telemetry, shutdown_telemetry
 from sturnus.observability.events import Event, log_event
@@ -113,6 +117,12 @@ _REQUIRED_TABLES = frozenset(
         GuildRole.__tablename__,
         GuildMember.__tablename__,
         OutlineCollection.__tablename__,
+        # Where a guild publishes, and what a session published. The
+        # export section reads the first and the protocol route reads the
+        # second, both while a page is being rendered -- the same argument
+        # `guild_config` is on this list for.
+        GuildExportTarget.__tablename__,
+        SessionDocument.__tablename__,
         "session",
         "session_participant",
         "transcription_job",
@@ -200,6 +210,10 @@ async def _run() -> None:
 
     admins = AdminMemberStore(session_factory)
     config = ConfigStore(session_factory)
+    keys = KeyWrapper(
+        base64.b64decode(settings.master_key.get_secret_value()),
+        settings.master_key_id,
+    )
 
     audio = AudioDelivery(
         # The configuration store, because the download route's rule
@@ -213,10 +227,7 @@ async def _run() -> None:
             access_key=settings.s3_access_key.get_secret_value(),
             secret_key=settings.s3_secret_key.get_secret_value(),
         ),
-        keys=KeyWrapper(
-            base64.b64decode(settings.master_key.get_secret_value()),
-            settings.master_key_id,
-        ),
+        keys=keys,
     )
 
     def now() -> datetime:
@@ -258,6 +269,19 @@ async def _run() -> None:
         # about the same meeting.
         transcripts=ConsoleTranscripts(session_factory, config),
         naming=ConsoleSessionNaming(session_factory),
+        # The real store, not a narrowed copy of it. The port
+        # (`sturnus.console.ports.ExportTargets`) is what keeps
+        # `secret_for` out of a handler's reach: it is not on the port, so
+        # nothing typed against the port can call it, and the store needs
+        # no second class to say so.
+        exports=ExportTargetStore(session_factory, keys),
+        documents=ConsoleSessionDocuments(session_factory),
+        artefacts=S3DocumentStore(
+            settings.s3_endpoint,
+            settings.s3_bucket,
+            settings.s3_access_key.get_secret_value(),
+            settings.s3_secret_key.get_secret_value(),
+        ),
     )
 
     runner = web.AppRunner(app)

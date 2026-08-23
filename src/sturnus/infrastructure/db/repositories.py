@@ -21,7 +21,9 @@ from sturnus.domain.consent import ConsentRecord, ConsentScope, scope_of
 from sturnus.infrastructure.db.models import (
     AccountLink,
     Consent,
+    GuildExportTarget,
     Session,
+    SessionDocument,
     SessionParticipant,
     TranscriptionJob,
 )
@@ -490,6 +492,59 @@ class SessionRepository:
                     Session.status == "closed",
                     Session.id.in_(has_jobs),
                     Session.id.not_in(unfinished),
+                )
+            )
+            return [row[0] for row in rows]
+
+    async def sessions_with_unpublished_targets(self) -> list[int]:
+        """Sessions that reached some of their guild's destinations but not all.
+
+        The candidate set a second destination made necessary. A session
+        whose primary destination succeeded is `documented`, and therefore
+        invisible to `closed_undocumented_sessions` above -- so a Markdown
+        export that failed beside a successful Outline document would never
+        be retried, and the guild would be missing an artefact with nothing
+        anywhere saying so. See
+        `sturnus.application.worker.retry_pending_documents`, which unions
+        the two.
+
+        One statement rather than three round trips per session: "an
+        enabled target of this session's guild that has no `session_document`
+        row for this session" is a correlated `EXISTS` over a `NOT EXISTS`,
+        and doing it in Python would mean reading every target of every
+        guild on every sweep.
+
+        Scoped to sessions that are `closed` or `documented` and whose jobs
+        are all terminal, exactly as `closed_undocumented_sessions` is: a
+        session still being transcribed has no transcript to publish, and
+        offering it here would have the sweep assemble a partial one every
+        five minutes for as long as the meeting's last job takes.
+        """
+        async with self._session_factory() as session:
+            has_jobs = select(TranscriptionJob.session_id).distinct()
+            unfinished = select(TranscriptionJob.session_id).where(
+                TranscriptionJob.status.not_in(("done", "dead"))
+            )
+            missing = (
+                select(GuildExportTarget.id)
+                .where(
+                    GuildExportTarget.guild_id == Session.guild_id,
+                    GuildExportTarget.enabled.is_(True),
+                    ~select(SessionDocument.session_id)
+                    .where(
+                        SessionDocument.session_id == Session.id,
+                        SessionDocument.target_id == GuildExportTarget.id,
+                    )
+                    .exists(),
+                )
+                .exists()
+            )
+            rows = await session.execute(
+                select(Session.id).where(
+                    Session.status.in_(("closed", DOCUMENTED_STATUS)),
+                    Session.id.in_(has_jobs),
+                    Session.id.not_in(unfinished),
+                    missing,
                 )
             )
             return [row[0] for row in rows]

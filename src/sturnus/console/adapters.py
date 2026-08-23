@@ -69,6 +69,7 @@ from sturnus.domain.consent import (
     is_consent_active,
     scope_of,
 )
+from sturnus.domain.exports import SessionDocument
 from sturnus.infrastructure.db.models import (
     AccountLink,
     AdminMember,
@@ -84,6 +85,7 @@ from sturnus.infrastructure.db.models import (
     TranscriptionJob,
 )
 from sturnus.infrastructure.db.models import Session as SessionRow
+from sturnus.infrastructure.db.models import SessionDocument as SessionDocumentRow
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, TERMINAL_STATUSES
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -2026,6 +2028,68 @@ class ConsoleCollectionNames:
             collections=tuple(MirroredCollection(row.collection_id, row.name) for row in rows),
             synced_at=_oldest(row.synced_at for row in rows),
         )
+
+
+class ConsoleSessionDocuments:
+    """What a session published, at each destination that took it.
+
+    **This class does not authorise anything, and must not be reached
+    without something that did.** The rule that governs a session's
+    protocols is the rule that governs the session itself, so it is the
+    caller's `SessionReads.session_for` -- see `sturnus.console.ports.
+    SessionDocumentDirectory`, and `ConsoleTranscripts` above, which is
+    built the same way for the same reason. A second `WHERE` on
+    `session_participant` here would be a second place for the session
+    endpoint, the transcript endpoint and this one to disagree about the
+    same meeting.
+
+    `None` for a session that does not exist; an empty tuple for one that
+    exists and has published nothing yet. The existence check is its own
+    statement precisely so those two stay different sentences -- a single
+    query over `session_document` would collapse them, and a participant
+    of a meeting still being transcribed would get the 404 meant for a
+    stranger.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def documents_of(self, session_id: int) -> tuple[SessionDocument, ...] | None:
+        return await self._read(session_id, None)
+
+    async def document_of(self, session_id: int, target_id: int) -> SessionDocument | None:
+        found = await self._read(session_id, target_id)
+        return found[0] if found else None
+
+    async def _read(
+        self, session_id: int, target_id: int | None
+    ) -> tuple[SessionDocument, ...] | None:
+        statement = select(SessionDocumentRow).where(SessionDocumentRow.session_id == session_id)
+        if target_id is not None:
+            statement = statement.where(SessionDocumentRow.target_id == target_id)
+        async with self._session_factory() as db:
+            exists = await db.scalar(
+                select(select(SessionRow.id).where(SessionRow.id == session_id).exists())
+            )
+            if not exists:
+                return None
+            rows = await db.scalars(
+                # Publication order, so the list reads as the history it
+                # is; ties break on id so two reads of an unchanged
+                # session agree.
+                statement.order_by(SessionDocumentRow.created_at, SessionDocumentRow.id)
+            )
+            return tuple(
+                SessionDocument(
+                    session_id=row.session_id,
+                    target_id=row.target_id,
+                    provider=row.provider,
+                    document_id=row.document_id,
+                    url=row.url,
+                    created_at=row.created_at,
+                )
+                for row in rows
+            )
 
 
 def _oldest(moments: Iterable[datetime]) -> datetime | None:

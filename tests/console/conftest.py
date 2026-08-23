@@ -9,9 +9,18 @@ need on pytest-asyncio's loop instead.
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    Sequence,
+)
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 import pytest
 from aiohttp import web
@@ -29,7 +38,9 @@ from sturnus.console.ports import (
     ConsentDirectory,
     ConsentHolder,
     ConsentPage,
+    DocumentArtefacts,
     DownloadableTrack,
+    ExportTargets,
     GuildDirectory,
     GuildNames,
     GuildQueue,
@@ -48,6 +59,7 @@ from sturnus.console.ports import (
     RequeueOutcome,
     RevocationOutcome,
     ScopeOutcome,
+    SessionDocumentDirectory,
     SessionNaming,
     SessionReads,
     SettingsStore,
@@ -56,7 +68,7 @@ from sturnus.console.ports import (
     Track,
     TranscriptReader,
 )
-from sturnus.console.session import SessionCookie
+from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.console.statistics import (
     AttendedSession,
     SessionName,
@@ -65,6 +77,7 @@ from sturnus.console.statistics import (
     TagUse,
 )
 from sturnus.domain import preferences
+from sturnus.domain.exports import ExportTarget, SessionDocument
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
 
@@ -193,6 +206,19 @@ class FakeAdmins:
 
 def now_at(moment: datetime = T0) -> Callable[[], datetime]:
     return lambda: moment
+
+
+def signed_cookie(discord_user_id: int = ANNA, moment: datetime = T0) -> str:
+    """A session cookie for one person, signed with the test secret.
+
+    Here rather than in each route test file: `build_test_api` defaults to
+    a `SessionCookie` built from `SECRET`, so every module that wants a
+    signed-in client needs exactly this and three of them had already
+    written their own.
+    """
+    return SessionCookie(SECRET, timedelta(hours=12)).issue(
+        SignedSession(discord_user_id), now=moment
+    )
 
 
 class FakeReads:
@@ -880,6 +906,123 @@ class FakeNaming:
         return self.stored[session_id]
 
 
+class FakeExportTargets:
+    """A guild's destinations, in memory, keyed the way the table is.
+
+    Structurally an `ExportTargets`, and it keeps the store's two rules
+    that the API depends on: `save` upserts on `(guild_id, name)`, and the
+    secret is written only by `set_secret`. `secret_for` deliberately does
+    not exist -- the port has no such method, so a handler that reached for
+    one would not compile, and a double that offered one would be the one
+    place that stopped being true.
+    """
+
+    def __init__(self) -> None:
+        self.rows: dict[int, ExportTarget] = {}
+        #: What was actually stored, so a test can prove a credential
+        #: reached the store while never appearing in a response.
+        self.secrets: dict[int, str | None] = {}
+        self._next_id = 1
+
+    async def all_for(self, guild_id: int) -> tuple[ExportTarget, ...]:
+        return tuple(
+            sorted(
+                (row for row in self.rows.values() if row.guild_id == guild_id),
+                key=lambda row: (row.name, row.id),
+            )
+        )
+
+    async def get(self, guild_id: int, target_id: int) -> ExportTarget | None:
+        row = self.rows.get(target_id)
+        return row if row is not None and row.guild_id == guild_id else None
+
+    async def save(
+        self,
+        guild_id: int,
+        *,
+        format: str,
+        name: str,
+        target: str,
+        config: Mapping[str, Any],
+        enabled: bool = True,
+        now: datetime,
+    ) -> int:
+        existing = next(
+            (r for r in self.rows.values() if r.guild_id == guild_id and r.name == name), None
+        )
+        target_id = existing.id if existing is not None else self._next_id
+        if existing is None:
+            self._next_id += 1
+        self.rows[target_id] = ExportTarget(
+            id=target_id,
+            guild_id=guild_id,
+            format=format,
+            name=name,
+            target=target,
+            config=dict(config),
+            has_secret=self.secrets.get(target_id) is not None,
+            enabled=enabled,
+            created_at=existing.created_at if existing is not None else now,
+            updated_at=now,
+        )
+        return target_id
+
+    async def delete(self, guild_id: int, target_id: int) -> bool:
+        if await self.get(guild_id, target_id) is None:
+            return False
+        del self.rows[target_id]
+        self.secrets.pop(target_id, None)
+        return True
+
+    async def set_secret(
+        self, guild_id: int, target_id: int, secret: str | None, now: datetime
+    ) -> bool:
+        row = await self.get(guild_id, target_id)
+        if row is None:
+            return False
+        self.secrets[target_id] = secret
+        self.rows[target_id] = replace(row, has_secret=secret is not None, updated_at=now)
+        return True
+
+
+class FakeSessionDocuments:
+    """What a session published, in memory, keyed by session id.
+
+    Deliberately unscoped, exactly as `FakeTranscripts` above is and for
+    the same reason: `SessionDocumentDirectory` carries no `requested_by`
+    because the participant rule is the handler's `session_for` call. What
+    the route tests use this for is the other half -- that the handler
+    asked the reads adapter first and only then came here, which is
+    visible in `asked` and in the 404 a fake with no session produces.
+    """
+
+    def __init__(self, documents: dict[int, list[SessionDocument]] | None = None) -> None:
+        self.documents = documents if documents is not None else {}
+        #: Every session this was asked about, in order.
+        self.asked: list[int] = []
+
+    async def documents_of(self, session_id: int) -> tuple[SessionDocument, ...] | None:
+        self.asked.append(session_id)
+        found = self.documents.get(session_id)
+        return None if found is None else tuple(found)
+
+    async def document_of(self, session_id: int, target_id: int) -> SessionDocument | None:
+        found = await self.documents_of(session_id)
+        if found is None:
+            return None
+        return next((row for row in found if row.target_id == target_id), None)
+
+
+class FakeArtefacts:
+    """The object store, as a dictionary."""
+
+    def __init__(self, objects: dict[str, bytes] | None = None) -> None:
+        self.objects = objects or {}
+
+    async def get(self, key: str) -> bytes:
+        return self.objects[key]
+
+
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
@@ -901,6 +1044,9 @@ def build_test_api(
     collections: CollectionNames | None = None,
     transcripts: TranscriptReader | None = None,
     naming: SessionNaming | None = None,
+    exports: ExportTargets | None = None,
+    documents: SessionDocumentDirectory | None = None,
+    artefacts: DocumentArtefacts | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -951,6 +1097,9 @@ def build_test_api(
         collections=collections or FakeCollections(),
         transcripts=transcripts or FakeTranscripts(),
         naming=naming or FakeNaming(),
+        exports=exports or FakeExportTargets(),
+        documents=documents or FakeSessionDocuments(),
+        artefacts=artefacts or FakeArtefacts(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,
