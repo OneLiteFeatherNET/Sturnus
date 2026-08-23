@@ -179,7 +179,29 @@
     "failureSession": "Diese Sitzung ist nicht mehr gültig.",
     "failureNoDashboard": "Diese API kennt noch keine Übersicht; sie ist älter als diese Konsole.",
     "failureUnreachable": "Die API war nicht erreichbar.",
-    "failureStatus": "Die API hat mit {code} geantwortet und konnte die Zahlen nicht erstellen."
+    "failureStatus": "Die API hat mit {code} geantwortet und konnte die Zahlen nicht erstellen.",
+    "quick": {
+      "loading": "Änderbare Einstellungen werden gelesen…",
+      "consent": {
+        "title": "Eigene Einwilligung",
+        "intro": "Was Sturnus aufzeichnen darf und auf welchen Servern. Es ist derselbe Eintrag, den auch die Einstellungsseite zeigt — eine Änderung hier gilt überall.",
+        "more": "Einwilligung vollständig"
+      },
+      "settings": {
+        "title": "Was dieser Server häufig ändert",
+        "intro": "Die wenigen Einstellungen, die ein Server nachjustiert statt einmalig festzulegen. Alles Weitere — Richtliniendokument, Rollen-IDs, Zeitgrenzen — liegt einen Klick entfernt unter Bot-Einstellungen.",
+        "more": "Alle Bot-Einstellungen",
+        "loading": "Konfiguration dieses Servers wird gelesen…",
+        "whichServer": "Welcher Server",
+        "showing": "Angezeigt wird {guild}",
+        "none": "Sturnus führt keine dieser Einstellungen für diesen Server. Die gesamte Konfiguration steht unter Bot-Einstellungen.",
+        "withheld": "{key} lässt sich hier nicht ändern: Schreiben widerruft jede Einwilligung dieses Servers, und dieser Hinweis gehört auf die Seite Bot-Einstellungen statt in ein Band auf der Übersicht.",
+        "save": "Speichern",
+        "saving": "Wird geschrieben…",
+        "clear": "Leeren",
+        "unsaved": "Noch nicht geschrieben"
+      }
+    }
   },
   "recordings": {
     "loadingList": "Aufnahmen werden geladen.",

@@ -179,7 +179,29 @@
     "failureSession": "Your session is no longer valid.",
     "failureNoDashboard": "This API has no dashboard yet; it is older than this console.",
     "failureUnreachable": "The API could not be reached.",
-    "failureStatus": "The API answered {code} and could not produce your figures."
+    "failureStatus": "The API answered {code} and could not produce your figures.",
+    "quick": {
+      "loading": "Reading what you can change from here…",
+      "consent": {
+        "title": "Your consent",
+        "intro": "What Sturnus may record of you, and in which servers. This is the same record your settings page holds, and changing it here changes it everywhere.",
+        "more": "Consent in full"
+      },
+      "settings": {
+        "title": "What this server changes often",
+        "intro": "The handful of settings a server adjusts rather than sets once. Everything else — the policy document, the role ids, the timeouts — is one click away on Bot Settings.",
+        "more": "All bot settings",
+        "loading": "Reading this server's configuration…",
+        "whichServer": "Which server",
+        "showing": "Showing {guild}",
+        "none": "Sturnus serves none of these settings for this server. Its whole configuration is on Bot Settings.",
+        "withheld": "{key} cannot be changed from here: writing it withdraws every consent this server holds, and that warning belongs on Bot Settings rather than in a band on the dashboard.",
+        "save": "Save",
+        "saving": "Writing…",
+        "clear": "Clear",
+        "unsaved": "Not written yet"
+      }
+    }
   },
   "recordings": {
     "loadingList": "Loading your sessions.",

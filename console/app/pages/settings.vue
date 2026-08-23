@@ -19,8 +19,11 @@
  * for.** Theme and language are conveniences; consent is a right somebody
  * exercises. Every decision it makes -- which sentence a state produces,
  * whether the video option exists at all, what a refusal reads like -- is
- * in `~/utils/myConsents` and tested without rendering anything. What is
- * left here is layout, request plumbing and per-guild state.
+ * in `~/utils/myConsents` and tested without rendering anything. One guild's
+ * block, and the two writes it can make, are in `ConsentCard`, which the
+ * dashboard band mounts as well: there is exactly one component in this
+ * console that writes a consent, because a second write path would be a
+ * second set of consent bugs. What is left here is the section around it.
  *
  * Three things this section refuses to do, all three on purpose:
  *
@@ -42,143 +45,42 @@
  * the same two rows the account menu shows -- read from the same list, so
  * the two cannot drift into promising different things.
  */
-import {
-  AUDIO_ONLY_KEY,
-  type ConsentScope,
-  type Line,
-  type MyConsent,
-  type Outcome,
-  consentBadgeKey,
-  consentNarrative,
-  consentTone,
-  describeMyConsentError,
-  isConsentServiceMissing,
-  mayChangeScope,
-  orderMyConsents,
-  parseMyConsents,
-  parseMyRevokeResult,
-  parseScopeResult,
-  scopeChoices,
-  scopeLabelKey,
-  scopeOutcome,
-  withdrawConfirmation,
-  withdrawOutcome,
-  withdrawability,
-} from '~/utils/myConsents'
+import { describeMyConsentError, isConsentServiceMissing } from '~/utils/myConsents'
 import { COMING_SOON_KEY, UNAVAILABLE_ITEMS } from '~/utils/profileMenu'
 import { themeLabelKey } from '~/utils/theme'
 
 const { t } = useI18n()
 useHead({ title: t('settings.title') })
 
-const api = useApi()
-
 /**
  * The person's own consent records.
  *
- * `useAsyncData` so the first paint already carries them: this section is
- * the reason most people open this page, and a spinner where a fact belongs
- * is a page that makes somebody wait to find out whether they are being
- * recorded.
+ * Not `lazy`, so the first paint already carries them: this section is the
+ * reason most people open this page, and a spinner where a fact belongs is a
+ * page that makes somebody wait to find out whether they are being recorded.
+ * The dashboard reads the same records through the same composable and does
+ * ask for `lazy`, because there the band is not what held the page up.
  */
 const {
   data: consentData,
   error: consentError,
   status: consentStatus,
   refresh: refreshConsents,
-} = await useAsyncData('my-consents', async () =>
-  orderMyConsents(parseMyConsents(await api('/me/consents'))),
-)
+} = await useMyConsentRecords()
 
 const consents = computed(() => consentData.value ?? [])
 /** The one failure with a shape of its own. See the module comment. */
 const serviceMissing = computed(() => isConsentServiceMissing(consentError.value))
 
-/** The guild whose withdrawal confirmation is open. One at a time: two open
- *  panels with the same red button on each is how the wrong one is
- *  pressed. */
-const confirming = ref<string | null>(null)
-const busy = ref<Record<string, boolean>>({})
-const scopeOutcomes = ref<Record<string, Outcome | null>>({})
-const withdrawOutcomes = ref<Record<string, Outcome | null>>({})
-const failures = ref<Record<string, Line | null>>({})
-
-function clear(guildId: string) {
-  failures.value[guildId] = null
-  scopeOutcomes.value[guildId] = null
-  withdrawOutcomes.value[guildId] = null
-}
-
 /**
- * Narrow or widen what may be recorded.
+ * The guild whose withdrawal confirmation is open. One at a time: two open
+ * panels with the same red button on each is how the wrong one is pressed.
  *
- * Narrowing takes effect immediately and needs nothing. Widening inserts a
- * new consent record carrying the guild's current policy version, which is
- * the API's business and not this page's -- the console asks for a scope
- * and reports what it is told, and never computes a policy version of its
- * own.
+ * It stays here rather than inside `ConsentCard` precisely because it is a
+ * property of the list and not of a card -- a card holding its own flag
+ * could not know that another one is already open.
  */
-async function chooseScope(row: MyConsent, scope: ConsentScope) {
-  if (scope === row.scope || busy.value[row.guild_id]) return
-  clear(row.guild_id)
-  busy.value[row.guild_id] = true
-  try {
-    const answer = await api<unknown>(`/me/consents/${row.guild_id}/scope`, {
-      method: 'PUT',
-      body: { scope },
-    })
-    // The endpoint's own answer decides what is reported, never the fact
-    // that the call did not throw.
-    scopeOutcomes.value[row.guild_id] = scopeOutcome(parseScopeResult(answer))
-    await refreshConsents()
-  } catch (error) {
-    failures.value[row.guild_id] = describeMyConsentError(error)
-    // A refusal always means the record on screen was out of date, so the
-    // list is reloaded rather than left showing the state that was already
-    // wrong when it was clicked.
-    await refreshConsents()
-  } finally {
-    busy.value[row.guild_id] = false
-  }
-}
-
-async function withdraw(row: MyConsent) {
-  confirming.value = null
-  clear(row.guild_id)
-  busy.value[row.guild_id] = true
-  try {
-    const answer = await api<unknown>(`/me/consents/${row.guild_id}/revoke`, { method: 'POST' })
-    withdrawOutcomes.value[row.guild_id] = withdrawOutcome(parseMyRevokeResult(answer))
-    await refreshConsents()
-  } catch (error) {
-    failures.value[row.guild_id] = describeMyConsentError(error)
-    await refreshConsents()
-  } finally {
-    busy.value[row.guild_id] = false
-  }
-}
-
-/** Why no withdrawal is offered, or null when one is. Written out here
- *  rather than inline in the template because a discriminated union does not
- *  narrow across two separate calls, and calling it twice in one expression
- *  is how the second call ends up asking a different question than the
- *  first. */
-function withdrawBlocked(row: MyConsent): Line | null {
-  const verdict = withdrawability(row)
-  return verdict.may ? null : verdict.reason
-}
-
-/** Four states, four colours. Rendering "withdrawn" and "the policy version
- *  moved on" in one grey would hide which of the two happened, and only one
- *  of them was this person's own decision. */
-const TONE_COLOUR: Record<string, string> = {
-  active: 'var(--color-brand-green)',
-  scheduled: 'var(--color-brand-yellow)',
-  withdrawn: 'var(--color-brand-magenta)',
-  superseded: 'var(--color-brand-yellow)',
-  done: 'var(--color-brand-green)',
-  refused: 'var(--color-brand-yellow)',
-}
+const confirming = ref<string | null>(null)
 
 // Destructured so the template reads `currentTheme` rather than
 // `theme.current.value`: a ref returned at the top level of `setup` is
@@ -344,216 +246,20 @@ function chipStyle(selected: boolean) {
           {{ $t('settings.consent.serverIdNote') }}
         </p>
 
-        <article
-          v-for="row in consents"
-          :key="row.guild_id"
-          class="mt-4 rounded-lg border p-3"
-          :style="{ borderColor: 'var(--border)', background: 'var(--surface-raised)' }"
-        >
-          <header class="mb-2 flex flex-wrap items-start justify-between gap-2">
-            <h3 class="text-sm font-semibold">
-              {{ $t('settings.consent.server', { guild: row.guild_id }) }}
-            </h3>
-            <span
-              class="shrink-0 rounded-full border px-2.5 py-1 text-xs font-medium"
-              :style="{
-                borderColor: TONE_COLOUR[consentTone(row)],
-                color: TONE_COLOUR[consentTone(row)],
-              }"
-            >
-              {{ $t(consentBadgeKey(row)) }}
-            </span>
-          </header>
-
-          <!-- Sentences rather than a table of raw fields: what is being
-               recorded of somebody right now, under which policy version,
-               since when, and — for a scheduled stop — that it is coming
-               and when. A person whose consent runs out on Friday should
-               see that on Tuesday. -->
-          <p
-            v-for="line in consentNarrative(row)"
-            :key="line.key"
-            class="mb-2 text-sm"
-            :style="{ color: 'var(--text-muted)' }"
-          >
-            {{ $t(line.key, line.values ?? {}) }}
-          </p>
-
-          <!-- `fieldset` and `legend` rather than a heading over a row of
-               buttons, for the same reason the theme chooser uses them: a
-               group of mutually exclusive choices is what a radio group
-               is, and the native one comes with the arrow keys and the
-               grouping a screen reader announces. -->
-          <fieldset v-if="mayChangeScope(row)" class="mt-3">
-            <legend class="text-xs font-medium uppercase tracking-wide" :style="{ color: 'var(--text-muted)' }">
-              {{ $t('settings.consent.scope.title') }}
-            </legend>
-            <div class="mt-2 flex flex-wrap gap-2">
-              <!-- **When the guild does not offer video consent there is
-                   no video option in this list at all.** Not disabled, not
-                   greyed, not behind a tooltip: a consent record naming
-                   video under a policy that describes only audio is not
-                   consent, and this interface must not offer what it
-                   cannot honour. -->
-              <label v-for="choice in scopeChoices(row)" :key="choice" class="cursor-pointer">
-                <input
-                  class="peer sr-only"
-                  type="radio"
-                  :name="`scope-${row.guild_id}`"
-                  :value="choice"
-                  :checked="row.scope === choice"
-                  :disabled="busy[row.guild_id]"
-                  @change="chooseScope(row, choice)"
-                >
-                <span
-                  class="block rounded-lg border px-3 py-2 text-sm transition-colors peer-focus-visible:outline peer-focus-visible:outline-2 peer-focus-visible:outline-offset-2 peer-disabled:opacity-40"
-                  :style="chipStyle(row.scope === choice)"
-                >{{ $t(scopeLabelKey(choice)) }}</span>
-              </label>
-            </div>
-            <!-- One sentence in place of the option, so its absence reads
-                 as a fact about this server rather than as a control that
-                 failed to render. -->
-            <p
-              v-if="!row.video_consent_offered"
-              class="mt-2 text-xs"
-              :style="{ color: 'var(--text-muted)' }"
-            >
-              {{ $t(AUDIO_ONLY_KEY) }}
-            </p>
-            <p class="mt-2 text-xs" :style="{ color: 'var(--text-muted)' }">
-              {{ $t('settings.consent.scope.note') }}
-            </p>
-          </fieldset>
-          <p v-else class="mt-3 text-xs" :style="{ color: 'var(--text-muted)' }">
-            {{ $t('settings.consent.scope.locked') }}
-          </p>
-
-          <div
-            v-if="scopeOutcomes[row.guild_id]"
-            class="mt-3 rounded-lg border p-3"
-            :style="{
-              borderColor: TONE_COLOUR[scopeOutcomes[row.guild_id]!.tone],
-              background: 'var(--surface)',
-            }"
-          >
-            <p class="text-sm font-semibold">
-              {{
-                $t(
-                  scopeOutcomes[row.guild_id]!.headline.key,
-                  scopeOutcomes[row.guild_id]!.headline.values ?? {},
-                )
-              }}
-            </p>
-            <p
-              v-for="line in scopeOutcomes[row.guild_id]!.detail"
-              :key="line.key"
-              class="mt-1 text-sm"
-              :style="{ color: 'var(--text-muted)' }"
-            >
-              {{ $t(line.key, line.values ?? {}) }}
-            </p>
-          </div>
-
-          <div class="mt-3 flex flex-wrap items-center gap-2">
-            <button
-              v-if="withdrawability(row).may"
-              type="button"
-              class="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface)] disabled:opacity-40"
-              :style="{ borderColor: 'var(--danger)', color: 'var(--danger)' }"
-              :disabled="busy[row.guild_id]"
-              @click="confirming = row.guild_id"
-            >
-              {{
-                busy[row.guild_id]
-                  ? $t('settings.consent.withdraw.busy')
-                  : $t('settings.consent.withdraw.button')
-              }}
-            </button>
-            <!-- No button on a consent already withdrawn. The API answers
-                 409, and an interface that offers an action it knows will
-                 fail is worse than one that explains why it cannot. -->
-            <span v-else-if="withdrawBlocked(row)" class="text-xs" :style="{ color: 'var(--text-muted)' }">
-              {{ $t(withdrawBlocked(row)!.key, withdrawBlocked(row)!.values ?? {}) }}
-            </span>
-          </div>
-
-          <div
-            v-if="confirming === row.guild_id"
-            class="mt-3 rounded-lg border p-3"
-            :style="{ borderColor: 'var(--danger)', background: 'var(--surface)' }"
-          >
-            <p class="mb-2 text-sm font-semibold">
-              {{ $t(withdrawConfirmation(row).titleKey) }}
-            </p>
-            <!-- Kept as separate sentences. One paragraph carrying all of
-                 them is a paragraph that gets skimmed, exactly where the
-                 reader most needs to notice that the Discord role and the
-                 recordings are not part of this. -->
-            <p
-              v-for="line in withdrawConfirmation(row).consequences"
-              :key="line.key"
-              class="mb-2 text-sm"
-              :style="{ color: 'var(--text-muted)' }"
-            >
-              {{ $t(line.key, line.values ?? {}) }}
-            </p>
-            <div class="mt-3 flex flex-wrap gap-2">
-              <button
-                type="button"
-                class="rounded-lg px-3 py-1.5 text-sm font-medium transition-opacity hover:opacity-90"
-                :style="{ background: 'var(--danger)', color: 'var(--danger-contrast)' }"
-                @click="withdraw(row)"
-              >
-                {{ $t(withdrawConfirmation(row).confirmKey) }}
-              </button>
-              <button
-                type="button"
-                class="rounded-lg border px-3 py-1.5 text-sm transition-colors hover:bg-[var(--surface-raised)]"
-                :style="{ borderColor: 'var(--border)' }"
-                @click="confirming = null"
-              >
-                {{ $t('settings.consent.withdraw.cancel') }}
-              </button>
-            </div>
-          </div>
-
-          <div
-            v-if="withdrawOutcomes[row.guild_id]"
-            class="mt-3 rounded-lg border p-3"
-            :style="{
-              borderColor: TONE_COLOUR[withdrawOutcomes[row.guild_id]!.tone],
-              background: 'var(--surface)',
-            }"
-          >
-            <p class="text-sm font-semibold">
-              {{
-                $t(
-                  withdrawOutcomes[row.guild_id]!.headline.key,
-                  withdrawOutcomes[row.guild_id]!.headline.values ?? {},
-                )
-              }}
-            </p>
-            <p
-              v-for="line in withdrawOutcomes[row.guild_id]!.detail"
-              :key="line.key"
-              class="mt-1 text-sm"
-              :style="{ color: 'var(--text-muted)' }"
-            >
-              {{ $t(line.key, line.values ?? {}) }}
-            </p>
-          </div>
-
-          <p
-            v-if="failures[row.guild_id]"
-            class="mt-3 rounded-lg border p-3 text-sm"
-            :style="{ borderColor: 'var(--danger)' }"
-          >
-            {{
-              $t(failures[row.guild_id]!.key, failures[row.guild_id]!.values ?? {})
-            }}
-          </p>
-        </article>
+        <div class="mt-4 flex flex-col gap-4">
+          <!-- The one component in this console that writes a consent. The
+               dashboard band mounts the same one, so there is a single
+               implementation of narrowing, widening and withdrawing rather
+               than two that can drift. `confirming` is held here because
+               only one confirmation may be open across the whole list. -->
+          <ConsentCard
+            v-for="row in consents"
+            :key="row.guild_id"
+            v-model:confirming="confirming"
+            :row="row"
+            @changed="refreshConsents()"
+          />
+        </div>
       </template>
     </section>
 
