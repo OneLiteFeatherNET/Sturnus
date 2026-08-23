@@ -94,6 +94,17 @@ export const ADMIN_VIEW: NavSection = {
       adminOnly: true,
     },
     {
+      to: '/admin/destinations',
+      labelKey: 'nav.destinations',
+      // One node branching into three: a protocol leaving for several
+      // places at once, which is the whole of what this page configures.
+      // Deliberately not a document glyph — the recordings entry above is
+      // already about documents, and this page is about *where they go*
+      // rather than about what is in them.
+      icon: 'M18 16.08a2.9 2.9 0 0 0-1.96.77L8.91 12.7c.06-.23.09-.46.09-.7s-.03-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81a3 3 0 1 0-3-3c0 .24.04.47.09.7L8.04 9.81A2.98 2.98 0 0 0 6 9a3 3 0 0 0 0 6c.79 0 1.5-.31 2.04-.81l7.12 4.16c-.05.21-.08.43-.08.65a2.92 2.92 0 1 0 2.92-2.92Z',
+      adminOnly: true,
+    },
+    {
       // Renamed from `/admin/user-settings`, which read as "settings for
       // users" and is in fact a roster of other people's consent. The old
       // address stays alive as a permanent redirect in `nuxt.config.ts`,

@@ -64,6 +64,9 @@ const IDENTICAL_BY_RIGHT: Record<string, string> = {
   'recordings.solo': 'the word every mixing desk prints on that button, in German too',
   'settings.appearance.system':
     'German calls the operating system "das System" too, and this label names it',
+  'admin.destinations.nameLabel': '"Name" is the same word in German, and this label is that word',
+  'admin.destinations.formatLabel':
+    'German borrowed "Format" unchanged; "Dateityp" would name something narrower than this field',
 }
 
 describe('the two locale files', () => {
