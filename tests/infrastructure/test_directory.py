@@ -19,11 +19,18 @@ from sturnus.application.directory_mirror import (
     TEXT,
     VOICE,
     MirroredChannel,
+    MirroredGuild,
     MirroredMember,
     MirroredRole,
 )
 from sturnus.infrastructure.db.directory import DirectoryStore
-from sturnus.infrastructure.db.models import Base, GuildChannel, GuildMember, GuildRole
+from sturnus.infrastructure.db.models import (
+    Base,
+    Guild,
+    GuildChannel,
+    GuildMember,
+    GuildRole,
+)
 
 GUILD, OTHER_GUILD = 1, 2
 ANNA, BEN = 100, 200
@@ -278,3 +285,101 @@ async def test_a_departure_is_written_even_though_nobody_was_added(
     await store.replace_members(GUILD, [_member(ANNA, "Anna")], T1)
     assert await store.members_for(GUILD) == [_member(ANNA, "Anna")]
     assert await _stamps(clean_database, GuildMember.synced_at) == [T1]
+
+
+def _guild(guild_id: int, name: str, icon_url: str | None = None) -> MirroredGuild:
+    return MirroredGuild(guild_id=guild_id, name=name, icon_url=icon_url)
+
+
+async def test_a_guild_nobody_swept_has_no_name(store: DirectoryStore) -> None:
+    """The absence is the answer, and it is why the console says "Server 128…".
+
+    A guild the bot has not reached yet has no row here, and a reader
+    handed a placeholder instead could not tell that apart from a guild
+    genuinely called that.
+    """
+    assert await store.guild(GUILD) is None
+    assert await store.guilds([GUILD, OTHER_GUILD]) == {}
+
+
+async def test_a_swept_guild_can_be_named(store: DirectoryStore) -> None:
+    await store.replace_guild(_guild(GUILD, "Acme", "https://cdn.example/a.png"), T0)
+    assert await store.guild(GUILD) == _guild(GUILD, "Acme", "https://cdn.example/a.png")
+
+
+async def test_a_guild_without_an_icon_is_ordinary(store: DirectoryStore) -> None:
+    await store.replace_guild(_guild(GUILD, "Acme"), T0)
+    assert await store.guild(GUILD) == _guild(GUILD, "Acme")
+
+
+async def test_a_rename_is_written(store: DirectoryStore, clean_database: str) -> None:
+    await store.replace_guild(_guild(GUILD, "Acme"), T0)
+    await store.replace_guild(_guild(GUILD, "Acme Corp"), T1)
+    assert await store.guild(GUILD) == _guild(GUILD, "Acme Corp")
+    assert await _stamps(clean_database, Guild.synced_at) == [T1]
+
+
+async def test_a_guild_sweep_that_changes_nothing_writes_nothing(
+    store: DirectoryStore, clean_database: str
+) -> None:
+    """The same rule the other three follow, for the same reason.
+
+    The sweep runs every ten seconds per guild forever over a name that
+    changes a handful of times a year. Rewritten unconditionally, one row
+    per guild per tick is 8,640 dead tuples a day per guild, for data no
+    reader was waiting on.
+    """
+    await store.replace_guild(_guild(GUILD, "Acme"), T0)
+    await store.replace_guild(_guild(GUILD, "Acme"), T1)
+    assert await _stamps(clean_database, Guild.synced_at) == [T0]
+
+
+async def test_losing_the_icon_is_a_change(store: DirectoryStore, clean_database: str) -> None:
+    """The comparison is over the whole row, not just the name.
+
+    A field left out of it is a field a real change can never be written
+    through, and the comparison is the only thing standing between the
+    sweep and a write.
+    """
+    await store.replace_guild(_guild(GUILD, "Acme", "https://cdn.example/a.png"), T0)
+    await store.replace_guild(_guild(GUILD, "Acme"), T1)
+    assert await store.guild(GUILD) == _guild(GUILD, "Acme")
+    assert await _stamps(clean_database, Guild.synced_at) == [T1]
+
+
+async def test_one_guilds_sweep_leaves_another_guilds_name_alone(
+    store: DirectoryStore,
+) -> None:
+    """There is no clear here, only a write, and it names exactly one guild.
+
+    That is the skip-versus-clear distinction as it applies to a
+    single-row fact: a guild the bot cannot currently see is one the
+    caller does not call for, and nothing in this store can empty it on a
+    gateway hiccup.
+    """
+    await store.replace_guild(_guild(GUILD, "Acme"), T0)
+    await store.replace_guild(_guild(OTHER_GUILD, "Other"), T1)
+    assert await store.guild(GUILD) == _guild(GUILD, "Acme")
+    assert await store.guild(OTHER_GUILD) == _guild(OTHER_GUILD, "Other")
+
+
+async def test_several_guilds_are_named_in_one_read(store: DirectoryStore) -> None:
+    """`GET /api/guilds` names every guild the caller administers at once.
+
+    One read rather than one per guild, for the reason
+    `ConfigStore.snapshot` gives: this happens while a page is being
+    rendered, and a handful of round trips per request is a handful of
+    round trips per request forever.
+    """
+    await store.replace_guild(_guild(GUILD, "Acme"), T0)
+    await store.replace_guild(_guild(OTHER_GUILD, "Other"), T0)
+    assert await store.guilds([GUILD, OTHER_GUILD, 999]) == {
+        GUILD: _guild(GUILD, "Acme"),
+        OTHER_GUILD: _guild(OTHER_GUILD, "Other"),
+    }
+
+
+async def test_naming_no_guilds_reads_nothing(store: DirectoryStore) -> None:
+    """Somebody who administers nothing must not produce an unbounded read."""
+    await store.replace_guild(_guild(GUILD, "Acme"), T0)
+    assert await store.guilds([]) == {}

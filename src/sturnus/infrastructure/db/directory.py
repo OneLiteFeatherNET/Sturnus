@@ -1,4 +1,4 @@
-"""A guild's channels, roles and named people, as far as `api` may know.
+"""A guild's name, channels, roles and named people, as far as `api` may know.
 
 `voice_channel_id`, `consent_role_id` and `admin_role_id` are Discord
 snowflakes an administrator pasted into the console, and the console shows
@@ -12,6 +12,16 @@ So `bot`, which does hold the gateway, writes the names here on the sweep
 it already runs for `admin_member`, and `api` only ever reads. The cost is
 staleness bounded by that sweep; the alternative cost was a second process
 holding the Discord token.
+
+**The guild's own name was the gap in all of this.** The three mirrors
+above answer "what is this channel called"; nothing answered "what is
+this *server* called", so `GET /api/guilds` could reply with ids alone
+and every guild switcher in the console renders "Server
+1289374650912837465" -- the one name on every admin page, and the one
+nobody could resolve. `replace_guild` and `guild` close it, on the same
+sweep and under the same rules as the rest of this module, with one
+difference stated in `replace_guild`: a single fact has no empty form, so
+there is no way to clear one here.
 
 **Every write is a replacement scoped to one guild, and never a merge.**
 The two halves matter separately. A merge would leave a channel deleted in
@@ -82,17 +92,100 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.directory_mirror import (
     MirroredChannel,
+    MirroredGuild,
     MirroredMember,
     MirroredRole,
 )
-from sturnus.infrastructure.db.models import GuildChannel, GuildMember, GuildRole
+from sturnus.infrastructure.db.models import (
+    Guild,
+    GuildChannel,
+    GuildMember,
+    GuildRole,
+)
 
 
 class DirectoryStore:
-    """Reads and replaces one guild's mirrored channels, roles and names."""
+    """Reads and replaces one guild's mirrored name, channels, roles and people."""
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
+
+    async def replace_guild(self, guild: MirroredGuild, now: datetime) -> None:
+        """Makes this guild's mirrored name and icon exactly `guild`.
+
+        **There is no method here that empties a guild's name, and that
+        is the skip-versus-clear distinction applied to a single row.**
+        The other three mirrors are lists, so their replacement has to be
+        able to shrink; a guild's name is one fact, and the only honest
+        representation of "the bot could not see this guild this tick" is
+        the row staying as it was. The caller skips such a guild, exactly
+        as it already does for the lists, and nothing in this store could
+        blank one on a gateway hiccup even if a caller asked it to.
+
+        Writes nothing when nothing changed, for the reason the module
+        docstring gives: the sweep runs every ten seconds per guild
+        forever over a name that changes a handful of times a year, and
+        an unconditional restamp is 8,640 dead tuples a day per guild for
+        data no reader was waiting on. The comparison covers the whole
+        row -- a field left out of it is a field a real change could
+        never be written through.
+        """
+        async with self._session_factory() as session:
+            if await self._stored_guild(session, guild.guild_id) == guild:
+                return
+            statement = insert(Guild).values(
+                guild_id=guild.guild_id,
+                name=guild.name,
+                icon_url=guild.icon_url,
+                synced_at=now,
+            )
+            await session.execute(
+                statement.on_conflict_do_update(
+                    index_elements=["guild_id"],
+                    set_={
+                        "name": statement.excluded.name,
+                        "icon_url": statement.excluded.icon_url,
+                        "synced_at": now,
+                    },
+                )
+            )
+            await session.commit()
+
+    async def guild(self, guild_id: int) -> MirroredGuild | None:
+        """What this guild is called, or `None` if nothing has said yet.
+
+        `None` rather than a placeholder: a guild the bot has not reached
+        must be distinguishable from one genuinely named "Server
+        1289374650912837465", and only the caller knows how to render the
+        difference -- the rule is that the name is the value and the id
+        is the subtext, and an id with no mirror row renders as the id
+        plus a note.
+        """
+        async with self._session_factory() as session:
+            return await self._stored_guild(session, guild_id)
+
+    async def guilds(self, guild_ids: Iterable[int]) -> dict[int, MirroredGuild]:
+        """The names of the guilds asked about, missing ones simply absent.
+
+        One read rather than one per guild: `GET /api/guilds` names every
+        guild the caller administers while a page is being rendered, and
+        a handful of round trips per request is a handful of round trips
+        per request forever.
+
+        An empty request asks nothing at all -- somebody who administers
+        no guild must not turn into an unfiltered scan of the table.
+        """
+        wanted = set(guild_ids)
+        if not wanted:
+            return {}
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(Guild.guild_id, Guild.name, Guild.icon_url).where(Guild.guild_id.in_(wanted))
+            )
+        return {
+            guild_id: MirroredGuild(guild_id=guild_id, name=name, icon_url=icon_url)
+            for guild_id, name, icon_url in rows.all()
+        }
 
     async def replace_channels(
         self, guild_id: int, channels: Iterable[MirroredChannel], now: datetime
@@ -258,6 +351,17 @@ class DirectoryStore:
     # for a real change to go unwritten forever. The ordering happens in
     # Python rather than in SQL because the comparison wants a mapping and
     # the reader wants an order, and these lists are tens of rows.
+
+    async def _stored_guild(self, session: AsyncSession, guild_id: int) -> MirroredGuild | None:
+        row = (
+            await session.execute(
+                select(Guild.name, Guild.icon_url).where(Guild.guild_id == guild_id)
+            )
+        ).one_or_none()
+        if row is None:
+            return None
+        name, icon_url = row
+        return MirroredGuild(guild_id=guild_id, name=name, icon_url=icon_url)
 
     async def _stored_channels(
         self, session: AsyncSession, guild_id: int

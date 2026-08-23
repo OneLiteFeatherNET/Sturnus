@@ -9,6 +9,7 @@ from sturnus.infrastructure.crypto import (
     KeyWrapper,
     decrypt_file,
     encrypt_file,
+    secret_context,
 )
 
 MASTER = b"0" * 32
@@ -102,3 +103,70 @@ def test_two_encryptions_of_the_same_file_differ(tmp_path: Path) -> None:
     encrypt_file(plain, tmp_path / "d1.enc", key)
     encrypt_file(plain, tmp_path / "d2.enc", key)
     assert (tmp_path / "d1.enc").read_bytes() != (tmp_path / "d2.enc").read_bytes()
+
+
+def test_a_wrap_with_no_context_still_unwraps_with_no_context() -> None:
+    """The existing callers pass nothing, and nothing changes for them.
+
+    Every audio data key ever written was wrapped without associated
+    data. Adding the parameter had to leave that spelling byte-compatible
+    or the master key would stop opening the recordings it wrapped.
+    """
+    w = wrapper()
+    wrapped = w.wrap(b"a secret")
+    assert w.unwrap(wrapped) == b"a secret"
+
+
+def test_a_secret_wrapped_under_a_context_needs_that_context_back() -> None:
+    w = wrapper()
+    wrapped = w.wrap(b"a secret", secret_context("export", 1))
+    assert w.unwrap(wrapped, secret_context("export", 1)) == b"a secret"
+
+
+def test_a_secret_wrapped_under_a_context_does_not_open_under_another() -> None:
+    """What binds a wrapped blob to the row it sits in.
+
+    AES-GCM's associated data is authenticated but not encrypted: it does
+    not hide anything, it makes the tag depend on it. So a blob wrapped
+    for guild 1 and pasted into guild 2's row fails to authenticate
+    rather than decrypting into a credential guild 2 was never given.
+    """
+    w = wrapper()
+    wrapped = w.wrap(b"a secret", secret_context("export", 1))
+    with pytest.raises(InvalidTag):
+        w.unwrap(wrapped, secret_context("export", 2))
+
+
+def test_a_secret_wrapped_for_one_purpose_does_not_open_under_another() -> None:
+    """One guild holds several kinds of secret, and they are not each other.
+
+    Binding to the guild alone would leave a Confluence token and an
+    OAuth client secret interchangeable within the guild that owns both.
+    """
+    w = wrapper()
+    wrapped = w.wrap(b"a secret", secret_context("export", 1))
+    with pytest.raises(InvalidTag):
+        w.unwrap(wrapped, secret_context("oauth", 1))
+
+
+def test_a_context_bound_secret_does_not_open_without_a_context() -> None:
+    """Dropping the argument must fail, not fall back to the unbound form."""
+    w = wrapper()
+    wrapped = w.wrap(b"a secret", secret_context("export", 1))
+    with pytest.raises(InvalidTag):
+        w.unwrap(wrapped)
+
+
+def test_an_unbound_secret_does_not_open_under_a_context() -> None:
+    """And the other direction, so neither side can be added by accident."""
+    w = wrapper()
+    wrapped = w.wrap(b"a secret")
+    with pytest.raises(InvalidTag):
+        w.unwrap(wrapped, secret_context("export", 1))
+
+
+def test_a_data_key_can_be_bound_too() -> None:
+    """The generator takes the same parameter, so nothing has two shapes."""
+    w = wrapper()
+    key = w.new_data_key(secret_context("export", 1))
+    assert w.unwrap(key.wrapped, secret_context("export", 1)) == key.plaintext

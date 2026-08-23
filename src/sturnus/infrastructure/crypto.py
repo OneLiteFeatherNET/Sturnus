@@ -58,8 +58,51 @@ class DataKey:
     wrapped: bytes
 
 
+def secret_context(purpose: str, guild_id: int) -> bytes:
+    """The associated data that binds a wrapped secret to where it lives.
+
+    A wrapped blob is otherwise portable. `KeyWrapper` seals bytes under
+    the master key and says nothing about which row they came out of, so
+    a wrapped Confluence token moved from one guild's `guild_export_target`
+    into another's -- by a direct `UPDATE`, a restored backup, a bug in a
+    bulk import -- decrypts perfectly well, and the second guild publishes
+    under the first one's credential. AES-GCM's associated data is
+    authenticated but not encrypted: passing this hides nothing and adds
+    no bytes, it makes the authentication tag depend on the guild and the
+    purpose, so the same move fails to authenticate instead.
+
+    **Why the purpose and not only the guild.** One guild holds several
+    kinds of secret -- an export token and an OAuth client secret at
+    least -- and binding to the guild alone would leave those two
+    interchangeable within the guild that owns both. The purpose costs a
+    string and closes that.
+
+    **What this is not.** It is not a defence against somebody holding
+    the master key: they can rewrap anything under any context they like.
+    It defends against a wrapped value being *relocated* by somebody who
+    can write rows but cannot decrypt them, which is the exposure a
+    database backup, a support script or a SQL injection actually has.
+
+    The audio data keys deliberately do not use it. They are wrapped
+    without associated data today, every recording ever made is sealed
+    that way, and adding a context to them would be a re-wrap of the
+    entire corpus rather than a parameter -- see `KeyWrapper.wrap`.
+    """
+    return f"sturnus:{purpose}:{guild_id}".encode()
+
+
 class KeyWrapper:
-    """Wraps and unwraps per-session data keys with the master key."""
+    """Wraps and unwraps per-session data keys with the master key.
+
+    Every method takes an optional `aad`, and every one of them defaults
+    to `None` -- which is byte-for-byte the behaviour that wrapped every
+    recording in the system before this parameter existed. That default
+    is a compatibility guarantee rather than a convenience: a data key
+    wrapped without associated data and unwrapped with some would fail to
+    authenticate, so the audio path passes nothing and must go on passing
+    nothing. `secret_context` says what the argument is for and which
+    callers it is for.
+    """
 
     def __init__(self, master_key: bytes, key_id: str) -> None:
         if len(master_key) != _KEY_BYTES:
@@ -67,17 +110,27 @@ class KeyWrapper:
         self._aead = AESGCM(master_key)
         self.key_id = key_id
 
-    def new_data_key(self) -> DataKey:
-        plaintext = os.urandom(_KEY_BYTES)
+    def wrap(self, plaintext: bytes, aad: bytes | None = None) -> bytes:
+        """Seals bytes the caller already has under the master key.
+
+        `new_data_key` generates and seals in one step, which is right for
+        a data key and wrong for a credential: an OAuth client secret and
+        a Confluence token are values an administrator typed, and there is
+        no version of them this process gets to invent.
+        """
         # Named `wrap_nonce` rather than `nonce`: the module-level `nonce`
         # is the *chunk* nonce and has nothing to do with this one, and a
         # local that shadows it here reads as though it did.
         wrap_nonce = os.urandom(_WRAP_NONCE_BYTES)
-        return DataKey(plaintext, wrap_nonce + self._aead.encrypt(wrap_nonce, plaintext, None))
+        return wrap_nonce + self._aead.encrypt(wrap_nonce, plaintext, aad)
 
-    def unwrap(self, wrapped: bytes) -> bytes:
+    def new_data_key(self, aad: bytes | None = None) -> DataKey:
+        plaintext = os.urandom(_KEY_BYTES)
+        return DataKey(plaintext, self.wrap(plaintext, aad))
+
+    def unwrap(self, wrapped: bytes, aad: bytes | None = None) -> bytes:
         wrap_nonce, ciphertext = wrapped[:_WRAP_NONCE_BYTES], wrapped[_WRAP_NONCE_BYTES:]
-        return self._aead.decrypt(wrap_nonce, ciphertext, None)
+        return self._aead.decrypt(wrap_nonce, ciphertext, aad)
 
 
 def nonce(prefix: bytes, counter: int) -> bytes:
