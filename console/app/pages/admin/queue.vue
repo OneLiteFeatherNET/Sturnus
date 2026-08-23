@@ -12,6 +12,23 @@
  * Settings and User Settings pages use, down to the remembered choice, so
  * switching servers on one admin page carries to the others.
  *
+ * **The page is sections, and one of them used not to be.** Everything on
+ * it lived in a bordered `<section>` under an `<h2>` except the one part
+ * that grows without limit — the list of sessions, which was a bare
+ * heading followed by loose paragraphs and a stack of cards. That is why a
+ * long queue read as an endless page with nothing to navigate by, and it
+ * is also why there was nowhere to put a pager or a reordering control
+ * without hanging it off a `<div>`. The list is now two sections, split by
+ * the one distinction that decides what can be done to a row:
+ *
+ * - **In the queue** — a session with outstanding jobs, which the API
+ *   gives a `priority`. Shown in the order a worker will reach them,
+ *   reorderable, and paged.
+ * - **Listed, but not in the queue** — `priority` present and null. A
+ *   meeting being recorded now, or one nothing will move on without a
+ *   person. Shown in the order that ranks attention, and paged, and
+ *   carrying no move handle at all, because there is nothing to move.
+ *
  * Three things this page refuses to do, all three on purpose:
  *
  * - **It never presents a derived figure as a fact.** Three of the numbers
@@ -45,29 +62,30 @@
  * not to be changing, which is exactly when somebody is deciding whether
  * to believe them.
  */
+import { pageCount } from '~/utils/paging'
 import {
   CLEAR_QUEUE_HEADING,
   CLEAR_QUEUE_NOTE,
   LIFECYCLE_SCOPE_NOTE,
+  QUEUE_TONE_COLOUR,
   type GuildQueue,
   attentionItems,
+  claimOrderSessions,
   describeQueueError,
   isQueueClear,
   isQueueMoving,
   lifecycleFigures,
-  orderQueueSessions,
   parseGuildQueue,
-  queueChannelLabel,
-  queueChannelNote,
   queuePath,
-  queueSessionState,
+  queueSliceSummary,
   queueStreamPath,
-  sessionCounts,
-  sessionStartLine,
-  sessionsSummaryLine,
   startQueuePolling,
   truncationNotice,
+  unqueuedSessions,
+  unqueuedSummary,
 } from '~/utils/queue'
+import { applyQueueOrder, type QueueOrder } from '~/utils/queueOrder'
+import { QUEUE_PAGE_SIZE, pageSlice } from '~/utils/queueReorder'
 import {
   describeQueueMode,
   isQueueStreamFinished,
@@ -75,7 +93,6 @@ import {
   type QueueStreamHandle,
   type QueueStreamMode,
 } from '~/utils/queueStream'
-import { recordingPath } from '~/utils/recordings'
 import {
   chooseGuild,
   guildLabel,
@@ -141,7 +158,66 @@ const currentGuild = computed(
   () => guilds.value.find((guild) => guild.id === selected.value) ?? null,
 )
 
-const sessions = computed(() => orderQueueSessions(queue.value?.sessions ?? []))
+const say = useSay()
+
+/**
+ * The two lists this page keeps, and why they are two.
+ *
+ * A session either has a place in the queue or it does not, and the API
+ * says which by sending `priority` present-and-null. The difference is not
+ * cosmetic: the queued ones can be reordered and are shown in the order a
+ * worker will reach them, and the rest cannot be reordered at all and are
+ * shown in the order that ranks what a person still has to do. One list
+ * carrying both would have to be in one of those orders, which makes the
+ * other one wrong — and it would offer a handle on rows that have nothing
+ * to move.
+ */
+const queued = computed(() => claimOrderSessions(queue.value?.sessions ?? []))
+const waiting = computed(() => unqueuedSessions(queue.value?.sessions ?? []))
+
+/** Which page of the not-queued list is on screen. That list is not
+ *  reordered, so its window is an ordinary pager with nothing following a
+ *  grab around. */
+const waitingPage = ref(1)
+const waitingShown = computed(() => pageSlice(waiting.value, waitingPage.value))
+const waitingOffset = computed(() => (waitingPage.value - 1) * QUEUE_PAGE_SIZE)
+const waitingSummary = computed(() =>
+  queueSliceSummary(waiting.value.length, waitingOffset.value, waitingShown.value.length),
+)
+
+// A guild switched is a different list entirely, so it starts at the top.
+watch(selected, () => {
+  waitingPage.value = 1
+})
+
+// The list also shrinks on its own, as sessions finish. Clamped rather than
+// reset, because a reader on page three whose section lost one row has not
+// asked to be sent back to the beginning — but a page that no longer exists
+// is an empty section under a pager still offering it.
+watch(
+  () => waiting.value.length,
+  (count) => {
+    waitingPage.value = Math.min(waitingPage.value, pageCount(count, QUEUE_PAGE_SIZE))
+  },
+)
+
+/**
+ * The queue renumbered by an order the server has just committed to.
+ *
+ * Applied here rather than inside the panel because the answer is about
+ * the *page's* copy of the queue: every reorder changes numbers on rows
+ * nobody touched — that is what "nothing is ever moved forward" means —
+ * and a panel reaching into the page's data to say so would be a second
+ * owner of it.
+ */
+function applyOrder(order: QueueOrder) {
+  const held = queueData.value
+  if (!held?.queue) return
+  queueData.value = {
+    guildId: held.guildId,
+    queue: { ...held.queue, sessions: applyQueueOrder(held.queue.sessions, order) },
+  }
+}
 
 /**
  * The reader's clock, and `null` until there is one.
@@ -327,15 +403,6 @@ onMounted(() => {
 watch([selected, moving], () => syncWatcher())
 
 onBeforeUnmount(stopWatching)
-
-/** Three tones, three colours. Rendering "a speaker failed for good" and
- *  "a worker has it in hand" in the same grey would hide the one
- *  distinction this page exists to draw. */
-const TONE_COLOUR: Record<string, string> = {
-  clear: 'var(--color-brand-green)',
-  watch: 'var(--color-brand-cyan)',
-  alarm: 'var(--color-brand-red)',
-}
 </script>
 
 <template>
@@ -475,7 +542,7 @@ const TONE_COLOUR: Record<string, string> = {
                 </dt>
                 <dd
                   class="text-2xl font-semibold tabular-nums"
-                  :style="{ color: TONE_COLOUR[figure.tone] }"
+                  :style="{ color: QUEUE_TONE_COLOUR[figure.tone] }"
                 >
                   {{ figure.value }}
                 </dd>
@@ -511,7 +578,7 @@ const TONE_COLOUR: Record<string, string> = {
                 :key="item.key"
                 class="rounded-lg border p-3"
                 :style="{
-                  borderColor: TONE_COLOUR[item.tone],
+                  borderColor: QUEUE_TONE_COLOUR[item.tone],
                   background: 'var(--surface-raised)',
                 }"
               >
@@ -519,7 +586,7 @@ const TONE_COLOUR: Record<string, string> = {
                   <span class="text-sm font-medium">{{ item.label }}</span>
                   <span
                     class="text-lg font-semibold tabular-nums"
-                    :style="{ color: TONE_COLOUR[item.tone] }"
+                    :style="{ color: QUEUE_TONE_COLOUR[item.tone] }"
                   >
                     {{ item.value }}
                   </span>
@@ -544,16 +611,13 @@ const TONE_COLOUR: Record<string, string> = {
           </section>
 
           <template v-else>
-            <h2 class="mb-1 text-sm font-semibold">Unfinished sessions</h2>
-            <p class="mb-2 text-sm" :style="{ color: 'var(--text-muted)' }">
-              {{ sessionsSummaryLine(sessions) }}
-            </p>
             <!-- Otherwise a page showing twenty sessions reads as "there
                  are twenty", which is the one question a backlog page is
-                 opened with. -->
+                 opened with. Above both sections rather than inside one,
+                 because the cut is made before either exists. -->
             <p
               v-if="truncation"
-              class="mb-4 rounded-lg border p-3 text-xs"
+              class="mb-6 rounded-lg border p-3 text-xs"
               :style="{ borderColor: 'var(--color-brand-yellow)', background: 'var(--surface)' }"
             >
               {{ truncation }}
@@ -564,7 +628,7 @@ const TONE_COLOUR: Record<string, string> = {
                  and a closed session missing its protocol is counted there
                  without necessarily fitting in a cut list. -->
             <p
-              v-if="sessions.length === 0"
+              v-if="queued.length === 0 && waiting.length === 0"
               class="rounded-xl border p-4 text-sm"
               :style="{
                 borderColor: 'var(--border)',
@@ -576,79 +640,69 @@ const TONE_COLOUR: Record<string, string> = {
               read them rather than this list to see whether anything is outstanding.
             </p>
 
-            <div v-else class="flex flex-col gap-4">
-              <article
-                v-for="item in sessions"
-                :key="item.id"
-                class="rounded-xl border p-4"
+            <template v-else>
+              <!-- The queue proper: what will run, in the order it will run
+                   in, with the controls that change that order. -->
+              <QueueOrderPanel
+                v-if="selected"
+                :guild-id="selected"
+                :sessions="queued"
+                @order="applyOrder"
+                @reload="reload()"
+              />
+
+              <!-- Kept apart from the queue above rather than mixed into
+                   it. These rows have no place in the queue at all — the
+                   API sends them a null priority — so there is nothing on
+                   them to reorder, and a handle offered on one would be an
+                   offer of a control that cannot exist. -->
+              <section
+                v-if="waiting.length"
+                class="mb-8 rounded-xl border p-4"
                 :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
               >
-                <header
-                  class="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between"
-                >
-                  <div>
-                    <h3 class="text-sm font-semibold">{{ queueChannelLabel(item) }}</h3>
-                    <p class="text-xs" :style="{ color: 'var(--text-muted)' }">
-                      {{ sessionStartLine(item) }}
-                    </p>
-                  </div>
-                  <span
-                    class="shrink-0 self-start rounded-full border px-2.5 py-1 text-xs font-medium"
-                    :style="{
-                      borderColor: TONE_COLOUR[queueSessionState(item).tone],
-                      color: TONE_COLOUR[queueSessionState(item).tone],
-                    }"
-                  >
-                    {{ queueSessionState(item).label }}
-                  </span>
-                </header>
-
-                <!-- The badge's long form is on the row rather than in a
-                     tooltip: which of the four states a row is in decides
-                     what to do next, and nobody hovers to find that out. -->
-                <p class="text-sm" :style="{ color: 'var(--text-muted)' }">
-                  {{ queueSessionState(item).detail }}
+                <h2 class="mb-1 text-sm font-semibold">
+                  {{ $t('admin.queue.list.unqueuedHeading') }}
+                </h2>
+                <p class="mb-3 text-xs" :style="{ color: 'var(--text-muted)' }">
+                  {{ $t('admin.queue.list.unqueuedNote') }}
+                </p>
+                <p class="mb-3 text-sm" :style="{ color: 'var(--text-muted)' }">
+                  {{ say(unqueuedSummary(waiting)) }}
                 </p>
 
-                <p
-                  v-if="queueChannelNote(item)"
-                  class="mt-2 text-xs"
-                  :style="{ color: 'var(--text-muted)' }"
+                <ul
+                  class="overflow-hidden rounded-xl border"
+                  :style="{ borderColor: 'var(--border)', background: 'var(--surface-raised)' }"
                 >
-                  {{ queueChannelNote(item) }}
-                </p>
-
-                <dl class="mt-3 flex flex-wrap gap-x-6 gap-y-1 text-xs">
-                  <div v-for="count in sessionCounts(item)" :key="count.key">
-                    <dt class="inline font-medium">{{ count.label }} ·</dt>
-                    <dd class="inline tabular-nums" :style="{ color: 'var(--text-muted)' }">
-                      {{ count.value }}
-                    </dd>
-                  </div>
-                </dl>
-
-                <div class="mt-3 flex flex-wrap items-center gap-3">
-                  <!-- The only control on a row, and deliberately the only
-                       one. Whether a re-queue is safe for this session is
-                       decided on the recording page, once. -->
-                  <NuxtLink
-                    :to="recordingPath(item.id)"
-                    class="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
-                    :style="{ borderColor: 'var(--color-brand-cyan)', color: 'var(--color-brand-cyan)' }"
+                  <li
+                    v-for="item in waitingShown"
+                    :key="item.id"
+                    class="border-t first:border-t-0"
+                    :style="{ borderColor: 'var(--border)' }"
                   >
-                    Open this recording
-                  </NuxtLink>
-                  <span class="text-xs" :style="{ color: 'var(--text-muted)' }">
-                    Session status
-                    <code class="rounded bg-[var(--surface-raised)] px-1 font-mono">{{
-                      item.status || 'unknown'
-                    }}</code>
-                    — asking for the transcription again is done there, where what the redo would
-                    overwrite is on the screen next to the button.
-                  </span>
+                    <QueueSessionRow :session="item" />
+                  </li>
+                </ul>
+
+                <div class="mt-4 flex flex-col items-center gap-2">
+                  <UiPagination
+                    :page="waitingPage"
+                    :total="waiting.length"
+                    :size="QUEUE_PAGE_SIZE"
+                    :label="$t('admin.queue.list.pagerWaiting')"
+                    @update:page="waitingPage = $event"
+                  />
+                  <p
+                    v-if="waitingSummary"
+                    class="text-sm"
+                    :style="{ color: 'var(--text-muted)' }"
+                  >
+                    {{ say(waitingSummary) }}
+                  </p>
                 </div>
-              </article>
-            </div>
+              </section>
+            </template>
           </template>
         </template>
       </template>

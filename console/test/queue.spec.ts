@@ -32,19 +32,23 @@ import {
   isQueueClear,
   isQueueMoving,
   lifecycleFigures,
+  claimOrderSessions,
+  isQueued,
   needsPersonCount,
   oldestPendingLine,
   orderQueueSessions,
+  queueSliceSummary,
+  queuedSummary,
+  unqueuedSessions,
+  unqueuedSummary,
   parseGuildQueue,
   pastLeaseLine,
   queueAttention,
-  queueChannelLabel,
   queueChannelNote,
   queuePath,
   queueSessionState,
   sessionCounts,
   sessionStartLine,
-  sessionsSummaryLine,
   truncationNotice,
   undocumentedLine,
   type GuildQueue,
@@ -65,6 +69,9 @@ function session(overrides: Partial<QueuedSession> & { id: string }): QueuedSess
     status: 'documented',
     document_url: 'https://outline.example/doc',
     counts: { pending: 0, running: 0, done: 4, dead: 0 },
+    // Nothing outstanding, so no place in the queue. Null is not zero:
+    // zero is a real position and null is a row with nothing to move.
+    priority: null,
     ...overrides,
   }
 }
@@ -151,6 +158,25 @@ describe('reading the queue payload', () => {
     ).toBeNull()
   })
 
+  it('keeps a place of zero and reads a missing one as no place at all', () => {
+    // The whole of the drag handle's existence hangs on this. Zero is the
+    // ordinary priority and a real position in the queue; null is a row
+    // with nothing outstanding, which is a row nothing can be moved
+    // about. Reading the two as the same would put a handle on a session
+    // that is still being recorded.
+    const rows = parseGuildQueue({
+      sessions: [
+        { id: '1', priority: 0 },
+        { id: '2', priority: null },
+        { id: '3' },
+        { id: '4', priority: 7 },
+        { id: '5', priority: -1 },
+        { id: '6', priority: 'first' },
+      ],
+    }).sessions
+    expect(rows.map((row) => row.priority)).toEqual([0, null, null, 7, null, null])
+  })
+
   it('never reports a negative or nonsensical count', () => {
     // A defect upstream must not render as "-3 pending" beside a server's
     // name, where it reads as a fact about that server.
@@ -192,18 +218,6 @@ describe('reading the queue payload', () => {
 })
 
 describe('naming a session', () => {
-  it('names the channel it happened in', () => {
-    expect(queueChannelLabel(session({ id: '1', channel_name: 'meeting' }))).toBe('#meeting')
-  })
-
-  it('falls back to the whole channel id, never a shortened one', () => {
-    // Snowflakes minted in the same era share their leading digits, so a
-    // truncated id names a group rather than a channel.
-    expect(
-      queueChannelLabel(session({ id: '1', channel_name: null, channel_id: '1129384756123456789' })),
-    ).toBe('Channel 1129384756123456789')
-  })
-
   it('says why a row has an id instead of a name', () => {
     // A bare snowflake where every other row carries a #name reads as a
     // fault in the console. It is not one.
@@ -443,24 +457,87 @@ describe('how much of the list is somebody’s problem', () => {
     ).toBe(2)
   })
 
-  it('says how many rows need a person and that they are listed first', () => {
-    const line = sessionsSummaryLine([
-      session({ id: '1', counts: counts({ dead: 1 }) }),
-      session({ id: '2', document_url: null, counts: counts({ running: 1 }) }),
-    ])
-    expect(line).toContain('2 unfinished sessions here')
-    expect(line).toContain('1 of them needs somebody')
-    expect(line).toContain('Those are listed first.')
+  it('counts the rows needing somebody, and the size of the section beside it', () => {
+    // Two numbers rather than one: twelve rows of which three are stuck
+    // says something a bare row count does not.
+    expect(
+      unqueuedSummary([
+        session({ id: '1', counts: counts({ dead: 1 }) }),
+        session({ id: '2', status: 'open', ended_at: null, document_url: null, counts: counts() }),
+      ]),
+    ).toEqual({ key: 'admin.queue.list.unqueuedStuck', params: { count: 1, total: 2 } })
   })
 
   it('says outright when none of them is waiting on a person', () => {
-    const line = sessionsSummaryLine([session({ id: '1', document_url: null, counts: counts({ running: 1 }) })])
-    expect(line).toContain('1 unfinished session here')
-    expect(line).toContain('none of them is waiting on a person')
+    expect(
+      unqueuedSummary([
+        session({ id: '1', status: 'open', ended_at: null, document_url: null, counts: counts() }),
+      ]),
+    ).toEqual({ key: 'admin.queue.list.unqueuedWaiting', params: { count: 1 } })
   })
 
-  it('has something to say about an empty list', () => {
-    expect(sessionsSummaryLine([])).toBe('No unfinished sessions are listed for this server.')
+  it('has something to say about either section being empty', () => {
+    expect(unqueuedSummary([])).toEqual({ key: 'admin.queue.list.unqueuedNone' })
+    expect(queuedSummary([])).toEqual({ key: 'admin.queue.list.queuedNone' })
+  })
+
+  it('counts the queue by how many are waiting to run', () => {
+    expect(queuedSummary([session({ id: '1', priority: 0 })])).toEqual({
+      key: 'admin.queue.list.queuedSome',
+      params: { count: 1 },
+    })
+  })
+})
+
+describe('splitting the list by whether a row is in the queue at all', () => {
+  it('reads the place off the API rather than working one out', () => {
+    // The field that decides whether a row can be moved has to be the one
+    // the endpoint that moves it also reads. A console that derived it
+    // from the counts would offer a handle the server then refuses.
+    expect(isQueued(session({ id: '1', priority: 0 }))).toBe(true)
+    expect(isQueued(session({ id: '1', priority: null }))).toBe(false)
+  })
+
+  it('lists the queued ones in the order a worker will claim them', () => {
+    // `ORDER BY priority, id`: lower priority first, and the lower id
+    // first within a priority, which is the opposite way round to the
+    // triage order and deliberately so.
+    const ordered = claimOrderSessions([
+      session({ id: '30', priority: 1 }),
+      session({ id: '20', priority: 0 }),
+      session({ id: '10', priority: 1 }),
+      session({ id: '40', priority: null }),
+    ])
+    expect(ordered.map((row) => row.id)).toEqual(['20', '10', '30'])
+  })
+
+  it('leaves every row with no place out of the queue entirely', () => {
+    expect(claimOrderSessions([session({ id: '1', priority: null })])).toEqual([])
+  })
+
+  it('ranks the rest by what a person still has to do about them', () => {
+    const rest = unqueuedSessions([
+      session({ id: '1', priority: null, status: 'open', ended_at: null, document_url: null }),
+      session({ id: '2', priority: null, counts: counts({ dead: 1 }) }),
+      session({ id: '3', priority: 0, counts: counts({ pending: 1 }) }),
+    ])
+    expect(rest.map((row) => row.id)).toEqual(['2', '1'])
+  })
+
+  it('says nothing underneath a section short enough to be read whole', () => {
+    // A sentence counting three rows a reader can see all three of reads
+    // as a page apologising for itself.
+    expect(queueSliceSummary(3, 0, 3)).toBeNull()
+    expect(queueSliceSummary(0, 0, 0)).toBeNull()
+  })
+
+  it('says which slice is on screen once there is more than one', () => {
+    expect(queueSliceSummary(12, 5, 5)).toEqual({
+      key: 'admin.queue.list.showing',
+      // Strings: a position in a list is an ordinal, and `1,024` is not a
+      // position.
+      params: { from: '6', to: '10', total: '12' },
+    })
   })
 })
 

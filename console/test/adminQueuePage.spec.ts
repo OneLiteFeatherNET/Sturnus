@@ -21,11 +21,38 @@
  * same reason it is in `requeuePanel.spec.ts`: which of the two ways of
  * watching runs is the thing under test.
  */
+import { readFileSync } from 'node:fs'
+import { resolve } from 'node:path'
+
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
-import { Suspense, computed, defineComponent, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import {
+  Suspense,
+  computed,
+  defineComponent,
+  h,
+  nextTick,
+  onBeforeUnmount,
+  onMounted,
+  ref,
+  useId,
+  watch,
+} from 'vue'
+import { createI18n, useI18n } from 'vue-i18n'
 
+import QueueOrderPanel from '../app/components/QueueOrderPanel.vue'
+import QueueSessionRow from '../app/components/QueueSessionRow.vue'
+import UiPagination from '../app/components/ui/UiPagination.vue'
+import { useSay } from '../app/composables/useSay'
 import QueuePage from '../app/pages/admin/queue.vue'
+
+/** The real locale files, loaded from disk, for the reason
+ *  `uiComponents.spec.ts` loads them: a template asking for
+ *  `admin.queue.list.queuedHeadng` renders the key at somebody, and
+ *  nothing but a render catches it. */
+function load(locale: string) {
+  return JSON.parse(readFileSync(resolve(process.cwd(), `i18n/locales/${locale}.json`), 'utf8'))
+}
 
 /** One guild, so the page renders its name rather than a switcher, and the
  *  only `<button>` on it is Refresh. */
@@ -121,6 +148,13 @@ function stubAutoImports(api: (path: string) => Promise<unknown>) {
   vi.stubGlobal('watch', watch)
   vi.stubGlobal('onMounted', onMounted)
   vi.stubGlobal('onBeforeUnmount', onBeforeUnmount)
+  vi.stubGlobal('nextTick', nextTick)
+  vi.stubGlobal('useId', useId)
+  vi.stubGlobal('useI18n', () => ({
+    ...useI18n(),
+    locales: computed(() => [{ code: 'en', language: 'en-GB' }]),
+  }))
+  vi.stubGlobal('useSay', useSay)
   vi.stubGlobal('useHead', () => {})
   vi.stubGlobal('useApi', () => api)
   vi.stubGlobal('useAsyncData', fakeUseAsyncData())
@@ -141,7 +175,22 @@ const Host = defineComponent({
 
 async function openPage(api: ReturnType<typeof servingQueue>) {
   stubAutoImports(api as never)
-  const page = mount(Host, { global: { stubs: { NuxtLink: true } } })
+  const i18n = createI18n({
+    legacy: false,
+    locale: 'en',
+    fallbackLocale: 'en',
+    messages: { en: load('en'), de: load('de') },
+  })
+  const page = mount(Host, {
+    global: {
+      plugins: [i18n],
+      // The three components Nuxt would auto-import. Registered rather
+      // than stubbed: which section a row lands in is the thing under
+      // test, and a stub would answer that question by not asking it.
+      components: { QueueOrderPanel, QueueSessionRow, UiPagination },
+      stubs: { NuxtLink: true },
+    },
+  })
   await flushPromises()
   await flushPromises()
   return page
@@ -246,5 +295,91 @@ describe('when the queue comes to rest', () => {
 
     expect(sources.opened[0]!.closed).toBe(true)
     expect(page.text()).toContain('stopped reading')
+  })
+})
+
+/**
+ * The page's other job, which is where a row is put.
+ *
+ * A session either has a place in the queue or it does not, and the API
+ * says which by sending `priority` present-and-null. Everything the
+ * reordering controls can do hangs on that one field being read the right
+ * way round, and the failure it prevents is silent: a handle offered on a
+ * meeting that is still being recorded is an offer of a control the server
+ * refuses, on the one row where a reader is least likely to expect one.
+ */
+function queueWith(sessions: unknown[]) {
+  return {
+    ...MOVING,
+    // Nothing in flight, so the page stops watching and the test is about
+    // the list rather than about a feed.
+    counts: { pending: 0, running: 0, done: 4, dead: 0 },
+    sessions,
+  }
+}
+
+function row(id: string, priority: number | null, extra: Record<string, unknown> = {}) {
+  return {
+    id,
+    channel_id: '555',
+    channel_name: `room-${id}`,
+    started_at: '2026-08-21T12:00:00+00:00',
+    ended_at: '2026-08-21T13:00:00+00:00',
+    status: 'closed',
+    document_url: null,
+    counts: { pending: 1, running: 0, done: 0, dead: 0 },
+    priority,
+    ...extra,
+  }
+}
+
+describe('which section a session is listed in', () => {
+  it('puts a row with a place in the queue where it can be moved', async () => {
+    withEventSource()
+    const page = await openPage(servingQueue(() => queueWith([row('7', 0)])))
+
+    expect(page.text()).toContain('The order this server’s work will run in')
+    // One handle, for the one row that has something to move.
+    expect(page.findAll('[aria-describedby]')).toHaveLength(1)
+    expect(page.text()).toContain('Runs 1 of 1')
+  })
+
+  it('gives a row with no place no handle at all, and says why', async () => {
+    withEventSource()
+    const page = await openPage(
+      servingQueue(() =>
+        queueWith([
+          row('9', null, {
+            status: 'open',
+            ended_at: null,
+            counts: { pending: 0, running: 0, done: 0, dead: 0 },
+          }),
+        ]),
+      ),
+    )
+
+    expect(page.text()).toContain('Listed, but not in the queue')
+    // Never a disabled handle. A control that cannot exist is not offered
+    // greyed out; the section says in prose that there is nothing to move.
+    expect(page.findAll('[aria-describedby]')).toHaveLength(0)
+    expect(page.text()).toContain('no handle to move them by')
+  })
+
+  it('keeps the ids secondary when a channel has lost its name', async () => {
+    // #141: an unresolved channel reads as an absence, not as a name.
+    // Eighteen digits in the heading slot read as what the meeting is
+    // called, and nobody has a meeting called `Channel 1129384756123456789`.
+    withEventSource()
+    const page = await openPage(
+      servingQueue(() =>
+        queueWith([row('7', 0, { channel_name: null, channel_id: '1129384756123456789' })]),
+      ),
+    )
+
+    const heading = page.find('article h3')
+    expect(heading.text()).toBe('Unnamed channel')
+    expect(heading.classes()).toContain('italic')
+    expect(page.text()).toContain('1129384756123456789')
+    expect(page.text()).toContain('Sturnus has no name for this channel')
   })
 })

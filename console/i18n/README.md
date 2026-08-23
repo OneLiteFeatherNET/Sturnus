@@ -51,11 +51,11 @@ matches the file that renders it:
 | `admin.reporting.*`| `pages/admin/reporting.vue`                           |
 | `ui.*`             | `components/ui/*` — the shared controls, and the gallery |
 
-`admin.settings.*`, `admin.consents.*` and `admin.queue.*` do not exist yet:
-Bot Settings, User Settings and the Queue are still English, and are being
-rewritten in three other pull requests. They are listed so that whichever of
-those lands first does not have to invent a name, and so that two of them
-landing in parallel do not invent two.
+`admin.settings.*` and `admin.consents.*` do not exist in full yet: Bot
+Settings and User Settings are still English, and are being rewritten in
+other pull requests. They are listed so that whichever of those lands first
+does not have to invent a name, and so that two of them landing in parallel
+do not invent two.
 
 Until then `utils/queue.ts` and `utils/consents.ts` still build English
 sentences by hand, and three helpers exist only to serve them:
@@ -84,6 +84,23 @@ for the sweep to reach. Three of its strings are not in it — a format's
 name (`common.formatOutline` and its two neighbours) lives in `common.*`,
 because the recording page has to say the same three words beside a
 published document and two copies of a word are two words that drift.
+
+`admin.queue.*` is half-populated on the same terms. The Queue page's older
+prose — its four lifecycle notes, its three caveats, its per-row state
+sentences — is still hard-coded English in `utils/queue.ts` and moves when
+the sweep reaches it. What is keyed is everything the reordering work added:
+the two sections the list was split into, the move handle and what it
+announces, and the two quick actions with the consequences they state before
+they run. New strings on that page go through `$t` from now on.
+
+One sentence on that page is deliberately **not** in its own namespace.
+`recordings.channelUnnamed` — the "Unnamed channel" a row shows where the
+channel's name has gone — is rendered by the Queue as well, because
+`channelNaming` in `utils/recordings.ts` is the console's single answer to
+"how is an unresolved snowflake presented", and a second copy of the string
+under `admin.queue.*` would be a second translation of one absence, free to
+drift from the first. The namespace rule holds for sentences a page owns;
+this is a sentence a *decision* owns.
 
 `ui.*` is the one namespace that does not name a page. It serves
 `app/components/ui/*` — the six shared controls every page is about to be
