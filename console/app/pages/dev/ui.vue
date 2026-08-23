@@ -93,6 +93,10 @@ const noneSelect = ref<string | null>(null)
 const channel = ref<string | null>(null)
 const moment = ref<string | null>(null)
 const boundedMoment = ref<string | null>(null)
+/** The other granularity. A day is what a filter over inclusive calendar
+ *  days emits, and the whole point of seeing it here is that it carries no
+ *  offset and no note. */
+const day = ref<string | null>('2026-08-21')
 const chips = ref<ChipValue>(EMPTY_CHIPS)
 const filledChips = ref<ChipValue>({ chips: ['standup', 'migration'], text: 'about the ' })
 const selected = ref<readonly string[]>(['row-0', 'not-on-this-page'])
@@ -226,6 +230,15 @@ const page = ref(3)
         />
         <p class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
           {{ $t('ui.gallery.emits') }}: {{ boundedMoment ?? 'null' }}
+        </p>
+      </div>
+      <div>
+        <p class="mb-1 text-xs" :style="{ color: 'var(--text-muted)' }">
+          {{ $t('ui.gallery.stateDay') }}
+        </p>
+        <UiDatePicker v-model="day" granularity="day" :label="$t('ui.gallery.datePicker')" />
+        <p class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
+          {{ $t('ui.gallery.emits') }}: {{ day ?? 'null' }}
         </p>
       </div>
       <div>

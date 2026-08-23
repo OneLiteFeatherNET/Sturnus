@@ -15,21 +15,36 @@
  * arrive out of order. Pressing Enter or "Search" is one request, at a
  * moment the reader chose.
  *
- * **What it searches is stated on the page.** The API matches the
- * channel, the people who were in a session and the reader's own tags,
- * and never a transcript — a decision about other people's speech, made
- * in `sturnus.console.filters`. A search box that does not say what it
- * searches leaves people assuming it does more, and here the wrong
- * assumption is that Sturnus will find them a phrase somebody said.
+ * **Tags and words are one field now.** They were two mechanisms for one
+ * question — a row of toggle buttons, and a box beside it — and the
+ * question people actually ask is `#standup #migration the bit where the
+ * database fell over`, which everybody typed into the box. `UiChipInput`
+ * holds both, and keeps the line between them in the value rather than
+ * only on screen, so the chips go out as `?tag=` and the words as `?q=`
+ * without anything here parsing a tag back out of a sentence. The
+ * translation is `~/utils/recordingFilters`.
+ *
+ * **What it searches is stated on the page, and stated so it stays true.**
+ * The API matches the channel, the people who were in a session and the
+ * reader's own tags, and never a transcript — a decision about other
+ * people's speech, made in `sturnus.console.filters`. The note below
+ * names the boundary rather than enumerating the columns, because the
+ * columns are due to grow and a sentence that lists three of them becomes
+ * quietly wrong the day a fourth is added. The half that must never
+ * change is stated hardest.
  */
 import {
   NO_FILTERS,
   activeFilterLabels,
+  chipsFromFilters,
+  filtersFromChips,
   hasActiveFilters,
-  toggledTag,
+  type ProtocolFilter,
   type RecordingFilters,
 } from '~/utils/recordingFilters'
 import { TAGS_PATH, type TagsResponse } from '~/utils/tagging'
+import type { ChipValue } from '~/utils/uiChipInput'
+import type { UiOption } from '~/utils/uiOption'
 
 const props = defineProps<{
   /** What the URL currently says. The single source of truth. */
@@ -40,6 +55,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{ apply: [filters: RecordingFilters] }>()
 
+const { t } = useI18n()
 const say = useSay()
 
 /** A working copy, so that typing does not navigate on every keystroke.
@@ -55,6 +71,54 @@ watch(
   { deep: true },
 )
 
+/** The one field, both halves of it. Written back through the module so
+ *  that the chips and the free text land in the fields the API reads. */
+const chips = computed<ChipValue>({
+  get: () => chipsFromFilters(draft.value),
+  set: (value) => {
+    draft.value = filtersFromChips(draft.value, value)
+  },
+})
+
+/**
+ * One end of the date range, as the control speaks it.
+ *
+ * The filter writes an absent bound as the empty string, because that is
+ * what an untouched field holds and what `filtersToRouteQuery` drops from
+ * the URL. `UiDatePicker` writes it as `null`, because a control that
+ * emits `''` for "nothing chosen" is one every caller has to remember to
+ * test twice. One adapter, in one place, rather than the two branches
+ * that would otherwise appear at both ends of the range.
+ */
+function dayBound(end: 'from' | 'to') {
+  return computed<string | null>({
+    get: () => draft.value[end] || null,
+    set: (value) => {
+      draft.value = { ...draft.value, [end]: value ?? '' }
+    },
+  })
+}
+
+const from = dayBound('from')
+const to = dayBound('to')
+
+/**
+ * The third control, which does *not* get that adapter.
+ *
+ * "Either" is a choice this filter can express and the API reads, so it
+ * is an option with a value rather than the absence of one. Mapping it to
+ * `null` would leave the trigger reading "Choose an option" for a filter
+ * that is perfectly well chosen — and the reason this control exists is
+ * to be able to say "the ones whose document never got written", which is
+ * only legible next to a stated "either".
+ */
+const protocol = computed<string | null>({
+  get: () => draft.value.protocol,
+  set: (value) => {
+    draft.value = { ...draft.value, protocol: (value ?? '') as ProtocolFilter }
+  },
+})
+
 const api = useApi()
 /** The reader's own labels, most used first. Only ever theirs: the API
  *  keys `session_tag` by its owner, so this list cannot contain anybody
@@ -62,7 +126,19 @@ const api = useApi()
 const { data: tagData } = await useAsyncData('recording-tags', () =>
   api<TagsResponse>(TAGS_PATH),
 )
-const offered = computed(() => tagData.value?.tags ?? [])
+/** Offered as suggestions rather than laid out as a row of buttons. The
+ *  row was a permanent inventory of somebody's whole vocabulary sitting
+ *  above a list they were trying to read; the suggestions appear under
+ *  the caret, when a tag is what is being typed. */
+const offered = computed(() => tagData.value?.tags.map((use) => use.tag) ?? [])
+
+const protocols = computed<UiOption[]>(() => [
+  { value: '', label: t('recordings.protocolEither') },
+  { value: 'with', label: t('recordings.protocolWritten') },
+  // How you find the meeting whose document never got written, which is
+  // the reason this control exists.
+  { value: 'without', label: t('recordings.protocolNotWritten') },
+])
 
 const active = computed(() => hasActiveFilters(props.filters))
 
@@ -83,22 +159,8 @@ const summary = computed(() => ({
   },
 }))
 
-const searchId = useId()
-const fromId = useId()
-const toId = useId()
-const protocolId = useId()
-
 function submit() {
   emit('apply', { ...draft.value, tags: [...draft.value.tags] })
-}
-
-/** A chip applies immediately: it is one click and it has no other
- *  half to fill in, so making somebody press Search afterwards would be
- *  asking for a second click that says nothing new. */
-function toggle(tag: string) {
-  const next = toggledTag(props.filters, tag)
-  draft.value = { ...next, tags: [...next.tags] }
-  emit('apply', next)
 }
 
 function clear() {
@@ -114,89 +176,73 @@ function clear() {
   >
     <h2 id="recordings-filter-heading" class="sr-only">{{ $t('recordings.filterHeading') }}</h2>
 
+    <!-- Enter in the chip field commits a chip rather than submitting, so
+         the button is not a convenience: it is how the form is sent once
+         a tag has been added. `UiChipInput` leaves an Enter it did not use
+         to the form around it, which is what makes both work. -->
     <form class="flex flex-col gap-3" @submit.prevent="submit()">
       <div class="flex flex-wrap items-end gap-3">
         <div class="min-w-56 flex-1">
-          <label class="block text-xs font-medium" :for="searchId">
+          <!-- The visible label and the control's accessible name are the
+               same words, so the visible one is hidden from assistive
+               technology rather than read out twice ahead of it. -->
+          <span aria-hidden="true" class="block text-xs font-medium">
             {{ $t('recordings.searchLabel') }}
-          </label>
-          <input
-            :id="searchId"
-            v-model="draft.q"
-            type="search"
-            :placeholder="$t('recordings.searchPlaceholder')"
-            class="mt-1 w-full rounded-lg border px-3 py-1.5 text-sm"
-            :style="{
-              borderColor: 'var(--control-border)',
-              background: 'var(--surface-raised)',
-              color: 'var(--text)',
-            }"
-          >
-        </div>
-
-        <div>
-          <label class="block text-xs font-medium" :for="fromId">
-            {{ $t('recordings.fromLabel') }}
-          </label>
-          <input
-            :id="fromId"
-            v-model="draft.from"
-            type="date"
-            class="mt-1 rounded-lg border px-3 py-1.5 text-sm"
-            :style="{
-              borderColor: 'var(--control-border)',
-              background: 'var(--surface-raised)',
-              color: 'var(--text)',
-            }"
-          >
-        </div>
-
-        <div>
-          <label class="block text-xs font-medium" :for="toId">
-            {{ $t('recordings.toLabel') }}
-          </label>
-          <input
-            :id="toId"
-            v-model="draft.to"
-            type="date"
-            class="mt-1 rounded-lg border px-3 py-1.5 text-sm"
-            :style="{
-              borderColor: 'var(--control-border)',
-              background: 'var(--surface-raised)',
-              color: 'var(--text)',
-            }"
-          >
-        </div>
-
-        <div>
-          <label class="block text-xs font-medium" :for="protocolId">
-            {{ $t('recordings.protocolLabel') }}
-          </label>
-          <select
-            :id="protocolId"
-            v-model="draft.protocol"
-            class="mt-1 rounded-lg border px-3 py-1.5 text-sm"
-            :style="{
-              borderColor: 'var(--control-border)',
-              background: 'var(--surface-raised)',
-              color: 'var(--text)',
-            }"
-          >
-            <option value="">{{ $t('recordings.protocolEither') }}</option>
-            <option value="with">{{ $t('recordings.protocolWritten') }}</option>
-            <!-- How you find the meeting whose document never got
-                 written, which is the reason this control exists. -->
-            <option value="without">{{ $t('recordings.protocolNotWritten') }}</option>
-          </select>
+          </span>
+          <div class="mt-1">
+            <UiChipInput
+              v-model="chips"
+              :suggestions="offered"
+              :label="$t('recordings.searchLabel')"
+              :placeholder="$t('recordings.searchPlaceholder')"
+            />
+          </div>
         </div>
 
         <button
           type="submit"
-          class="rounded-lg border px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+          class="rounded-lg border px-3 py-2 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
           :style="{ borderColor: 'var(--control-border)', color: 'var(--text)' }"
         >
           {{ $t('recordings.searchButton') }}
         </button>
+      </div>
+
+      <!-- The three narrower controls, side by side where there is room
+           and stacked where there is not. They wrap rather than scroll,
+           for the same reason a tab strip does: whatever is pushed off the
+           edge is the control nobody finds again. -->
+      <div class="grid gap-3 sm:grid-cols-3">
+        <div>
+          <span aria-hidden="true" class="block text-xs font-medium">
+            {{ $t('recordings.fromLabel') }}
+          </span>
+          <div class="mt-1">
+            <UiDatePicker v-model="from" granularity="day" :label="$t('recordings.fromLabel')" />
+          </div>
+        </div>
+
+        <div>
+          <span aria-hidden="true" class="block text-xs font-medium">
+            {{ $t('recordings.toLabel') }}
+          </span>
+          <div class="mt-1">
+            <UiDatePicker v-model="to" granularity="day" :label="$t('recordings.toLabel')" />
+          </div>
+        </div>
+
+        <div>
+          <span aria-hidden="true" class="block text-xs font-medium">
+            {{ $t('recordings.protocolLabel') }}
+          </span>
+          <div class="mt-1">
+            <UiSelect
+              v-model="protocol"
+              :options="protocols"
+              :label="$t('recordings.protocolLabel')"
+            />
+          </div>
+        </div>
       </div>
 
       <!-- What the search actually looks at. Left unsaid, people assume
@@ -205,26 +251,6 @@ function clear() {
       <p class="text-xs" :style="{ color: 'var(--text-muted)' }">
         {{ $t('recordings.searchScopeNote') }}
       </p>
-
-      <ul v-if="offered.length > 0" class="flex flex-wrap items-center gap-1.5">
-        <li class="text-xs" :style="{ color: 'var(--text-muted)' }">
-          {{ $t('recordings.yourTagsLabel') }}
-        </li>
-        <li v-for="use in offered" :key="use.tag">
-          <button
-            type="button"
-            class="rounded-full border px-2.5 py-0.5 text-xs tabular-nums transition-colors hover:bg-[var(--surface-raised)]"
-            :style="{
-              borderColor: filters.tags.includes(use.tag) ? 'var(--text)' : 'var(--control-border)',
-              color: 'var(--text)',
-            }"
-            :aria-pressed="filters.tags.includes(use.tag)"
-            @click="toggle(use.tag)"
-          >
-            {{ use.tag }} · {{ $n(use.sessions) }}
-          </button>
-        </li>
-      </ul>
     </form>
 
     <!-- Why this list is shorter than the reader's history. A list that

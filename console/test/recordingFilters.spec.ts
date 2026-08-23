@@ -12,11 +12,12 @@ import { describe, expect, it } from 'vitest'
 import {
   NO_FILTERS,
   activeFilterLabels,
+  chipsFromFilters,
   filteredSessionsPath,
+  filtersFromChips,
   filtersFromQuery,
   filtersToRouteQuery,
   hasActiveFilters,
-  toggledTag,
   type RecordingFilters,
 } from '../app/utils/recordingFilters'
 
@@ -123,23 +124,50 @@ describe('knowing whether a list is filtered', () => {
   })
 })
 
-describe('pressing a tag chip', () => {
-  it('adds a tag that is not yet required', () => {
-    expect(toggledTag(filters(), 'retro').tags).toEqual(['retro'])
+describe('the one field holding tags and words', () => {
+  it('shows the required tags as chips and the search as text', () => {
+    expect(chipsFromFilters(filters({ tags: ['retro', 'kunde'], q: 'august' }))).toEqual({
+      chips: ['retro', 'kunde'],
+      text: 'august',
+    })
   })
 
-  it('takes off a tag that already is', () => {
-    // A chip that can only be added is a filter somebody has to edit the
-    // URL to escape.
-    expect(toggledTag(filters({ tags: ['retro'] }), 'retro').tags).toEqual([])
+  it('hands the field a copy, so editing chips does not edit the URL', () => {
+    // The draft is a working copy; a shared array would let a keystroke
+    // change the filter the page is currently describing.
+    const asked = filters({ tags: ['retro'] })
+    chipsFromFilters(asked).chips.push('kunde')
+    expect(asked.tags).toEqual(['retro'])
   })
 
-  it('keeps the tags in one order, so the URL of a list is stable', () => {
-    expect(toggledTag(filters({ tags: ['retro'] }), 'kunde').tags).toEqual(['kunde', 'retro'])
+  it('takes the chips as tags and the words as the search', () => {
+    const next = filtersFromChips(filters(), { chips: ['retro'], text: 'the database' })
+    expect([next.tags, next.q]).toEqual([['retro'], 'the database'])
   })
 
-  it('leaves the rest of the filter alone', () => {
-    expect(toggledTag(filters({ q: 'august' }), 'retro').q).toBe('august')
+  it('keeps text that was typed and never committed', () => {
+    // Discarding it loses a search somebody wrote; promoting it to a chip
+    // invents a tag they did not ask for. The API matches free text
+    // against their own tags anyway, so an uncommitted word still finds
+    // what they meant.
+    expect(filtersFromChips(filters(), { chips: [], text: 'retro' })).toEqual(
+      filters({ q: 'retro' }),
+    )
+  })
+
+  it('does not send the space somebody left after a word', () => {
+    expect(filtersFromChips(filters(), { chips: [], text: '  august ' }).q).toBe('august')
+  })
+
+  it('leaves the dates and the protocol alone', () => {
+    const held = filters({ from: '2026-08-01', protocol: 'without' })
+    const next = filtersFromChips(held, { chips: ['retro'], text: '' })
+    expect([next.from, next.protocol]).toEqual(['2026-08-01', 'without'])
+  })
+
+  it('survives the round trip, which is what keeps the field and the URL agreeing', () => {
+    const held = filters({ tags: ['retro', 'kunde'], q: 'august' })
+    expect(filtersFromChips(held, chipsFromFilters(held))).toEqual(held)
   })
 })
 

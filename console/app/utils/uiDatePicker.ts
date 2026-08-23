@@ -301,3 +301,84 @@ export function clampDay(day: Day, min: Day | null = null, max: Day | null = nul
   if (max != null && day > max) return max
   return day
 }
+
+/* -------------------------------------------------------------------- */
+/* What the control is choosing: a moment, or a day                      */
+/* -------------------------------------------------------------------- */
+
+/**
+ * A moment on the clock, or a day on the calendar.
+ *
+ * This control was written to emit an instant, because the one API that
+ * needed a date — `POST /consents/.../revoke` — answers 400 to anything
+ * without an offset. A recordings filter is the other question entirely:
+ * `sturnus.console.filters` documents `since` and `until` as **inclusive
+ * UTC days** and reads them with `date.fromisoformat`.
+ *
+ * Handing that filter an instant would be wrong twice over. It would put
+ * "Sent as 2026-08-01T00:00:00+02:00" under a field whose request carries
+ * `from=2026-08-01`, claiming a precision the API does not have — and,
+ * because the offset is the browser's and a server has a different one, a
+ * server render and the hydrated page would disagree about it on exactly
+ * the filtered links this page exists to make shareable.
+ *
+ * A day carries no offset, so neither failure is available.
+ */
+export type Granularity = 'instant' | 'day'
+
+/**
+ * Everything that differs between the two, in one object each.
+ *
+ * A strategy rather than a `granularity === 'day'` at each of the six
+ * places the component touches its value. Six ternaries is six chances to
+ * add a seventh place and forget one of them, and the one that gets
+ * forgotten is always the one nobody clicks.
+ */
+export interface DateShape {
+  /** The native field this shape is typed into. The browser's own date
+   *  entry knows the reader's date order and steps with the arrow keys;
+   *  nothing written here would. */
+  inputType: 'datetime-local' | 'date'
+  /** What the field shows for a model value — empty for nothing, and for
+   *  anything that is not a value of this shape. */
+  toField: (value: string | null) => string
+  /** What the field is worth emitting as, or `null` while it is not a
+   *  value yet. Never a half-typed string: the API answers 400 to those. */
+  toModel: (field: string, reference?: Date) => string | null
+  /** The calendar day the field names, which is where the grid opens. */
+  dayOf: (field: string) => Day | null
+  /** The field moved to another day, keeping whatever else it held. */
+  onDay: (field: string, day: Day) => string
+  /** What the control says it is about to send, or `null` where saying it
+   *  would only read the field back out. */
+  note: (field: string, reference?: Date) => Message | null
+}
+
+const AS_INSTANT: DateShape = {
+  inputType: 'datetime-local',
+  toField: (value) => (value ? (localFrom(value) ?? '') : ''),
+  toModel: (field, reference) => (field.trim() === '' ? null : instantFrom(field, reference)),
+  dayOf: dayOfLocal,
+  onDay: withDay,
+  note: (field, reference) => describeChoice(field, reference),
+}
+
+const AS_DAY: DateShape = {
+  inputType: 'date',
+  // The model value *is* the day, so both directions are the identity —
+  // once the string has been checked to be a day at all. `2026-02-30`
+  // reaches this from a hand-edited URL, and `Date` rolls it forward into
+  // March rather than refusing it.
+  toField: (value) => (value && partsOf(value.trim()) ? value.trim() : ''),
+  toModel: (field) => (partsOf(field.trim()) ? field.trim() : null),
+  dayOf: (field) => (partsOf(field.trim()) ? field.trim() : null),
+  onDay: (_field, day) => day,
+  // Nothing to add. The instant shape's note exists to show the offset
+  // about to be attached; a day has none, and "Sent as 2026-08-01" under a
+  // field already reading 2026-08-01 is a line of chrome that says nothing.
+  note: () => null,
+}
+
+export function shapeOf(granularity: Granularity): DateShape {
+  return granularity === 'day' ? AS_DAY : AS_INSTANT
+}
