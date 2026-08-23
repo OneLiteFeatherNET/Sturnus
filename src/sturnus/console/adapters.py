@@ -44,17 +44,24 @@ from sturnus.console.ports import (
     GuildDirectory,
     GuildQueue,
     GuildRecording,
+    OwnConsent,
     QueuedSession,
     QueueSnapshot,
     QueueSpeaker,
     RequeueOutcome,
     RevocationOutcome,
+    ScopeOutcome,
     SettingsStore,
     Track,
 )
 from sturnus.console.reporting import RecordedSession
 from sturnus.domain import settings
-from sturnus.domain.consent import ConsentRecord, is_consent_active
+from sturnus.domain.consent import (
+    ConsentRecord,
+    ConsentScope,
+    is_consent_active,
+    scope_of,
+)
 from sturnus.infrastructure.db.models import (
     AccountLink,
     Consent,
@@ -461,6 +468,40 @@ def refusal_reason(view: SessionView) -> str:
 #: produced them.
 NO_CONSENT_ON_RECORD = "no_consent_on_record"
 ALREADY_REVOKED = "already_revoked"
+#: An effective instant before the consent was ever given. Nonsense
+#: rather than merely unusual: it would claim a grant ended before it
+#: started, and every reader of the row would then have to decide what
+#: that meant. Refused rather than clamped, because clamping would store
+#: an instant nobody asked for and report success.
+EFFECTIVE_BEFORE_GRANT = "effective_before_grant"
+#: A widening asked for in a guild whose `video_consent_offered` is
+#: false. Refused rather than silently narrowed: a person who asked for
+#: something and got a success answering a different question has been
+#: told the wrong thing about their own consent.
+VIDEO_CONSENT_NOT_OFFERED = "video_consent_not_offered"
+#: A widening in a guild with no `policy_version` set. A new grant has to
+#: name the policy it was given under, and there is nothing to name.
+NO_POLICY_VERSION = "no_policy_version"
+#: A scope this code cannot name. From the API's point of view a bad
+#: request rather than a conflict; see `routes_consent_self`.
+UNKNOWN_SCOPE = "unknown_scope"
+
+#: Why a person's consent stands where it does, as bounded literals for
+#: the interface to write a sentence from. Four rather than a boolean
+#: because the four lead to four different sentences and two of them --
+#: `ACTIVE` and `SCHEDULED` -- are both "you are being recorded right
+#: now", which no single flag can say.
+STATE_ACTIVE = "active"
+#: `revoked_at` is in the future: consent stands until then. The recorder
+#: needs no notification to honour it -- `is_consent_active` compares the
+#: instant against the current time on every read.
+STATE_SCHEDULED = "scheduled"
+#: `revoked_at` has passed.
+STATE_REVOKED = "revoked"
+#: Never withdrawn, and inactive anyway: the guild's `policy_version`
+#: moved on and this grant names the old one. A distinct state because it
+#: is the one nobody expects and the only one the person did not cause.
+STATE_POLICY_SUPERSEDED = "policy_superseded"
 
 
 @dataclass(frozen=True)
@@ -477,6 +518,7 @@ class _ConsentRow:
     granted_at: datetime
     revoked_at: datetime | None
     policy_version: str
+    scope: ConsentScope
 
 
 class ConsoleConsentDirectory:
@@ -562,10 +604,13 @@ class ConsoleConsentDirectory:
                         granted_at=row.granted_at,
                         revoked_at=row.revoked_at,
                         policy_version=row.policy_version,
+                        scope=row.scope,
                     ),
                     policy,
+                    self._now(),
                 ),
                 recordings_with_audio=held.get(discord_user_id, 0),
+                scope=row.scope.value,
             )
             # By id, so two page loads agree. What order a *person*
             # wants to read this in is the console's decision, made in
@@ -575,29 +620,42 @@ class ConsoleConsentDirectory:
         )
 
     async def revoke(
-        self, guild_id: int, discord_user_id: int, *, requested_by: int
+        self,
+        guild_id: int,
+        discord_user_id: int,
+        *,
+        requested_by: int,
+        effective_at: datetime | None = None,
     ) -> RevocationOutcome | None:
+        """Withdraws one person's consent, from an instant of the caller's choosing.
+
+        `effective_at` absent means now, which is exactly what this method
+        did before it existed. A future instant is a scheduled
+        withdrawal and needs no machinery to fire: `is_consent_active`
+        compares it against the current time, and the recorder re-reads
+        the row through a five-second cache, so it takes effect within
+        five seconds of the instant it names.
+
+        **A past instant does not delete anything, and the answer says
+        how much it did not delete.** Back-dating a revocation is a
+        statement about recordings that already exist -- somebody left in
+        March and nobody wrote it down until June -- and turning that
+        statement into an erasure would mean an administrator correcting a
+        date had silently destroyed three months of meetings their team
+        has read. `recordings_from_effective_at` is how many recordings
+        with audio fall on or after the instant, so the console can offer
+        `/audio purge` as the separate, deliberate act it is.
+        """
         if not await self._admins.is_admin(guild_id, requested_by):
             return None
-
-        # Read before writing, only so the answer can say what happened.
-        # `record_revocation` is idempotent and silent -- it stamps the
-        # newest row or does nothing -- and an administrator told
-        # "revoked" for somebody who never consented would believe a
-        # protection is in place that never was.
-        record = await self._consents.current(discord_user_id, guild_id)
-        if record is None or record.granted_at is None:
-            return RevocationOutcome(revoked=False, refusal=NO_CONSENT_ON_RECORD)
-        if record.revoked_at is not None:
-            return RevocationOutcome(revoked=False, refusal=ALREADY_REVOKED)
-
-        # A grant naming a superseded `policy_version` is revoked rather
-        # than refused, even though it is already inactive. It is inactive
-        # *because of a setting*, and a setting can be set back; stamping
-        # `revoked_at` is the only thing that survives somebody restoring
-        # the old policy version.
-        await self._consents.record_revocation(discord_user_id, guild_id, self._now())
-        return RevocationOutcome(revoked=True, refusal=None)
+        return await _write_revocation(
+            self._consents,
+            self._session_factory,
+            self._now,
+            guild_id,
+            discord_user_id,
+            effective_at,
+        )
 
     async def _newest_consent_per_person(self, guild_id: int) -> dict[int, _ConsentRow]:
         """The newest grant per person in this guild.
@@ -619,6 +677,7 @@ class ConsoleConsentDirectory:
                         Consent.granted_at,
                         Consent.revoked_at,
                         Consent.policy_version,
+                        Consent.scope,
                     )
                     .where(Consent.guild_id == guild_id)
                     .order_by(
@@ -630,10 +689,10 @@ class ConsoleConsentDirectory:
             ).all()
 
         newest: dict[int, _ConsentRow] = {}
-        for discord_user_id, granted_at, revoked_at, policy_version in rows:
+        for discord_user_id, granted_at, revoked_at, policy_version, scope in rows:
             newest.setdefault(
                 discord_user_id,
-                _ConsentRow(granted_at, revoked_at, policy_version),
+                _ConsentRow(granted_at, revoked_at, policy_version, scope_of(scope)),
             )
         return newest
 
@@ -697,6 +756,339 @@ class ConsoleConsentDirectory:
                 )
             ).all()
         return {discord_user_id: held for discord_user_id, held in rows}
+
+
+#: What goes in `consent.source` for a grant made from the console. The
+#: only other value the column has ever held is `"button"`, from the
+#: Discord consent embed. It is not decoration: a grant that widened a
+#: scope from a web page and one made by pressing a button under a policy
+#: link are different acts, and the column is the only place the
+#: difference survives.
+_CONSOLE_SOURCE = "console"
+
+
+async def _write_revocation(
+    consents: ConsentRepository,
+    session_factory: async_sessionmaker[AsyncSession],
+    now: Callable[[], datetime],
+    guild_id: int,
+    discord_user_id: int,
+    effective_at: datetime | None,
+) -> RevocationOutcome:
+    """What a revocation *is*, once who may ask has been settled elsewhere.
+
+    A module-level function rather than a method because two classes need
+    it and neither owns it: `ConsoleConsentDirectory.revoke` reaches it
+    after an administrator check, `ConsolePersonalConsents.revoke_own`
+    after the session has already named the subject. They differ in who
+    may ask and in nothing else, and a second implementation of the rest
+    would agree with this one right up until one of them changed -- the
+    same argument `ConsoleConsentDirectory` makes for calling
+    `ConsentRepository.record_revocation` unwrapped.
+
+    `effective_at` absent means now, which is what every caller meant
+    before the parameter existed.
+    """
+    # Read before writing, only so the answer can say what happened.
+    # `record_revocation` is idempotent and silent -- it stamps the newest
+    # row or does nothing -- and somebody told "revoked" for a consent
+    # that was never given would believe a protection is in place that
+    # never was.
+    record = await consents.current(discord_user_id, guild_id)
+    if record is None or record.granted_at is None:
+        return RevocationOutcome(revoked=False, refusal=NO_CONSENT_ON_RECORD)
+    if record.revoked_at is not None:
+        return RevocationOutcome(revoked=False, refusal=ALREADY_REVOKED)
+
+    instant = now() if effective_at is None else effective_at
+    if instant < record.granted_at:
+        # Refused rather than clamped to `granted_at`. Clamping would
+        # store an instant nobody asked for and report success, and the
+        # request is itself evidence that whoever made it is working from
+        # a date this system disagrees with -- which is worth saying.
+        return RevocationOutcome(revoked=False, refusal=EFFECTIVE_BEFORE_GRANT)
+
+    # A grant naming a superseded `policy_version` is revoked rather than
+    # refused, even though it is already inactive. It is inactive
+    # *because of a setting*, and a setting can be set back; stamping
+    # `revoked_at` is the only thing that survives somebody restoring the
+    # old policy version.
+    await consents.record_revocation(discord_user_id, guild_id, instant)
+    return RevocationOutcome(
+        revoked=True,
+        refusal=None,
+        effective_at=instant,
+        recordings_from_effective_at=await _recordings_since(
+            session_factory, guild_id, discord_user_id, instant
+        ),
+    )
+
+
+async def _recordings_since(
+    session_factory: async_sessionmaker[AsyncSession],
+    guild_id: int,
+    discord_user_id: int,
+    instant: datetime,
+) -> int:
+    """Recordings of this person in this guild that fall on or after `instant`.
+
+    **This is a count, and counting is all that happens.** A back-dated
+    revocation says something about recordings that already exist; it does
+    not erase them, and the number exists so the console can offer the
+    erasure path (`/audio purge`, admin-gated, in Discord) rather than
+    quietly taking it. `/audio purge` and the retention sweep are the only
+    two things in this system that delete audio, and this change
+    deliberately does not add a third.
+
+    By the session's `started_at`, because that is when the person was in
+    the room -- no job row carries a time a human would read as "when this
+    was recorded". `audio_deleted_at IS NULL` for the reason
+    `ConsoleConsentDirectory._recordings_with_audio` gives: the retention
+    sweep erases the object before it stamps the row, so a stamped row is
+    one whose audio is already gone.
+    """
+    async with session_factory() as db:
+        count = await db.scalar(
+            select(func.count())
+            .select_from(TranscriptionJob)
+            .join(SessionRow, SessionRow.id == TranscriptionJob.session_id)
+            .where(
+                SessionRow.guild_id == guild_id,
+                TranscriptionJob.discord_user_id == discord_user_id,
+                TranscriptionJob.audio_deleted_at.is_(None),
+                SessionRow.started_at >= instant,
+            )
+        )
+    return int(count or 0)
+
+
+def _state_of(record: ConsentRecord, policy: str, now: datetime) -> str:
+    """Why this consent stands where it does, as one bounded literal.
+
+    Ordered so the answer names the *cause* rather than the first
+    condition that happens to be true: a withdrawal the person chose is
+    what they need to be told about even in a guild whose policy has also
+    moved on, because it is the one they can act on.
+    """
+    if record.revoked_at is not None:
+        return STATE_REVOKED if now >= record.revoked_at else STATE_SCHEDULED
+    if is_consent_active(record, policy, now):
+        return STATE_ACTIVE
+    return STATE_POLICY_SUPERSEDED
+
+
+class ConsolePersonalConsents:
+    """What one person may see and change about their own consent.
+
+    The mirror image of `ConsoleConsentDirectory`, and a separate class
+    for one structural reason: **there is no argument here for somebody
+    else.** Every method takes the signed-in person and acts on that
+    person, so a handler cannot act on a third party through this object
+    even by mistake. The administrator's power to withdraw somebody
+    else's consent stays where it is, behind an `AdminDirectory` check,
+    and the two never share an entry point.
+
+    **The write for a widening is an insert, not an update.** `consent` is
+    an append-only history: a grant is a row, and the newest row by
+    `granted_at` is what the recorder acts on. Widening `audio` to
+    `audio_video` is a *grant* -- somebody agreeing to something they had
+    not agreed to -- so it inserts a row carrying the guild's current
+    `policy_version`. Overwriting the scope in place would leave a record
+    claiming video consent under a policy document written before video
+    was a question, which is precisely the record an append-only history
+    exists to make impossible.
+
+    Narrowing is not a grant and does not insert. It withdraws part of
+    what was given, and a withdrawal modifies the grant it withdraws from
+    -- the same rule `ConsentRepository.record_revocation` follows.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        config: SettingsStore,
+        now: Callable[[], datetime],
+    ) -> None:
+        self._session_factory = session_factory
+        self._config = config
+        self._consents = ConsentRepository(session_factory)
+        self._now = now
+
+    async def for_person(self, discord_user_id: int) -> tuple[OwnConsent, ...]:
+        """Every guild this person holds a consent record in.
+
+        One configuration read per guild rather than one query for all of
+        them: a person belongs to a handful of guilds, `SettingsStore`
+        offers `snapshot` and nothing narrower on purpose (see its
+        docstring), and a bespoke join here would be a second way to
+        resolve a setting -- the thing that port exists to prevent.
+        """
+        newest = await self._newest_per_guild(discord_user_id)
+        now = self._now()
+        answers: list[OwnConsent] = []
+        for guild_id, row in sorted(newest.items()):
+            stored = await self._config.snapshot(guild_id)
+            policy = stored.get(settings.POLICY_VERSION, "")
+            record = ConsentRecord(
+                granted_at=row.granted_at,
+                revoked_at=row.revoked_at,
+                policy_version=row.policy_version,
+                scope=row.scope,
+            )
+            answers.append(
+                OwnConsent(
+                    guild_id=guild_id,
+                    state=_state_of(record, policy, now),
+                    # The domain's rule, not a second reading of it. A
+                    # person must be shown the same verdict the recorder
+                    # acts on, including the case nobody expects: a policy
+                    # bump has ended a consent they never withdrew.
+                    active=is_consent_active(record, policy, now),
+                    scope=row.scope.value,
+                    policy_version=row.policy_version,
+                    guild_policy_version=policy,
+                    granted_at=row.granted_at,
+                    revoked_at=row.revoked_at,
+                    video_consent_offered=settings.is_true(
+                        stored.get(settings.VIDEO_CONSENT_OFFERED)
+                    ),
+                )
+            )
+        return tuple(answers)
+
+    async def set_scope(self, discord_user_id: int, guild_id: int, scope: str) -> ScopeOutcome:
+        """Narrows or widens what this person's consent covers."""
+        try:
+            wanted = ConsentScope(scope)
+        except ValueError:
+            return ScopeOutcome(scope=scope, changed=False, refusal=UNKNOWN_SCOPE)
+
+        record = await self._consents.current(discord_user_id, guild_id)
+        if record is None or record.granted_at is None:
+            return ScopeOutcome(scope=scope, changed=False, refusal=NO_CONSENT_ON_RECORD)
+        if record.revoked_at is not None:
+            # Not a scope question. Somebody whose consent has ended
+            # consents again, in Discord, under the policy in force then
+            # -- they do not edit a record that already says it stopped.
+            return ScopeOutcome(scope=scope, changed=False, refusal=ALREADY_REVOKED)
+
+        if record.scope == wanted:
+            # Neither a refusal nor a write: asking for the scope you
+            # already have is a page that was open a while, and answering
+            # it with a new grant row would stamp a fresh `granted_at` on
+            # a decision nobody made.
+            return ScopeOutcome(
+                scope=wanted.value,
+                changed=False,
+                refusal=None,
+                policy_version=record.policy_version,
+            )
+
+        if wanted is ConsentScope.AUDIO:
+            # Narrowing. Immediate, unconditional, and nothing to check:
+            # nobody needs permission to consent to less.
+            await self._consents.narrow_scope(discord_user_id, guild_id, wanted)
+            return ScopeOutcome(
+                scope=wanted.value,
+                changed=True,
+                refusal=None,
+                policy_version=record.policy_version,
+            )
+
+        stored = await self._config.snapshot(guild_id)
+        if not settings.is_true(stored.get(settings.VIDEO_CONSENT_OFFERED)):
+            # The guild has not asserted that its policy document names
+            # video, and software cannot read the document to check. A
+            # silent downgrade to `audio` would report success for a
+            # question the person did not ask; this says no.
+            return ScopeOutcome(
+                scope=record.scope.value,
+                changed=False,
+                refusal=VIDEO_CONSENT_NOT_OFFERED,
+            )
+        policy = stored.get(settings.POLICY_VERSION, "")
+        if not policy:
+            # A guild with no policy version records no active consent at
+            # all (`is_consent_active`), so there is nothing for a new
+            # grant to name and no wording for it to stand under.
+            return ScopeOutcome(
+                scope=record.scope.value,
+                changed=False,
+                refusal=NO_POLICY_VERSION,
+            )
+
+        await self._consents.record_grant(
+            discord_user_id,
+            guild_id,
+            policy,
+            source=_CONSOLE_SOURCE,
+            now=self._now(),
+            scope=wanted,
+        )
+        return ScopeOutcome(scope=wanted.value, changed=True, refusal=None, policy_version=policy)
+
+    async def revoke_own(self, discord_user_id: int, guild_id: int) -> RevocationOutcome:
+        """This person withdrawing their own consent, effective now.
+
+        No `effective_at`. Back-dating is an administrator's correction of
+        a record -- "they left in March and nobody wrote it down" -- and
+        scheduling is a guild's arrangement; a person withdrawing their
+        own consent means now, and a date field here would invite somebody
+        to withdraw retroactively under the impression that it erases
+        something. It does not (see `_recordings_since`).
+
+        The role stays. `api` holds no Discord token (Spec 13.2), so this
+        writes `revoked_at` and nothing else: recording stops within the
+        consent cache's five seconds, and Discord goes on showing a role
+        that no longer means anything. The answer says so rather than
+        leaving the person to find out from `/consent status` -- see
+        `routes_consent_self`.
+        """
+        return await _write_revocation(
+            self._consents,
+            self._session_factory,
+            self._now,
+            guild_id,
+            discord_user_id,
+            None,
+        )
+
+    async def _newest_per_guild(self, discord_user_id: int) -> dict[int, _ConsentRow]:
+        """The newest grant per guild for this person.
+
+        `ConsoleConsentDirectory._newest_consent_per_person` turned ninety
+        degrees, and ordered by the same rule for the same reason:
+        `ConsentRepository.current` reads the newest by `granted_at`, and
+        showing somebody a row the recorder does not act on would show
+        them a decision nothing enforces. `id` descending is the tiebreak
+        that keeps two page loads agreeing.
+        """
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(
+                        Consent.guild_id,
+                        Consent.granted_at,
+                        Consent.revoked_at,
+                        Consent.policy_version,
+                        Consent.scope,
+                    )
+                    .where(Consent.discord_user_id == discord_user_id)
+                    .order_by(
+                        Consent.guild_id,
+                        Consent.granted_at.desc(),
+                        Consent.id.desc(),
+                    )
+                )
+            ).all()
+
+        newest: dict[int, _ConsentRow] = {}
+        for guild_id, granted_at, revoked_at, policy_version, scope in rows:
+            newest.setdefault(
+                guild_id,
+                _ConsentRow(granted_at, revoked_at, policy_version, scope_of(scope)),
+            )
+        return newest
 
 
 class ConsoleQueueOverview:

@@ -33,6 +33,8 @@ from sturnus.console.ports import (
     GuildReports,
     LinkDirectory,
     OAuthClient,
+    OwnConsent,
+    PersonalConsents,
     PreferenceDirectory,
     ProfileDirectory,
     QueueControl,
@@ -40,6 +42,7 @@ from sturnus.console.ports import (
     QueueSnapshot,
     RequeueOutcome,
     RevocationOutcome,
+    ScopeOutcome,
     SessionReads,
     SettingsStore,
     StateStore,
@@ -524,6 +527,7 @@ class FakeConsents:
         #: the authorisation tests assert on, and it cannot be seen in a
         #: response body.
         self.revoked: list[tuple[int, int, int]] = []
+        self.effective_instants: list[datetime | None] = []
         self.listed: list[tuple[int, int]] = []
 
     async def holders(self, guild_id: int, *, requested_by: int) -> Sequence[ConsentHolder] | None:
@@ -531,10 +535,61 @@ class FakeConsents:
         return self.holders_by_guild
 
     async def revoke(
-        self, guild_id: int, discord_user_id: int, *, requested_by: int
+        self,
+        guild_id: int,
+        discord_user_id: int,
+        *,
+        requested_by: int,
+        effective_at: datetime | None = None,
     ) -> RevocationOutcome | None:
         self.revoked.append((guild_id, discord_user_id, requested_by))
+        #: What instant each revocation named, or `None` for "now". Kept
+        #: apart from `revoked` so the tuples in that list stay the shape
+        #: the authorisation tests already read.
+        self.effective_instants.append(effective_at)
         return self.outcome
+
+
+class FakePersonalConsents:
+    """A person with no consent records anywhere, until a test says otherwise.
+
+    Defaults to an empty listing and to refusing every write, which is
+    what the real adapter answers for somebody who has never consented --
+    so a test with no interest in consent gets 409s rather than a fake
+    that quietly grants things.
+    """
+
+    def __init__(
+        self,
+        consents: Sequence[OwnConsent] | None = None,
+        scope_outcome: ScopeOutcome | None = None,
+        revocation: RevocationOutcome | None = None,
+    ) -> None:
+        self.consents = tuple(consents or ())
+        self.scope_outcome = scope_outcome or ScopeOutcome(
+            scope="audio", changed=False, refusal="no_consent_on_record"
+        )
+        self.revocation = revocation or RevocationOutcome(
+            revoked=False, refusal="no_consent_on_record"
+        )
+        #: Who each call was made for. The route tests assert on it: "the
+        #: handler passed the id out of the signed cookie, and there is no
+        #: other id it could have passed" cannot be seen in a body.
+        self.listed: list[int] = []
+        self.scopes: list[tuple[int, int, str]] = []
+        self.revoked: list[tuple[int, int]] = []
+
+    async def for_person(self, discord_user_id: int) -> Sequence[OwnConsent]:
+        self.listed.append(discord_user_id)
+        return self.consents
+
+    async def set_scope(self, discord_user_id: int, guild_id: int, scope: str) -> ScopeOutcome:
+        self.scopes.append((discord_user_id, guild_id, scope))
+        return self.scope_outcome
+
+    async def revoke_own(self, discord_user_id: int, guild_id: int) -> RevocationOutcome:
+        self.revoked.append((discord_user_id, guild_id))
+        return self.revocation
 
 
 class FakeReports:
@@ -659,6 +714,7 @@ def build_test_api(
     tags: TagWriter | None = None,
     queues: QueueOverview | None = None,
     consents: ConsentDirectory | None = None,
+    own_consents: PersonalConsents | None = None,
     reports: GuildReports | None = None,
     profile: ProfileDirectory | None = None,
     prefs: PreferenceDirectory | None = None,
@@ -690,6 +746,7 @@ def build_test_api(
         links=links or FakeLinks(),
         admins=admins or FakeAdmins(),
         consents=consents or FakeConsents(),
+        own_consents=own_consents or FakePersonalConsents(),
         reads=reads or FakeReads(),
         config=config or FakeConfig(),
         audio=audio

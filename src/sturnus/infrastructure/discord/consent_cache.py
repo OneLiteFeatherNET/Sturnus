@@ -35,7 +35,7 @@ from datetime import datetime, timedelta
 
 from sturnus.application.ports import Clock
 from sturnus.domain import settings
-from sturnus.domain.consent import ConsentRecord, may_record
+from sturnus.domain.consent import ConsentRecord, may_record, may_record_video
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.repositories import ConsentRepository
 
@@ -53,14 +53,26 @@ class _Entry:
 class ConsentCache:
     """Per-`(guild_id, discord_user_id)` cache of the stored consent record.
 
-    `may_record` is the only entry point: it refreshes the cached
-    record/policy pair when missing or stale, then combines it with the
-    caller's role check exactly as `sturnus.domain.consent.may_record`
-    does. There is no explicit invalidation -- entries simply expire after
-    `ttl`, which is enough because the record changes only through slow,
-    human-driven paths (`/consent grant`, `/consent revoke`, an
-    administrator editing roles, `/config set policy_version`), never
-    per-packet.
+    `may_record` and `may_record_video` are the only entry points: each
+    refreshes the cached record/policy pair when missing or stale, then
+    combines it with the caller's role check exactly as the matching
+    function in `sturnus.domain.consent` does. There is no explicit
+    invalidation -- entries simply expire after `ttl`, which is enough
+    because the record changes only through slow, human-driven paths
+    (`/consent grant`, `/consent revoke`, an administrator editing roles,
+    `/config set policy_version`), never per-packet.
+
+    **What is cached is the record, not a verdict, and that is what makes
+    a scheduled revocation work with no new machinery.** `revoked_at` is
+    an effective instant: a withdrawal dated for the end of the month
+    sits in the row for weeks while consent stays in force. Because the
+    domain rule is applied against `self._clock.now()` on every call and
+    only the *row* is held here, the instant passing turns the verdict
+    over on the next packet -- not on the next refresh. The five second
+    TTL therefore bounds how stale the row may be, never how late the
+    schedule may fire. A cache that stored the boolean would have got
+    this exactly wrong: the withdrawal would arrive up to five seconds
+    late, silently, and nothing in the log would say why.
     """
 
     def __init__(
@@ -79,6 +91,30 @@ class ConsentCache:
     async def may_record(self, guild_id: int, discord_user_id: int, has_consent_role: bool) -> bool:
         """True when a packet from this user may be recorded (Spec 3.1's second layer)."""
         now = self._clock.now()
+        entry = await self._entry(guild_id, discord_user_id, now)
+        return may_record(entry.record, entry.policy_version, has_consent_role, now)
+
+    async def may_record_video(
+        self, guild_id: int, discord_user_id: int, has_consent_role: bool
+    ) -> bool:
+        """True when this person's consent names video as well as audio.
+
+        Nothing records video. What this gates is whether the bot asks
+        Discord for the stream at all
+        (`sturnus.infrastructure.discord.voice`), which is the part that
+        is visible to the person on the other end and therefore the part
+        that has to be right first.
+
+        It shares the entry `may_record` fills, so a session in which
+        somebody speaks and shares costs one database read every five
+        seconds rather than two.
+        """
+        now = self._clock.now()
+        entry = await self._entry(guild_id, discord_user_id, now)
+        return may_record_video(entry.record, entry.policy_version, has_consent_role, now)
+
+    async def _entry(self, guild_id: int, discord_user_id: int, now: datetime) -> _Entry:
+        """The cached row for this pair, refreshed when missing or stale."""
         key = (guild_id, discord_user_id)
         entry = self._entries.get(key)
         if entry is None or now - entry.fetched_at >= self._ttl:
@@ -86,4 +122,4 @@ class ConsentCache:
             policy_version = await self._config_store.get(guild_id, settings.POLICY_VERSION)
             entry = _Entry(record=record, policy_version=policy_version or "", fetched_at=now)
             self._entries[key] = entry
-        return may_record(entry.record, entry.policy_version, has_consent_role)
+        return entry

@@ -519,6 +519,11 @@ class ConsentHolder:
     revoked_at: datetime | None
     active: bool
     recordings_with_audio: int
+    #: What the grant covers -- `sturnus.domain.consent.ConsentScope`.
+    #: An administrator looking at a roster has to be able to see that
+    #: one person's consent is wider than everybody else's, or the
+    #: setting that made it possible is a switch with no readout.
+    scope: str
 
 
 @dataclass(frozen=True)
@@ -529,6 +534,20 @@ class RevocationOutcome:
     #: Why nothing happened, as one of a fixed set of reasons. `None` when
     #: something did.
     refusal: str | None
+    #: The instant the consent stops. `None` when nothing was written.
+    #: Echoed back rather than assumed by the caller, because a request
+    #: that named no instant gets `now` -- and the client showing a
+    #: person "withdrawn as of ..." must show what was stored, not what
+    #: it guessed would be stored.
+    effective_at: datetime | None = None
+    #: How many recordings of this person the guild still holds that fall
+    #: **on or after** `effective_at`. Not a delete and not a promise of
+    #: one: a back-dated revocation is a statement about recordings that
+    #: already exist, and this is how many of them the statement is about
+    #: so the console can offer the erasure path that does delete
+    #: (`/audio purge`). Zero for a revocation dated now or later, which
+    #: is the ordinary case.
+    recordings_from_effective_at: int = 0
 
 
 class ConsentDirectory(Protocol):
@@ -560,9 +579,110 @@ class ConsentDirectory(Protocol):
         self, guild_id: int, *, requested_by: int
     ) -> Sequence[ConsentHolder] | None: ...
 
+    #: `effective_at` is the instant the consent stops, and `None` means
+    #: now -- which is what every caller meant before it existed, so no
+    #: client breaks by not sending it. Any instant not before
+    #: `granted_at` is allowed: a future one is a scheduled withdrawal
+    #: that the recorder honours on its own, a past one is a statement
+    #: about recordings that already exist and **deletes none of them**.
     async def revoke(
-        self, guild_id: int, discord_user_id: int, *, requested_by: int
+        self,
+        guild_id: int,
+        discord_user_id: int,
+        *,
+        requested_by: int,
+        effective_at: datetime | None = None,
     ) -> RevocationOutcome | None: ...
+
+
+@dataclass(frozen=True)
+class OwnConsent:
+    """One person's consent in one guild, as that person sees it.
+
+    The same newest-row-per-guild selection `ConsentHolder` makes, from
+    the other end: keyed by guild rather than by person, because the
+    question here is "where am I recorded" rather than "who consented
+    here". No display name -- a person does not need to be told their own
+    -- and no `recordings_with_audio`, which the person's own session
+    list already answers in far more detail than a count.
+
+    `state` and `active` are both here and neither is redundant. `state`
+    names *why*, which is the sentence the interface has to write, and
+    the four values are not two pairs: `SCHEDULED` means a withdrawal is
+    dated in the future and recording is still happening, which reads as
+    "ending" and behaves as "active". A client deriving one from the
+    other would be reimplementing
+    `sturnus.domain.consent.is_consent_active`, which is exactly what
+    `ConsentHolder.active` exists to prevent.
+    """
+
+    guild_id: int
+    state: str
+    active: bool
+    scope: str
+    #: The version the grant names, which is not necessarily the guild's
+    #: current one -- that difference is the whole of `POLICY_SUPERSEDED`.
+    policy_version: str
+    #: What the guild requires today. Sent alongside rather than compared
+    #: here, so a person can be shown "you consented to 2026-01, the
+    #: policy is now 2026-06" rather than only the verdict.
+    guild_policy_version: str
+    granted_at: datetime
+    revoked_at: datetime | None
+    #: Whether this guild offers the video scope at all
+    #: (`settings.VIDEO_CONSENT_OFFERED`). False means the control is
+    #: absent from the interface, not disabled: an administrator has not
+    #: asserted that the policy document names video, and offering a
+    #: choice the API will refuse is worse than not offering it.
+    video_consent_offered: bool
+
+
+@dataclass(frozen=True)
+class ScopeOutcome:
+    """What a scope change did, or why it did nothing."""
+
+    scope: str
+    changed: bool
+    #: Why nothing happened, as one of a fixed set of reasons. `None`
+    #: when something did.
+    refusal: str | None
+    #: The policy version the scope now stands under. For a widening this
+    #: is the guild's current version, because a widening inserts a new
+    #: grant; for a narrowing it is the version the existing grant already
+    #: named. `None` when nothing was written.
+    policy_version: str | None = None
+
+
+class PersonalConsents(Protocol):
+    """A signed-in person's own consent records, and the two things they may change.
+
+    **Authorisation here is the session and nothing else.** Every method
+    takes the person as its first argument and there is no method that
+    takes a subject separate from the actor -- which is the difference
+    between this protocol and `ConsentDirectory`, and the reason they are
+    two protocols rather than one with a flag. A handler cannot
+    accidentally act on somebody else through this, because there is no
+    argument for somebody else.
+
+    `None` means "you have no consent record in that guild", which is
+    also the answer for a guild id that names nothing at all. The person
+    is asking about themselves, so there is nothing here to conceal by
+    conflating the two -- they are conflated because they are the same
+    fact.
+    """
+
+    async def for_person(self, discord_user_id: int) -> Sequence[OwnConsent]: ...
+
+    #: Narrowing takes effect at once and modifies the grant. Widening is
+    #: a new grant carrying the guild's current `policy_version`, and is
+    #: refused outright while the guild does not offer video consent.
+    async def set_scope(self, discord_user_id: int, guild_id: int, scope: str) -> ScopeOutcome: ...
+
+    #: The person withdrawing their own consent. It writes the record and
+    #: cannot remove the Discord role -- `api` holds no Discord token
+    #: (Spec 13.2) -- which is why the outcome says so rather than
+    #: leaving them to find out from `/consent status`.
+    async def revoke_own(self, discord_user_id: int, guild_id: int) -> RevocationOutcome: ...
 
 
 @dataclass(frozen=True)

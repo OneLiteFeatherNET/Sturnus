@@ -155,6 +155,19 @@ class AccountLink(Base):
 
 
 class Consent(Base):
+    """One decision about being recorded, kept forever.
+
+    Append-only: a grant inserts a row, `ConsentRepository.current` reads
+    the newest by `granted_at`, and nothing is ever deleted -- the row is
+    the evidence that consent was once given.
+
+    `revoked_at` is an **effective instant**, not a tombstone. Any value
+    used to mean "not active"; it now means "not active from then on", so
+    a withdrawal can be dated to the end of the month or to last
+    Tuesday's meeting. `sturnus.domain.consent.is_consent_active` is the
+    one place that rule is written down.
+    """
+
     __tablename__ = "consent"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -164,6 +177,12 @@ class Consent(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     policy_version: Mapped[str] = mapped_column(Text, nullable=False)
     source: Mapped[str] = mapped_column(Text, nullable=False)
+    #: What this grant covers -- `sturnus.domain.consent.ConsentScope`.
+    #: Text with a server default rather than an enum, so a writer that
+    #: forgets it produces the narrow scope instead of failing, and a
+    #: value this code cannot name is read as narrow rather than
+    #: refusing the row (`consent.scope_of`).
+    scope: Mapped[str] = mapped_column(Text, nullable=False, server_default="audio")
 
     __table_args__ = (Index("ix_consent_user_guild", "discord_user_id", "guild_id"),)
 

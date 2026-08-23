@@ -76,6 +76,14 @@ class ConfigStore:
         that cannot be parsed must be refused at the write, where an
         administrator is looking at the reply — discovering it at the join
         means a guild that reports itself configured and records nothing.
+
+        A known boolean key must be exactly `"true"` or `"false"`
+        (`settings.BOOLEAN_VALUES`). The same argument as for integers,
+        one step stronger: `settings.is_true` reads anything else as
+        false, so an unvalidated `"yes"` would not fail anywhere -- it
+        would quietly mean the opposite of what whoever typed it meant.
+        The one boolean key today decides whether a guild may offer video
+        consent at all, which is not a question to answer by accident.
         """
         if key not in settings.KNOWN_KEYS:
             raise ValueError(f"unknown configuration key {key!r}")
@@ -93,6 +101,14 @@ class ConfigStore:
                 raise ValueError(f"{key!r} must be an integer, got {value!r}") from exc
             if parsed <= 0:
                 raise ValueError(f"{key!r} must be positive, got {parsed}")
+
+        if (
+            value is not None
+            and key in settings.BOOLEAN_KEYS
+            and value not in settings.BOOLEAN_VALUES
+        ):
+            allowed = " or ".join(sorted(settings.BOOLEAN_VALUES))
+            raise ValueError(f"{key!r} must be {allowed}, got {value!r}")
 
         async with self._session_factory() as session:
             if value is None:

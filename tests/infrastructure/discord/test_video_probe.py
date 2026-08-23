@@ -37,7 +37,9 @@ def test_an_announced_stream_that_never_arrives_is_reported_as_such(
         probe.report()
 
     text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "1 stream(s) announced, 0 delivered any packet" in text
+    assert (
+        "1 stream(s) announced, 0 refused for lack of video consent, 0 delivered any packet" in text
+    )
     assert "packets=0" in text
 
 
@@ -53,7 +55,9 @@ def test_packets_on_an_announced_stream_are_counted(
         probe.report()
 
     text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "1 stream(s) announced, 1 delivered any packet" in text
+    assert (
+        "1 stream(s) announced, 0 refused for lack of video consent, 1 delivered any packet" in text
+    )
     assert "packets=3" in text
     assert "<1200:2" in text and "<700:1" in text
 
@@ -228,3 +232,56 @@ def test_sizes_are_reported_as_bands(size: int, band: str) -> None:
     """Video packets run to the MTU and audio does not, so the band alone
     distinguishes them."""
     assert size_band(size) == band
+
+
+# ---------------------------------------------------------------------------
+# Streams this connection deliberately did not ask for
+# ---------------------------------------------------------------------------
+
+
+def test_a_stream_nobody_consented_to_is_reported_as_refused_rather_than_absent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Zero packets is the same number whether Discord withheld the stream
+    or this bot never asked for it, and the two lead to opposite
+    conclusions about whether video reaches a bot at all. Without this the
+    probe would read a session full of non-consenting speakers as evidence
+    that Discord sends nothing."""
+    probe = VideoProbe()
+    _announced(probe)
+    probe.note_subscription([SCREEN_SSRC], subscribed=False)
+
+    with caplog.at_level(logging.WARNING):
+        probe.report()
+
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "1 refused for lack of video consent" in text
+    assert "(no video consent)" in text
+    assert "nobody in this session has consented to video" in text
+
+
+def test_a_stream_that_was_asked_for_is_not_reported_as_refused() -> None:
+    probe = VideoProbe()
+    _announced(probe)
+    probe.note_subscription([SCREEN_SSRC], subscribed=True)
+
+    assert probe.is_refused(SCREEN_SSRC) is False
+
+
+def test_a_stream_nobody_has_decided_about_is_not_yet_a_refusal() -> None:
+    """Only an explicit no is a no. Reporting an undecided stream as
+    refused would put a consent verdict in a metric no consent produced."""
+    probe = VideoProbe()
+    _announced(probe)
+
+    assert probe.is_refused(SCREEN_SSRC) is False
+
+
+def test_a_refusal_survives_an_announcement_arriving_afterwards() -> None:
+    """The two run on different threads from one gateway dispatch, so
+    either order is possible and neither may lose the decision."""
+    probe = VideoProbe()
+    probe.note_subscription([SCREEN_SSRC], subscribed=False)
+    _announced(probe)
+
+    assert probe.is_refused(SCREEN_SSRC) is True

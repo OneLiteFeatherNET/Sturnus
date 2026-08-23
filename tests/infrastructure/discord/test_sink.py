@@ -32,6 +32,7 @@ from sturnus.infrastructure.discord.sink import (
     RecordingSink,
     SpeakerStreamEnded,
 )
+from sturnus.infrastructure.discord.video_probe import VideoProbe
 
 SINK_LOGGER = "sturnus.infrastructure.discord.sink"
 
@@ -39,6 +40,11 @@ T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 ROLE_ID = 42
 ANNA_SSRC = 111
 ANNA_ID = 1001
+#: A video SSRC. The library registers only the *audio* SSRC against a
+#: member (`gateway.py:93`), so a video packet reaches the sink with no
+#: member mapped -- which is why the branch under test comes before the
+#: unattributed-audio path swallows it.
+VIDEO_SSRC = 5001
 
 
 class FakeClock:
@@ -378,3 +384,69 @@ def test_cleanup_survives_a_decoder_that_raises() -> None:
     sink, _, _ = build(decoder)
 
     sink.cleanup()  # must not raise
+
+
+# --- video packets, which are counted and never decoded ---
+#
+# Two outcomes rather than one. `video` means "this system does not keep
+# video at all", which is true of every packet here. `video_no_consent`
+# means the same drop happened to a stream this connection deliberately
+# refused -- so Discord sent it unasked, which is a fact about Discord
+# and belongs in its own series rather than in a log line nobody reads.
+
+
+def video_sink(probe: VideoProbe) -> RecordingSink:
+    return RecordingSink(
+        consent_role_id=ROLE_ID,
+        decoder=FakeDecoder(),
+        clock=FakeClock(),
+        emit=lambda _message: None,
+        video_probe=probe,
+    )
+
+
+def outcomes(recorded: list[tuple[str, dict[str, object]]]) -> list[object]:
+    return [labels.get("outcome") for _name, labels in recorded]
+
+
+@pytest.fixture
+def counted(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, dict[str, object]]]:
+    """Every `record(...)` the sink made, as (metric, labels)."""
+    seen: list[tuple[str, dict[str, object]]] = []
+
+    def note(metric: object, _value: int, **labels: object) -> None:
+        seen.append((getattr(metric, "name", str(metric)), labels))
+
+    monkeypatch.setattr("sturnus.infrastructure.discord.sink.record", note)
+    return seen
+
+
+def test_a_video_packet_is_counted_and_never_decoded(
+    counted: list[tuple[str, dict[str, object]]],
+) -> None:
+    probe = VideoProbe()
+    probe.announce(
+        ssrc=VIDEO_SSRC, discord_user_id=ANNA_ID, kind="video", active=True, resolution="?"
+    )
+    sink = video_sink(probe)
+
+    sink.write(None, voice_data(b"h264", ssrc=VIDEO_SSRC))
+
+    assert outcomes(counted) == ["video"]
+
+
+def test_a_video_packet_from_a_refused_stream_is_counted_as_its_own_outcome(
+    counted: list[tuple[str, dict[str, object]]],
+) -> None:
+    """Discord sent a stream this connection asked it not to send. Both
+    packets are dropped identically; only the counter tells them apart."""
+    probe = VideoProbe()
+    probe.announce(
+        ssrc=VIDEO_SSRC, discord_user_id=ANNA_ID, kind="video", active=True, resolution="?"
+    )
+    probe.note_subscription([VIDEO_SSRC], subscribed=False)
+    sink = video_sink(probe)
+
+    sink.write(None, voice_data(b"h264", ssrc=VIDEO_SSRC))
+
+    assert outcomes(counted) == ["video_no_consent"]

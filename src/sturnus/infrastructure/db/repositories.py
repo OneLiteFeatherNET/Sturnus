@@ -17,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sturnus.application.assembly import deserialize_transcript
 from sturnus.application.publishing import DOCUMENTED_STATUS
 from sturnus.application.transcription import TranscriptionResult
-from sturnus.domain.consent import ConsentRecord
+from sturnus.domain.consent import ConsentRecord, ConsentScope, scope_of
 from sturnus.infrastructure.db.models import (
     AccountLink,
     Consent,
@@ -40,7 +40,16 @@ class ConsentRepository:
         policy_version: str,
         source: str,
         now: datetime,
+        scope: ConsentScope = ConsentScope.AUDIO,
     ) -> None:
+        """Inserts a grant. `scope` defaults to the narrow one deliberately.
+
+        A caller that does not say what it is granting is granting audio.
+        The alternative -- a required argument -- reads as safer and is
+        not: it makes every call site restate the same value, which is
+        exactly the condition under which one of them eventually restates
+        the wrong one.
+        """
         async with self._session_factory() as session:
             session.add(
                 Consent(
@@ -50,14 +59,26 @@ class ConsentRepository:
                     revoked_at=None,
                     policy_version=policy_version,
                     source=source,
+                    scope=scope.value,
                 )
             )
             await session.commit()
 
-    async def record_revocation(self, discord_user_id: int, guild_id: int, now: datetime) -> None:
+    async def record_revocation(
+        self, discord_user_id: int, guild_id: int, effective_at: datetime
+    ) -> None:
         """Sets `revoked_at` on the newest row rather than inserting a new one.
 
         The history keeps grants; a revocation modifies the grant it revokes.
+
+        `effective_at` is the instant the consent stops, which is usually
+        but no longer always `now`. A past instant is a statement about
+        recordings that already exist and **deletes nothing**; a future
+        one is a scheduled withdrawal that takes effect on its own,
+        because `is_consent_active` compares it against the current time
+        on every read. Refusing an instant before `granted_at` is the
+        caller's job -- this method writes what it is told, exactly as it
+        did before.
         """
         async with self._session_factory() as session:
             newest_id = await session.scalar(
@@ -68,7 +89,35 @@ class ConsentRepository:
             )
             if newest_id is not None:
                 await session.execute(
-                    update(Consent).where(Consent.id == newest_id).values(revoked_at=now)
+                    update(Consent).where(Consent.id == newest_id).values(revoked_at=effective_at)
+                )
+            await session.commit()
+
+    async def narrow_scope(self, discord_user_id: int, guild_id: int, scope: ConsentScope) -> None:
+        """Narrows the newest grant in place, the way a revocation does.
+
+        Narrowing is a withdrawal of part of a grant, and this table
+        treats a withdrawal as a modification of the grant it withdraws
+        from rather than as a new row -- see `record_revocation`. So this
+        is that statement with a different column.
+
+        **Widening is not this method and must never become it.** A wider
+        scope is a new grant and has to carry the policy version in force
+        when it was given, which is `record_grant`. Overwriting `scope`
+        upwards would leave a record claiming video consent under a
+        policy document that predates the question -- exactly the record
+        an append-only history exists to make impossible.
+        """
+        async with self._session_factory() as session:
+            newest_id = await session.scalar(
+                select(Consent.id)
+                .where(Consent.discord_user_id == discord_user_id, Consent.guild_id == guild_id)
+                .order_by(Consent.granted_at.desc())
+                .limit(1)
+            )
+            if newest_id is not None:
+                await session.execute(
+                    update(Consent).where(Consent.id == newest_id).values(scope=scope.value)
                 )
             await session.commit()
 
@@ -92,6 +141,7 @@ class ConsentRepository:
             granted_at=row.granted_at,
             revoked_at=row.revoked_at,
             policy_version=row.policy_version,
+            scope=scope_of(row.scope),
         )
 
 

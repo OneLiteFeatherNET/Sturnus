@@ -14,17 +14,29 @@ dropped, because the handler was never given anything to check.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import pytest
+from sqlalchemy import Row
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.console.adapters import (
     ALREADY_REVOKED,
+    EFFECTIVE_BEFORE_GRANT,
     NO_CONSENT_ON_RECORD,
+    NO_POLICY_VERSION,
+    STATE_ACTIVE,
+    STATE_POLICY_SUPERSEDED,
+    STATE_REVOKED,
+    STATE_SCHEDULED,
+    VIDEO_CONSENT_NOT_OFFERED,
     ConsoleConsentDirectory,
+    ConsolePersonalConsents,
 )
 from sturnus.domain import settings
+from sturnus.domain.consent import ConsentScope
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.models import (
     Base,
@@ -106,6 +118,7 @@ async def grant(
     granted_at: datetime = T0,
     revoked_at: datetime | None = None,
     policy_version: str = POLICY,
+    scope: ConsentScope = ConsentScope.AUDIO,
 ) -> None:
     """One `consent` row, written straight to the table.
 
@@ -123,6 +136,7 @@ async def grant(
                 revoked_at=revoked_at,
                 policy_version=policy_version,
                 source="button",
+                scope=scope.value,
             )
         )
         await db.commit()
@@ -448,7 +462,8 @@ async def test_a_revocation_stamps_the_newest_grant(
 
     assert outcome is not None
     assert outcome.revoked is True
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    assert outcome.effective_at == revoked_at
+    holders = await directory(factory, now=revoked_at).holders(GUILD, requested_by=ANNA)
     assert holders is not None
     assert holders[0].revoked_at == revoked_at
     assert holders[0].active is False
@@ -543,3 +558,422 @@ async def test_a_revocation_leaves_the_earlier_grants_alone(
         rows = (await db.execute(Consent.__table__.select())).all()
     assert len(rows) == 2
     assert sum(1 for row in rows if row.revoked_at is not None) == 1
+
+
+async def consent_rows(
+    factory: async_sessionmaker[AsyncSession], discord_user_id: int
+) -> Sequence[Row[Any]]:
+    """Every `consent` row for one person.
+
+    Written once because half the tests below turn on *how many rows* a
+    change produced: a widening inserts and a narrowing does not, and
+    that difference is the whole of what an append-only history means
+    here.
+    """
+    async with factory() as db:
+        return (
+            await db.execute(
+                Consent.__table__.select().where(Consent.discord_user_id == discord_user_id)
+            )
+        ).all()
+
+
+# ---------------------------------------------------------------------------
+# An effective instant on the administrator's withdrawal
+# ---------------------------------------------------------------------------
+
+
+async def test_a_revocation_that_names_no_instant_still_means_now(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The behaviour every existing client depends on, kept intact.
+
+    `effective_at` is optional precisely so that not sending it is not a
+    client that needs updating -- a required field with a documented
+    sentinel would have broken the console on the day this shipped.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN)
+
+    outcome = await directory(factory).revoke(GUILD, BEN, requested_by=ANNA)
+
+    assert outcome is not None
+    assert outcome.effective_at == T0
+
+
+async def test_a_withdrawal_dated_for_the_end_of_the_month_leaves_consent_in_force(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A scheduled revocation, and nothing new fires it.
+
+    The stored instant is what `is_consent_active` compares against on
+    every read, so the moment it passes the answer changes -- inside the
+    consent cache's five seconds, with no timer, no sweep and no job.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN)
+    end_of_month = T0 + timedelta(days=10)
+
+    outcome = await directory(factory).revoke(
+        GUILD, BEN, requested_by=ANNA, effective_at=end_of_month
+    )
+
+    assert outcome is not None
+    assert outcome.revoked is True
+    still_recording = await directory(factory).holders(GUILD, requested_by=ANNA)
+    assert still_recording is not None
+    assert still_recording[0].active is True
+    after = await directory(factory, now=end_of_month).holders(GUILD, requested_by=ANNA)
+    assert after is not None
+    assert after[0].active is False
+
+
+async def test_a_backdated_revocation_says_how_many_recordings_it_did_not_delete(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The number exists so the console can offer `/audio purge`, not so it
+    can take it. A back-dated revocation is a statement about recordings
+    that already exist; erasing them would mean an administrator
+    correcting a date had destroyed months of meetings their team read.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN, granted_at=T0 - timedelta(days=30))
+    await a_recorded_session(factory, started_at=T0 - timedelta(days=20), people={BEN: "ben"})
+    await a_recorded_session(factory, started_at=T0 - timedelta(days=3), people={BEN: "ben"})
+    await a_recorded_session(factory, started_at=T0 - timedelta(days=1), people={BEN: "ben"})
+
+    outcome = await directory(factory).revoke(
+        GUILD, BEN, requested_by=ANNA, effective_at=T0 - timedelta(days=5)
+    )
+
+    assert outcome is not None
+    assert outcome.recordings_from_effective_at == 2
+    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    assert holders is not None
+    # And every one of them is still there.
+    assert holders[0].recordings_with_audio == 3
+
+
+async def test_an_instant_before_the_grant_is_refused_rather_than_clamped(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """It would claim a grant ended before it began, and every later reader
+    of the row would have to decide what that meant. Clamping to
+    `granted_at` would store an instant nobody asked for and report
+    success -- while the request itself is evidence that whoever made it
+    is working from a date this system disagrees with.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN, granted_at=T0)
+
+    outcome = await directory(factory).revoke(
+        GUILD, BEN, requested_by=ANNA, effective_at=T0 - timedelta(seconds=1)
+    )
+
+    assert outcome is not None
+    assert outcome.revoked is False
+    assert outcome.refusal == EFFECTIVE_BEFORE_GRANT
+    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    assert holders is not None
+    assert holders[0].revoked_at is None
+
+
+async def test_an_instant_may_be_chosen_only_by_somebody_who_administers_the_guild(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    await grant(factory, BEN)
+
+    outcome = await directory(factory).revoke(
+        GUILD, BEN, requested_by=CARL, effective_at=T0 + timedelta(days=1)
+    )
+
+    assert outcome is None
+
+
+async def test_the_roster_says_what_each_grant_covers(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A setting an administrator can switch on with no readout of who then
+    used it is a setting nobody can audit.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN, scope=ConsentScope.AUDIO_VIDEO)
+    await grant(factory, CARL)
+
+    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+
+    assert holders is not None
+    assert {holder.discord_user_id: holder.scope for holder in holders} == {
+        BEN: "audio_video",
+        CARL: "audio",
+    }
+
+
+# ---------------------------------------------------------------------------
+# A person's own consent
+# ---------------------------------------------------------------------------
+
+
+def mine(
+    factory: async_sessionmaker[AsyncSession], *, now: datetime = T0
+) -> ConsolePersonalConsents:
+    return ConsolePersonalConsents(factory, ConfigStore(factory), lambda: now)
+
+
+async def offer_video(
+    factory: async_sessionmaker[AsyncSession],
+    guild_id: int = GUILD,
+    offered: bool = True,
+) -> None:
+    await ConfigStore(factory).set(
+        guild_id,
+        settings.VIDEO_CONSENT_OFFERED,
+        settings.TRUE if offered else settings.FALSE,
+        T0,
+    )
+
+
+async def test_a_person_sees_every_guild_they_have_a_record_in(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    await set_policy(factory, guild_id=OTHER_GUILD)
+    await grant(factory, BEN)
+    await grant(factory, BEN, guild_id=OTHER_GUILD)
+    await grant(factory, CARL)
+
+    consents = await mine(factory).for_person(BEN)
+
+    assert [consent.guild_id for consent in consents] == [GUILD, OTHER_GUILD]
+
+
+async def test_a_person_sees_only_the_newest_grant_per_guild(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The row the recorder acts on, and never an older one: showing
+    somebody a decision nothing enforces is worse than showing nothing.
+    """
+    await set_policy(factory)
+    await grant(
+        factory, BEN, granted_at=T0 - timedelta(days=30), revoked_at=T0 - timedelta(days=20)
+    )
+    await grant(factory, BEN, granted_at=T0 - timedelta(days=1))
+
+    consents = await mine(factory).for_person(BEN)
+
+    assert len(consents) == 1
+    assert consents[0].state == STATE_ACTIVE
+
+
+async def test_a_policy_bump_reads_as_its_own_state_rather_than_as_a_withdrawal(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The one state nobody expects and the only one the person did not
+    cause. Folded into "revoked" it would read as something they did.
+    """
+    await set_policy(factory, "2026-06")
+    await grant(factory, BEN, policy_version="2026-01")
+
+    consents = await mine(factory).for_person(BEN)
+
+    assert consents[0].state == STATE_POLICY_SUPERSEDED
+    assert consents[0].active is False
+    assert consents[0].policy_version == "2026-01"
+    assert consents[0].guild_policy_version == "2026-06"
+
+
+async def test_a_scheduled_withdrawal_reads_as_scheduled_and_still_active(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    await grant(factory, BEN, revoked_at=T0 + timedelta(days=7))
+
+    consents = await mine(factory).for_person(BEN)
+
+    assert consents[0].state == STATE_SCHEDULED
+    assert consents[0].active is True
+
+
+async def test_a_withdrawal_that_has_passed_reads_as_revoked(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    await grant(factory, BEN, revoked_at=T0 - timedelta(days=1))
+
+    consents = await mine(factory).for_person(BEN)
+
+    assert consents[0].state == STATE_REVOKED
+    assert consents[0].active is False
+
+
+async def test_a_person_is_told_whether_their_guild_offers_video_at_all(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """So the console can leave the control out entirely rather than
+    rendering one the API will refuse.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN)
+    assert (await mine(factory).for_person(BEN))[0].video_consent_offered is False
+
+    await offer_video(factory)
+    assert (await mine(factory).for_person(BEN))[0].video_consent_offered is True
+
+
+async def test_widening_a_scope_is_refused_while_the_guild_does_not_offer_video(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Refused, not silently narrowed. Software cannot read the document at
+    `policy_url`, so it must not pretend to have checked it -- and a
+    success answering a question the person did not ask has told them
+    something false about their own consent.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN)
+
+    outcome = await mine(factory).set_scope(BEN, GUILD, "audio_video")
+
+    assert outcome.changed is False
+    assert outcome.refusal == VIDEO_CONSENT_NOT_OFFERED
+    assert (await mine(factory).for_person(BEN))[0].scope == "audio"
+
+
+async def test_widening_a_scope_inserts_a_new_grant_under_the_current_policy(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The heart of the change. `consent` is an append-only history and a
+    widening is a *grant*, so it gets a row of its own carrying the policy
+    version in force when it was given. Overwriting the scope in place
+    would leave a record claiming video consent under a document written
+    before video was a question.
+    """
+    await set_policy(factory, "2026-06")
+    await offer_video(factory)
+    await grant(factory, BEN, granted_at=T0 - timedelta(days=5), policy_version="2026-06")
+    later = T0 + timedelta(days=1)
+
+    outcome = await mine(factory, now=later).set_scope(BEN, GUILD, "audio_video")
+
+    assert outcome.changed is True
+    assert outcome.policy_version == "2026-06"
+    rows = await consent_rows(factory, BEN)
+    assert len(rows) == 2
+    record = (await mine(factory, now=later).for_person(BEN))[0]
+    assert record.scope == "audio_video"
+    assert record.granted_at == later
+
+
+async def test_narrowing_a_scope_modifies_the_grant_rather_than_adding_one(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Nobody needs permission to consent to less, and withdrawing part of
+    a grant modifies the grant -- exactly as withdrawing all of it does.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN, scope=ConsentScope.AUDIO_VIDEO)
+
+    outcome = await mine(factory).set_scope(BEN, GUILD, "audio")
+
+    assert outcome.changed is True
+    rows = await consent_rows(factory, BEN)
+    assert len(rows) == 1
+    assert (await mine(factory).for_person(BEN))[0].scope == "audio"
+
+
+async def test_narrowing_needs_nothing_from_the_guild_that_widening_needs(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A guild that switched `video_consent_offered` back off must not trap
+    the people who consented while it was on.
+    """
+    await set_policy(factory)
+    await offer_video(factory, offered=False)
+    await grant(factory, BEN, scope=ConsentScope.AUDIO_VIDEO)
+
+    assert (await mine(factory).set_scope(BEN, GUILD, "audio")).changed is True
+
+
+async def test_asking_for_the_scope_you_already_have_writes_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A page that was open a while, not a decision. A new grant row here
+    would stamp a fresh `granted_at` on something nobody did.
+    """
+    await set_policy(factory)
+    await offer_video(factory)
+    await grant(factory, BEN, scope=ConsentScope.AUDIO_VIDEO)
+
+    outcome = await mine(factory).set_scope(BEN, GUILD, "audio_video")
+
+    assert outcome.changed is False
+    assert outcome.refusal is None
+    rows = await consent_rows(factory, BEN)
+    assert len(rows) == 1
+
+
+async def test_a_guild_with_no_policy_version_has_nothing_for_a_new_grant_to_name(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await offer_video(factory)
+    await grant(factory, BEN)
+
+    outcome = await mine(factory).set_scope(BEN, GUILD, "audio_video")
+
+    assert outcome.refusal == NO_POLICY_VERSION
+
+
+async def test_a_scope_cannot_be_changed_on_a_consent_that_has_ended(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Somebody whose consent has ended consents again, in Discord, under
+    the policy in force then -- they do not edit a record that already says
+    it stopped.
+    """
+    await set_policy(factory)
+    await offer_video(factory)
+    await grant(factory, BEN, revoked_at=T0 - timedelta(days=1))
+
+    outcome = await mine(factory).set_scope(BEN, GUILD, "audio_video")
+
+    assert outcome.refusal == ALREADY_REVOKED
+
+
+async def test_a_person_with_no_record_in_that_guild_is_told_so(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+
+    assert (await mine(factory).set_scope(BEN, GUILD, "audio")).refusal == NO_CONSENT_ON_RECORD
+    assert (await mine(factory).revoke_own(BEN, GUILD)).refusal == NO_CONSENT_ON_RECORD
+
+
+async def test_a_person_may_withdraw_their_own_consent(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    await grant(factory, BEN)
+
+    outcome = await mine(factory).revoke_own(BEN, GUILD)
+
+    assert outcome.revoked is True
+    assert outcome.effective_at == T0
+    assert (await mine(factory).for_person(BEN))[0].state == STATE_REVOKED
+
+
+async def test_a_person_withdrawing_their_own_consent_deletes_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Withdrawing consent is a decision about the future. Erasing what was
+    recorded under the consent that existed at the time is `/audio purge`,
+    and it is deliberately a separate act.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN, granted_at=T0 - timedelta(days=10))
+    await a_recorded_session(factory, started_at=T0 - timedelta(days=2), people={BEN: "ben"})
+
+    await mine(factory).revoke_own(BEN, GUILD)
+
+    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    assert holders is not None
+    assert holders[0].recordings_with_audio == 1

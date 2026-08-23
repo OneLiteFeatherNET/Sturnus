@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import discord
@@ -612,3 +613,159 @@ async def test_a_stop_with_no_close_code_reports_none_rather_than_inventing_one(
         await voice._handle(CaptureStopped(OpusNotLoaded()))
 
     assert getattr(voice_record(caplog), "sturnus_fields", {})["close_code"] is None
+
+
+# --- whose video this connection is willing to ask Discord for ---
+#
+# Nothing here records video and this section does not make it
+# recordable. What it pins is narrower and comes first: the bot must not
+# *ask Discord for* a stream from somebody whose consent does not name
+# video. Asking and then discarding is not the same act as not asking --
+# a person's client can show them that a stream is being consumed, and
+# nothing about the discard reaches them.
+
+
+def announcement(ssrcs: list[int], *, member: object) -> object:
+    """What `voice_recv` dispatches on op 12, reduced to what is read."""
+    return SimpleNamespace(
+        member=member,
+        streams=[SimpleNamespace(ssrc=ssrc) for ssrc in ssrcs],
+    )
+
+
+def sharer(*, role_id: int | None = ROLE_ID, user_id: int = ANNA_ID) -> object:
+    return SimpleNamespace(
+        id=user_id,
+        roles=[SimpleNamespace(id=role_id)] if role_id is not None else [],
+    )
+
+
+def watching(voice: VoiceReceiveAdapter, *, video_allowed: bool) -> tuple[MagicMock, AsyncMock]:
+    """Puts the adapter where `_ask_for_video` leaves it, minus the gateway.
+
+    Returns the probe and the consent lookup, because both are what the
+    assertions are about: what was recorded, and what was asked.
+    """
+    probe = MagicMock()
+    voice._video_probe = probe
+    voice._voice_client = MagicMock()
+    voice._consent_role_id = ROLE_ID
+    asked = AsyncMock(return_value=video_allowed)
+    voice._consent_cache = MagicMock(may_record_video=asked)
+    return probe, asked
+
+
+async def test_video_is_not_asked_for_from_somebody_who_consented_to_audio_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asked: list[list[int]] = []
+
+    async def never(_client: object, ssrcs: list[int]) -> bool:
+        asked.append(ssrcs)
+        return True
+
+    monkeypatch.setattr("sturnus.infrastructure.discord.voice.request_video_streams", never)
+    voice = adapter()
+    probe, _ = watching(voice, video_allowed=False)
+
+    await voice._on_video_announced(sharer(), announcement([5001], member=sharer()))
+
+    assert asked == []
+    probe.note_subscription.assert_called_once_with([5001], subscribed=False)
+
+
+async def test_a_refusal_is_recorded_rather_than_silently_returned() -> None:
+    """ "Announced and never asked for" and "asked for and never delivered"
+    are the same zero in every packet count, and they mean opposite things
+    about whether Discord sends a bot video at all. The probe is where
+    that difference survives; the sink reports packets on a refused stream
+    under its own outcome for the same reason."""
+    voice = adapter()
+    probe, _ = watching(voice, video_allowed=False)
+
+    await voice._on_video_announced(sharer(), announcement([5001, 5002], member=sharer()))
+
+    probe.note_subscription.assert_called_once_with([5001, 5002], subscribed=False)
+
+
+async def test_video_is_asked_for_when_the_record_names_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subscriptions: list[list[int]] = []
+
+    async def note(_client: object, ssrcs: list[int]) -> bool:
+        subscriptions.append(ssrcs)
+        return True
+
+    monkeypatch.setattr("sturnus.infrastructure.discord.voice.request_video_streams", note)
+    voice = adapter()
+    probe, _ = watching(voice, video_allowed=True)
+
+    await voice._on_video_announced(sharer(), announcement([5001], member=sharer()))
+
+    assert subscriptions == [[5001]]
+    probe.note_subscription.assert_called_once_with([5001], subscribed=True)
+
+
+async def test_the_consent_role_is_read_off_the_member_rather_than_assumed() -> None:
+    """Spec 3.1's first layer applies here too, and there is no packet to
+    carry it: this runs on the event loop before anything has arrived, so
+    the role has to be read directly off the `Member` the gateway named."""
+    voice = adapter()
+    _, asked = watching(voice, video_allowed=True)
+
+    await voice._on_video_announced(
+        sharer(role_id=None), announcement([5001], member=sharer(role_id=None))
+    )
+
+    asked.assert_awaited_once_with(GUILD_ID, ANNA_ID, False)
+
+
+async def test_an_announcement_naming_nobody_is_refused_rather_than_guessed_at() -> None:
+    """The consent of a person who cannot be identified cannot be read, and
+    the answer to "we do not know" is no."""
+    voice = adapter()
+    probe, asked = watching(voice, video_allowed=True)
+
+    await voice._on_video_announced(object(), SimpleNamespace(streams=[SimpleNamespace(ssrc=1)]))
+
+    probe.note_subscription.assert_called_once_with([1], subscribed=False)
+    asked.assert_not_awaited()
+
+
+async def test_a_consent_lookup_that_fails_does_not_end_the_recording() -> None:
+    """A database that cannot be reached is not a yes -- and it is also not
+    a reason to lose a capture that is recording audio correctly."""
+    voice = adapter()
+    probe, _ = watching(voice, video_allowed=True)
+    voice._consent_cache = MagicMock(
+        may_record_video=AsyncMock(side_effect=RuntimeError("database gone"))
+    )
+
+    await voice._on_video_announced(sharer(), announcement([5001], member=sharer()))
+
+    probe.note_subscription.assert_called_once_with([5001], subscribed=False)
+
+
+async def test_nothing_is_asked_for_at_connect_time(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`_ask_for_video` used to send `{"any": 100}` -- everybody's camera,
+    before a word had been said about anybody's consent. It now sends the
+    refusal, and every stream is named individually afterwards."""
+    sent: list[str] = []
+
+    async def announce(_client: object) -> bool:
+        sent.append("op12")
+        return True
+
+    async def refuse(_client: object) -> bool:
+        sent.append("op15-any-off")
+        return True
+
+    monkeypatch.setattr("sturnus.infrastructure.discord.voice.announce_video_capability", announce)
+    monkeypatch.setattr("sturnus.infrastructure.discord.voice.refuse_unnamed_video", refuse)
+    voice = adapter()
+    watching(voice, video_allowed=True)
+
+    await voice._ask_for_video()
+
+    assert sent == ["op12", "op15-any-off"]

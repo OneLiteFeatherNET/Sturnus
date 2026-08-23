@@ -64,8 +64,18 @@ measurement says anything.
 **It still records nothing.** Requesting a stream is not decoding one.
 Video packets arriving here land where they already landed -- in
 `RecordingSink.write`, counted by `.video_probe` and dropped. Whether
-they may ever be *kept* is a consent question with a role of its own, and
-that decision is not made in this file.
+they may ever be *kept* remains a question this file does not answer.
+
+**What did change is who is asked about.** This module used to send
+`{"any": 100}` -- give me every stream from everybody -- because the only
+question was whether Discord would send a bot anything at all. It is
+`{"any": 0}` now, and a stream is asked for by name only when the
+person's stored consent says `audio_video`
+(`sturnus.domain.consent.may_record_video`). Discarding somebody's video
+after asking for it is not the same as not asking: a client can show its
+owner that a stream is being consumed, and nothing about the discard
+reaches them. The measurement is unchanged for anyone who consents; for
+everyone else the honest answer to "did you ask for my camera" is now no.
 """
 
 from __future__ import annotations
@@ -93,10 +103,17 @@ MEDIA_SINK_WANTS = 15
 #: happened to be dropped would answer it wrongly.
 HIGHEST_QUALITY = 100
 
+#: The other end of the same scale: 0 disables a stream. It is what this
+#: connection says about every stream nobody has consented to, which
+#: after the consent scope arrived is every stream by default.
+DISABLED = 0
+
 #: The key that applies to every stream not named explicitly. Sent once at
 #: connect so a share already running when the bot joins is covered too:
 #: a subscription keyed to an SSRC cannot be sent before that SSRC is
 #: known, and the op 12 that would name it may already have gone past.
+#: It now carries `DISABLED` rather than `HIGHEST_QUALITY` -- see
+#: `refuse_unnamed_video`.
 ANY_STREAM = "any"
 
 #: Offsets for the SSRCs this connection declares as its own. A client
@@ -214,15 +231,32 @@ async def announce_video_capability(client: voice_recv.VoiceRecvClient) -> bool:
     )
 
 
-async def request_all_video(client: voice_recv.VoiceRecvClient) -> bool:
-    """Asks for every stream the server has, at the highest layer.
+async def refuse_unnamed_video(client: voice_recv.VoiceRecvClient) -> bool:
+    """Asks for no stream this connection has not named. Sent once, at connect.
 
-    Sent once after connecting, before any individual SSRC is known.
+    This is where `request_all_video` used to be, and the replacement is
+    the point rather than an optimisation. `{"any": 100}` asks the server
+    for every stream it has, from everybody in the channel, before
+    anybody has said whether they consent to that -- and "we asked for
+    your camera and then threw the packets away" is not a defence, it is
+    a description of the thing somebody objected to. A person's client
+    can show them that a stream is being consumed; nothing about
+    discarding it afterwards reaches them.
+
+    So the blanket subscription becomes a blanket refusal, and every
+    stream is asked for by name afterwards, once and only once the
+    consent behind that name says `audio_video`
+    (`voice.VoiceReceiveAdapter._on_video_announced`).
+
+    `DISABLED` rather than simply not sending anything: the key `any`
+    covers streams this connection never names, and a share already
+    running when the bot joins is exactly such a stream. Silence would
+    leave the server's default in charge of that case; this says no.
     """
     return await _send(
         client,
-        {"op": MEDIA_SINK_WANTS, "d": {ANY_STREAM: HIGHEST_QUALITY}},
-        "media sink wants (any)",
+        {"op": MEDIA_SINK_WANTS, "d": {ANY_STREAM: DISABLED}},
+        "media sink wants (any: off)",
     )
 
 
@@ -230,8 +264,10 @@ async def request_video_streams(client: voice_recv.VoiceRecvClient, ssrcs: list[
     """Asks for the named video SSRCs, at the highest layer.
 
     Sent on `on_voice_member_video`, the first moment an SSRC exists to
-    name. Redundant with `request_all_video` if `any` behaves as
-    documented, and the cheap insurance if it does not.
+    name -- and, since `refuse_unnamed_video` turned `any` off, the only
+    thing that ever asks for video at all. The caller decides which SSRCs
+    belong here, and the rule it applies is one person's consent scope:
+    see `voice.VoiceReceiveAdapter._on_video_announced`.
     """
     if not ssrcs:
         return False

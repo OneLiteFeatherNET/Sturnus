@@ -389,6 +389,39 @@ a guild administrator bypasses channel overwrites and could otherwise
 speak in the channel without the role — and because the record check is
 what makes bumping `policy_version` take effect on its own (see section 6).
 
+### 3.2.1 What a consent covers: `scope`
+
+A consent record names a **scope**, either `audio` (the default, and what
+every record written before this existed says) or `audio_video`.
+
+**Sturnus does not record video, and the scope does not change that.**
+What exists is a diagnostic that measures whether Discord will send a bot
+the video streams it announces at all; packets that arrive are counted and
+dropped without a byte being decoded, and the whole thing is off unless
+`STURNUS_CAPTURE_DIAGNOSTICS` is set. The scope exists *before* the
+capability on purpose: a system must be able to record that somebody said
+no before it acquires the ability to do the thing they said no to, and
+built the other way round there is a window in which every grant taken has
+to be taken again.
+
+What the scope enforces today is narrower and comes first: **the bot does
+not ask Discord for a speaker's video unless that speaker's consent says
+`audio_video`.** At connect it sends Media Sink Wants with `{"any": 0}` —
+send me no stream I have not named — and it names a stream only after
+reading the consent behind it. Asking for somebody's camera and discarding
+the packets is not the same act as not asking: a person's client can show
+them that a stream is being consumed, and nothing about the discard
+reaches them.
+
+Two things to look at when a video diagnostic reports nothing:
+
+- `sturnus.voice.packets{outcome="video_no_consent"}` — Discord sent a
+  stream this connection asked it not to send.
+- The probe's own line, which now counts announced streams refused for
+  lack of video consent separately. A run in which every speaker consented
+  to audio only says nothing about whether Discord sends video; the
+  verdict in that line says so rather than reading as a finding.
+
 ### 3.3 Why non-recorded channels must also exist
 
 If the recording channels are the *only* voice channels available,
@@ -506,6 +539,27 @@ Keep it a sentence rather than a word list, keep it in the transcription
 language, and keep it short — Whisper only sees the last ~224 tokens of it,
 and a long prompt bleeds its own wording into the transcript.
 
+`video_consent_offered` is `true` or `false`, and defaults to `false`. It
+decides whether the people in this guild may widen their consent scope to
+`audio_video` at all (section 3.2.1). While it is false the API refuses a
+widening with `video_consent_not_offered` and the console leaves the
+option out of its interface entirely — absent, not disabled.
+
+**Turning it on is an assertion, and nothing can check it for you.**
+Switching it to `true` says: the document at `policy_url`, at the current
+`policy_version`, describes video recording. Software cannot read that
+document, so it does not pretend to have checked it. A consent record
+naming `audio_video` under a policy that describes only audio is not
+consent, and the switch is where that judgement is recorded. The same
+construction as the audio-playback question in section 6.2, and honest for
+the same reason: the implementation cannot enforce it, so it is written
+down where the person switching it on will read it.
+
+The value must be exactly `true` or `false`. `/config set` refuses
+anything else, deliberately: readers treat an unrecognised value as false,
+so `yes` would fail nowhere at all and quietly mean the opposite of what
+whoever typed it meant.
+
 ### 4.0 `voice_channel_ids`, and the key it replaced
 
 `voice_channel_ids` names every voice channel Sturnus is allowed to record
@@ -579,8 +633,9 @@ recording earlier but never discards it. `/config set` warns explicitly
 when it detects this.
 
 **Live immediately, and never were stale.** `admin_role_id`,
-`policy_version`, `policy_url` (read per command invocation, and by the
-consent cache with a five-second TTL), and `transcription_language`,
+`policy_version`, `policy_url`, `video_consent_offered` (read per command
+invocation, per API request, and by the consent cache with a five-second
+TTL), and `transcription_language`,
 `transcription_prompt`, `document_target`, `document_provider`,
 `merge_gap_seconds` (read per job by the *worker* process, not the bot at
 all). The two transcription keys apply to the next job the worker claims,
@@ -1144,17 +1199,55 @@ cannot be without giving `api` a Discord token.
   a recording. The console shows the track and omits the speaker rather
   than dropping a recording that exists.
 
-### 6.2.6 Withdrawing somebody else's consent
+### 6.2.6 Consent from the console: scope, and withdrawing it
 
 An administrator can end a member's consent from the console's **Admin
-View → User Settings**, per guild. This is the third way a consent can
-end, and the three are not interchangeable:
+View → User Settings**, per guild; a person can end their own from their
+settings page. These are the third and fourth ways a consent can end, and
+the four are not interchangeable:
 
-| Way | Scope | Removes the role? | Effect on recording |
+| Way | Who it covers | Removes the role? | Effect on recording |
 |---|---|---|---|
 | `/consent revoke` in Discord | The person themselves | **Yes** | Immediate (role check is per frame, uncached) |
 | Bumping `policy_version` | Everybody in the guild at once | No | Within the consent cache's 5 s TTL |
-| Console → User Settings | One named person | **No** | Within the consent cache's 5 s TTL |
+| Console → Admin View → User Settings | One named person | **No** | Within the consent cache's 5 s TTL, or from the chosen instant |
+| Console → the person's own settings | Themselves | **No** | Within the consent cache's 5 s TTL |
+
+**`revoked_at` is an effective instant, not a tombstone.** Any non-null
+value used to mean "not active"; it now means "not active from then on",
+and `is_consent_active` reads `now < revoked_at` on every check. An
+administrator may therefore send an optional `effective_at` (ISO-8601,
+with an offset) with a withdrawal:
+
+- **Absent** means now, which is exactly what this endpoint always did. No
+  client breaks by not sending it.
+- **A future instant** is a scheduled withdrawal — "from the end of the
+  month". Nothing new fires it: the bot re-reads the record through the
+  consent cache, and the cache stores the record rather than a verdict, so
+  the moment passes and recording stops within five seconds of it. There
+  is no timer, no sweep and no job to watch.
+- **A past instant** is a correction — somebody left in March and nobody
+  wrote it down until June.
+
+The only value refused is one before `granted_at`, which would claim a
+grant ended before it began.
+
+**A back-dated revocation deletes nothing.** It is a statement about
+recordings that already exist, not an erasure of them. The response says
+how many recordings with audio fall on or after the chosen instant so the
+console can offer the erasure path; `/audio purge` (§12.3) and the
+retention sweep remain the only two things in this system that delete
+audio, and correcting a date must never quietly become a third.
+
+The audit line distinguishes the two acts. `console.consent_revoked`
+carries `effective_at_given`, because an administrator back-dating a
+withdrawal and one clicking "withdraw" both leave a perfectly ordinary
+date in `revoked_at`, and by the time anybody reads the row nothing else
+can tell them apart. A person withdrawing their own consent from the
+console emits `console.consent_self_revoked` instead, at INFO —
+`requested_by` equals `discord_user_id` there and is written anyway, so a
+query over both events answers "who withdrew whose consent" without a row
+falling out of it.
 
 **The console cannot remove the Discord role, and this is deliberate.**
 `api` holds no Discord token (§6.2.2), so it writes `consent.revoked_at`
@@ -1212,6 +1305,51 @@ naming a superseded `policy_version` has no force and a NULL `revoked_at`:
 nobody withdrew anything, the guild's policy moved on under them (§6).
 Restoring the old `policy_version` would bring every one of those back.
 Withdrawing through the console is what survives that.
+
+The roster also shows each grant's **scope** (§3.2.1). Every row reads
+`audio` until a guild turns `video_consent_offered` on; a setting an
+administrator can switch on with no readout of who then used it is a
+setting nobody can audit.
+
+#### What a person may do to their own consent
+
+`GET /api/me/consents` lists every guild the signed-in person holds a
+consent record in — the state, the scope, the policy version their grant
+names alongside the guild's current one, the instants, and whether that
+guild offers video consent at all. There is no user in any of those paths:
+the session decides whose records they are, so there is no parameter for
+somebody else's.
+
+They may do two things with them.
+
+**Change the scope** (`PUT /api/me/consents/{guild_id}/scope`).
+
+- **Narrowing** (`audio_video` → `audio`) takes effect immediately and
+  needs nothing from the guild. Nobody needs permission to consent to
+  less, and a guild that switched `video_consent_offered` back off must
+  not trap the people who consented while it was on.
+- **Widening** is a new grant. It **inserts a new `consent` row** carrying
+  the guild's current `policy_version`, because the table is an
+  append-only history and a widened scope sitting under a superseded
+  policy is exactly the record that history exists to prevent. It is
+  refused with `video_consent_not_offered` while the guild does not offer
+  it — refused, not silently narrowed: a success answering a question the
+  person did not ask has told them something false about their own
+  consent.
+
+**Withdraw entirely** (`POST /api/me/consents/{guild_id}/revoke`),
+effective now. There is no `effective_at` here on purpose: back-dating is
+an administrator's correction of a record and scheduling is a guild's
+arrangement, while a date field offered to the person themselves would
+invite somebody to withdraw retroactively believing it erases something.
+It does not.
+
+**It cannot remove the Discord role**, for the same reason the
+administrator's path cannot: `api` holds no Discord token (§6.2.2). The
+answer carries `role_stays: true` so the console says so next to the
+button rather than leaving the person to discover it from `/consent
+status`. If the role should go too, run `/consent revoke` in Discord,
+which does both.
 
 ### 6.2.7 The queue overview
 

@@ -44,6 +44,23 @@ TIMEZONE = "timezone"
 TRANSCRIPTION_LANGUAGE = "transcription_language"
 TRANSCRIPTION_PROMPT = "transcription_prompt"
 
+#: Whether this guild may offer the `audio_video` consent scope at all.
+#:
+#: A consent record naming `audio_video` under a policy document that
+#: describes only audio is not consent. Software cannot read the document
+#: at `policy_url`, so it must not pretend to have checked it -- and the
+#: honest form of "cannot check" is a switch that starts off and that an
+#: administrator turns on as an assertion about the document they wrote.
+#: Turning it on says: the policy at the current `policy_version` names
+#: video. Nothing here can verify that, and nothing pretends to.
+#:
+#: The API refuses to widen a scope while this is false, rather than
+#: quietly recording `audio` for somebody who asked for more; the console
+#: leaves the option out of the interface entirely rather than showing a
+#: control that always fails. Same construction as the console design's
+#: §1.1 for audio playback, and honest for the same reason.
+VIDEO_CONSENT_OFFERED = "video_consent_offered"
+
 #: The one value of `TRANSCRIPTION_LANGUAGE` that is not a language: it
 #: asks the engine to detect one per speaker and pin what it found for the
 #: rest of the session, which is what the worker did unconditionally before
@@ -53,6 +70,15 @@ TRANSCRIPTION_PROMPT = "transcription_prompt"
 #: languages would have no way back to detection at all.
 DETECT_LANGUAGE = "auto"
 
+#: The two spellings a boolean key may hold. Lowercase literals rather
+#: than anything Python's `bool()` would accept, because the value lives
+#: in a `Text` column that several processes read: `"False"`, `"0"` and
+#: `""` are all obviously false to a person and three different answers
+#: to three different parsers.
+FALSE = "false"
+TRUE = "true"
+BOOLEAN_VALUES: frozenset[str] = frozenset({FALSE, TRUE})
+
 DEFAULTS: dict[str, str] = {
     EMPTY_GRACE_SECONDS: "60",
     IDLE_TIMEOUT_MINUTES: "15",
@@ -61,6 +87,11 @@ DEFAULTS: dict[str, str] = {
     DOCUMENT_PROVIDER: "outline",
     AUDIO_RETENTION_DAYS: "30",
     MERGE_GAP_SECONDS: "15",
+    # Off, and this is the only defensible default: it says the policy
+    # document has not been checked, which for every guild that has not
+    # been asked is true. A default of `true` would assert something
+    # about somebody else's wording.
+    VIDEO_CONSENT_OFFERED: FALSE,
     # Protocols are read by the people who were in the room, so the
     # times in them are theirs, not the cluster's. A wrong offset is
     # not obviously wrong to a reader -- 15:08 looks like a plausible
@@ -138,6 +169,32 @@ INTEGER_KEYS: frozenset[str] = frozenset(
         ADMIN_ROLE_ID,
     }
 )
+
+# Keys whose stored value must be `"true"` or `"false"`. Checked by
+# `ConfigStore.set` at write time exactly as `INTEGER_KEYS` is, and for
+# the same reason: a read path that has to cope with `"yes"`, `"1"` and
+# `"Off"` is a read path where two processes eventually disagree about
+# what a guild decided. Here that disagreement would be about whether a
+# guild may offer video consent at all, which is not a question to leave
+# to whichever parser ran.
+BOOLEAN_KEYS: frozenset[str] = frozenset(
+    {
+        VIDEO_CONSENT_OFFERED,
+    }
+)
+
+
+def is_true(value: str | None) -> bool:
+    """Reads a stored boolean, and reads anything unrecognised as false.
+
+    The one conversion, so no caller invents a second one. `ConfigStore`
+    refuses to store anything but the two literals, so the fallback
+    covers only what got in around it -- a hand-edited row, a value
+    written before `BOOLEAN_KEYS` existed -- and false is the safe
+    reading of a value nobody can vouch for: it withholds an option
+    rather than offering one on the strength of a string.
+    """
+    return value == TRUE
 
 
 class InvalidChannelList(ValueError):

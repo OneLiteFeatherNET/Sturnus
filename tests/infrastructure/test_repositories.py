@@ -6,8 +6,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from sturnus.application.assembly import serialize_transcript
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
+from sturnus.domain.consent import ConsentScope
 from sturnus.entrypoints.worker import _WorkerSessionStore
-from sturnus.infrastructure.db.models import AccountLink, Base, Session, SessionParticipant
+from sturnus.infrastructure.db.models import (
+    AccountLink,
+    Base,
+    Consent,
+    Session,
+    SessionParticipant,
+)
 from sturnus.infrastructure.db.queue import JobQueue
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -75,6 +82,79 @@ async def test_guilds_do_not_share_consent(factory: async_sessionmaker[AsyncSess
     repo = ConsentRepository(factory)
     await repo.record_grant(ANNA, GUILD, POLICY, "button", T0)
     assert await repo.current(ANNA, 999) is None
+
+
+# ---------------------------------------------------------------------------
+# Scope
+# ---------------------------------------------------------------------------
+
+
+async def test_a_grant_that_does_not_say_what_it_covers_covers_audio(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The column's default, exercised through the writer that omits it.
+
+    `/consent grant` names no scope and never will: it is the audio flow,
+    and a caller forced to restate `ConsentScope.AUDIO` at every call site
+    is a caller one of whose call sites eventually restates the wrong
+    thing.
+    """
+    repo = ConsentRepository(factory)
+    await repo.record_grant(ANNA, GUILD, POLICY, "button", T0)
+
+    record = await repo.current(ANNA, GUILD)
+    assert record is not None
+    assert record.scope is ConsentScope.AUDIO
+
+
+async def test_a_grant_may_name_video_and_reads_back_as_naming_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    repo = ConsentRepository(factory)
+    await repo.record_grant(ANNA, GUILD, POLICY, "console", T0, scope=ConsentScope.AUDIO_VIDEO)
+
+    record = await repo.current(ANNA, GUILD)
+    assert record is not None
+    assert record.scope is ConsentScope.AUDIO_VIDEO
+
+
+async def test_narrowing_modifies_the_grant_rather_than_writing_a_new_one(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Narrowing is a withdrawal of part of a grant, and this table treats
+    a withdrawal as a modification of the grant it withdraws from -- the
+    same rule `record_revocation` follows. A second row would read as a
+    fresh decision made at a moment nobody decided anything."""
+    repo = ConsentRepository(factory)
+    await repo.record_grant(ANNA, GUILD, POLICY, "console", T0, scope=ConsentScope.AUDIO_VIDEO)
+
+    await repo.narrow_scope(ANNA, GUILD, ConsentScope.AUDIO)
+
+    async with factory() as session:
+        rows = (await session.execute(select(Consent).where(Consent.discord_user_id == ANNA))).all()
+    assert len(rows) == 1
+    record = await repo.current(ANNA, GUILD)
+    assert record is not None
+    assert record.scope is ConsentScope.AUDIO
+    assert record.granted_at == T0
+
+
+async def test_a_scheduled_revocation_is_stored_as_the_instant_it_names(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The repository writes what it is told, including a date in the
+    future. Whether that instant is allowed -- not before `granted_at` --
+    is the caller's decision, because only the caller knows what the
+    request was for."""
+    repo = ConsentRepository(factory)
+    await repo.record_grant(ANNA, GUILD, POLICY, "button", T0)
+    end_of_month = T0 + timedelta(days=12)
+
+    await repo.record_revocation(ANNA, GUILD, end_of_month)
+
+    record = await repo.current(ANNA, GUILD)
+    assert record is not None
+    assert record.revoked_at == end_of_month
 
 
 async def test_session_lifecycle(factory: async_sessionmaker[AsyncSession]) -> None:
