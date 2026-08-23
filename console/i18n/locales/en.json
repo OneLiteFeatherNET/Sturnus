@@ -486,5 +486,77 @@
       "noChannelsChosen": "No channel chosen. Sturnus records nothing in this server until at least one is.",
       "chosenIds": "Stored as"
     }
+  },
+  "ui": {
+    "select": {
+      "placeholder": "Choose an option",
+      "empty": "There is nothing to choose from."
+    },
+    "combobox": {
+      "filter": "Filter the list",
+      "matchCount": "{count} option matches. | {count} options match.",
+      "noMatches": "Nothing matches “{query}”."
+    },
+    "datePicker": {
+      "openCalendar": "Open the calendar",
+      "previousMonth": "Previous month",
+      "nextMonth": "Next month",
+      "sends": "Sent as {instant}",
+      "unreadable": "That is not a date that exists.",
+      "nothingChosen": "No moment chosen yet."
+    },
+    "chipInput": {
+      "placeholder": "Add a tag, or just type",
+      "remove": "Remove the tag {chip}",
+      "suggestions": "Suggested tags",
+      "empty": "Nothing entered yet.",
+      "chipsOnly": "{count} tag. | {count} tags.",
+      "textOnly": "Searching for “{text}”.",
+      "chipsAndText": "{count} tag, and searching for “{text}”. | {count} tags, and searching for “{text}”."
+    },
+    "list": {
+      "selectPage": "Select this page",
+      "selectRow": "Select row {row}",
+      "expand": "Show actions",
+      "collapse": "Hide actions",
+      "empty": "There is nothing in this list.",
+      "selected": "{count} row selected. | {count} rows selected.",
+      "selectedWithOffPage": "{count} row selected, {away} of them not on this page. | {count} rows selected, {away} of them not on this page.",
+      "bulkScope": "“{action}” would apply to {count} row. | “{action}” would apply to {count} rows."
+    },
+    "pagination": {
+      "nav": "Pages",
+      "previous": "Previous",
+      "next": "Next",
+      "page": "Page {number}",
+      "position": "Page {page} of {count}"
+    },
+    "gallery": {
+      "title": "Console controls",
+      "intro": "Every control in app/components/ui, in the states a reviewer has to see: empty, filled, disabled, refused, and a list too long to scroll. This page exists so that the controls can be read without running the rest of the console, and it is reachable in development only.",
+      "select": "Dropdown",
+      "combobox": "Dropdown with a filter",
+      "datePicker": "Date and time",
+      "chipInput": "Tags and free text",
+      "tabs": "Tabs",
+      "list": "List that opens, with bulk actions",
+      "pagination": "Pager",
+      "stateEmpty": "Nothing chosen",
+      "stateFilled": "Something chosen",
+      "stateDisabled": "Refusing to be used",
+      "stateInvalid": "Marked as wrong",
+      "stateLong": "Two hundred rows",
+      "stateNone": "Nothing to choose from",
+      "emits": "What it emits",
+      "panelOverview": "This panel was built when the page opened, because its tab was the one the address named.",
+      "panelQueue": "This panel did not exist until its tab was pressed. That is the whole of the lazy mounting: a panel whose data is expensive must not load because it exists.",
+      "panelConsents": "And this one is still not built until somebody asks for it.",
+      "tabOverview": "Overview",
+      "tabQueue": "Queue",
+      "tabConsents": "Consents",
+      "tabLocked": "Locked",
+      "erase": "Erase",
+      "rowAction": "The actions a row reveals live here, and belong to whichever page is using the list."
+    }
   }
 }

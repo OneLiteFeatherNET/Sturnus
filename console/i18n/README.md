@@ -48,6 +48,7 @@ matches the file that renders it:
 | `admin.consents.*` | `pages/admin/consents.vue`                            |
 | `admin.queue.*`    | `pages/admin/queue.vue`                               |
 | `admin.reporting.*`| `pages/admin/reporting.vue`                           |
+| `ui.*`             | `components/ui/*` — the shared controls, and the gallery |
 
 `admin.settings.*`, `admin.consents.*` and `admin.queue.*` do not exist yet:
 Bot Settings, User Settings and the Queue are still English, and are being
@@ -74,6 +75,21 @@ effective-instant work added — the withdrawal's effective moment, and the
 scope on a roster row — so that the sweep has less to do rather than more.
 New strings on that page go through `$t` from now on; the existing ones move
 when the sweep reaches them.
+
+`ui.*` is the one namespace that does not name a page. It serves
+`app/components/ui/*` — the six shared controls every page is about to be
+built out of — and the gallery at `/dev/ui` that renders them. They are keyed
+from the start and keyed completely: a control is used by several pages, so a
+hard-coded English string in one of them would appear in a German page
+without any German page having been edited, and nobody would know which file
+to look in.
+
+**A control's contents are not translated here.** The labels in a dropdown, a
+tab's name, the word a bulk action is called — those come from the page using
+the control, which knows whether they are sentences this console wrote or a
+guild's own channel names. What lives under `ui.*` is the control's own
+chrome: its placeholder, its "there is nothing to choose from", the sentence
+saying how much of a selection is not on this page.
 
 `settings.consent.*` sits under `settings.*` rather than in a namespace of
 its own, because it is a section of that page and not a page. It is the one
