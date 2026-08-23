@@ -484,7 +484,17 @@
       "choose": "Bitte auswählen",
       "notSet": "Nicht gesetzt",
       "noChannelsChosen": "Kein Kanal ausgewählt. Solange das so bleibt, nimmt Sturnus auf diesem Server nichts auf.",
-      "chosenIds": "Gespeichert als"
+      "chosenIds": "Gespeichert als",
+      "editingServer": "Bearbeiteter Server",
+      "groupTabs": "Einstellungen, nach Zweck gruppiert",
+      "groupRecording": "Aufnahme",
+      "groupConsent": "Einwilligung und Daten",
+      "groupTranscription": "Transkription",
+      "groupPublishing": "Veröffentlichung",
+      "groupAdministration": "Verwaltung",
+      "groupOther": "Alles Weitere",
+      "groupNeedsAttention": "{group} · {count} fehlt | {group} · {count} fehlen",
+      "groupOtherNote": "Diese Schlüssel gehören zu keiner der Gruppen oben: sie sind zur API hinzugekommen, nachdem diese Gruppen entstanden sind, und diese Seite zeigt lieber einen Schlüssel ohne Gruppe, als ihn stillschweigend wegzulassen. Sonst unterscheidet sie nichts — setzen, leeren und wirksam werden funktionieren wie bei jedem anderen Schlüssel hier."
     }
   },
   "ui": {

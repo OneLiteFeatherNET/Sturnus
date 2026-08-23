@@ -22,6 +22,7 @@ import {
   effectBadge,
   fieldHints,
   guildLabel,
+  guildOptions,
   inputKind,
   keyLabel,
   missingRequired,
@@ -163,6 +164,34 @@ describe('naming a guild', () => {
   })
 })
 
+describe('the guilds as rows of a dropdown', () => {
+  it('puts the id under the name, where the control renders subtext', () => {
+    expect(guildOptions([{ id: '42', name: 'OneLiteFeather' }])).toEqual([
+      { value: '42', label: 'OneLiteFeather', detail: '42' },
+    ])
+  })
+
+  it('does not print the id twice for a guild that has no name', () => {
+    // `guildLabel` has already put the whole snowflake in the label. A
+    // `detail` repeating it renders eighteen digits above eighteen digits.
+    const [option] = guildOptions([{ id: '1129384756123456789', name: null }])
+    expect(option?.label).toContain('1129384756123456789')
+    expect(option?.detail).toBeUndefined()
+  })
+
+  it('keeps the order the API sent', () => {
+    const options = guildOptions([
+      { id: '2', name: 'Second' },
+      { id: '1', name: 'First' },
+    ])
+    expect(options.map((option) => option.value)).toEqual(['2', '1'])
+  })
+
+  it('yields nothing for somebody who administers nothing', () => {
+    expect(guildOptions([])).toEqual([])
+  })
+})
+
 describe('saying when a change takes effect', () => {
   it('says an immediately-read key is in force now', () => {
     const outcome = writeOutcome(view({ key: 'timezone', takes_effect: 'immediately' }), 'saved')
@@ -249,6 +278,29 @@ describe('saying when a change takes effect', () => {
     )
     expect(outcome.headline).toContain('Cleared')
     expect(outcome.detail.toLowerCase()).toContain('restart')
+  })
+
+  it('says which key it is about, in every one of the four tones', () => {
+    // Grouped onto tabs, two of these panels can be open a screen apart,
+    // one of them left over from a key written a minute ago. A headline
+    // that names no key can be read against the wrong one -- and the
+    // reading that costs something is a cheerful "in effect now" being
+    // taken for the restart-only key underneath it.
+    for (const timing of ['immediately', 'next_reconcile', 'process_restart', 'next_full_moon']) {
+      const outcome = writeOutcome(view({ key: 'admin_role_id', takes_effect: timing }), 'saved')
+      expect(outcome.headline, `${timing} names no key`).toContain('Admin role ID')
+    }
+  })
+
+  it('names the key the way the heading above it names it', () => {
+    // Not the raw key: the two sit centimetres apart, and a reader should
+    // not have to work out that they are the same word twice.
+    const outcome = writeOutcome(
+      view({ key: 'merge_gap_seconds', takes_effect: 'immediately' }),
+      'saved',
+    )
+    expect(outcome.headline).toContain(keyLabel('merge_gap_seconds'))
+    expect(outcome.headline).not.toContain('merge_gap_seconds')
   })
 })
 
