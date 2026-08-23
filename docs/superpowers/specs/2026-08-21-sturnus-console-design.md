@@ -256,7 +256,8 @@ scanning for a protocol link.
 
 ## 5.2 Re-queueing, for administrators
 
-`GET /api/sessions/{id}/queue` and `POST /api/sessions/{id}/queue/requeue`
+`GET /api/sessions/{id}/queue`, `GET /api/sessions/{id}/queue/stream` and
+`POST /api/sessions/{id}/queue/requeue`
 
 The rule here is **administrator of the session's guild**, not participant
 of the session — the only place in the console where those differ.
@@ -281,8 +282,50 @@ anywhere.
 The progress half is not decoration. A re-queue is not instantaneous, and
 a control that reports nothing after being pressed is one people press
 twice — the second press landing while the first redo is `running`, which
-is exactly the state `plan_requeue` refuses. So the queue is polled while
-it is moving, and the poll stops when the jobs do.
+is exactly the state `plan_requeue` refuses. So the queue is watched while
+it is moving, and the watching stops when the jobs do.
+
+**The watching is a stream, and the timer moved to the server.** Both queue
+views — this panel and the guild-wide page over `GET
+/api/guilds/{id}/queue` — used to re-read their endpoint on a timer in the
+browser, every three seconds here and every five there, and be told
+"nothing changed" almost every time. Each endpoint now has a `/stream`
+twin serving `text/event-stream`, under the same authorisation rule and
+reached by calling the same method: the server re-reads the
+same snapshot on its own two-second interval, serialises it with the same
+function, and sends a `data:` event only when that serialisation differs
+from the one it last sent. An unchanged queue produces nothing. A stream
+sends the current snapshot on connect, so a page renders the moment it
+connects rather than waiting for something to happen; emits a comment line
+every fifteen seconds while nothing changes, so no intermediary decides an
+idle connection is dead; ends with a named terminal event when the queue
+comes to rest, because a browser cannot tell a deliberate close from a
+dropped one and would otherwise reconnect for ever; and closes itself after
+ten minutes regardless, because an unbounded server-side loop is how a
+process accumulates tasks belonging to browsers that were closed hours ago.
+
+The cost is stated rather than assumed: **one database read per two seconds
+per open stream**, and none at all for a queue at rest. That is affordable
+where the browser's five seconds were not, because the browser paid a TLS
+handshake, a Cloudflare Tunnel hop, a cookie signature check and a whole
+request cycle for each of its reads and paid them whether or not the answer
+had changed.
+
+`X-Accel-Buffering: no` travels with every stream and is not optional here.
+Sturnus is served through a Cloudflare Tunnel and a reverse proxy, and a
+proxy that buffers a response holds every event until the response ends —
+which for these streams is ten minutes later, all at once, long after
+anybody cared.
+
+**The polling endpoints stay, and the console keeps its timer.** An event
+stream is the one response shape an intermediary can break without breaking
+anything else, and the browser cannot tell a buffering proxy from a server
+with nothing to say: the connection is open, no error is raised, and
+nothing arrives. So the console treats silence as a failure on a deadline
+and falls back to re-reading the polling endpoint, and the page says in a
+sentence which of the two it is doing — "live" and "checking every few
+seconds" look identical whenever the figures happen not to be changing,
+which is exactly when somebody is deciding whether to believe them.
 
 ### 5.1 What is deliberately not built
 
