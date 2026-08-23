@@ -90,12 +90,22 @@ def _guild(
     voice: Sequence[MagicMock] = (),
     text: Sequence[MagicMock] = (),
     roles: Sequence[MagicMock] = (),
+    members: Sequence[MagicMock] = (),
 ) -> MagicMock:
+    """A gateway-cached guild, `members` included.
+
+    `members` is the guild's whole membership -- the thing this module is
+    forbidden from reading. It is set here rather than left as an
+    attribute of the mock so that a future `guild.members` reaches a real
+    list and produces a real, wrong answer that a test can catch, instead
+    of a `MagicMock` that fails in whatever way a mock happens to fail.
+    """
     guild = MagicMock(spec=discord.Guild)
     guild.id = GUILD_ID
     guild.voice_channels = list(voice)
     guild.text_channels = list(text)
     guild.roles = list(roles)
+    guild.members = list(members)
     by_id = {role.id: role for role in roles}
     guild.get_role = MagicMock(side_effect=by_id.get)
     return guild
@@ -145,10 +155,17 @@ async def test_only_the_holders_of_the_two_naming_roles_are_mirrored() -> None:
     """The bound that keeps this from becoming a copy of Discord's user
     directory: a member of the guild who holds neither role is somebody
     the console never names, and so somebody this table never holds.
+
+    Cara is in this guild and in neither role, which is the whole point
+    of the fixture. Without her the assertion could not fail: a guild
+    whose only members are the two roles' holders is a guild where
+    reading `guild.members` and reading the two roles give the same
+    answer, and the bound this test claims to guard would be untested.
     """
-    consent = _role_object(CONSENT_ROLE_ID, "recorded", 1, _member(ANNA, "Anna"))
-    admin = _role_object(ADMIN_ROLE_ID, "staff", 2, _member(BEN, "Ben"))
-    guild = _guild(roles=[consent, admin])
+    anna, ben, cara = _member(ANNA, "Anna"), _member(BEN, "Ben"), _member(CARA, "Cara")
+    consent = _role_object(CONSENT_ROLE_ID, "recorded", 1, anna)
+    admin = _role_object(ADMIN_ROLE_ID, "staff", 2, ben)
+    guild = _guild(roles=[consent, admin], members=[anna, ben, cara])
     store = FakeStore()
 
     await sync_directory(guild, FakeConfig(str(CONSENT_ROLE_ID), str(ADMIN_ROLE_ID)), store, T0)
@@ -162,6 +179,30 @@ async def test_only_the_holders_of_the_two_naming_roles_are_mirrored() -> None:
             ],
         )
     ]
+
+
+async def test_a_guild_full_of_people_in_neither_role_mirrors_nobody() -> None:
+    """The sharper edge of the same bound, and the case a real guild is:
+    a few dozen people in the two roles, hundreds who joined for reasons
+    that have nothing to do with Sturnus.
+
+    Both roles are configured here, so this is the SYNC path rather than
+    the SKIP one -- the sweep does write, and what it writes is empty.
+    Anyone reaching for `guild.members` to "fill in the missing names"
+    turns that empty write into a copy of the guild's user directory in a
+    database that exists to hold recordings, and fails here.
+    """
+    consent = _role_object(CONSENT_ROLE_ID, "recorded", 1)
+    admin = _role_object(ADMIN_ROLE_ID, "staff", 2)
+    guild = _guild(
+        roles=[consent, admin],
+        members=[_member(ANNA, "Anna"), _member(BEN, "Ben"), _member(CARA, "Cara")],
+    )
+    store = FakeStore()
+
+    await sync_directory(guild, FakeConfig(str(CONSENT_ROLE_ID), str(ADMIN_ROLE_ID)), store, T0)
+
+    assert store.members == [(GUILD_ID, [])]
 
 
 async def test_somebody_in_both_roles_is_written_once() -> None:

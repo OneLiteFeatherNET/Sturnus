@@ -80,13 +80,26 @@ def test_the_same_membership_twice_produces_the_same_write() -> None:
     ]
 
 
-def test_nobody_outside_the_two_roles_is_named() -> None:
-    """The bound is the privacy story: mirroring the whole guild would
-    copy a Discord user directory into a database that exists to hold
-    recordings, for people who consented to nothing.
+def test_the_union_adds_nobody_its_callers_did_not_pass() -> None:
+    """Half of the privacy story, and only half -- which is why this test
+    no longer claims to be the whole of it.
+
+    What lives here is that this function is a union and nothing more: it
+    invents no ids and drops none. It used to assert that an id never
+    passed in did not come back, which is true of every possible
+    implementation, mirroring the entire guild included, and so could not
+    fail for the claim it was making.
+
+    The bound that actually keeps a Discord user directory out of this
+    database is which groups the caller passes, and it lives in
+    `directory_sync._holders`. It is tested against a guild that has a
+    member in neither role, in
+    `tests/infrastructure/discord/test_directory_sync.py`:
+    `test_only_the_holders_of_the_two_naming_roles_are_mirrored` and
+    `test_a_guild_full_of_people_in_neither_role_mirrors_nobody`.
     """
     assert members_to_mirror([_member(ANNA)], [_member(BEN)]) == [_member(ANNA), _member(BEN)]
-    assert not any(member.discord_user_id == CARA for member in members_to_mirror([_member(ANNA)]))
+    assert [member.discord_user_id for member in members_to_mirror([_member(CARA)])] == [CARA]
 
 
 def test_a_role_id_is_read_through_the_whitespace_around_it() -> None:
