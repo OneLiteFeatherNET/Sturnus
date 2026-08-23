@@ -17,11 +17,13 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from sturnus.application.directory_mirror import MirroredGuild
 from sturnus.console.app import build_api
 from sturnus.console.audio import AudioDelivery
 from sturnus.console.filters import SessionFilter
 from sturnus.console.ports import (
     AdminDirectory,
+    AdministeredGuild,
     CollectionListing,
     CollectionNames,
     ConsentDirectory,
@@ -748,18 +750,53 @@ class FakeNames:
     Defaults to `None`, which is what the real directory answers for "no
     such guild or not yours" -- so a test with no interest in names gets
     404s rather than a fake that quietly authorises everything.
+
+    The guild *listing* is derived from whichever `AdminDirectory` the
+    application was built with rather than tracked here, because that is
+    what the real adapter does: it asks who administers what and then
+    names those guilds and no others. A double that kept its own list
+    could answer with a guild the administrator mirror has never heard
+    of, which is precisely the widening this endpoint must not do.
+    `names` supplies what the bot swept, and a guild missing from it is a
+    guild swept by nobody yet -- listed, and nameless.
     """
 
-    def __init__(self, directory: GuildDirectory | None = None) -> None:
+    def __init__(
+        self,
+        directory: GuildDirectory | None = None,
+        *,
+        admins: AdminDirectory | None = None,
+        names: dict[int, MirroredGuild] | None = None,
+    ) -> None:
         self.directory = directory
+        self._admins = admins
+        self._names = dict(names or {})
         #: Every guild this was asked about, with who asked. The route
         #: tests assert on it: "the handler passed the signed-in id, not
         #: one from the URL" cannot be seen in a response body.
         self.asked: list[tuple[int, int]] = []
+        #: Everybody who asked for their own guild list, in order.
+        self.listed: list[int] = []
 
     async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildDirectory | None:
         self.asked.append((guild_id, requested_by))
         return self.directory
+
+    async def administered(self, *, requested_by: int) -> Sequence[AdministeredGuild]:
+        self.listed.append(requested_by)
+        if self._admins is None:
+            return ()
+        return tuple(
+            AdministeredGuild(
+                guild_id=guild_id,
+                name=mirrored.name if mirrored else None,
+                icon_url=mirrored.icon_url if mirrored else None,
+            )
+            for guild_id, mirrored in (
+                (guild_id, self._names.get(guild_id))
+                for guild_id in await self._admins.administered_guilds(requested_by)
+            )
+        )
 
 
 class FakeCollections:
@@ -818,11 +855,16 @@ def build_test_api(
 
     Every argument is an override, so a test names only what it is about.
     """
+    # Named once and handed to both, because the guild listing is a
+    # question about names asked of the guilds this directory says the
+    # caller administers: two independent doubles would let a test pass
+    # while the two disagreed about who administers what.
+    administrators = admins or FakeAdmins()
     return build_api(
         oauth=oauth or FakeOAuth(),
         states=states or FakeStates(),
         links=links or FakeLinks(),
-        admins=admins or FakeAdmins(),
+        admins=administrators,
         consents=consents or FakeConsents(),
         own_consents=own_consents or FakePersonalConsents(),
         reads=reads or FakeReads(),
@@ -839,7 +881,7 @@ def build_test_api(
         reports=reports or FakeReports(),
         profile=profile or FakeProfile(),
         prefs=prefs or FakePreferences(),
-        names=names or FakeNames(),
+        names=names or FakeNames(admins=administrators),
         collections=collections or FakeCollections(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),

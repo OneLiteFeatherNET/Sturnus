@@ -44,6 +44,13 @@ from aiohttp import web
 
 from sturnus.console import settings_view
 from sturnus.console.ports import AdminDirectory, SettingsStore
+
+# The guild switcher this module serves and the directory that names one
+# guild read the same mirror, so they share one collaborator and one key
+# rather than two of each pointing at the same object. The key stays
+# where it was defined; `routes_directory` imports nothing from here, so
+# reading it across is not a cycle.
+from sturnus.console.routes_directory import GUILD_NAMES
 from sturnus.observability.events import Event, log_event, log_exception
 
 # Why every reference to `sturnus.console.app` below is imported inside a
@@ -109,18 +116,40 @@ def register(app: web.Application) -> None:
 
 
 async def guilds(request: web.Request) -> web.Response:
-    """The guilds the signed-in person administers.
+    """The guilds the signed-in person administers, by name.
 
     An empty list rather than a refusal for somebody who administers
     nothing: that is the ordinary state of a participant who signed in to
     look at their own recordings, and answering 403 would make the console
     show an error for it.
+
+    **Which guilds are listed has not changed and must not.** The names
+    come from `GuildNames`, which asks the same `AdminDirectory` this
+    handler used to ask and names what it says -- an administrator of one
+    guild is nobody in another, and a name is not a reason to relax that.
     """
-    administered = await _admins(request).administered_guilds(_caller(request))
-    # Every Discord id as a string: a snowflake exceeds JavaScript's safe
-    # integer range, where a JSON number silently loses its last digits
-    # and produces an id that looks right and names nothing.
-    return web.json_response({"guilds": [{"guild_id": str(guild_id)} for guild_id in administered]})
+    administered = await request.app[GUILD_NAMES].administered(requested_by=_caller(request))
+    return web.json_response(
+        {
+            "guilds": [
+                {
+                    # Every Discord id as a string: a snowflake exceeds
+                    # JavaScript's safe integer range, where a JSON number
+                    # silently loses its last digits and produces an id
+                    # that looks right and names nothing.
+                    "guild_id": str(guild.guild_id),
+                    # Present and null for a guild the bot has not swept
+                    # since it joined, never absent: a console that could
+                    # not tell "no name yet" from "an API that does not
+                    # send one" would have to guess which, and both guesses
+                    # are wrong somewhere.
+                    "name": guild.name,
+                    "icon_url": guild.icon_url,
+                }
+                for guild in administered
+            ]
+        }
+    )
 
 
 async def read_settings(request: web.Request) -> web.Response:

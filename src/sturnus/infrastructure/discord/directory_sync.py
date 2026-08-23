@@ -1,4 +1,4 @@
-"""Mirroring a guild's channels, roles and named people into the database.
+"""Mirroring a guild's own name, channels, roles and named people into the database.
 
 The sibling of `sturnus.infrastructure.discord.admin_sync`, on the same
 sweep and for the same reason. `api` has no gateway and must not be given
@@ -13,8 +13,9 @@ named at all, and when a guild's mirror is left alone rather than emptied
 connection and is tested without one.
 
 Every gateway read here is a cache lookup rather than an API call:
-`Guild.voice_channels`, `Guild.text_channels`, `Guild.roles` and
-`Role.members` all answer from what the gateway already pushed. That is
+`Guild.name`, `Guild.icon`, `Guild.voice_channels`, `Guild.text_channels`,
+`Guild.roles` and `Role.members` all answer from what the gateway already
+pushed. That is
 why this can ride the ordinary ten-second tick without a rate-limit budget
 of its own, exactly as `sync_administrators` does. `Role.members` needs the
 members intent, which `SturnusClient` already declares for the consent
@@ -33,6 +34,7 @@ from sturnus.application.directory_mirror import (
     VOICE,
     DirectorySyncDecision,
     MirroredChannel,
+    MirroredGuild,
     MirroredMember,
     MirroredRole,
     decide_member_mirror,
@@ -47,6 +49,8 @@ class ConfigReader(Protocol):
 
 
 class DirectoryMirror(Protocol):
+    async def replace_guild(self, guild: MirroredGuild, now: datetime) -> None: ...
+
     async def replace_channels(
         self, guild_id: int, channels: list[MirroredChannel], now: datetime
     ) -> None: ...
@@ -75,6 +79,14 @@ async def sync_directory(
     the same sweep, which is what stops the console offering something
     nobody can join.
 
+    The guild's own name is written on the same terms as the channels:
+    ungated, because a guild that has configured nothing is exactly the
+    guild an administrator is looking at while running `/setup`, and it
+    is the name every admin page in the console puts at the top. Clearing
+    it is not a case this reaches -- a guild the bot cannot see has no
+    `discord.Guild` to be called with, so the caller skips it and the
+    stored name stands.
+
     Member names are gated, and the gate is the skip-versus-clear
     distinction `admin_mirror` draws. A guild that has configured neither
     naming role is left alone: it has no roster *yet*, which is not the
@@ -83,6 +95,7 @@ async def sync_directory(
     deleted or emptied must stop naming people rather than go on naming
     them out of a mirror nothing refreshes.
     """
+    await mirror.replace_guild(_guild(guild), now)
     await mirror.replace_channels(guild.id, _channels(guild), now)
     await mirror.replace_roles(guild.id, _roles(guild), now)
 
@@ -100,6 +113,26 @@ async def sync_directory(
     # queue, an administrator list.
     named = members_to_mirror(_holders(guild, consent), _holders(guild, admin))
     await mirror.replace_members(guild.id, list(named), now)
+
+
+def _guild(guild: discord.Guild) -> MirroredGuild:
+    """What this server is called, and where its icon is.
+
+    Both come off the same cached `discord.Guild` the channels and roles
+    are read from, so this costs the sweep nothing beyond the row it
+    writes -- and reading the icon here rather than later is why there is
+    no second sweep for one string.
+
+    `Guild.icon` is an asset or nothing; a guild without one is ordinary
+    and mirrors a null. The name is never logged: it is an
+    organisation's name, and nothing in a log line needs it.
+    """
+    icon = guild.icon
+    return MirroredGuild(
+        guild_id=guild.id,
+        name=guild.name,
+        icon_url=None if icon is None else icon.url,
+    )
 
 
 def _channels(guild: discord.Guild) -> list[MirroredChannel]:

@@ -1973,7 +1973,7 @@ class SturnusClient(commands.AutoShardedBot):
             )
 
     async def _mirror_directory(self, guild_id: int, now: datetime) -> None:
-        """Writes this guild's channel, role and member names for `api` to read.
+        """Writes this guild's own, channel, role and member names for `api` to read.
 
         On the same tick as `_mirror_administrators`, and for the same
         reasons: every gateway read behind it is a cache lookup rather
@@ -2013,7 +2013,7 @@ class SturnusClient(commands.AutoShardedBot):
                 log,
                 logging.WARNING,
                 Event.GUILD_TICK_FAILED,
-                "Could not mirror this guild's channel and role names; the console "
+                "Could not mirror this guild's own, channel and role names; the console "
                 "keeps the names it already had",
                 exc,
                 guild_id=guild_id,

@@ -2,9 +2,10 @@
 
 The decisions are tested in `tests/application/test_directory_mirror.py`;
 what is tested here is the adapter around them -- that the gateway is read
-for channels, roles and exactly the two role memberships, that what comes
-back reaches the store, and that the guild mid-`/setup` is skipped rather
-than written empty.
+for the guild's own name, its channels, its roles and exactly the two role
+memberships, that what comes back reaches the store, and that the guild
+mid-`/setup` is named and given its channels while its roster is skipped
+rather than written empty.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from sturnus.application.directory_mirror import (
     TEXT,
     VOICE,
     MirroredChannel,
+    MirroredGuild,
     MirroredMember,
     MirroredRole,
 )
@@ -33,9 +35,13 @@ T0 = datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC)
 
 class FakeStore:
     def __init__(self) -> None:
+        self.guilds: list[MirroredGuild] = []
         self.channels: list[tuple[int, list[MirroredChannel]]] = []
         self.roles: list[tuple[int, list[MirroredRole]]] = []
         self.members: list[tuple[int, list[MirroredMember]]] = []
+
+    async def replace_guild(self, guild: MirroredGuild, _now: datetime) -> None:
+        self.guilds.append(guild)
 
     async def replace_channels(
         self, guild_id: int, channels: Sequence[MirroredChannel], _now: datetime
@@ -85,8 +91,17 @@ def _channel_object(channel_id: int, name: str, position: int) -> MagicMock:
     return channel
 
 
+def _icon(url: str) -> MagicMock:
+    """The guild's icon as the gateway hands it over: an asset, not a URL."""
+    asset = MagicMock(spec=discord.Asset)
+    asset.url = url
+    return asset
+
+
 def _guild(
     *,
+    name: str = "Acme",
+    icon: MagicMock | None = None,
     voice: Sequence[MagicMock] = (),
     text: Sequence[MagicMock] = (),
     roles: Sequence[MagicMock] = (),
@@ -102,6 +117,8 @@ def _guild(
     """
     guild = MagicMock(spec=discord.Guild)
     guild.id = GUILD_ID
+    guild.name = name
+    guild.icon = icon
     guild.voice_channels = list(voice)
     guild.text_channels = list(text)
     guild.roles = list(roles)
@@ -109,6 +126,47 @@ def _guild(
     by_id = {role.id: role for role in roles}
     guild.get_role = MagicMock(side_effect=by_id.get)
     return guild
+
+
+async def test_the_guild_is_mirrored_under_its_own_name() -> None:
+    """The one name on every admin page, and the one nobody wrote down:
+    without this, `GET /api/guilds` answers with ids alone and every
+    guild switcher in the console renders "Server 1289374650912837465".
+    """
+    store = FakeStore()
+
+    await sync_directory(_guild(name="Acme Corp"), FakeConfig(), store, T0)
+
+    assert store.guilds == [MirroredGuild(guild_id=GUILD_ID, name="Acme Corp", icon_url=None)]
+
+
+async def test_a_guild_with_an_icon_mirrors_where_to_find_it() -> None:
+    """The sweep already holds the asset the moment it reads the name, so
+    coming back for it later would be a second sweep for one string.
+    """
+    store = FakeStore()
+
+    await sync_directory(
+        _guild(icon=_icon("https://cdn.example/icon.png")), FakeConfig(), store, T0
+    )
+
+    assert store.guilds == [
+        MirroredGuild(guild_id=GUILD_ID, name="Acme", icon_url="https://cdn.example/icon.png")
+    ]
+
+
+async def test_a_guild_mid_setup_is_still_named() -> None:
+    """Ungated, exactly as the channels and roles are. A guild that has
+    configured nothing is the guild an administrator is looking at while
+    running `/setup`, so it is the guild that most needs its own name on
+    the page.
+    """
+    store = FakeStore()
+
+    await sync_directory(_guild(name="Acme Corp"), FakeConfig(), store, T0)
+
+    assert [guild.name for guild in store.guilds] == ["Acme Corp"]
+    assert store.members == []
 
 
 async def test_the_guilds_voice_and_text_channels_are_both_mirrored() -> None:

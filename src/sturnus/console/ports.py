@@ -145,10 +145,34 @@ class GuildDirectory:
     timer and a freshly configured guild has not had its turn.
     """
 
+    #: What the server itself is called, or `None` while the bot has not
+    #: swept it yet. Carried with the three mirrors rather than fetched
+    #: separately: a page that resolves a channel id and two role ids in
+    #: one paint also has a heading to write, and a second request for
+    #: one string is a second request forever.
+    name: str | None
     channels: tuple[MirroredChannel, ...]
     roles: tuple[MirroredRole, ...]
     members: tuple[MirroredMember, ...]
     synced_at: datetime | None
+
+
+@dataclass(frozen=True)
+class AdministeredGuild:
+    """One guild somebody administers, as far as anything has been able to name it.
+
+    `name` is nullable because the mirror is written by a sweep on a
+    timer: a guild the bot joined a minute ago has no row yet, and that
+    is a real state rather than an error. It is still a guild this person
+    administers, so it is still listed -- dropping it would lock somebody
+    out of the very guild they came to configure -- and the caller
+    renders the id, which is what every console did for every guild
+    before there was a name to render at all.
+    """
+
+    guild_id: int
+    name: str | None
+    icon_url: str | None
 
 
 class GuildNames(Protocol):
@@ -161,9 +185,18 @@ class GuildNames(Protocol):
     covers "no such guild" and "you do not administer it" alike, because
     from outside those must look the same -- this names the people who
     consented to being recorded.
+
+    `administered` answers the guild switcher: the guilds this person
+    administers, named. It is the same authorisation question
+    `AdminDirectory.administered_guilds` answers and deliberately not a
+    wider one -- a name is not a reason to show somebody a guild they
+    have no business with -- so the implementation asks that directory
+    first and names what it says, never the other way round.
     """
 
     async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildDirectory | None: ...
+
+    async def administered(self, *, requested_by: int) -> Sequence[AdministeredGuild]: ...
 
 
 @dataclass(frozen=True)

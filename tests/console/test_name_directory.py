@@ -24,6 +24,7 @@ from sturnus.application.directory_mirror import (
     TEXT,
     VOICE,
     MirroredChannel,
+    MirroredGuild,
     MirroredMember,
     MirroredRole,
 )
@@ -174,6 +175,22 @@ async def test_the_freshness_reported_is_that_of_the_stalest_mirror(
     assert directory.synced_at == T0
 
 
+async def test_the_directory_carries_the_guilds_own_name(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A client holding the directory can title the page from it: the
+    guild's name arrives with the channels, roles and people it names,
+    rather than in a second request for one string.
+    """
+    admins = await an_administrator(factory)
+    await DirectoryStore(factory).replace_guild(MirroredGuild(GUILD, "Acme Corp"), T0)
+
+    directory = await names(factory, admins).for_guild(GUILD, requested_by=ANNA)
+
+    assert directory is not None
+    assert directory.name == "Acme Corp"
+
+
 async def test_a_guild_the_bot_has_not_swept_yet_is_empty_and_undated(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -183,7 +200,73 @@ async def test_a_guild_the_bot_has_not_swept_yet_is_empty_and_undated(
 
     assert directory is not None
     assert directory.channels == () and directory.roles == () and directory.members == ()
+    assert directory.name is None
     assert directory.synced_at is None
+
+
+# ---------------------------------------------------------------------------
+# The guilds somebody administers, by name
+# ---------------------------------------------------------------------------
+
+
+async def test_the_guilds_somebody_administers_come_back_named(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    admins = await an_administrator(factory)
+    await DirectoryStore(factory).replace_guild(
+        MirroredGuild(GUILD, "Acme Corp", "https://cdn.example/a.png"), T0
+    )
+
+    listing = await names(factory, admins).administered(requested_by=ANNA)
+
+    assert [(entry.guild_id, entry.name) for entry in listing] == [(GUILD, "Acme Corp")]
+    assert [entry.icon_url for entry in listing] == ["https://cdn.example/a.png"]
+
+
+async def test_a_guild_the_bot_has_not_swept_is_listed_without_a_name(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A guild joined a minute ago is still a guild this person
+    administers, and dropping it from the switcher would lock them out of
+    the very guild they came to configure.
+    """
+    admins = await an_administrator(factory)
+
+    listing = await names(factory, admins).administered(requested_by=ANNA)
+
+    assert [(entry.guild_id, entry.name, entry.icon_url) for entry in listing] == [
+        (GUILD, None, None)
+    ]
+
+
+async def test_somebody_who_administers_nothing_is_offered_no_guild(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """An empty listing rather than a refusal: a participant who signed in
+    to look at their own recordings administers nothing, and that is
+    ordinary rather than an error.
+    """
+    admins = await an_administrator(factory)
+    await DirectoryStore(factory).replace_guild(MirroredGuild(GUILD, "Acme Corp"), T0)
+
+    assert await names(factory, admins).administered(requested_by=BEN) == ()
+
+
+async def test_the_listing_never_names_a_guild_somebody_does_not_administer(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The name is not a reason to widen who sees which guild: an
+    administrator of one guild is nobody in another, before and after
+    there was anything to call it.
+    """
+    admins = await an_administrator(factory)
+    store = DirectoryStore(factory)
+    await store.replace_guild(MirroredGuild(GUILD, "Acme Corp"), T0)
+    await store.replace_guild(MirroredGuild(OTHER_GUILD, "Somebody Else"), T0)
+
+    listing = await names(factory, admins).administered(requested_by=ANNA)
+
+    assert [entry.name for entry in listing] == ["Acme Corp"]
 
 
 async def test_somebody_who_does_not_administer_the_guild_is_told_nothing(
