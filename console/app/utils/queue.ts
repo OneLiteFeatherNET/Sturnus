@@ -39,6 +39,7 @@
  */
 import { formatDuration } from '~/utils/duration'
 import { formatCount, formatMoment } from '~/utils/format'
+import type { Message } from '~/utils/message'
 
 /* -------------------------------------------------------------------- */
 /* What the API describes                                                */
@@ -81,6 +82,19 @@ export interface QueuedSession {
   status: string
   document_url: string | null
   counts: QueueCounts
+  /**
+   * The number this session's outstanding jobs are claimed in, lower
+   * first — and **`null` when it has none**.
+   *
+   * Null is not zero, and the difference is the one this page acts on.
+   * Zero is the ordinary priority and a real place in the queue; null is a
+   * session with nothing to reorder — still recording, or listed only
+   * because one of its jobs died — and a row that must therefore not offer
+   * a way to move it. The API sends the field present-and-null rather than
+   * omitting it, so this console never has to tell "no place in the queue"
+   * from "an API that predates the field".
+   */
+  priority: number | null
 }
 
 export interface GuildQueue {
@@ -126,6 +140,22 @@ function asText(value: unknown): string | null {
  */
 function asCount(value: unknown): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return 0
+  return Math.round(value)
+}
+
+/**
+ * A place in the queue, or `null` for a row that has none.
+ *
+ * Everything that is not a whole number becomes `null`, and that includes
+ * a negative one. The server only ever raises a priority and `0` is what
+ * untouched work carries, so a negative number is not a queue position
+ * this console has ever been able to produce — and reading one as a place
+ * would put a drag handle on a row and then argue with the server about
+ * where it went. `null` says "there is nothing here to move", which is
+ * true of a row whose priority cannot be read for any reason.
+ */
+function asPriority(value: unknown): number | null {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) return null
   return Math.round(value)
 }
 
@@ -192,6 +222,7 @@ export function parseGuildQueue(payload: unknown): GuildQueue {
           status: asText(entry.status) ?? '',
           document_url: asText(entry.document_url),
           counts: asCounts(entry.counts),
+          priority: asPriority(entry.priority),
         },
       ]
     }),
@@ -218,15 +249,23 @@ export function queueStreamPath(guildId: string): string {
 /* Naming a session                                                      */
 /* -------------------------------------------------------------------- */
 
-/** What to call the channel a session happened in. The whole id when there
- *  is no name -- never a shortened one, since snowflakes minted in the
- *  same era share their leading digits, and a truncated id is something
- *  nobody can search a page for either. */
-export function queueChannelLabel(session: QueuedSession): string {
-  const name = session.channel_name?.trim()
-  if (name) return `#${name}`
-  return session.channel_id ? `Channel ${session.channel_id}` : 'An unnamed channel'
-}
+/**
+ * What to call the channel a session happened in.
+ *
+ * **Not a function any more, and that is the point.** This module used to
+ * answer `Channel 1240377558927872021` and the page set it as a row's
+ * heading in semibold, which is exactly the thing #141 abolished on the
+ * recordings list: eighteen digits in the heading slot read as the
+ * meeting's *name*, nobody has a meeting called that, and a column of them
+ * cannot be scanned. `channelNaming` in `~/utils/recordings` is the one
+ * answer to that question — an absence in the muted role with the id
+ * demoted underneath — and the Queue asks it rather than keeping a second,
+ * older one that no longer agrees with the rest of the console.
+ *
+ * `queueChannelNote` below stays, and is the reason the two pages differ
+ * at all: a recordings row shows an absence, and an administrator looking
+ * at a backlog is additionally owed the explanation for it.
+ */
 
 /**
  * The line under a row whose channel has no name, or `null` when it has
@@ -268,6 +307,22 @@ export function sessionStartLine(session: QueuedSession): string {
  * would hide the one distinction this page exists to draw.
  */
 export type QueueTone = 'clear' | 'watch' | 'alarm'
+
+/**
+ * Which role token each tone is painted in.
+ *
+ * Here rather than in the page because the page is no longer the only
+ * thing that paints one: a row, the panel that reorders rows, and the
+ * lifecycle band all read the same three tones, and three copies of this
+ * map is how "a speaker failed for good" ends up green in one of them.
+ * The tokens themselves, and whether they can be read against the surface
+ * they sit on, are `main.css` and `palette.spec.ts`.
+ */
+export const QUEUE_TONE_COLOUR: Record<QueueTone, string> = {
+  clear: 'var(--color-brand-green)',
+  watch: 'var(--color-brand-cyan)',
+  alarm: 'var(--color-brand-red)',
+}
 
 /**
  * What kind of row this is.
@@ -542,6 +597,61 @@ export function orderQueueSessions(sessions: readonly QueuedSession[]): QueuedSe
   })
 }
 
+/**
+ * Whether this session has a place in the queue at all.
+ *
+ * Read off the API's `priority` and never re-derived from the counts.
+ * They agree today — a session has a priority exactly when it has a
+ * pending or running job — and the moment they stop agreeing, the one
+ * that decides whether a row can be moved has to be the one the endpoint
+ * that moves it also reads. A console that worked it out for itself would
+ * offer a handle on a row the server then refuses to place.
+ */
+export function isQueued(session: QueuedSession): boolean {
+  return session.priority !== null
+}
+
+/**
+ * The sessions that have a place in the queue, in the order a worker will
+ * reach them: `(priority, id)` ascending.
+ *
+ * This is `JobQueue.claim`'s own `ORDER BY priority, id` said in
+ * TypeScript, and it is deliberately **not** `orderQueueSessions`. That
+ * one ranks rows by what a reader can still do about them, which is the
+ * right order for triage and a meaningless one to drag in: a list sorted
+ * by somebody's attention cannot express "this meeting runs before that
+ * one", so a session dropped in it would land somewhere the queue does not
+ * have. The two orders are two questions, and this page now asks both
+ * separately rather than answering one of them with the other.
+ */
+export function claimOrderSessions(sessions: readonly QueuedSession[]): QueuedSession[] {
+  return sessions
+    .filter(isQueued)
+    .sort((a, b) => {
+      const byPriority = (a.priority ?? 0) - (b.priority ?? 0)
+      if (byPriority !== 0) return byPriority
+      // Lower id first, which is what the claim does. Note this points the
+      // opposite way to `orderQueueSessions`' tiebreak, and on purpose:
+      // that one is showing the newest first, this one is showing what
+      // runs first.
+      return compareIds(a.id, b.id)
+    })
+}
+
+/**
+ * The sessions with no place in the queue, in the order they were already
+ * listed in.
+ *
+ * Nothing queued will move any of these on: the meeting is still being
+ * recorded, or every job of it is terminal and one of them died, or it
+ * closed with nothing ever queued. `orderQueueSessions` is exactly the
+ * right order for them — rows needing a person first, newest first inside
+ * that — because attention is all these rows have left to be sorted by.
+ */
+export function unqueuedSessions(sessions: readonly QueuedSession[]): QueuedSession[] {
+  return orderQueueSessions(sessions.filter((session) => !isQueued(session)))
+}
+
 /** How many rows nothing will move without a person. The headline figure
  *  for the list: twelve unfinished sessions where three are stuck says
  *  something a bare row count does not. */
@@ -549,24 +659,61 @@ export function needsPersonCount(sessions: readonly QueuedSession[]): number {
   return sessions.filter((session) => queueAttention(session) === 'needs-person').length
 }
 
-/** The line above the list, naming what it holds and how much of it is
- *  actually somebody's problem. */
-export function sessionsSummaryLine(sessions: readonly QueuedSession[]): string {
-  const total = sessions.length
-  if (total === 0) return 'No unfinished sessions are listed for this server.'
+/**
+ * The line above the queue, naming what is in it.
+ *
+ * It says one thing the old single-list summary could not: that this order
+ * is the order a worker will reach them in, and therefore the thing the
+ * controls beside it change. The stuck rows are no longer counted here
+ * because they are no longer in this list — they have a section of their
+ * own, and a count of them in the wrong section is a count nobody can
+ * reconcile with what they can see.
+ */
+export function queuedSummary(sessions: readonly QueuedSession[]): Message {
+  const count = sessions.length
+  if (count === 0) return { key: 'admin.queue.list.queuedNone' }
+  return { key: 'admin.queue.list.queuedSome', params: { count } }
+}
+
+/**
+ * The line above the sessions with nothing queued, and how many of them
+ * are somebody's problem.
+ *
+ * The two counts are kept apart for the reason the old summary kept them
+ * apart: twelve rows of which three are stuck says something a bare row
+ * count does not. What has changed is that "those are listed first" is no
+ * longer part of it — this whole section is rows nothing will move on its
+ * own, so being first inside it means nothing.
+ */
+export function unqueuedSummary(sessions: readonly QueuedSession[]): Message {
+  const count = sessions.length
+  if (count === 0) return { key: 'admin.queue.list.unqueuedNone' }
   const stuck = needsPersonCount(sessions)
-  const noun = total === 1 ? 'session' : 'sessions'
-  if (stuck === 0) {
-    return (
-      `${formatCount(total)} unfinished ${noun} here, and none of them is waiting on a person — `
-      + 'every one is either being worked on or still being recorded.'
-    )
+  if (stuck === 0) return { key: 'admin.queue.list.unqueuedWaiting', params: { count } }
+  return {
+    key: 'admin.queue.list.unqueuedStuck',
+    // `count` governs the verb, so it is the number of sessions that need
+    // somebody; the size of the section rides beside it as a value.
+    params: { count: stuck, total: sessions.length },
   }
-  const verb = stuck === 1 ? 'needs' : 'need'
-  return (
-    `${formatCount(total)} unfinished ${noun} here; ${formatCount(stuck)} of them ${verb} `
-    + 'somebody, because nothing queued will move them on. Those are listed first.'
-  )
+}
+
+/**
+ * Which slice of a section is on screen, or `null` when the whole of it
+ * is.
+ *
+ * Null rather than "1–3 of 3". A list short enough to fit on one page
+ * needs no arithmetic underneath it, and a sentence that counts three rows
+ * a reader can see all three of reads as a page apologising for itself.
+ */
+export function queueSliceSummary(total: number, offset: number, shown: number): Message | null {
+  if (shown <= 0 || shown >= total) return null
+  return {
+    key: 'admin.queue.list.showing',
+    // Ordinals rather than quantities: these are positions in a list, and
+    // `1,024` is not a position. `i18n/README.md` draws that line.
+    params: { from: String(offset + 1), to: String(offset + shown), total: String(total) },
+  }
 }
 
 /* -------------------------------------------------------------------- */

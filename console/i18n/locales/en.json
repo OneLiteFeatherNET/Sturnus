@@ -559,6 +559,62 @@
         "outcomeRefused": "Refused, and Sturnus did not say why. Nothing of theirs was changed."
       }
     },
+    "queue": {
+      "list": {
+        "queuedHeading": "The order this server’s work will run in",
+        "queuedNote": "Every session with a job still queued or running, first to last. This is the order a worker reaches them in, and it is the order the controls here change.",
+        "queuedNone": "Nothing is queued or running in this server, so there is no order to set.",
+        "queuedSome": "One session is waiting to run. | {count} sessions are waiting to run, in the order shown.",
+        "unqueuedHeading": "Listed, but not in the queue",
+        "unqueuedNote": "These sessions have no job queued or running, so there is nothing about them to reorder and no handle to move them by. Each one is here because it is being recorded at this moment, or because nothing will move it on without a person.",
+        "unqueuedNone": "Every unfinished session in this server has work queued for it.",
+        "unqueuedWaiting": "One session is listed with nothing queued, and it is not waiting on a person. | {count} sessions are listed with nothing queued, and none of them is waiting on a person.",
+        "unqueuedStuck": "One session here needs somebody: nothing queued will move it on. | {count} of the {total} sessions here need somebody: nothing queued will move them on.",
+        "showing": "Showing {from}–{to} of {total}.",
+        "pagerQueued": "Pages of the queue",
+        "pagerWaiting": "Pages of the sessions with nothing queued"
+      },
+      "order": {
+        "handle": "Move {session}",
+        "instructions": "Press Enter or Space to pick a session up, then Up and Down to move it, Home to send it to the front and End to the back. Enter puts it down where it is; Escape leaves it where it was. It can also be dragged with a mouse, within the page it is on.",
+        "position": "Runs {position} of {total}",
+        "pickedUp": "{session} picked up, position {position} of {total}. Move it with the arrow keys, then press Enter to put it down.",
+        "held": "Position {position} of {total}.",
+        "droppedBack": "{session} was put back where it was, and nothing was changed.",
+        "sending": "Moving this session…",
+        "moved": "Moved. One session’s place in this queue changed. | Moved. {count} sessions changed place — going first is expressed as everything that was ahead going second, so rows nobody touched carry new numbers too.",
+        "unchanged": "Nothing to do: this queue was already in that order.",
+        "stale": "Somebody else moved something in this queue while that was in the air, so nothing was written. The list below is the order as it now stands — move it again if it still needs moving.",
+        "failedSignedOut": "Your session has ended, so nothing was moved. Sign in again.",
+        "failedGone": "The session has left this queue, or you no longer administer this server — Sturnus answers the same way to both. Nothing was written; refresh to see where things stand.",
+        "failedRefused": "Sturnus refused that as malformed and wrote nothing. That is a fault in this console rather than anything to do differently, so reloading the page is the only thing worth trying.",
+        "failedUnreachable": "Could not reach the API, so nothing was moved. The order below is the last one read.",
+        "failedUnknown": "Sturnus could not move it and said nothing about why. Nothing was written."
+      },
+      "rules": {
+        "heading": "Change the whole order at once",
+        "note": "Two ways to re-rank everything this server has outstanding. Each rewrites every priority in the queue, so each says what it will do before it does it.",
+        "cancel": "Leave the order alone",
+        "working": "Reordering…",
+        "wholeServer": "This reaches every session this server has outstanding, including any the list above was cut short of showing.",
+        "neverForward": "Nothing is moved forward. A session going first is expressed as everything that was ahead of it going second, so this holds work back rather than speeding anything up — and it holds it back behind every other server’s work as well, not only behind this server’s.",
+        "notUndone": "Pressing the other button afterwards does not undo this. It writes an order of its own on top of the numbers this one leaves behind.",
+        "participants": {
+          "name": "Biggest meetings first",
+          "blurb": "Ranks by how many people were recorded in each session.",
+          "confirmTitle": "Run the biggest meetings first?",
+          "ties": "Sessions with the same number of participants keep the order they already had.",
+          "confirm": "Reorder by participants"
+        },
+        "short": {
+          "name": "Shortest recordings first",
+          "blurb": "Ranks by how much audio has been measured, and a session nothing has measured ranks last.",
+          "confirmTitle": "Run the shortest recordings first?",
+          "unmeasured": "A recording nothing has ever measured has no length to rank by, so it goes after every measured one and keeps the place it had. Most sessions are unmeasured until they have been transcribed once, so on a queue of fresh recordings this changes very little — it earns its place on a queue of re-queued ones.",
+          "confirm": "Reorder by length"
+        }
+      }
+    },
     "settings": {
       "kindVoice": "Voice channels",
       "kindStage": "Stage channels",

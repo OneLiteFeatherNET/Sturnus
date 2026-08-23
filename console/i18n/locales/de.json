@@ -559,6 +559,62 @@
         "outcomeRefused": "Abgelehnt, ohne dass Sturnus einen Grund genannt hat. Bei dieser Person hat sich nichts geändert."
       }
     },
+    "queue": {
+      "list": {
+        "queuedHeading": "Die Reihenfolge, in der dieser Server abgearbeitet wird",
+        "queuedNote": "Jede Sitzung, für die noch ein Auftrag wartet oder läuft, von vorn nach hinten. Genau in dieser Reihenfolge greift ein Worker zu, und genau diese Reihenfolge ändern die Bedienelemente hier.",
+        "queuedNone": "Auf diesem Server wartet und läuft nichts, also gibt es keine Reihenfolge festzulegen.",
+        "queuedSome": "Eine Sitzung wartet auf ihre Abarbeitung. | {count} Sitzungen warten auf ihre Abarbeitung, in der gezeigten Reihenfolge.",
+        "unqueuedHeading": "Aufgeführt, aber nicht in der Warteschlange",
+        "unqueuedNote": "Für diese Sitzungen wartet und läuft kein Auftrag, also gibt es nichts umzusortieren und keinen Griff zum Verschieben. Jede steht hier, weil sie gerade aufgezeichnet wird oder weil ohne eine Person nichts weitergeht.",
+        "unqueuedNone": "Für jede unfertige Sitzung dieses Servers ist Arbeit eingeplant.",
+        "unqueuedWaiting": "Eine Sitzung ist ohne eingeplante Arbeit aufgeführt und wartet nicht auf eine Person. | {count} Sitzungen sind ohne eingeplante Arbeit aufgeführt, und keine davon wartet auf eine Person.",
+        "unqueuedStuck": "Eine Sitzung hier braucht jemanden: ohne Zutun geht nichts weiter. | {count} der {total} Sitzungen hier brauchen jemanden: ohne Zutun geht nichts weiter.",
+        "showing": "Angezeigt: {from}–{to} von {total}.",
+        "pagerQueued": "Seiten der Warteschlange",
+        "pagerWaiting": "Seiten der Sitzungen ohne eingeplante Arbeit"
+      },
+      "order": {
+        "handle": "{session} verschieben",
+        "instructions": "Mit Eingabe oder Leertaste eine Sitzung aufnehmen, dann mit Pfeil hoch und runter verschieben, Pos1 nach ganz vorn, Ende nach ganz hinten. Eingabe legt sie dort ab, Escape lässt sie, wo sie war. Mit der Maus ist sie innerhalb der aktuellen Seite ziehbar.",
+        "position": "Läuft als {position} von {total}",
+        "pickedUp": "{session} aufgenommen, Platz {position} von {total}. Mit den Pfeiltasten verschieben, danach mit Eingabe ablegen.",
+        "held": "Platz {position} von {total}.",
+        "droppedBack": "{session} liegt wieder an der alten Stelle, geändert wurde nichts.",
+        "sending": "Sitzung wird verschoben…",
+        "moved": "Verschoben. Eine Sitzung hat ihren Platz gewechselt. | Verschoben. {count} Sitzungen haben den Platz gewechselt — nach vorn geht es nur, indem alles davor nach hinten rückt, deshalb tragen auch unberührte Zeilen jetzt neue Nummern.",
+        "unchanged": "Nichts zu tun: diese Warteschlange stand bereits so.",
+        "stale": "Währenddessen hat jemand anderes in dieser Warteschlange etwas verschoben, deshalb wurde nichts geschrieben. Die Liste unten zeigt die Reihenfolge, wie sie jetzt ist — bei Bedarf erneut verschieben.",
+        "failedSignedOut": "Die Anmeldung ist abgelaufen, verschoben wurde nichts. Erneut anmelden.",
+        "failedGone": "Die Sitzung ist nicht mehr in dieser Warteschlange, oder dieser Server wird von diesem Konto nicht mehr verwaltet — Sturnus antwortet auf beides gleich. Geschrieben wurde nichts; zum aktuellen Stand neu laden.",
+        "failedRefused": "Sturnus hat das als fehlerhaft abgelehnt und nichts geschrieben. Das ist ein Fehler dieser Konsole und nichts, was anders zu bedienen wäre — nur ein Neuladen der Seite hilft.",
+        "failedUnreachable": "Die API war nicht erreichbar, verschoben wurde nichts. Unten steht der zuletzt gelesene Stand.",
+        "failedUnknown": "Sturnus konnte nicht verschieben und nannte keinen Grund. Geschrieben wurde nichts."
+      },
+      "rules": {
+        "heading": "Die ganze Reihenfolge auf einmal ändern",
+        "note": "Zwei Arten, alles Ausstehende dieses Servers neu zu ordnen. Beide schreiben jede Priorität der Warteschlange neu und sagen vorher, was sie tun.",
+        "cancel": "Reihenfolge so lassen",
+        "working": "Wird neu geordnet…",
+        "wholeServer": "Das betrifft jede ausstehende Sitzung dieses Servers, auch die, für die die Liste oben zu kurz war.",
+        "neverForward": "Nichts rückt nach vorn. Dass eine Sitzung zuerst läuft, entsteht dadurch, dass alles davor nach hinten rückt — das hält Arbeit zurück, statt etwas zu beschleunigen, und zwar auch hinter der Arbeit jedes anderen Servers, nicht nur hinter der dieses Servers.",
+        "notUndone": "Die andere Schaltfläche macht das danach nicht rückgängig, sondern schreibt eine eigene Reihenfolge über die Nummern, die diese hier hinterlässt.",
+        "participants": {
+          "name": "Größte Besprechungen zuerst",
+          "blurb": "Ordnet danach, wie viele Personen in einer Sitzung aufgezeichnet wurden.",
+          "confirmTitle": "Größte Besprechungen zuerst laufen lassen?",
+          "ties": "Sitzungen mit gleich vielen Teilnehmenden behalten die Reihenfolge, die sie schon hatten.",
+          "confirm": "Nach Teilnehmenden ordnen"
+        },
+        "short": {
+          "name": "Kürzeste Aufnahmen zuerst",
+          "blurb": "Ordnet nach gemessener Audiolänge, und was nie gemessen wurde, kommt zuletzt.",
+          "confirmTitle": "Kürzeste Aufnahmen zuerst laufen lassen?",
+          "unmeasured": "Eine Aufnahme, die nie gemessen wurde, hat keine Länge zum Ordnen; sie kommt hinter jede gemessene und behält ihren bisherigen Platz. Die meisten Sitzungen sind ungemessen, bis sie einmal transkribiert wurden — bei lauter frischen Aufnahmen ändert das also kaum etwas, bei erneut eingereihten dagegen schon.",
+          "confirm": "Nach Länge ordnen"
+        }
+      }
+    },
     "settings": {
       "kindVoice": "Sprachkanäle",
       "kindStage": "Bühnenkanäle",

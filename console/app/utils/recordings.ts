@@ -218,7 +218,26 @@ export interface ChannelNaming {
   id: string | null
 }
 
-export function channelNaming(session: RecordedSession): ChannelNaming {
+/**
+ * The two fields naming a channel actually reads.
+ *
+ * Written out so that the queue page can ask the same question of its own
+ * rows without either owning a second copy of the answer. "An unresolved
+ * channel reads as an absence, not as a name" is one decision about how
+ * this console presents a snowflake, and a second implementation of it is
+ * a second answer — the one that goes on saying `Channel 1240377…` in
+ * semibold long after everybody agreed it should not.
+ *
+ * That is also why the sentence stays keyed under `recordings.*` when the
+ * Queue borrows it: one absence, one translation. `i18n/README.md` records
+ * the exception.
+ */
+export interface ChannelNamed {
+  channel_id: string
+  channel_name: string | null
+}
+
+export function channelNaming(session: ChannelNamed): ChannelNaming {
   const name = session.channel_name?.trim()
   if (name) return { named: true, heading: `#${name}`, id: null }
   return { named: false, heading: { key: 'recordings.channelUnnamed' }, id: session.channel_id }
