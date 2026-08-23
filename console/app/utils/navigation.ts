@@ -105,6 +105,20 @@ export const ADMIN_VIEW: NavSection = {
       adminOnly: true,
     },
     {
+      to: '/admin/sign-in-link',
+      labelKey: 'nav.signInLink',
+      // A key, because that is what this page configures: the credential a
+      // guild's own identity provider issues, and therefore who this
+      // console lets in at all. Deliberately not a padlock — a padlock says
+      // "this is protected", and this page is where somebody decides who is
+      // let through rather than a statement that somebody is being kept
+      // out. The third configuration entry, so that the three pages that
+      // configure a guild sit together and this one sits next to Bot
+      // Settings, where `admin_role_id` decides who can reach it.
+      icon: 'M12.65 10A6 6 0 0 0 7 6a6 6 0 1 0 0 12 6 6 0 0 0 5.65-4H17v4h4v-4h2v-4H12.65ZM7 14a2 2 0 1 1 0-4 2 2 0 0 1 0 4Z',
+      adminOnly: true,
+    },
+    {
       // Renamed from `/admin/user-settings`, which read as "settings for
       // users" and is in fact a roster of other people's consent. The old
       // address stays alive as a permanent redirect in `nuxt.config.ts`,
