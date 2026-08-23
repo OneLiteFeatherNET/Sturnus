@@ -705,6 +705,31 @@ describe('the span the report covers', () => {
       params: { at: instant('2026-08-21T12:00:00+00:00') },
     })
   })
+
+  it('treats a date nothing can read as the absence it is', () => {
+    // `parseGuildReport` keeps any non-empty string here, because an id and
+    // an instant are both text on the wire and it does not parse either.
+    // So an unreadable date reaches this function, and it used to reach the
+    // sentence as an em dash -- "recorded —", a glyph standing where a time
+    // should be. An instant nobody can read is not a date, so the end it
+    // was going to describe is simply not known.
+    expect(
+      reportSpanLine(report({ first_session_at: 'not a date', last_session_at: null })),
+    ).toEqual({ key: 'admin.reporting.spanUnreadable' })
+  })
+
+  it('still gives the end it can read when only the other one is unreadable', () => {
+    // Better than the em dash this replaced in a second way: half a span is
+    // half a span whether the other end is missing or merely unreadable.
+    expect(
+      reportSpanLine(
+        report({ first_session_at: 'not a date', last_session_at: '2026-08-21T12:00:00+00:00' }),
+      ),
+    ).toEqual({
+      key: 'admin.reporting.spanPartial',
+      params: { at: instant('2026-08-21T12:00:00+00:00') },
+    })
+  })
 })
 
 describe('the months, and the gaps between them', () => {
@@ -826,6 +851,24 @@ describe('the months, and the gaps between them', () => {
         recorded: { key: 'common.durationHours', params: { count: 5 } },
         documented: 5,
       },
+    })
+  })
+
+  it('says a month has no length rather than reading an em dash out loud', () => {
+    // The column shows the em dash, and there it is legible: the eye reads
+    // it against the numbers above and below. Dropped into the middle of a
+    // sentence it is a glyph standing where a length should be, and the
+    // reader listening to this page -- the one this sentence exists for --
+    // hears nothing at all. So the absence gets its own sentence.
+    const rows = reportMonthRows(
+      report({
+        months: [month({ month: '2026-08', sessions: 3, recorded_seconds: null, documented: 1 })],
+      }),
+    )
+    expect(rows[0]!.recorded).toBeNull()
+    expect(rows[0]!.detail).toEqual({
+      key: 'admin.reporting.monthDetailUnmeasured',
+      params: { month: monthInstant('2026-08'), count: 3, documented: 1 },
     })
   })
 

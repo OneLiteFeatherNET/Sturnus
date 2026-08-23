@@ -51,7 +51,7 @@
  * stuck, and the two would drift.
  */
 import { figureDuration, figureMoment } from '~/utils/format'
-import { NOT_MEASURED, type Instant, type Message } from '~/utils/message'
+import type { Message } from '~/utils/message'
 
 /* -------------------------------------------------------------------- */
 /* What the API describes                                                */
@@ -423,6 +423,14 @@ function noFinishedMeetings(reasonKey: string): Message[] {
  * thing across three meetings and another across sixty.
  */
 export function reportHeadlineFigures(report: GuildReport): ReportFigure[] {
+  // Read off the value rather than off the payload field it came from. The
+  // two agree today because `parseGuildReport` nulls anything that cannot
+  // be true -- but `figureDuration` refuses a negative or non-finite figure
+  // as well, and a report built any other way would then render an absence
+  // in the colour of a value somebody failed to parse.
+  const recorded = figureDuration(report.recorded_seconds)
+  const speech = figureDuration(report.speech_seconds)
+
   return [
     {
       key: 'sessions',
@@ -441,16 +449,16 @@ export function reportHeadlineFigures(report: GuildReport): ReportFigure[] {
     {
       key: 'recorded',
       labelKey: 'admin.reporting.recordedLabel',
-      value: figureDuration(report.recorded_seconds),
+      value: recorded,
       note: reportRecordedLine(report),
-      tone: report.recorded_seconds === null ? 'absent' : 'plain',
+      tone: recorded === null ? 'absent' : 'plain',
     },
     {
       key: 'speech',
       labelKey: 'admin.reporting.speechLabel',
-      value: figureDuration(report.speech_seconds),
+      value: speech,
       note: reportSpeechCaveat(report),
-      tone: report.speech_seconds === null ? 'absent' : 'plain',
+      tone: speech === null ? 'absent' : 'plain',
     },
   ]
 }
@@ -468,8 +476,11 @@ export function reportHeadlineFigures(report: GuildReport): ReportFigure[] {
  * leaving the reader to wonder whether a list is one click away.
  */
 export function reportShapeFigures(report: GuildReport): ReportFigure[] {
-  const average = report.average_duration_seconds
-  const longest = report.longest_duration_seconds
+  // The lengths are read off their own values for the reason
+  // `reportHeadlineFigures` gives: an absence and the colour it is drawn in
+  // should not be decided by two different things.
+  const average = figureDuration(report.average_duration_seconds)
+  const longest = figureDuration(report.longest_duration_seconds)
   const perMeeting = report.average_participants
   const largest = report.largest_meeting
 
@@ -477,7 +488,7 @@ export function reportShapeFigures(report: GuildReport): ReportFigure[] {
     {
       key: 'average-duration',
       labelKey: 'admin.reporting.averageDurationLabel',
-      value: figureDuration(average),
+      value: average,
       note:
         average === null
           ? noFinishedMeetings('admin.reporting.absentAverageDuration')
@@ -487,7 +498,7 @@ export function reportShapeFigures(report: GuildReport): ReportFigure[] {
     {
       key: 'longest-duration',
       labelKey: 'admin.reporting.longestDurationLabel',
-      value: figureDuration(longest),
+      value: longest,
       note:
         longest === null
           ? noFinishedMeetings('admin.reporting.absentLongestDuration')
@@ -649,28 +660,33 @@ export function reportCaveats(report: GuildReport): ReportCaveat[] {
  * own sentence rather than an em dash standing in for half a range.
  */
 export function reportSpanLine(report: GuildReport): Message {
-  const first = report.first_session_at
-  const last = report.last_session_at
+  const firstText = report.first_session_at
+  const lastText = report.last_session_at
 
-  if (!first && !last) return { key: 'admin.reporting.spanNothing' }
+  if (!firstText && !lastText) return { key: 'admin.reporting.spanNothing' }
+
+  // An instant nobody can read is not a date, and it is treated as the
+  // absence it is rather than dropped into the sentence as an em dash --
+  // "recorded —" is a glyph standing where a time should be, which is the
+  // whole failure this module spends its length avoiding elsewhere.
+  // `figureMoment` already makes that judgement for the dashboard; making
+  // it again here would be a second answer to one question.
+  const first = firstText ? figureMoment(firstText) : null
+  const last = lastText ? figureMoment(lastText) : null
+
   if (first && last) {
-    if (first === last) {
-      return { key: 'admin.reporting.spanOne', params: { at: moment(first) } }
+    if (firstText === lastText) {
+      return { key: 'admin.reporting.spanOne', params: { at: first } }
     }
-    return {
-      key: 'admin.reporting.spanBetween',
-      params: { from: moment(first), to: moment(last) },
-    }
+    return { key: 'admin.reporting.spanBetween', params: { from: first, to: last } }
   }
-  return { key: 'admin.reporting.spanPartial', params: { at: moment((first ?? last)!) } }
-}
 
-/** An instant, or the em dash that stands for one the API sent in a shape
- *  nothing can read. `figureMoment` already makes that judgement for the
- *  dashboard; making it again here would be a second answer to one
- *  question. */
-function moment(iso: string): Instant | string {
-  return figureMoment(iso) ?? NOT_MEASURED
+  const known = first ?? last
+  // Dated with something, and none of it readable. Saying nothing was
+  // recorded would be a claim, and this server plainly did record
+  // something -- the figure this sentence sits under says how much.
+  if (!known) return { key: 'admin.reporting.spanUnreadable' }
+  return { key: 'admin.reporting.spanPartial', params: { at: known } }
 }
 
 /* -------------------------------------------------------------------- */
@@ -792,12 +808,22 @@ export function reportMonthRows(report: GuildReport): ReportMonthRow[] {
     // same as one the payload skipped, and it does not get the silent
     // row's wording -- the API said something about it, and this page
     // should not overwrite that with an assumption.
+    // A month the API sent with no total gets its own sentence rather than
+    // the em dash the column shows. A dash is legible in a column of
+    // numbers, where the eye reads it against its neighbours; dropped into
+    // the middle of a sentence it is a glyph standing where a length should
+    // be, and the reader listening to this page hears nothing at all.
     const detail: Message = silent
       ? { key: 'admin.reporting.monthSilent', params: { month } }
-      : {
-          key: 'admin.reporting.monthDetail',
-          params: { month, count: sessions, recorded: recorded ?? NOT_MEASURED, documented },
-        }
+      : recorded === null
+        ? {
+            key: 'admin.reporting.monthDetailUnmeasured',
+            params: { month, count: sessions, documented },
+          }
+        : {
+            key: 'admin.reporting.monthDetail',
+            params: { month, count: sessions, recorded, documented },
+          }
 
     const scaled = busiest > 0 ? sessions / busiest : 0
     return {
