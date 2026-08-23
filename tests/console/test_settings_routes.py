@@ -28,6 +28,7 @@ import pytest
 from aiohttp import web
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from sturnus.application.directory_mirror import MirroredGuild
 from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.domain import settings
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
@@ -40,6 +41,7 @@ from tests.console.conftest import (
     SECRET,
     T0,
     AiohttpClientFactory,
+    FakeNames,
     build_test_api,
 )
 
@@ -67,12 +69,21 @@ async def stores(clean_database: str) -> Stores:
     return Stores(config=ConfigStore(factory), admins=AdminMemberStore(factory))
 
 
-def api(stores: Stores) -> web.Application:
+def api(stores: Stores, mirrored: dict[int, MirroredGuild] | None = None) -> web.Application:
     # Through the shared factory, which defaults every collaborator these
     # tests are not about. The two that matter here are the real ones: the
     # value validation under test is `ConfigStore`'s, and a per-guild
     # authorisation rule is not worth proving against a dictionary.
-    return build_test_api(admins=stores.admins, config=stores.config)
+    #
+    # `mirrored` is what the bot swept, and it is deliberately not what
+    # decides who sees which guild: the double reads that from the real
+    # administrator store above, so a name can never smuggle a guild into
+    # somebody's list.
+    return build_test_api(
+        admins=stores.admins,
+        config=stores.config,
+        names=FakeNames(admins=stores.admins, names=mirrored or {}),
+    )
 
 
 def token(discord_user_id: int = ANNA) -> str:
@@ -80,9 +91,12 @@ def token(discord_user_id: int = ANNA) -> str:
 
 
 async def signed_in_client(
-    aiohttp_client: AiohttpClientFactory, stores: Stores, as_user: int = ANNA
+    aiohttp_client: AiohttpClientFactory,
+    stores: Stores,
+    as_user: int = ANNA,
+    mirrored: dict[int, MirroredGuild] | None = None,
 ) -> Any:
-    client = await aiohttp_client(api(stores))
+    client = await aiohttp_client(api(stores, mirrored))
     client.session.cookie_jar.update_cookies({SESSION_COOKIE: token(as_user)})
     return client
 
@@ -140,6 +154,69 @@ async def test_the_guild_list_is_empty_for_somebody_who_administers_nothing(
     response = await client.get("/api/guilds")
     assert response.status == 200
     assert (await response.json())["guilds"] == []
+
+
+async def test_the_guild_list_calls_each_guild_by_the_name_the_bot_swept(
+    aiohttp_client: AiohttpClientFactory, stores: Stores
+) -> None:
+    """The complaint this endpoint answered with an id alone: every guild
+    switcher on every admin page rendered "Server 1289374650912837465",
+    because the payload carried nothing else to render.
+    """
+    await stores.admins.replace(GUILD, [ANNA], T0)
+    client = await signed_in_client(
+        aiohttp_client,
+        stores,
+        mirrored={GUILD: MirroredGuild(GUILD, "Acme Corp", "https://cdn.example/a.png")},
+    )
+
+    body = await (await client.get("/api/guilds")).json()
+
+    assert body["guilds"] == [
+        {
+            "guild_id": str(GUILD),
+            "name": "Acme Corp",
+            "icon_url": "https://cdn.example/a.png",
+        }
+    ]
+
+
+async def test_a_guild_the_bot_has_not_swept_is_listed_with_a_null_name(
+    aiohttp_client: AiohttpClientFactory, stores: Stores
+) -> None:
+    """Present and null, never absent: a client must never have to tell
+    "the bot has not swept this guild yet" from "an older API that does
+    not send a name at all", and a guild joined a minute ago is still one
+    this person administers.
+    """
+    await stores.admins.replace(GUILD, [ANNA], T0)
+    client = await signed_in_client(aiohttp_client, stores)
+
+    body = await (await client.get("/api/guilds")).json()
+
+    assert body["guilds"] == [{"guild_id": str(GUILD), "name": None, "icon_url": None}]
+
+
+async def test_a_name_never_widens_which_guilds_somebody_is_shown(
+    aiohttp_client: AiohttpClientFactory, stores: Stores
+) -> None:
+    """An administrator of one guild is nobody in another, and a mirrored
+    name is not a reason to relax that.
+    """
+    await stores.admins.replace(GUILD, [ANNA], T0)
+    await stores.admins.replace(OTHER_GUILD, [BEN], T0)
+    client = await signed_in_client(
+        aiohttp_client,
+        stores,
+        mirrored={
+            GUILD: MirroredGuild(GUILD, "Acme Corp"),
+            OTHER_GUILD: MirroredGuild(OTHER_GUILD, "Somebody Else"),
+        },
+    )
+
+    body = await (await client.get("/api/guilds")).json()
+
+    assert [entry["name"] for entry in body["guilds"]] == ["Acme Corp"]
 
 
 async def test_a_guild_id_is_serialised_as_a_string(

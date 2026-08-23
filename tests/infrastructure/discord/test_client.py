@@ -36,6 +36,7 @@ import discord
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sturnus.application.directory_mirror import MirroredGuild
 from sturnus.application.ports import AudioStore, AudioWriter, Clock, SessionKey, VoiceReceiver
 from sturnus.application.reconfigure import GuildRuntimeConfig, ReconfigureAction
 from sturnus.application.recording import RecordingService
@@ -2728,10 +2729,16 @@ class _RecordingDirectoryMirror:
     """Stands in for `DirectoryStore` on the tick's mirroring path."""
 
     def __init__(self, fails: bool = False) -> None:
+        self.guilds: list[str] = []
         self.channels: list[tuple[int, int]] = []
         self.roles: list[tuple[int, int]] = []
         self.members: list[tuple[int, int]] = []
         self._fails = fails
+
+    async def replace_guild(self, guild: object, _now: object) -> None:
+        if self._fails:
+            raise RuntimeError("the database said no")
+        self.guilds.append(cast(MirroredGuild, guild).name)
 
     async def replace_channels(self, guild_id: int, channels: object, _now: object) -> None:
         if self._fails:
@@ -2749,6 +2756,8 @@ def _named_guild() -> MagicMock:
     """A guild whose gateway cache holds one channel and one role."""
     guild = MagicMock(spec=discord.Guild)
     guild.id = GUILD_ID
+    guild.name = "Acme Corp"
+    guild.icon = None
     channel = MagicMock()
     channel.id, channel.name, channel.position = CHANNEL_ID, "meeting", 1
     role = MagicMock(spec=discord.Role)
@@ -2772,6 +2781,7 @@ async def test_the_tick_writes_the_names_the_console_cannot_ask_discord_for() ->
 
     assert mirror.channels == [(GUILD_ID, 1)]
     assert mirror.roles == [(GUILD_ID, 1)]
+    assert mirror.guilds == ["Acme Corp"]
 
 
 async def test_a_guild_the_bot_cannot_see_is_left_alone_rather_than_emptied() -> None:
@@ -2786,6 +2796,7 @@ async def test_a_guild_the_bot_cannot_see_is_left_alone_rather_than_emptied() ->
 
     await client._mirror_directory(GUILD_ID, T0)
 
+    assert mirror.guilds == []
     assert mirror.channels == []
     assert mirror.roles == []
     assert mirror.members == []

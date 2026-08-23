@@ -95,7 +95,12 @@ def register(app: web.Application) -> None:
 
 
 async def guild_directory(request: web.Request) -> web.Response:
-    """One guild's channels, roles and named people, as last mirrored."""
+    """One guild's own name, channels, roles and named people, as last mirrored.
+
+    The guild's name rides along because a client holding this payload is
+    already drawing the page it belongs at the top of, and a second
+    request for one string is a second request on every page load.
+    """
     viewer = _caller(request)
     try:
         guild_id = int(request.match_info["guild_id"])
@@ -112,6 +117,11 @@ async def guild_directory(request: web.Request) -> web.Response:
     return web.json_response(
         {
             "guild_id": str(guild_id),
+            # Present and null for a guild the bot has not swept yet,
+            # exactly as `synced_at` is: "nobody has said what this server
+            # is called" is an answer, and a client must never have to
+            # tell it from an API that does not send a name at all.
+            "name": directory.name,
             "synced_at": _moment(directory.synced_at),
             "channels": [_channel_json(channel) for channel in directory.channels],
             "roles": [_role_json(role) for role in directory.roles],

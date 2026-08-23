@@ -39,6 +39,7 @@ from sturnus.application.publishing import DOCUMENTED_STATUS
 from sturnus.console.auth import PROVIDER
 from sturnus.console.ports import (
     AdminDirectory,
+    AdministeredGuild,
     CollectionListing,
     ConsentHolder,
     DownloadableTrack,
@@ -68,6 +69,7 @@ from sturnus.infrastructure.db.models import (
     AdminMember,
     Consent,
     ConsoleState,
+    Guild,
     GuildChannel,
     GuildMember,
     GuildRole,
@@ -1454,11 +1456,17 @@ class ConsoleProfileDirectory:
 
 
 class ConsoleGuildNames:
-    """A guild's mirrored channels, roles and named people, for an administrator.
+    """A guild's mirrored name, channels, roles and named people, for an administrator.
 
-    Three statements over the three mirrors, with the administrator check
-    where every other directory in this module puts it: inside the one
-    call, so a handler cannot serve a guild by forgetting to ask.
+    One statement per mirror, with the administrator check where every
+    other directory in this module puts it: inside the one call, so a
+    handler cannot serve a guild by forgetting to ask.
+
+    **Two questions, one class.** `for_guild` names what is inside one
+    guild; `administered` names the guilds themselves, which is what the
+    switcher on every admin page renders. They share the same mirror and
+    the same rule about who may see which guild, and splitting them would
+    have been two adapters holding the same two collaborators.
 
     **Read here rather than through `DirectoryStore`.** That store is the
     bot's writer and its readers exist to let a sweep compare; they order
@@ -1476,11 +1484,57 @@ class ConsoleGuildNames:
         self._session_factory = session_factory
         self._admins = admins
 
+    async def administered(self, *, requested_by: int) -> Sequence[AdministeredGuild]:
+        """The guilds this person administers, each called by its name.
+
+        Two statements and never more, whatever the number of guilds: the
+        administrator mirror says which guilds, and one `IN` over the
+        guild mirror names them. A name per guild would be a round trip
+        per guild on a page every administrator loads first.
+
+        The order is the administrator directory's, so the switcher does
+        not reshuffle itself the first time the bot learns what a server
+        is called. A guild with no mirrored row is listed with `None` for
+        both fields rather than dropped -- see `AdministeredGuild`.
+        """
+        administered = await self._admins.administered_guilds(requested_by)
+        if not administered:
+            # Nobody's guilds are no guilds, and asking the database to
+            # match an empty set is a scan bought for an answer already
+            # known.
+            return ()
+
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(Guild.guild_id, Guild.name, Guild.icon_url).where(
+                        Guild.guild_id.in_(administered)
+                    )
+                )
+            ).all()
+        mirrored = {row.guild_id: row for row in rows}
+        listing = []
+        for guild_id in administered:
+            row = mirrored.get(guild_id)
+            listing.append(
+                AdministeredGuild(
+                    guild_id=guild_id,
+                    name=None if row is None else row.name,
+                    icon_url=None if row is None else row.icon_url,
+                )
+            )
+        return tuple(listing)
+
     async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildDirectory | None:
         if not await self._admins.is_admin(guild_id, requested_by):
             return None
 
         async with self._session_factory() as db:
+            named = (
+                await db.execute(
+                    select(Guild.name, Guild.synced_at).where(Guild.guild_id == guild_id)
+                )
+            ).one_or_none()
             # Ordered in the statement and never afterwards. A handler
             # that sorted the answer would be a second ordering to keep
             # in step with this one, and the database is where the rows
@@ -1539,18 +1593,22 @@ class ConsoleGuildNames:
             ).all()
 
         return GuildDirectory(
+            name=None if named is None else named.name,
             channels=tuple(
                 MirroredChannel(row.channel_id, row.name, row.kind, row.position)
                 for row in channels
             ),
             roles=tuple(MirroredRole(row.role_id, row.name, row.position) for row in roles),
             members=tuple(MirroredMember(row.discord_user_id, row.display_name) for row in members),
-            # Read off all three lists rather than queried separately:
-            # the rows are already here, and a fourth statement to
-            # aggregate what three statements just returned is a round
-            # trip bought for nothing.
+            # Read off the rows already in hand rather than queried
+            # separately: a further statement to aggregate what the ones
+            # above just returned is a round trip bought for nothing. The
+            # guild's own row counts among them now that the payload
+            # carries its name -- a freshness claim is only as good as
+            # the stalest thing it describes.
             synced_at=_oldest(
                 [
+                    *(() if named is None else (named.synced_at,)),
                     *(row.synced_at for row in channels),
                     *(row.synced_at for row in roles),
                     *(row.synced_at for row in members),

@@ -361,20 +361,30 @@ level and can always run `/setup` and `/config` regardless of role
 assignment (see `require_admin`).
 
 **View Channel, guild-wide, if the console is in use.** Every ten seconds
-the bot mirrors the guild's channels, roles and the display names of the
-consent-role and admin-role holders into the database, because the
-console's API process has no Discord token and must never be given one
-(see `docs/superpowers/specs/2026-08-21-sturnus-console-design.md`
+the bot mirrors the guild's own name and icon, its channels, its roles and
+the display names of the consent-role and admin-role holders into the
+database — the tables `guild`, `guild_channel`, `guild_role` and
+`guild_member` — because the console's API process has no Discord token
+and must never be given one (see
+`docs/superpowers/specs/2026-08-21-sturnus-console-design.md`
 Section 6.1). That mirror is what lets the console show "meeting" where it
-would otherwise show a raw snowflake. Discord only pushes channels the bot
-can see, so a channel the bot lacks **View Channel** on is simply absent
-from the mirror and the console shows its id — which is what it does today
-for every channel, so this costs nothing beyond a less helpful picker.
+would otherwise show a raw snowflake, and "Acme Corp" where the guild
+switcher would otherwise say "Server 1289374650912837465". Discord only
+pushes channels the bot can see, so a channel the bot lacks **View
+Channel** on is simply absent from the mirror and the console shows its id
+— which is what it does today for every channel, so this costs nothing
+beyond a less helpful picker.
 
-**No new intent for that sweep.** It reads `Guild.voice_channels`,
-`Guild.roles` and `Role.members`, all of them gateway-cache lookups rather
-than API calls. The last one needs the **Server Members Intent**, which is
-already required above for the consent gate.
+A guild the bot has not swept since it joined has no `guild` row yet, and
+the API answers `null` for its name rather than refusing: it is still a
+guild its administrators may configure, and the console falls back to the
+id until the next sweep lands.
+
+**No new intent for that sweep.** It reads `Guild.name`, `Guild.icon`,
+`Guild.voice_channels`, `Guild.text_channels`, `Guild.roles` and
+`Role.members`, all of them gateway-cache lookups rather than API calls.
+The last one needs the **Server Members Intent**, which is already
+required above for the consent gate.
 
 ### 3.2 Why the recording channels' permissions matter
 

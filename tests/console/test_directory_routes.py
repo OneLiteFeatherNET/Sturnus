@@ -64,6 +64,7 @@ def directory_url(guild_id: int | str = GUILD) -> str:
 
 def a_directory(**over: object) -> GuildDirectory:
     base: dict[str, object] = {
+        "name": "Acme Corp",
         "channels": (
             MirroredChannel(channel_id=BIG_CHANNEL, name="Standup", kind=VOICE, position=3),
         ),
@@ -130,18 +131,33 @@ async def test_the_directory_says_when_the_bot_last_saw_the_guild(
     assert body["synced_at"] == T0.isoformat()
 
 
+async def test_the_directory_says_what_the_guild_itself_is_called(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Carried here as well as in the guild list: a client that already
+    holds the directory can title the page from it rather than making a
+    second request for one string.
+    """
+    client = await signed_in(aiohttp_client, build_test_api(names=FakeNames(a_directory())))
+
+    body = await (await client.get(directory_url())).json()
+
+    assert body["name"] == "Acme Corp"
+
+
 async def test_a_guild_nothing_was_ever_mirrored_for_is_empty_and_undated(
     aiohttp_client: AiohttpClientFactory,
 ) -> None:
     """Present and null rather than absent, so a client never has to tell
     "never swept" from "an API that does not send this".
     """
-    empty = a_directory(channels=(), roles=(), members=(), synced_at=None)
+    empty = a_directory(name=None, channels=(), roles=(), members=(), synced_at=None)
     client = await signed_in(aiohttp_client, build_test_api(names=FakeNames(empty)))
 
     body = await (await client.get(directory_url())).json()
 
     assert body["synced_at"] is None
+    assert body["name"] is None
     assert body["channels"] == [] and body["roles"] == [] and body["members"] == []
 
 
