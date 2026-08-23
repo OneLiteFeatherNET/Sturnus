@@ -164,34 +164,75 @@ class ReconfigurePlan:
     retune: bool
     applied_keys: tuple[str, ...]
     deferred_keys: tuple[str, ...]
+    #: The rooms whose sessions are the reason `deferred_keys` has to
+    #: wait, in the order they were given. Empty whenever nothing is
+    #: deferred.
+    #:
+    #: A *list* because the runtime is keyed per room now, and because the
+    #: answer this field gives is the one `_apply_pending` needs: the
+    #: change may land when **every** room named here is idle, not when
+    #: the first of them finishes. The configuration it carries is the
+    #: guild's -- one row set, read by every room -- so landing it while a
+    #: second room is still recording would move that room's consent role
+    #: or its allowed list out from under a session in progress, which is
+    #: the exact thing the deferral exists to prevent.
+    #:
+    #: With `MAX_CONCURRENT_SESSIONS_PER_GUILD` at one it always holds
+    #: either nothing or one room, and saying so in the log line is
+    #: already worth it: "waiting for the recording in #standup" beats
+    #: "waiting for the recording".
+    deferred_for_channel_ids: tuple[int, ...] = ()
 
 
 def plan_reconfigure(
     *,
     current: GuildRuntimeConfig | None,
     desired: GuildRuntimeConfig | None,
-    is_recording: bool,
+    recording_channel_ids: tuple[int, ...],
 ) -> ReconfigurePlan:
     """Compares what the process is doing against what the database says.
 
     `current` is `None` when the process holds no pipeline for the guild,
     `desired` is `None` when the guild has no usable configuration (no
     recording channel is named, or `consent_role_id` is unset).
-    `is_recording` is
-    the one fact that turns an immediate change into a deferred one.
+
+    `recording_channel_ids` names the guild's rooms that have a session in
+    progress -- empty when it is idle. It replaced a bare `is_recording`
+    flag when the runtime became keyed per room, and the difference is not
+    cosmetic: the caller now has to *collect* it across the guild's rooms,
+    so a second room recording cannot be overlooked, and the plan can name
+    the rooms a deferral is waiting on rather than gesturing at "the
+    guild".
+
+    What did **not** change is which changes defer. Every identity key is
+    the guild's, not a room's: `consent_role_id` decides whose voice is
+    recorded in every room at once, and `voice_channel_ids` decides which
+    rooms exist to record in at all -- including whether the room a
+    session is already open in is still one of them. So any of them
+    changing while any room records still waits for that room, and a list
+    change mid-session is still applied at session end and not before.
     """
     if desired is None:
         if current is None:
             return ReconfigurePlan(ReconfigureAction.NOTHING, False, (), ())
         # Nothing to retune with: the configuration is gone, not different.
-        if is_recording:
-            return ReconfigurePlan(ReconfigureAction.DEFER_TEARDOWN, False, (), IDENTITY_KEYS)
+        if recording_channel_ids:
+            return ReconfigurePlan(
+                ReconfigureAction.DEFER_TEARDOWN, False, (), IDENTITY_KEYS, recording_channel_ids
+            )
         return ReconfigurePlan(ReconfigureAction.TEARDOWN, False, IDENTITY_KEYS, ())
 
     if current is None:
         # A fresh pipeline is constructed with the desired values, so every
         # key is in force the moment it exists -- there is nothing to
         # defer and nothing to retune afterwards.
+        #
+        # Deliberately not conditioned on `recording_channel_ids`: a room
+        # this process holds no pipeline for cannot be recording, so a
+        # session elsewhere in the guild is no reason to refuse to build.
+        # What *does* refuse is the connection limit, and the caller asks
+        # that (`SturnusClient._may_open_another`) rather than this
+        # function pretending a configuration question has been answered.
         return ReconfigurePlan(ReconfigureAction.BUILD, False, IDENTITY_KEYS + TUNABLE_KEYS, ())
 
     identity_changes = desired.identity_changes_from(current)
@@ -202,12 +243,16 @@ def plan_reconfigure(
             return ReconfigurePlan(ReconfigureAction.NOTHING, False, (), ())
         return ReconfigurePlan(ReconfigureAction.NOTHING, True, tunable_changes, ())
 
-    if is_recording:
-        # The identity waits for the session to end; the tunables do not.
+    if recording_channel_ids:
+        # The identity waits for the sessions to end; the tunables do not.
         # Splitting them is the whole point: a shortened idle timeout must
         # not have to wait four hours behind a channel move.
         return ReconfigurePlan(
-            ReconfigureAction.DEFER_RETARGET, True, tunable_changes, identity_changes
+            ReconfigureAction.DEFER_RETARGET,
+            True,
+            tunable_changes,
+            identity_changes,
+            recording_channel_ids,
         )
     return ReconfigurePlan(ReconfigureAction.RETARGET, True, identity_changes + tunable_changes, ())
 
@@ -242,13 +287,25 @@ class RunningState:
 
     is_live: bool
     is_recording: bool
-    #: The one allowed channel currently being served -- the channel the
-    #: session in progress is in, or the one the next session would open
-    #: against. `None` when the guild has no pipeline at all.
-    channel_id: int | None
-    #: Every channel the guild allows, this one included. `/config show`
-    #: names the others so a person waiting in one of them is not left to
-    #: guess why nothing is happening.
+    #: The allowed channels currently being served -- the rooms a session
+    #: is open in, or the ones the next sessions would open against. Empty
+    #: when the guild has no pipeline at all.
+    #:
+    #: A collection rather than the single id it was, because a session is
+    #: a property of a room now rather than of a server. It holds at most
+    #: `channel_choice.MAX_CONCURRENT_SESSIONS_PER_GUILD` entries, which is
+    #: one -- and `session_limit` below is what lets `/config show` say
+    #: *why* it is one instead of leaving the reader to infer that the
+    #: other rooms are idle by choice.
+    channel_ids: tuple[int, ...]
+    #: How many of this guild's rooms may be recorded at the same moment.
+    #: Carried on the record rather than read from the constant by every
+    #: reader, so the sentence `/config show` prints and the number the
+    #: runtime enforced are the same number.
+    session_limit: int
+    #: Every channel the guild allows, the served ones included.
+    #: `/config show` names the others so a person waiting in one of them
+    #: is not left to guess why nothing is happening.
     allowed_channel_ids: tuple[int, ...]
     #: Allowed channels that hold consenting members and are not being
     #: served, as of the last headcount. In-memory bookkeeping like the

@@ -11,6 +11,7 @@ The renderers are plain functions over a `ReconfigureResult`, so none of
 this needs an `Interaction`, a gateway, or a database.
 """
 
+from sturnus.application.channel_choice import MAX_CONCURRENT_SESSIONS_PER_GUILD
 from sturnus.application.reconfigure import (
     IDENTITY_KEYS,
     ReconfigureAction,
@@ -144,7 +145,8 @@ def _state(
     *,
     is_live: bool = True,
     is_recording: bool = True,
-    channel_id: int | None = 1,
+    channel_ids: tuple[int, ...] = (1,),
+    session_limit: int = MAX_CONCURRENT_SESSIONS_PER_GUILD,
     allowed_channel_ids: tuple[int, ...] = (1,),
     waiting_channel_ids: tuple[int, ...] = (),
     pending_keys: tuple[str, ...] = (),
@@ -153,7 +155,8 @@ def _state(
     return RunningState(
         is_live=is_live,
         is_recording=is_recording,
-        channel_id=channel_id,
+        channel_ids=channel_ids,
+        session_limit=session_limit,
         allowed_channel_ids=allowed_channel_ids,
         waiting_channel_ids=waiting_channel_ids,
         pending_keys=pending_keys,
@@ -180,7 +183,7 @@ def test_show_names_the_allowed_channels_that_are_not_being_recorded() -> None:
     is available nowhere an administrator can reach it.
     """
     line = render_running_state(
-        _state(channel_id=1, allowed_channel_ids=(1, 2, 3)), has_missing_keys=False
+        _state(channel_ids=(1,), allowed_channel_ids=(1, 2, 3)), has_missing_keys=False
     )
     assert "Recording channel: <#1>" in line
     assert "<#2>" in line
@@ -188,9 +191,23 @@ def test_show_names_the_allowed_channels_that_are_not_being_recorded() -> None:
     assert "one voice connection per server" in line
 
 
+def test_show_says_how_many_of_the_allowed_channels_are_being_served() -> None:
+    """ "One of three" beats a list of rooms that are "also allowed".
+
+    The second reads as though Sturnus is choosing to leave them alone.
+    The reason it is not in them is that it has run out of voice
+    connections, and the number is what says so.
+    """
+    line = render_running_state(
+        _state(channel_ids=(1,), allowed_channel_ids=(1, 2, 3)), has_missing_keys=False
+    )
+    assert "serving 1 of 3 allowed channels" in line
+    assert "records 1 at a time" in line
+
+
 def test_show_marks_an_allowed_channel_that_has_people_waiting_in_it() -> None:
     line = render_running_state(
-        _state(channel_id=1, allowed_channel_ids=(1, 2), waiting_channel_ids=(2,)),
+        _state(channel_ids=(1,), allowed_channel_ids=(1, 2), waiting_channel_ids=(2,)),
         has_missing_keys=False,
     )
     assert "<#2> (people waiting)" in line
@@ -206,7 +223,7 @@ def test_show_names_the_keys_that_are_still_waiting() -> None:
 
 
 def test_show_reports_a_guild_that_is_not_being_watched() -> None:
-    state = _state(is_live=False, is_recording=False, channel_id=None, allowed_channel_ids=())
+    state = _state(is_live=False, is_recording=False, channel_ids=(), allowed_channel_ids=())
     assert "not applied" in render_running_state(state, has_missing_keys=True)
 
 

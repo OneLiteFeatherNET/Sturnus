@@ -16,6 +16,22 @@ it may do to a guild that is recording right now is decided by
 `sturnus.application.reconfigure.plan_reconfigure` -- read its module
 docstring before changing anything here.
 
+**A recording belongs to a room, not to a server.** `self._recordings` is
+keyed by `(guild_id, channel_id)`, so a pipeline is findable under the room
+it is actually recording and a retarget moves the entry rather than
+mutating a field on a server-level object. What is genuinely per guild
+stays per guild and says so: the reconfigure lock (a guild's configuration
+is one row set), the configuration complaints, and the capture-failure
+cooldown (one voice connection failed, so nothing in that server may open a
+session for a while).
+
+None of that lets one guild record two rooms at once, and nothing here
+could: one bot identity holds one voice connection per guild. That limit
+lives in `channel_choice.MAX_CONCURRENT_SESSIONS_PER_GUILD` and is *asked*
+-- `_may_open_another`, `_recording_of`, `ChannelSelection.take` -- rather
+than assumed, so lifting it is a constant, a second Discord application and
+whatever the type checker then points at.
+
 The bot does **not** run Alembic migrations on start -- the worker owns the
 schema (Spec 13.1) -- so `main()` (`sturnus.entrypoints.bot`) waits for the
 expected tables to exist and fails loudly if they don't, before this class
@@ -35,7 +51,10 @@ import discord
 from discord.ext import commands
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from sturnus.application.channel_choice import choose_channel
+from sturnus.application.channel_choice import (
+    MAX_CONCURRENT_SESSIONS_PER_GUILD,
+    choose_channels,
+)
 from sturnus.application.ports import (
     AudioStore,
     AudioWriterFactory,
@@ -124,6 +143,23 @@ CAPTURE_FAILURE_REASONS = frozenset({EndReason.CAPTURE_FAILURE, EndReason.DECODE
 #: channel, fail there, block that one, and work down the list --
 #: announcing to each room in turn that it is being recorded, and
 #: recording none of them.
+#:
+#: The decision was put to the question a second time when the runtime
+#: became keyed per room, and it survived -- but on narrower grounds than
+#: before, which is why the cooldown no longer sits on a room's record at
+#: all. It lives in `_capture_cooldowns`, keyed by guild, so that
+#: "guild-wide" is something the state says rather than something the
+#: shape of the state happens to imply.
+#:
+#: **What would make it per room.** Not another allowed channel -- that
+#: changes nothing about the connection that failed. A *second bot
+#: identity* would: a second token, a second gateway session, a second
+#: libopus, a second connection. At that point a fault in one identity's
+#: room says nothing about the other's, and blocking both would be an
+#: outage invented out of caution. Whoever supplies that second identity
+#: (see `MAX_CONCURRENT_SESSIONS_PER_GUILD`) has to key this by whatever
+#: actually failed -- the connection -- rather than inherit "guild-wide"
+#: because that is what it said here.
 REJOIN_COOLDOWN = timedelta(minutes=15)
 
 #: The keys `_desired_config` reads as integers, in the order it reads
@@ -160,14 +196,40 @@ def _unparseable_keys(snapshot: Mapping[str, str | None]) -> tuple[str, ...]:
 
 
 @dataclass
-class _GuildRecording:
-    """Everything the client needs to act on one guild's configured channel."""
+class _ChannelRecording:
+    """One room's recording pipeline: the session machine and its connection.
+
+    Filed in `SturnusClient._recordings` under `(guild_id, channel_id)`,
+    because that is what it is about. It used to be a `_GuildRecording`,
+    filed under the guild alone, with the room it served as a field on it
+    -- which said that a recording is something a *server* has and the
+    room is a detail of it. It is the other way round: a session belongs to
+    the room its audio came from, and its `sessions` row names that room
+    for as long as the recording exists.
+
+    Renaming it changes what the runtime can express, not what it does
+    today. A guild still holds exactly one of these at a time, because a
+    bot identity holds one voice connection per guild -- see
+    `MAX_CONCURRENT_SESSIONS_PER_GUILD`, which the client asks rather than
+    assumes.
+
+    A note on what is *not* per room. `config`, `pending` and
+    `pending_teardown` describe the guild's configuration, which is one
+    row set read by every room. They live here because the guild's one
+    pipeline is where they can be reached, and lifting the connection
+    limit means moving them to a guild-keyed record rather than copying
+    them into each room's. `_apply_pending` already behaves as if that had
+    happened: it lands a deferred change only when every room of the guild
+    is idle.
+    """
 
     #: The configuration actually in force for this pipeline right now --
     #: not what the database says, which is what `reconcile_guild`
     #: compares against. `channel_id`/`role_id` are read off it rather
     #: than duplicated beside it, so a retarget cannot update one and
     #: forget the other.
+    #:
+    #: Per guild, not per room (see the class docstring).
     config: GuildRuntimeConfig
     service: RecordingService
     #: Typed against the narrow `VoiceReceiver` port rather than the
@@ -178,25 +240,24 @@ class _GuildRecording:
     voice: VoiceReceiver
     #: An identity change that arrived mid-session and must wait for it to
     #: end. Applied by `_apply_pending`, at the one moment nothing is in
-    #: flight.
+    #: flight. Per guild, not per room (see the class docstring).
     pending: GuildRuntimeConfig | None = None
     #: The configuration was cleared mid-session. A separate flag rather
     #: than `pending=None` overloaded: "nothing is waiting" and "stopping
-    #: is waiting" are different states.
+    #: is waiting" are different states. Per guild, not per room.
     pending_teardown: bool = False
-    #: Set when a session ended because capture failed; while it is in the
-    #: future, no new session opens for this guild. Cleared by the tick
-    #: loop once it has passed -- a guard that only an operator can clear
-    #: turns a transient fault into an outage. Guild-wide rather than per
-    #: channel; the reasoning is on `REJOIN_COOLDOWN` above.
-    blocked_until: datetime | None = None
     #: Allowed channels that held consenting members and were not being
-    #: served, as of the last headcount. Kept so `/config show` can tell a
-    #: person waiting in the second room why nothing is happening, and so
-    #: the log line about it is emitted once per *decision* rather than
-    #: once per voice-state update.
+    #: served, as of the last headcount -- the rooms this room's session is
+    #: keeping waiting. Kept so `/config show` can tell a person waiting in
+    #: the second room why nothing is happening, and so the log line about
+    #: it is emitted once per *decision* rather than once per voice-state
+    #: update.
+    #:
+    #: Per room, deliberately: "which meetings am I not recording" is
+    #: answered relative to the one being recorded, and it is this
+    #: pipeline that has to answer it.
     waiting_channel_ids: tuple[int, ...] = ()
-    #: Monotonic timestamp of the moment this guild's session started
+    #: Monotonic timestamp of the moment this room's session started
     #: recording, or `None` when it is idle. Kept here rather than on
     #: `RecordingService` because it exists purely to feed
     #: `sturnus.session.duration` and `sturnus.session.active`, and
@@ -208,11 +269,19 @@ class _GuildRecording:
     #: `/config apply force:true` and through `graceful_shutdown`, and
     #: `sturnus.session.active` must be decremented exactly once whichever
     #: of them gets there.
+    #:
+    #: Per room, and now trivially so: a session belongs to a room, so the
+    #: moment it started belongs to the same place.
     started_monotonic: float | None = None
 
     @property
+    def guild_id(self) -> int:
+        """The guild this room belongs to. Half of this record's key."""
+        return self.service.guild_id
+
+    @property
     def channel_id(self) -> int:
-        """The one allowed channel currently being served.
+        """The room this pipeline serves. The other half of its key.
 
         Read off the service rather than the configuration, because that is
         where it is decided: the configuration names every channel that is
@@ -220,6 +289,10 @@ class _GuildRecording:
         from who is sitting in them. During a session it is the channel the
         session's row names, which is the only answer that is ever true of
         audio already on disk.
+
+        Because it is half the key, moving it is not an assignment but a
+        move between dictionary entries -- `SturnusClient._point_at` is
+        the one place that happens.
         """
         return self.service.channel_id
 
@@ -305,40 +378,166 @@ class SturnusClient(commands.Bot):
         self._tick_interval_seconds = tick_interval_seconds
         self._capture_diagnostics = capture_diagnostics
 
-        self._guilds: dict[int, _GuildRecording] = {}
+        #: Every room this process is recording, or is watching so that it
+        #: can, keyed by the room: `(guild_id, channel_id)`.
+        #:
+        #: The key is the change. A recording used to be filed under the
+        #: guild with the room as a field on it, which made "which room" a
+        #: detail of a server-level object; it is the room that a session,
+        #: its `sessions` row and its audio all belong to. One guild still
+        #: has at most one entry here, because one bot identity holds one
+        #: voice connection per guild -- but that is now a *limit the code
+        #: asks about* (`_may_open_another`,
+        #: `MAX_CONCURRENT_SESSIONS_PER_GUILD`) rather than a shape the
+        #: dictionary quietly enforces.
+        self._recordings: dict[tuple[int, int], _ChannelRecording] = {}
         self._tick_task: asyncio.Task[None] | None = None
-        #: One lock per guild. The tick loop and a slash command both
-        #: reconcile on this event loop and both await database I/O, so
-        #: they interleave; without this, two passes could each decide
-        #: "build" and construct two `VoiceReceiveAdapter`s, one of whose
-        #: voice connections would then sit in the channel forever with
-        #: nothing holding a reference to it.
+        #: One lock per guild -- **not** per room, and that is a decision
+        #: rather than an omission. What it guards is a guild's
+        #: *configuration*, which is one row set: a reconcile reads every
+        #: key at once and may build, retarget or tear down whatever
+        #: pipelines the guild has. Two passes holding different rooms'
+        #: locks could each decide "build" from the same configuration and
+        #: construct two `VoiceReceiveAdapter`s, one of whose voice
+        #: connections would then sit in a channel forever with nothing
+        #: holding a reference to it -- which is the exact failure this
+        #: lock exists to prevent.
+        #:
+        #: The tick loop and a slash command both reconcile on this event
+        #: loop and both await database I/O, so they do interleave.
         self._reconfigure_locks: dict[int, asyncio.Lock] = {}
         #: Guilds with a voice-state update already queued behind the lock
-        #: above. discord.py dispatches every gateway event as its own
-        #: task, so a busy channel can produce a dozen of them while one
-        #: reconcile holds the lock through a `leave()`; each would then
-        #: recount the very same membership in turn. Since the handler
-        #: reads the channel's *current* members rather than replaying a
+        #: above. Keyed the same way the lock is, necessarily: it coalesces
+        #: waiters *on that lock*, so a per-room key would let one waiter
+        #: per room queue behind a single guild-wide lock and undo the
+        #: coalescing entirely.
+        #:
+        #: discord.py dispatches every gateway event as its own task, so a
+        #: busy channel can produce a dozen of them while one reconcile
+        #: holds the lock through a `leave()`; each would then recount the
+        #: very same membership in turn. Since the handler reads every
+        #: allowed channel's *current* members rather than replaying a
         #: delta, one waiter answers for all of them and the rest can be
-        #: dropped on arrival -- which is what keeps the lock from turning
-        #: a burst of joins into a queue of handlers.
+        #: dropped on arrival.
         self._voice_updates_waiting: set[int] = set()
-        #: Last configuration complaint logged per guild, so a guild that
-        #: is simply unconfigured -- or whose value someone fat-fingered
-        #: with a direct UPDATE -- is reported once, not every ten seconds.
+        #: Last configuration complaint logged per guild -- per guild
+        #: because the complaint is about the guild's configuration, which
+        #: is one row set and is unreadable or missing as a whole. A guild
+        #: that is simply unconfigured -- or whose value someone
+        #: fat-fingered with a direct UPDATE -- is reported once, not every
+        #: ten seconds.
         self._config_notices: dict[int, str] = {}
-        #: Allowed channels last reported as unseeable, per guild. A list
-        #: can now name a channel that was deleted, or one the bot cannot
-        #: see, and that must be skipped rather than allowed to stop the
-        #: other channels working -- but it must also be *said*, once,
-        #: rather than on every headcount for as long as the id stays in
-        #: the configuration.
-        self._unreadable_channels: dict[int, tuple[int, ...]] = {}
+        #: Rooms last reported as unseeable, as `(guild_id, channel_id)`.
+        #:
+        #: Per room, and re-keyed from a per-guild tuple deliberately: "id
+        #: 5 cannot be seen as a voice channel" is a fact about that
+        #: channel, not about the list it sits in. Keyed per guild, one
+        #: newly broken id re-announced every id already known to be
+        #: broken, because the deduplication compared the whole set. Now
+        #: each room is announced once and stays quiet.
+        self._unreadable_channels: set[tuple[int, int]] = set()
+        #: Guilds that may not open a session until this moment has passed,
+        #: because capture failed. **Keyed by guild, and that is the whole
+        #: point of it living here** rather than on a room's record: both
+        #: end reasons that arm it are properties of this process's one
+        #: voice connection, so the guard is guild-wide, and state that is
+        #: guild-wide should have to be written down somewhere guild-wide.
+        #: The reasoning, and what would make it per room, is on
+        #: `REJOIN_COOLDOWN`.
+        self._capture_cooldowns: dict[int, datetime] = {}
         #: Set before anything is torn down, so a `/config set` landing
         #: during SIGTERM cannot rebuild a pipeline (and reconnect a voice
         #: client) after `graceful_shutdown` has already left the channel.
         self._shutting_down = False
+
+    # -- The one-connection limit, in one place -----------------------------
+
+    def _recordings_of(self, guild_id: int) -> tuple[_ChannelRecording, ...]:
+        """Every room of this guild that has a pipeline, in channel id order.
+
+        The honest reading of `_recordings`, and the one every loop should
+        take. Sorted rather than left in insertion order so a tick, a
+        shutdown and a test all visit a guild's rooms in the same sequence
+        whatever order they were built in.
+        """
+        return tuple(
+            recording
+            for (recorded_guild_id, _channel_id), recording in sorted(self._recordings.items())
+            if recorded_guild_id == guild_id
+        )
+
+    def _recording_of(self, guild_id: int) -> _ChannelRecording | None:
+        """This guild's one pipeline, or `None` while it has none.
+
+        **The single-connection assumption, funnelled into one method.**
+        Every caller that says "the guild's recording" -- reconcile,
+        `/config`'s reply, the running-state reader -- comes through here,
+        so lifting `MAX_CONCURRENT_SESSIONS_PER_GUILD` turns "find the
+        callers to fix" into "find the callers of this", which the type
+        checker can do. Each of them becomes a loop over `_recordings_of`
+        and a decision about which room it meant.
+
+        It returns the lowest-numbered room when the limit is above one,
+        which is a defensible answer to a question that will have stopped
+        making sense; the point is that it is one place to stop asking it.
+        """
+        recordings = self._recordings_of(guild_id)
+        return recordings[0] if recordings else None
+
+    def _recording_channel_ids(self, guild_id: int) -> tuple[int, ...]:
+        """The guild's rooms that have a session in progress right now.
+
+        The replacement for a bare "is this guild recording" boolean, and
+        the reason `plan_reconfigure` takes a list. Two things read it: the
+        plan, which defers an identity change while any of these rooms is
+        busy, and `_apply_pending`, which lands the change only once the
+        answer is empty.
+        """
+        return tuple(
+            recording.channel_id
+            for recording in self._recordings_of(guild_id)
+            if recording.service.is_recording
+        )
+
+    def _may_open_another(self, guild_id: int) -> bool:
+        """Whether this guild has a free slot for another room's pipeline.
+
+        The guard everything that used to *assume* one connection now
+        *asks*. A pipeline holds a `VoiceReceiveAdapter`, an adapter holds
+        one voice client, and discord.py allows one voice client per guild
+        -- so the slot is taken by the pipeline existing, not by a session
+        being open in it.
+
+        Lifting the limit is editing `MAX_CONCURRENT_SESSIONS_PER_GUILD`
+        and supplying the second bot identity its docstring describes.
+        Nothing else in this class needs to learn to count.
+        """
+        return len(self._recordings_of(guild_id)) < MAX_CONCURRENT_SESSIONS_PER_GUILD
+
+    def _point_at(self, recording: _ChannelRecording, channel_id: int) -> None:
+        """Moves an idle pipeline to another room, its key included.
+
+        The one place a recording changes room, and the reason
+        `_recordings` is keyed by `(guild_id, channel_id)` at all: a
+        session is a property of the room it happens in, so a pipeline
+        that moves has to be findable under the room it moved to and
+        nowhere else. Re-pointing without re-keying would file a guild's
+        recording under a room nothing is being recorded from, which is
+        exactly the bookkeeping this change exists to remove.
+
+        Also the one place the cached channel *name* is refreshed, because
+        `RecordingService.retarget` refreshes it and nothing else in the
+        process ever does -- so this is called even when the room is
+        unchanged. See `_retarget`.
+
+        `RecordingService.retarget` refuses mid-session (a `sessions` row
+        must never name one room while its audio came from another), so
+        every caller has already established that this pipeline is idle.
+        """
+        guild_id = recording.guild_id
+        self._recordings.pop((guild_id, recording.channel_id), None)
+        recording.service.retarget(channel_id, self._channel_name(guild_id, channel_id))
+        self._recordings[(guild_id, channel_id)] = recording
 
     async def setup_hook(self) -> None:
         """Loads the cogs and syncs the command tree; runs once before login completes.
@@ -375,8 +574,8 @@ class SturnusClient(commands.Bot):
 
         discord.py raises `on_ready` again whenever a RESUME fails and the
         client has to re-IDENTIFY -- a routine gateway blip. The old
-        one-shot `_configure_guild` unconditionally overwrote
-        `self._guilds[guild.id]`, so that blip dropped a recording guild's
+        one-shot `_configure_guild` unconditionally overwrote the guild's
+        entry in `self._recordings`, so that blip dropped a recording guild's
         `RecordingService` (unflushed writers, an orphaned plaintext WAV)
         and its `VoiceReceiveAdapter` (a live voice connection nothing
         would ever disconnect). `reconcile_guild` is idempotent, so this
@@ -390,7 +589,7 @@ class SturnusClient(commands.Bot):
             logging.INFO,
             Event.BOT_CONNECTED,
             "Connected to Discord",
-            count=len(self._guilds),
+            count=len(self._recordings),
         )
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -561,7 +760,7 @@ class SturnusClient(commands.Bot):
 
     async def _reconcile(self, guild_id: int, *, force: bool = False) -> ReconfigureResult:
         """The reconcile body. Assumes the guild's lock is already held."""
-        recording = self._guilds.get(guild_id)
+        recording = self._recording_of(guild_id)
         if self._shutting_down:
             return self._result(
                 ReconfigurePlan(ReconfigureAction.NOTHING, False, (), ()), recording, False
@@ -569,8 +768,15 @@ class SturnusClient(commands.Bot):
 
         current = recording.config if recording is not None else None
         desired = await self._desired_config(guild_id, current)
-        is_recording = recording is not None and recording.service.is_recording
-        plan = plan_reconfigure(current=current, desired=desired, is_recording=is_recording)
+        # Collected across the guild's rooms rather than read off one of
+        # them: an identity key belongs to the guild, so a session
+        # anywhere in it is a reason to wait, and the plan gets to name
+        # which rooms those are.
+        plan = plan_reconfigure(
+            current=current,
+            desired=desired,
+            recording_channel_ids=self._recording_channel_ids(guild_id),
+        )
 
         if plan.retune and recording is not None and desired is not None:
             # Timeouts and retention move now, mid-session included, even
@@ -585,52 +791,66 @@ class SturnusClient(commands.Bot):
         became_live = False
         if plan.action is ReconfigureAction.BUILD:
             assert desired is not None
-            await self._build(guild_id, desired)
-            recording = self._guilds[guild_id]
-            became_live = True
+            # The configuration says "build"; whether there is a
+            # connection left to build with is a different question, and
+            # it is asked in exactly one place. Today the two answers can
+            # only disagree if a pipeline already exists, which
+            # `plan_reconfigure` has just ruled out -- the guard is here
+            # so that raising the limit is the whole change rather than
+            # the beginning of a hunt.
+            if self._may_open_another(guild_id):
+                await self._build(guild_id, desired)
+                recording = self._recording_of(guild_id)
+                became_live = True
         elif plan.action is ReconfigureAction.RETARGET:
             assert recording is not None and desired is not None
             await self._retarget(guild_id, recording, desired)
         elif plan.action is ReconfigureAction.DEFER_RETARGET:
             assert recording is not None and desired is not None
             if force:
-                await self._end_session_now(guild_id, recording)
+                await self._end_sessions_now(guild_id)
                 await self._retarget(guild_id, recording, desired)
                 plan = replace(
                     plan,
                     action=ReconfigureAction.RETARGET,
                     applied_keys=plan.applied_keys + plan.deferred_keys,
                     deferred_keys=(),
+                    deferred_for_channel_ids=(),
                 )
             else:
-                self._defer_retarget(guild_id, recording, desired)
+                self._defer_retarget(guild_id, recording, desired, plan.deferred_for_channel_ids)
         elif plan.action is ReconfigureAction.TEARDOWN:
             assert recording is not None
-            await self._teardown(guild_id, recording)
+            await self._teardown_guild(guild_id)
             log.info("Guild %d is no longer configured; stopped watching it.", guild_id)
         elif plan.action is ReconfigureAction.DEFER_TEARDOWN:
             assert recording is not None
             if force:
-                await self._end_session_now(guild_id, recording)
-                await self._teardown(guild_id, recording)
+                await self._end_sessions_now(guild_id)
+                await self._teardown_guild(guild_id)
                 plan = replace(
                     plan,
                     action=ReconfigureAction.TEARDOWN,
                     applied_keys=plan.deferred_keys,
                     deferred_keys=(),
+                    deferred_for_channel_ids=(),
                 )
             else:
-                self._defer_teardown(guild_id, recording)
+                self._defer_teardown(guild_id, recording, plan.deferred_for_channel_ids)
 
-        live = self._guilds.get(guild_id)
+        live = self._recording_of(guild_id)
         if live is not None:
             self._forget_stale_deferrals(guild_id, live, plan.action)
         return self._result(plan, live, became_live)
 
     def _defer_retarget(
-        self, guild_id: int, recording: _GuildRecording, desired: GuildRuntimeConfig
+        self,
+        guild_id: int,
+        recording: _ChannelRecording,
+        desired: GuildRuntimeConfig,
+        waiting_on: tuple[int, ...],
     ) -> None:
-        """Parks an identity change until the session ends, announcing it once.
+        """Parks an identity change until the sessions end, announcing it once.
 
         This runs on every reconcile pass for as long as the session lasts
         -- every ten seconds from the tick loop alone -- so the log line
@@ -642,20 +862,28 @@ class SturnusClient(commands.Bot):
         identity is deferred (`_apply_pending` takes nothing else from it),
         but keeping it current means it never describes a configuration
         that has since been replaced.
+
+        `waiting_on` comes from the plan, which collected it across the
+        guild's rooms. It is what the line names, rather than "the room
+        this pipeline happens to serve" -- with one connection the two are
+        the same room, and only one of them is still the right answer
+        afterwards.
         """
         if recording.pending is None or recording.pending.identity != desired.identity:
             log.info(
                 "Guild %d: channel/role change is stored but a session is "
-                "recording in channel %d; it takes effect when that session "
+                "recording in channel %s; it takes effect when that session "
                 "ends (at the latest after max_session_hours=%d).",
                 guild_id,
-                recording.channel_id,
+                ", ".join(str(channel_id) for channel_id in waiting_on),
                 recording.config.timeouts.max_session_hours,
             )
         recording.pending = desired
 
-    def _defer_teardown(self, guild_id: int, recording: _GuildRecording) -> None:
-        """Parks a teardown until the session ends, announcing it once.
+    def _defer_teardown(
+        self, guild_id: int, recording: _ChannelRecording, waiting_on: tuple[int, ...]
+    ) -> None:
+        """Parks a teardown until the sessions end, announcing it once.
 
         Same reasoning as `_defer_retarget`: the transition is news, the
         state persisting is not.
@@ -663,14 +891,15 @@ class SturnusClient(commands.Bot):
         if not recording.pending_teardown:
             log.info(
                 "Guild %d: configuration was cleared while a session is "
-                "recording; the recording finishes and uploads normally, "
-                "then Sturnus stops watching.",
+                "recording in channel %s; the recording finishes and uploads "
+                "normally, then Sturnus stops watching.",
                 guild_id,
+                ", ".join(str(channel_id) for channel_id in waiting_on),
             )
         recording.pending_teardown = True
 
     def _forget_stale_deferrals(
-        self, guild_id: int, recording: _GuildRecording, action: ReconfigureAction
+        self, guild_id: int, recording: _ChannelRecording, action: ReconfigureAction
     ) -> None:
         """Retracts a deferral this pass no longer asks for.
 
@@ -708,7 +937,7 @@ class SturnusClient(commands.Bot):
     def _result(
         self,
         plan: ReconfigurePlan,
-        recording: _GuildRecording | None,
+        recording: _ChannelRecording | None,
         became_live: bool,
     ) -> ReconfigureResult:
         """Turns the plan and the resulting state into the cogs' answer."""
@@ -730,10 +959,11 @@ class SturnusClient(commands.Bot):
 
         The only path on which a `RecordingService` or a
         `VoiceReceiveAdapter` is ever created, and it runs only for a
-        guild that holds neither. Every other change retargets the
-        existing objects in place, so there is no window in which an
-        adapter -- and with it a live voice connection -- can be dropped
-        without anyone left to disconnect it.
+        guild that holds neither and has a free connection slot
+        (`_may_open_another`, checked by the caller). Every other change
+        retargets the existing objects in place, so there is no window in
+        which an adapter -- and with it a live voice connection -- can be
+        dropped without anyone left to disconnect it.
 
         The `_sync_participants` at the end is not an optimisation: a
         pipeline built from an empty headcount only ever learns who is in
@@ -767,9 +997,10 @@ class SturnusClient(commands.Bot):
             announcer=DiscordAnnouncer(self),
             retention_days=desired.retention_days,
         )
-        self._guilds[guild_id] = _GuildRecording(
+        recording = _ChannelRecording(
             config=desired, service=service, voice=self._make_voice(service)
         )
+        self._recordings[(guild_id, initial_channel_id)] = recording
         log_event(
             log,
             logging.INFO,
@@ -779,7 +1010,7 @@ class SturnusClient(commands.Bot):
             channel_id=initial_channel_id,
             count=len(desired.channel_ids),
         )
-        await self._sync_participants(self.get_guild(guild_id), self._guilds[guild_id])
+        await self._sync_participants(self.get_guild(guild_id), recording)
 
     def _channel_name(self, guild_id: int, channel_id: int) -> str | None:
         """The voice channel's name, resolved here because only we can.
@@ -800,7 +1031,7 @@ class SturnusClient(commands.Bot):
         A named seam rather than an inline constructor call: it is what
         lets the client-level tests exercise the real build path -- the
         one the reported defect broke -- against a fake `VoiceReceiver`,
-        instead of either reaching into `_guilds` after the fact or
+        instead of either reaching into `_recordings` after the fact or
         needing `discord-ext-voice-recv` and a live gateway connection.
         """
         return VoiceReceiveAdapter(
@@ -813,7 +1044,7 @@ class SturnusClient(commands.Bot):
         )
 
     async def _retarget(
-        self, guild_id: int, recording: _GuildRecording, desired: GuildRuntimeConfig
+        self, guild_id: int, recording: _ChannelRecording, desired: GuildRuntimeConfig
     ) -> None:
         """Points an idle guild at a new list of channels and/or consent role, in place.
 
@@ -848,7 +1079,7 @@ class SturnusClient(commands.Bot):
             # would move it before the next session opened against it.
             target = desired.channel_ids[0]
         # Unconditional, including when the served channel is unchanged.
-        # `retarget` also refreshes the cached channel *name*, and nothing
+        # `_point_at` refreshes the cached channel *name*, and nothing
         # else in the process ever does: `RecordingService` holds the name
         # for the worker, which has no Discord connection to resolve one,
         # and a rename in Discord emits no event this bot acts on. A
@@ -856,13 +1087,13 @@ class SturnusClient(commands.Bot):
         # its room and then changed only `consent_role_id` would otherwise
         # keep the old name for the life of the process, and head every
         # protocol from then on with a room that no longer exists under it.
-        recording.service.retarget(target, self._channel_name(guild_id, target))
+        self._point_at(recording, target)
         recording.config = desired
         recording.pending = None
         await self._sync_participants(self.get_guild(guild_id), recording)
 
     def _consenting_counts(
-        self, guild: discord.Guild, recording: _GuildRecording
+        self, guild: discord.Guild, recording: _ChannelRecording
     ) -> dict[int, int]:
         """How many consenting members sit in each allowed channel right now.
 
@@ -882,45 +1113,56 @@ class SturnusClient(commands.Bot):
         having.
         """
         counts: dict[int, int] = {}
-        unreadable: list[int] = []
         for channel_id in recording.channel_ids:
             channel = guild.get_channel(channel_id)
             if not isinstance(channel, discord.VoiceChannel):
-                unreadable.append(channel_id)
+                self._note_unreadable_channel(guild.id, channel_id)
                 continue
+            self._forget_unreadable_channel(guild.id, channel_id)
             counts[channel_id] = sum(
                 1
                 for participant in channel.members
                 if any(role.id == recording.role_id for role in participant.roles)
             )
-        self._note_unreadable_channels(guild.id, tuple(unreadable))
         return counts
 
-    def _note_unreadable_channels(self, guild_id: int, unreadable: tuple[int, ...]) -> None:
-        """Reports allowed channels this process cannot see, once per change.
+    def _note_unreadable_channel(self, guild_id: int, channel_id: int) -> None:
+        """Reports one room this process cannot see, once.
 
         Every headcount runs this, and a headcount runs on every voice-state
         update, so the line has to belong to the *transition* -- a channel
         deleted out from under a stored list would otherwise repeat the same
         sentence for as long as the id stays in the configuration.
+
+        Per room rather than per guild, which is the honest key for it: a
+        second stale id appearing in the list is news about that id, and
+        under the old per-guild tuple it re-announced every id already
+        known to be stale alongside it.
         """
-        if self._unreadable_channels.get(guild_id, ()) == unreadable:
+        if (guild_id, channel_id) in self._unreadable_channels:
             return
-        self._unreadable_channels[guild_id] = unreadable
-        if not unreadable:
-            return
+        self._unreadable_channels.add((guild_id, channel_id))
         log.warning(
-            "Guild %d allows %s, which %s cannot be seen as a voice channel; skipping "
-            "it. Every other allowed channel keeps working. Remove it with "
+            "Guild %d allows channel %d, which cannot be seen as a voice channel; "
+            "skipping it. Every other allowed channel keeps working. Remove it with "
             "/config set %s.",
             guild_id,
-            ", ".join(str(channel_id) for channel_id in unreadable),
-            "they" if len(unreadable) > 1 else "it",
+            channel_id,
             settings.VOICE_CHANNEL_IDS,
         )
 
+    def _forget_unreadable_channel(self, guild_id: int, channel_id: int) -> None:
+        """Forgets a room that can be read again, so a relapse is reported.
+
+        A channel can come back -- the gateway cache fills in after a
+        reconnect, or somebody recreates the room and puts the new id in
+        the list. Without this the complaint would be suppressed for the
+        life of the process the next time the same id went missing.
+        """
+        self._unreadable_channels.discard((guild_id, channel_id))
+
     async def _sync_participants(
-        self, guild: discord.Guild | None, recording: _GuildRecording
+        self, guild: discord.Guild | None, recording: _ChannelRecording
     ) -> None:
         """Counts every allowed channel, picks one, and joins it if it starts a session.
 
@@ -934,10 +1176,10 @@ class SturnusClient(commands.Bot):
         missed.
 
         It is also the single place a channel is *chosen*. A guild allows a
-        list; a Discord bot holds one voice connection per guild; so when
-        two allowed channels are both busy something must pick one, and
-        `sturnus.application.channel_choice.choose_channel` is the rule --
-        most consenting members first, lowest channel id to break a tie.
+        list, `sturnus.application.channel_choice.choose_channels` orders
+        it -- most consenting members first, lowest channel id to break a
+        tie -- and how many of that order are actually served is asked of
+        `MAX_CONCURRENT_SESSIONS_PER_GUILD` rather than assumed to be one.
         The rule lives there rather than inline here so every clause of it
         can be pinned down without a gateway.
 
@@ -950,13 +1192,14 @@ class SturnusClient(commands.Bot):
         """
         if guild is None:
             return
-        if recording.blocked_until is not None:
+        blocked_until = self._capture_cooldowns.get(guild.id)
+        if blocked_until is not None:
             log.info(
                 "Not counting guild %d: capture failed in channel %d and no session "
                 "will start anywhere in this server before %s.",
                 guild.id,
                 recording.channel_id,
-                recording.blocked_until.isoformat(),
+                blocked_until.isoformat(),
             )
             return
 
@@ -973,16 +1216,19 @@ class SturnusClient(commands.Bot):
             consented_count = counts.get(recording.channel_id)
             if consented_count is None:
                 return
+            # The rooms this session is keeping waiting, ranked by the same
+            # rule that would pick one of them the moment it ends -- so the
+            # first name in the line is the room that goes next, not merely
+            # the room with the lowest id.
+            others = {
+                channel_id: count
+                for channel_id, count in counts.items()
+                if channel_id != recording.channel_id
+            }
             self._note_waiting(
                 guild.id,
                 recording,
-                tuple(
-                    sorted(
-                        channel_id
-                        for channel_id, count in counts.items()
-                        if count > 0 and channel_id != recording.channel_id
-                    )
-                ),
+                tuple(ranking.channel_id for ranking in choose_channels(others).ranked),
             )
             await recording.service.participants_changed(consented_count, self._clock.now())
             return
@@ -993,18 +1239,23 @@ class SturnusClient(commands.Bot):
             # tell it everybody left.
             return
 
-        choice = choose_channel(counts)
-        self._note_waiting(guild.id, recording, choice.waiting)
-        if choice.channel_id is None:
+        served = choose_channels(counts).take(MAX_CONCURRENT_SESSIONS_PER_GUILD)
+        self._note_waiting(guild.id, recording, served.waiting)
+        if not served.serving:
             await recording.service.participants_changed(0, self._clock.now())
             return
-        if choice.channel_id != recording.channel_id:
+        # This guild holds one pipeline because it holds one voice
+        # connection, so it serves the head of the selection and nothing
+        # else. `serving` is already no longer than the limit allows, which
+        # is the half that will not need rewriting: lifting the limit turns
+        # these three lines into a loop that pairs each served room with
+        # its own pipeline.
+        chosen = served.serving[0]
+        if chosen.channel_id != recording.channel_id:
             # Idle, so this is safe: `retarget` only refuses mid-session,
             # and the branch above has already taken every such case.
-            recording.service.retarget(
-                choice.channel_id, self._channel_name(guild.id, choice.channel_id)
-            )
-        await recording.service.participants_changed(choice.consenting, self._clock.now())
+            self._point_at(recording, chosen.channel_id)
+        await recording.service.participants_changed(chosen.consenting, self._clock.now())
         if recording.service.is_recording:
             # The session's bookkeeping opens here, not inside
             # `_start_capture`. The session row exists from this moment
@@ -1022,7 +1273,7 @@ class SturnusClient(commands.Bot):
             await self._start_capture(recording)
 
     def _note_waiting(
-        self, guild_id: int, recording: _GuildRecording, waiting: tuple[int, ...]
+        self, guild_id: int, recording: _ChannelRecording, waiting: tuple[int, ...]
     ) -> None:
         """Records, and announces once, which allowed channels are not being served.
 
@@ -1035,6 +1286,12 @@ class SturnusClient(commands.Bot):
         every voice-state update and every tick, so a second meeting
         running alongside the first for an hour would otherwise repeat the
         same sentence hundreds of times.
+
+        The rooms arrive ranked, so the line names the one that goes next
+        first. It also names the *number* Sturnus can serve rather than
+        asserting "one" in prose: the reason those people are waiting is a
+        count of voice connections, and printing the count is what makes
+        the sentence stay true if the count ever changes.
         """
         if waiting == recording.waiting_channel_ids:
             return
@@ -1043,17 +1300,19 @@ class SturnusClient(commands.Bot):
             return
         log.info(
             "Guild %d: recording channel %d; %s also %s consenting members and "
-            "%s waiting. Sturnus holds one voice connection per server, so it "
-            "records whichever allowed channel has the most consenting members "
-            "and follows that one until its session ends.",
+            "%s waiting. Sturnus records %d of a server's allowed channels at a "
+            "time -- one bot identity holds one voice connection per server -- so "
+            "it takes whichever has the most consenting members and follows that "
+            "one until its session ends.",
             guild_id,
             recording.channel_id,
             ", ".join(str(channel_id) for channel_id in waiting),
             "have" if len(waiting) > 1 else "has",
             "are" if len(waiting) > 1 else "is",
+            MAX_CONCURRENT_SESSIONS_PER_GUILD,
         )
 
-    async def _start_capture(self, recording: _GuildRecording) -> None:
+    async def _start_capture(self, recording: _ChannelRecording) -> None:
         """Joins the voice channel, or ends the session it could not capture.
 
         A `join` that raises used to leave the session row open with no
@@ -1102,7 +1361,7 @@ class SturnusClient(commands.Bot):
                 )
                 recording.service.request_close(EndReason.CAPTURE_FAILURE)
 
-    async def _return_to_idle(self, guild_id: int, recording: _GuildRecording) -> None:
+    async def _return_to_idle(self, guild_id: int, recording: _ChannelRecording) -> None:
         """Leaves the channel and puts the machine back where a session can start.
 
         Deliberately independent of whether the `close()` that preceded it
@@ -1143,7 +1402,7 @@ class SturnusClient(commands.Bot):
             )
         recording.service.reset()
 
-    async def _end_session_now(self, guild_id: int, recording: _GuildRecording) -> None:
+    async def _end_session_now(self, guild_id: int, recording: _ChannelRecording) -> None:
         """Ends the session in progress deliberately, keeping every recording.
 
         The same sequence a timeout takes -- encrypt, upload, enqueue,
@@ -1180,16 +1439,50 @@ class SturnusClient(commands.Bot):
             self._record_session_close(recording, SHUTDOWN_END_REASON, session_id)
             await self._return_to_idle(guild_id, recording)
 
-    async def _teardown(self, guild_id: int, recording: _GuildRecording) -> None:
-        """Stops watching a guild. The lock is kept, not popped: a waiter
+    async def _end_sessions_now(self, guild_id: int) -> None:
+        """Ends every session this guild has in progress. `force`'s first half.
+
+        A loop rather than a call, because a session belongs to a room and
+        a guild may in principle have one per free connection. With the
+        limit at one it runs at most once -- but "end the recording in
+        progress" was never a promise about a single room, and `/config
+        apply force:true` says "any recording in progress" for a reason.
+        """
+        for recording in self._recordings_of(guild_id):
+            await self._end_session_now(guild_id, recording)
+
+    async def _teardown(self, guild_id: int, recording: _ChannelRecording) -> None:
+        """Stops watching one room. The lock is kept, not popped: a waiter
         blocked on it must not be handed a fresh one and run concurrently."""
         await recording.voice.leave()
-        self._guilds.pop(guild_id, None)
+        self._recordings.pop((guild_id, recording.channel_id), None)
+
+    async def _teardown_guild(self, guild_id: int) -> None:
+        """Stops watching a guild: every room of it, and its guild-wide notes.
+
+        The bookkeeping cleared here is the bookkeeping that is *about the
+        guild* rather than about one of its rooms, which is why it is
+        cleared here rather than in `_teardown`: an unreadable channel and
+        a capture cooldown outlive any single pipeline, and a guild that is
+        no longer configured has no use for either.
+
+        The reconfigure lock is deliberately not among them -- see
+        `_teardown`.
+        """
+        for recording in self._recordings_of(guild_id):
+            await self._teardown(guild_id, recording)
         # Forgotten with the pipeline, so a guild reconfigured later is
         # told again about a channel it still cannot see.
-        self._unreadable_channels.pop(guild_id, None)
+        self._unreadable_channels = {
+            room for room in self._unreadable_channels if room[0] != guild_id
+        }
+        # Forgotten for the same reason, and with the same consequence: a
+        # guild reconfigured after its configuration was cleared starts
+        # from a clean slate rather than serving out a guard whose fault
+        # nobody can any longer investigate.
+        self._capture_cooldowns.pop(guild_id, None)
 
-    async def _apply_pending(self, guild_id: int, recording: _GuildRecording) -> None:
+    async def _apply_pending(self, guild_id: int, recording: _ChannelRecording) -> None:
         """Lands a deferred identity change, at the one safe moment there is.
 
         Called from `_tick_guild` immediately after `reset()`, which is
@@ -1200,9 +1493,35 @@ class SturnusClient(commands.Bot):
         connection has already been left. It is the only point in the
         process where a channel or role may move without lying about
         where audio came from or stranding a connection.
+
+        **Every room of the guild, not merely this one.** What was
+        deferred is a change to `consent_role_id` or `voice_channel_ids`,
+        and both belong to the guild: one decides whose voice is recorded
+        in every room at once, the other decides which rooms may be
+        recorded at all. So the moment is safe only when the guild has no
+        session left anywhere -- landing it while a second room still
+        records would move that room's consent role or its allowed list
+        out from under a session in progress, which is the exact thing
+        the deferral exists to prevent.
+
+        With one voice connection per guild the room that just closed is
+        always the only one there was, so this guard never fires today. It
+        is the difference between a rule and a coincidence.
         """
+        if not recording.pending_teardown and recording.pending is None:
+            return
+        still_recording = self._recording_channel_ids(guild_id)
+        if still_recording:
+            log.info(
+                "Guild %d: a room finished recording, but channel %s is still "
+                "recording and the deferred change belongs to the whole server; "
+                "it waits for that one too.",
+                guild_id,
+                ", ".join(str(channel_id) for channel_id in still_recording),
+            )
+            return
         if recording.pending_teardown:
-            await self._teardown(guild_id, recording)
+            await self._teardown_guild(guild_id)
             log.info(
                 "Guild %d: the recording finished and uploaded; its configuration "
                 "was cleared meanwhile, so Sturnus has stopped watching it.",
@@ -1239,29 +1558,41 @@ class SturnusClient(commands.Bot):
         database for the stored values already, and this line exists
         precisely to say whether those values are the ones in use --
         answering that from the database again would defeat the point.
+
+        `channel_ids` is a collection and `session_limit` travels beside
+        it, so the reply can say *serving one of three, because one
+        connection is the limit* rather than naming one room and leaving a
+        reader to assume the other two are idle by choice.
         """
-        recording = self._guilds.get(guild_id)
-        if recording is None:
+        recordings = self._recordings_of(guild_id)
+        if not recordings:
             return RunningState(
                 is_live=False,
                 is_recording=False,
-                channel_id=None,
+                channel_ids=(),
+                session_limit=MAX_CONCURRENT_SESSIONS_PER_GUILD,
                 allowed_channel_ids=(),
                 waiting_channel_ids=(),
                 pending_keys=(),
                 pending_teardown=False,
             )
+        # The guild's configuration, its deferrals and its waiting rooms
+        # are the same on every one of its pipelines -- they belong to the
+        # guild (see `_ChannelRecording`) -- so any of them answers for all
+        # of them, while the served rooms are collected across the lot.
+        first = recordings[0]
         pending_keys: tuple[str, ...] = ()
-        if recording.pending is not None:
-            pending_keys = recording.pending.identity_changes_from(recording.config)
+        if first.pending is not None:
+            pending_keys = first.pending.identity_changes_from(first.config)
         return RunningState(
             is_live=True,
-            is_recording=recording.service.is_recording,
-            channel_id=recording.channel_id,
-            allowed_channel_ids=recording.channel_ids,
-            waiting_channel_ids=recording.waiting_channel_ids,
+            is_recording=any(recording.service.is_recording for recording in recordings),
+            channel_ids=tuple(recording.channel_id for recording in recordings),
+            session_limit=MAX_CONCURRENT_SESSIONS_PER_GUILD,
+            allowed_channel_ids=first.channel_ids,
+            waiting_channel_ids=first.waiting_channel_ids,
             pending_keys=pending_keys,
-            pending_teardown=recording.pending_teardown,
+            pending_teardown=first.pending_teardown,
         )
 
     async def on_voice_state_update(
@@ -1276,7 +1607,7 @@ class SturnusClient(commands.Bot):
         counting participants are not independent. `_teardown` and
         `_retarget` both `await voice.leave()`, and a join landing inside
         that await used to interleave with it: the handler still saw the
-        pipeline in `_guilds`, opened a session row against the channel
+        pipeline in `_recordings`, opened a session row against the channel
         being abandoned, generated its data key and reconnected the voice
         client that had just been disconnected -- after which `_teardown`
         popped the guild, stranding both (a session row that nothing is
@@ -1304,7 +1635,7 @@ class SturnusClient(commands.Bot):
         keep restarting itself.
         """
         guild_id = member.guild.id
-        recording = self._guilds.get(guild_id)
+        recording = self._recording_of(guild_id)
         if recording is None:
             return
 
@@ -1330,10 +1661,8 @@ class SturnusClient(commands.Bot):
                 # one behind its back.
                 if self._shutting_down:
                     return
-                recording = self._guilds.get(guild_id)
-                if recording is None:
-                    return
-                await self._sync_participants(member.guild, recording)
+                for recording in self._recordings_of(guild_id):
+                    await self._sync_participants(member.guild, recording)
         finally:
             self._voice_updates_waiting.discard(guild_id)
 
@@ -1367,7 +1696,9 @@ class SturnusClient(commands.Bot):
         readiness heartbeat and every other guild's timeout enforcement,
         and one guild raising here must not take those with it.
         """
-        guild_ids = {guild.id for guild in self.guilds} | set(self._guilds)
+        guild_ids = {guild.id for guild in self.guilds} | {
+            guild_id for guild_id, _channel_id in self._recordings
+        }
         for guild_id in sorted(guild_ids):
             try:
                 await self._tick_guild(guild_id, now)
@@ -1412,19 +1743,19 @@ class SturnusClient(commands.Bot):
         if lock.locked():
             return
         async with lock:
-            recording = self._guilds.get(guild_id)
-            if recording is not None:
+            # Per room, because a due session is one room's session: each
+            # is swept, closed and put back to idle on its own terms.
+            for recording in self._recordings_of(guild_id):
                 await self._sweep_due_session(guild_id, recording, now)
             await self._reconcile(guild_id)
             await self._mirror_administrators(guild_id, now)
             await self._mirror_directory(guild_id, now)
-            recording = self._guilds.get(guild_id)
-            if (
-                recording is not None
-                and recording.blocked_until is not None
-                and now >= recording.blocked_until
-            ):
-                await self._end_capture_cooldown(guild_id, recording)
+            # Per guild, because the cooldown is: one voice connection
+            # failed, so nothing in this server may open a session until
+            # it has been left alone for a while.
+            blocked_until = self._capture_cooldowns.get(guild_id)
+            if blocked_until is not None and now >= blocked_until:
+                await self._end_capture_cooldown(guild_id)
 
     async def _mirror_administrators(self, guild_id: int, now: datetime) -> None:
         """Writes this guild's administrators where the console's API can read them.
@@ -1506,7 +1837,7 @@ class SturnusClient(commands.Bot):
             )
 
     async def _sweep_due_session(
-        self, guild_id: int, recording: _GuildRecording, now: datetime
+        self, guild_id: int, recording: _ChannelRecording, now: datetime
     ) -> None:
         """Closes a session the clock says is over, then makes the guild recordable again.
 
@@ -1585,7 +1916,7 @@ class SturnusClient(commands.Bot):
         await self._apply_pending(guild_id, recording)
 
     def _begin_capture_cooldown(
-        self, recording: _GuildRecording, reason: EndReason, now: datetime
+        self, recording: _ChannelRecording, reason: EndReason, now: datetime
     ) -> None:
         """Stops this guild rejoining straight back into the same fault.
 
@@ -1595,8 +1926,13 @@ class SturnusClient(commands.Bot):
         row, rejoins with fresh decoders, meets the same fault and closes
         again -- an endless run of empty sessions, every one of them
         announcing to the channel that it is being recorded.
+
+        Armed by a *room* -- one room's session failed -- and recorded
+        against the *guild*, because what failed is the connection the
+        whole guild shares. `REJOIN_COOLDOWN` carries the argument, and
+        what a second bot identity would change about it.
         """
-        recording.blocked_until = now + REJOIN_COOLDOWN
+        self._capture_cooldowns[recording.guild_id] = now + REJOIN_COOLDOWN
         # `duration_seconds` rather than the absolute `blocked_until`: the
         # line carries its own `ts`, so the two together give the moment
         # the guard lifts, and the registry has no field for a timestamp
@@ -1614,8 +1950,8 @@ class SturnusClient(commands.Bot):
             duration_seconds=REJOIN_COOLDOWN.total_seconds(),
         )
 
-    async def _end_capture_cooldown(self, guild_id: int, recording: _GuildRecording) -> None:
-        """Lifts the guard and picks the channel back up, if anyone is still in it.
+    async def _end_capture_cooldown(self, guild_id: int) -> None:
+        """Lifts the guard and picks the rooms back up, if anyone is still in them.
 
         Deliberately driven from the tick rather than from the next
         voice-state update: the people who were in the channel when
@@ -1623,13 +1959,19 @@ class SturnusClient(commands.Bot):
         cooldown makes one of them leave and come back. A guard that can
         only lapse on somebody else's action is an outage wearing a
         timeout's clothes.
+
+        Lifted for the guild, because that is what it was taken out
+        against -- and the recount that follows is the ordinary one, so
+        the room picked up afterwards is whichever room the headcount now
+        says, not necessarily the room capture failed in.
         """
         log.info(
-            "The capture-failure cooldown for channel %d has passed; recording may resume.",
-            recording.channel_id,
+            "The capture-failure cooldown for guild %d has passed; recording may resume.",
+            guild_id,
         )
-        recording.blocked_until = None
-        await self._sync_participants(self.get_guild(guild_id), recording)
+        del self._capture_cooldowns[guild_id]
+        for recording in self._recordings_of(guild_id):
+            await self._sync_participants(self.get_guild(guild_id), recording)
 
     async def graceful_shutdown(self) -> None:
         """Closes every active session before the connection is torn down.
@@ -1645,9 +1987,9 @@ class SturnusClient(commands.Bot):
         self._shutting_down = True
         if self._tick_task is not None:
             self._tick_task.cancel()
-        for guild_id, recording in list(self._guilds.items()):
-            # Each guild is isolated: SIGTERM gives us one pass at this,
-            # and one guild whose upload fails must not cost every guild
+        for (guild_id, _channel_id), recording in sorted(self._recordings.items()):
+            # Each room is isolated: SIGTERM gives us one pass at this,
+            # and one room whose upload fails must not cost every room
             # after it in the dict the session it is still holding open.
             was_recording = recording.service.is_recording
             session_id = recording.service.session_id
@@ -1706,7 +2048,7 @@ class SturnusClient(commands.Bot):
 
     def _record_session_close(
         self,
-        recording: _GuildRecording,
+        recording: _ChannelRecording,
         reason: EndReason | None,
         session_id: int | None,
     ) -> None:

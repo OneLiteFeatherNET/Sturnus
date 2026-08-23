@@ -459,12 +459,18 @@ one deterministically: **the most consenting members wins, and the lowest
 channel id breaks a tie** (`sturnus.application.channel_choice`). A session
 already in progress is never moved — its `sessions` row names the channel
 its audio came from — so the second room waits for the first meeting to
-end. `/config show` names which channel is being recorded and which allowed
-channels are not, marking any that have people waiting in them.
+end. `/config show` says how many of the allowed channels are being served
+("serving 1 of 3 allowed channels"), names which one it is and which are
+not, and marks any that have people waiting in them. The count is there so
+the other rooms do not read as ones Sturnus is choosing to leave alone.
 
 Recording two rooms of one server simultaneously would need a second bot
 identity (a second Discord application and a second deployment). That is a
-deployment decision nobody has taken.
+deployment decision nobody has taken. The runtime no longer stands in the
+way of it — a recording is keyed by the room it happens in, and the limit
+is one constant (`MAX_CONCURRENT_SESSIONS_PER_GUILD`) that the code asks
+rather than assumes — but raising that constant without supplying the
+second identity breaks the bot instead of improving it.
 
 ## 4. First run
 

@@ -406,17 +406,25 @@ def render_running_state(state: RunningState, has_missing_keys: bool) -> str:
 
 
 def _channel_service_line(state: RunningState) -> str:
-    """Says which allowed channel is being served, and which are not.
+    """Says which allowed channels are being served, how many of them, and why.
 
     The question this answers is asked by somebody sitting in the second
     allowed room wondering why the bot is not there. Without it the honest
     answer — "it is in the other room, because more consenting people are
     in it, and it can only be in one" — is available nowhere an
     administrator can reach it.
+
+    It says *one of three*, with the limit spelled out, rather than naming
+    one room and listing the others: a list of rooms that are "also
+    allowed" reads as though Sturnus is choosing to leave them alone,
+    when in fact it has run out of voice connections. Both numbers come
+    off `RunningState`, so the sentence cannot drift from the number the
+    runtime actually enforced.
     """
-    served = f"<#{state.channel_id}>" if state.channel_id is not None else "no channel"
+    served_ids = state.channel_ids
+    served = ", ".join(f"<#{channel_id}>" for channel_id in served_ids) or "no channel"
     others = tuple(
-        channel_id for channel_id in state.allowed_channel_ids if channel_id != state.channel_id
+        channel_id for channel_id in state.allowed_channel_ids if channel_id not in served_ids
     )
     if not others:
         return f"Recording channel: {served}."
@@ -426,10 +434,12 @@ def _channel_service_line(state: RunningState) -> str:
         for channel_id in others
     )
     return (
-        f"Recording channel: {served} — also allowed, but not being recorded right "
-        f"now: {rendered}. Sturnus holds one voice connection per server, so it "
-        "records whichever allowed channel has the most consenting members and "
-        "follows that one until its session ends."
+        f"Recording channel: {served} — serving {len(served_ids)} of "
+        f"{len(state.allowed_channel_ids)} allowed channels, because Sturnus holds "
+        f"one voice connection per server and so records {state.session_limit} at a "
+        f"time. Not being recorded right now: {rendered}. It takes whichever allowed "
+        "channel has the most consenting members and follows that one until its "
+        "session ends."
     )
 
 
