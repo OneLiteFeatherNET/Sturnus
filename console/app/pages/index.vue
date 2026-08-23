@@ -88,16 +88,16 @@ const rest = computed(() => figures.value.slice(1))
     <!-- Loading. A skeleton of the shape that is coming, not a spinner:
          the layout does not jump when the figures land. -->
     <div v-if="loading" aria-busy="true">
-      <p class="sr-only">Loading your figures.</p>
+      <p class="sr-only">{{ $t('dashboard.loadingFigures') }}</p>
       <div
-        class="mb-4 h-36 animate-pulse rounded-2xl border"
+        class="mb-4 h-36 animate-pulse rounded-2xl border motion-reduce:animate-none"
         :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
       />
       <div class="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <div
           v-for="n in 4"
           :key="n"
-          class="h-28 animate-pulse rounded-2xl border"
+          class="h-28 animate-pulse rounded-2xl border motion-reduce:animate-none"
           :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
         />
       </div>

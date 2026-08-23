@@ -136,13 +136,29 @@ const others = computed(() => session.value?.other_participants ?? [])
       ← All recordings
     </NuxtLink>
 
-    <p
+    <!-- Three blocks, in the three sizes this page is: the metadata card,
+         the reader's tags, and the transport. The back link above is real
+         and stays put, so the only thing that moves when the recording
+         lands is the recording. -->
+    <div
       v-if="status === 'pending' && !error"
-      class="rounded-2xl border p-6 text-sm"
-      :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+      aria-busy="true"
+      class="flex flex-col gap-4"
     >
-      Loading this recording…
-    </p>
+      <p class="sr-only">{{ $t('recordings.loadingOne') }}</p>
+      <div
+        class="h-56 animate-pulse rounded-2xl border motion-reduce:animate-none"
+        :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+      />
+      <div
+        class="h-24 animate-pulse rounded-2xl border motion-reduce:animate-none"
+        :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+      />
+      <div
+        class="h-72 animate-pulse rounded-2xl border motion-reduce:animate-none"
+        :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+      />
+    </div>
 
     <div
       v-else-if="missing"

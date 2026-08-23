@@ -1,5 +1,7 @@
 import tailwindcss from '@tailwindcss/vite'
 
+import { PAGE_TRANSITION } from './app/utils/motion'
+
 // The console is served from the same origin as the API it calls
 // (`sturnus.onelitefeather.dev`, with `/api/*` routed to the API process),
 // which is what lets the session cookie be `SameSite=Lax` and `HttpOnly`:
@@ -83,6 +85,13 @@ export default defineNuxtConfig({
       titleTemplate: '%s · Sturnus',
       link: [{ rel: 'icon', type: 'image/png', href: '/favicon.png' }],
     },
+
+    // What a click looks like before the next page has anything to say.
+    // Until now: nothing at all. The classes, and the reasoning about how
+    // long a navigation is allowed to take to acknowledge itself, are in
+    // `app/utils/motion.ts` -- they have to be under `app/` for Tailwind to
+    // emit them, and that file says why.
+    pageTransition: PAGE_TRANSITION,
   },
 
   routeRules: {

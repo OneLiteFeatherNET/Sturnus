@@ -33,5 +33,16 @@
     "retry": "Try again",
     "goToSignIn": "Go to sign-in",
     "status": "Status {code}"
+  },
+  "dashboard": {
+    "loadingFigures": "Loading your figures."
+  },
+  "recordings": {
+    "loadingList": "Loading your sessions.",
+    "loadingOne": "Loading this recording."
+  },
+  "calendar": {
+    "loadingYear": "Loading the calendar for {year}.",
+    "loadingDay": "Loading the sessions recorded on {date}."
   }
 }

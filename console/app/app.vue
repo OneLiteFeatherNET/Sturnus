@@ -25,6 +25,21 @@ useHead({ htmlAttrs: { lang: language } })
 </script>
 
 <template>
+  <!-- The bar that says a navigation is still happening.
+       `throttle` is Nuxt's default 200 ms and is left alone deliberately: a
+       bar that appears for every navigation, including the ones that finish
+       in forty milliseconds, is a flicker at the top of the window rather
+       than information. It appears when a wait becomes a wait.
+
+       Coloured from `--action` rather than Nuxt's own green-to-blue
+       gradient, so the console has one colour that means "a control, or the
+       thing a control is doing" in both themes.
+
+       The `!` is load-bearing: the component writes its transition into an
+       inline `style`, and only an important declaration can overrule that.
+       Under `prefers-reduced-motion` the bar still reports progress -- it
+       jumps to each figure instead of gliding to it. -->
+  <NuxtLoadingIndicator color="var(--action)" class="motion-reduce:transition-none!" />
   <NuxtLayout>
     <NuxtPage />
   </NuxtLayout>

@@ -163,9 +163,23 @@ async function select(date: string) {
       class="rounded-xl border p-5"
       :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
     >
-      <p v-if="yearStatus === 'pending'" class="text-sm" :style="{ color: 'var(--text-muted)' }">
-        Loading {{ year }}&hellip;
-      </p>
+      <!-- The heatmap's own box, reserved. Seven rows of 13 px cells at
+           3 px spacing plus the month row above them is 137 px, and the
+           scroll container adds 4 below; then the legend. Stepping from
+           2025 to 2024 used to collapse this panel to one line of text and
+           push the day below it up the screen, which is a particularly bad
+           reflow to have on a control somebody presses repeatedly. -->
+      <div v-if="yearStatus === 'pending'" aria-busy="true">
+        <p class="sr-only">{{ $t('calendar.loadingYear', { year }) }}</p>
+        <div
+          class="h-[141px] animate-pulse rounded-lg motion-reduce:animate-none"
+          :style="{ background: 'var(--surface-sunken)' }"
+        />
+        <div
+          class="mt-3 h-4 w-52 max-w-full animate-pulse rounded motion-reduce:animate-none"
+          :style="{ background: 'var(--surface-sunken)' }"
+        />
+      </div>
 
       <div v-else-if="yearError">
         <p class="text-sm font-medium">The calendar for {{ year }} could not be loaded.</p>
@@ -208,9 +222,34 @@ async function select(date: string) {
       class="mt-6 rounded-xl border p-5"
       :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
     >
-      <p v-if="dayStatus === 'pending'" class="text-sm" :style="{ color: 'var(--text-muted)' }">
-        Loading {{ selected }}&hellip;
-      </p>
+      <!-- The day panel in the shape the timeline will fill: its heading,
+           its two sentences about sessions and about the timezone, and one
+           lane of bars. A day with several overlapping sessions is taller
+           than this, and no skeleton can know that before the answer
+           arrives -- one lane is the floor rather than a guess. -->
+      <div v-if="dayStatus === 'pending'" aria-busy="true">
+        <p class="sr-only">{{ $t('calendar.loadingDay', { date: selected }) }}</p>
+        <div
+          class="h-7 w-56 max-w-full animate-pulse rounded motion-reduce:animate-none"
+          :style="{ background: 'var(--surface-sunken)' }"
+        />
+        <div
+          class="mt-1 h-5 w-72 max-w-full animate-pulse rounded motion-reduce:animate-none"
+          :style="{ background: 'var(--surface-sunken)' }"
+        />
+        <div
+          class="mt-0.5 h-8 animate-pulse rounded motion-reduce:animate-none"
+          :style="{ background: 'var(--surface-sunken)' }"
+        />
+        <!-- The hour marks, which are four small numbers on a transparent
+             row. Reserved rather than drawn: a grey bar here would promise
+             something the timeline never puts in this space. -->
+        <div class="mt-5 h-4" />
+        <div
+          class="h-[42px] animate-pulse rounded-lg border motion-reduce:animate-none"
+          :style="{ borderColor: 'var(--border)', background: 'var(--surface-sunken)' }"
+        />
+      </div>
       <p v-else-if="dayError" class="text-sm">
         The sessions for {{ selected }} could not be loaded.
       </p>

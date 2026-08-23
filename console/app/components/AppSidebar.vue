@@ -28,7 +28,7 @@ const visible = computed(() => visibleSections(session.value))
 
 <template>
   <nav
-    class="flex shrink-0 flex-col gap-1 border-r p-3 transition-[width] duration-200"
+    class="flex shrink-0 flex-col gap-1 border-r p-3 transition-[width] duration-200 motion-reduce:transition-none"
     :class="collapsed ? 'w-16' : 'w-16 sm:w-56'"
     :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
     :aria-label="$t('nav.sections')"
