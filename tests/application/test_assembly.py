@@ -1,7 +1,8 @@
 from datetime import UTC, datetime, timedelta
 
-from sturnus.application.assembly import assemble
+from sturnus.application.assembly import BoundLinks, assemble, merge_gap_from
 from sturnus.application.transcription import TranscribedSegment, TranscriptionResult
+from sturnus.domain.transcript import DEFAULT_MERGE_GAP
 
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 ANNA, BEN = 100, 200
@@ -192,3 +193,79 @@ async def test_a_silent_attendee_carries_their_linked_identity() -> None:
     ben = transcript.participants[1]
     assert ben.external_user_id == "out-2"
     assert ben.external_display_name == "Ben Example"
+
+
+# ---------------------------------------------------------------------------
+# What both callers of `assemble` have to do around it
+#
+# There are two of them now: the worker builds the published protocol,
+# and the console serves `GET /api/sessions/{id}/transcript`. They must
+# produce the same reading of the same meeting, so anything either has to
+# do to get there lives next to `assemble` rather than in one of them.
+# ---------------------------------------------------------------------------
+
+
+class ProviderKeyedLinks:
+    """A link repository that has to be told which provider is meant."""
+
+    def __init__(self, per_provider: dict[tuple[int, str], tuple[str, str]]) -> None:
+        self._per_provider = per_provider
+        self.asked: list[tuple[int, str]] = []
+
+    async def external_identity(
+        self, discord_user_id: int, provider: str
+    ) -> tuple[str, str] | None:
+        self.asked.append((discord_user_id, provider))
+        return self._per_provider.get((discord_user_id, provider))
+
+
+async def test_a_bound_reader_asks_for_the_provider_it_was_built_with() -> None:
+    """`assemble` knows nothing about per-guild configuration and must
+    not: which provider's account-link mapping applies is `document_provider`,
+    which cannot be resolved until a session's guild is known."""
+    links = ProviderKeyedLinks({(ANNA, "outline"): ("ext-1", "Anna A.")})
+
+    found = await BoundLinks(links, "outline").external_identity(ANNA)
+
+    assert found == ("ext-1", "Anna A.")
+    assert links.asked == [(ANNA, "outline")]
+
+
+async def test_a_bound_reader_finds_nothing_under_another_provider() -> None:
+    links = ProviderKeyedLinks({(ANNA, "outline"): ("ext-1", "Anna A.")})
+    assert await BoundLinks(links, "confluence").external_identity(ANNA) is None
+
+
+def test_a_configured_merge_gap_is_read_in_seconds() -> None:
+    assert merge_gap_from("30") == timedelta(seconds=30)
+
+
+def test_a_guild_that_configured_nothing_gets_the_default_gap() -> None:
+    assert merge_gap_from(None) == DEFAULT_MERGE_GAP
+
+
+def test_a_value_no_reader_can_use_falls_back_rather_than_raising() -> None:
+    """`ConfigStore.set` refuses a non-integer, but `docs/operations.md`
+    section 4.1 tells operators they may edit `guild_config` with SQL and
+    that write never sees the validation.
+
+    Blocks merged by the default rule are a smaller loss than a protocol
+    that is never written and a transcript tab that answers 500 -- the
+    same argument `_configured_language` and `_parallel_track_limit` are
+    both total for.
+    """
+    assert merge_gap_from("half a minute") == DEFAULT_MERGE_GAP
+    assert merge_gap_from("") == DEFAULT_MERGE_GAP
+    assert merge_gap_from("-5") == DEFAULT_MERGE_GAP
+
+
+def test_a_gap_typed_with_a_stray_space_is_still_a_gap() -> None:
+    """A value typed with a trailing space is not a decision to merge
+    every block of every protocol differently."""
+    assert merge_gap_from(" 30 ") == timedelta(seconds=30)
+
+
+def test_a_gap_of_nothing_splits_every_pause() -> None:
+    """Zero is a real setting and not a stand-in for "unset": it means
+    every pause starts a new block."""
+    assert merge_gap_from("0") == timedelta(0)

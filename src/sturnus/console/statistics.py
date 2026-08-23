@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from datetime import UTC, date, datetime, time
 from typing import TypedDict
 
+from sturnus.domain.transcript import SpeakerIdentity, TranscriptBlock
+
 
 @dataclass(frozen=True)
 class Participant:
@@ -59,6 +61,18 @@ class Track:
     audio_seconds: float | None
     speech_seconds: float | None
     segment_count: int | None
+    #: What the recording is as a file, written down by the worker while
+    #: it still held both copies on disk (`sturnus.domain.measurements.
+    #: RecordedAudio`). Null for every job that finished before those
+    #: columns existed, and null is not zero here either: a track nobody
+    #: measured is not a track recorded at nought hertz.
+    #:
+    #: Defaulted, like `AttendedSession.tags`, so the places that build
+    #: one of these to talk about durations do not have to say "and no
+    #: file facts either".
+    sample_rate: int | None = None
+    channels: int | None = None
+    stored_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -99,6 +113,64 @@ class TagUse:
 
 
 @dataclass(frozen=True)
+class SessionName:
+    """What a meeting is called and what was written about it.
+
+    A pair rather than two values because one form writes both, and a
+    write of half of it is a form that saved half of itself. Both are
+    `None` for a session nobody has named -- see `sturnus.console.naming`
+    for why the empty string is not a second spelling of that.
+    """
+
+    title: str | None
+    description: str | None
+
+
+@dataclass(frozen=True)
+class SessionTranscript:
+    """One session's assembled transcript, and why it may hold nothing.
+
+    Built by `sturnus.application.assembly.assemble` -- the same function
+    the worker builds the published protocol with, so the console cannot
+    show a different reading of the same meeting than the document does.
+    The block and speaker types are the domain's own for the same reason:
+    a third shape here would be a third place for the merge rules to
+    drift.
+
+    **The two fields that are not the transcript.** A transcript tab that
+    can only say "nothing here" is a tab people report as broken, and
+    there are two entirely different reasons for it to be empty:
+
+    - `audio_available` is `False` once the retention sweep has deleted
+      every one of this session's recordings. The transcript survives
+      that deliberately -- the retention window is about the recording
+      and not about the minutes -- so this is the tab saying "the audio
+      is gone and these are still the words", which is a different
+      sentence from "something failed".
+    - `pending_tracks` is how many of the session's speakers have not
+      been transcribed yet. Zero blocks with a pending track is a meeting
+      still being decoded; zero blocks with none is a meeting in which
+      nobody said anything the engine could hear.
+
+    `ended_at` is `None` for a session still being recorded, and such a
+    session has no assembled transcript at all: its jobs are not enqueued
+    until it closes, and `assemble` cannot place words in a session with
+    no end. The blocks are then empty and `pending_tracks` says so.
+    """
+
+    session_id: int
+    started_at: datetime
+    ended_at: datetime | None
+    #: Whether any of this session's tracks still has its stored audio.
+    audio_available: bool
+    #: Tracks that have not reached a transcript, whether they are
+    #: waiting, running, or a session that has not closed yet.
+    pending_tracks: int
+    participants: tuple[SpeakerIdentity, ...]
+    blocks: tuple[TranscriptBlock, ...]
+
+
+@dataclass(frozen=True)
 class AttendedSession:
     """A session the signed-in person was in.
 
@@ -116,6 +188,13 @@ class AttendedSession:
     document_url: str | None
     participants: tuple[Participant, ...]
     tracks: tuple[Track, ...]
+    #: What a participant called this meeting and what they said about
+    #: it. Shared, one per session, unlike `tags` below -- see
+    #: `sturnus.console.naming` for why those two are not the same
+    #: feature. Null until somebody types one, which is every session
+    #: until somebody does.
+    title: str | None = None
+    description: str | None = None
     #: The labels the *viewer* put on this session, alphabetical. Never
     #: anybody else's: `session_tag` is keyed by its owner and the query
     #: that fills this names the signed-in person, so a session two people
@@ -153,6 +232,14 @@ class TrackJson(TypedDict):
     audio_seconds: float | None
     speech_seconds: float | None
     segment_count: int | None
+    #: The file's own description, so a metadata tab needs no round trip
+    #: to the object store to render one. A number rather than a string:
+    #: unlike a snowflake, none of these is anywhere near JavaScript's
+    #: safe integer range -- `stored_bytes` would have to be nine
+    #: petabytes.
+    sample_rate: int | None
+    channels: int | None
+    stored_bytes: int | None
 
 
 class SessionSummaryJson(TypedDict):
@@ -178,6 +265,8 @@ class SessionJson(TypedDict):
     duration_seconds: float | None
     channel_id: str
     channel_name: str | None
+    title: str | None
+    description: str | None
     document_url: str | None
     other_participants: list[ParticipantJson]
     tracks: list[TrackJson]
@@ -214,6 +303,64 @@ class CalendarDayJson(TypedDict):
     sessions: int
     total_duration_seconds: float
     participants: int
+
+
+class SessionNameJson(TypedDict):
+    """What a meeting is called, as its own endpoint answers it."""
+
+    title: str | None
+    description: str | None
+
+
+class SpeakerJson(TypedDict):
+    """One person as the transcript names them.
+
+    Both external fields are carried, and both are `None` for somebody
+    who never linked an account. They are already in the published
+    document -- the template renders them -- so a transcript tab that
+    could not show the same name as the protocol would be showing a
+    different meeting.
+    """
+
+    discord_user_id: str
+    display_name: str
+    external_user_id: str | None
+    external_display_name: str | None
+
+
+class TranscriptBlockJson(TypedDict):
+    """One speaker's uninterrupted turn.
+
+    `started_at` and not a duration: a block is anchored to a moment in
+    the meeting, which is what lets the console line it up with the
+    audio player next to it. The end of a block is not recorded because
+    the merge does not keep one -- see
+    `sturnus.domain.transcript.build_transcript`.
+    """
+
+    discord_user_id: str
+    display_name: str
+    started_at: str
+    text: str
+
+
+class TranscriptJson(TypedDict):
+    """A whole session's transcript, as the recording page consumes it."""
+
+    session_id: str
+    started_at: str
+    ended_at: str | None
+    #: `False` once retention has swept every one of this session's
+    #: recordings. The words below survive that, and the console says so
+    #: rather than rendering an audio tab that answers 404 with no
+    #: explanation.
+    audio_available: bool
+    #: How many speakers are still waiting to be transcribed. What tells
+    #: "nobody spoke" from "not decoded yet", both of which are an empty
+    #: `blocks`.
+    pending_tracks: int
+    participants: list[SpeakerJson]
+    blocks: list[TranscriptBlockJson]
 
 
 class TimelineEntryJson(TypedDict):
@@ -260,6 +407,11 @@ def session_json(session: AttendedSession, viewer: int) -> SessionJson:
         duration_seconds=session.duration_seconds,
         channel_id=str(session.channel_id),
         channel_name=session.channel_name,
+        # Carried on the session itself as well as being served on their
+        # own endpoint, so the list can show what a meeting was called
+        # without a request per row.
+        title=session.title,
+        description=session.description,
         document_url=session.document_url,
         other_participants=[
             ParticipantJson(
@@ -284,8 +436,58 @@ def session_json(session: AttendedSession, viewer: int) -> SessionJson:
                 audio_seconds=track.audio_seconds,
                 speech_seconds=track.speech_seconds,
                 segment_count=track.segment_count,
+                sample_rate=track.sample_rate,
+                channels=track.channels,
+                stored_bytes=track.stored_bytes,
             )
             for track in session.tracks
+        ],
+    )
+
+
+def session_name_json(name: SessionName) -> SessionNameJson:
+    """A meeting's name, straight through.
+
+    Straight through and not defaulted to the empty string: null is how
+    "nobody has named this" is spelled everywhere else in this payload,
+    and a client that had to treat `""` and `null` alike would be
+    checking twice for one fact.
+    """
+    return SessionNameJson(title=name.title, description=name.description)
+
+
+def _speaker_json(speaker: SpeakerIdentity) -> SpeakerJson:
+    return SpeakerJson(
+        discord_user_id=str(speaker.discord_user_id),
+        display_name=speaker.discord_display_name,
+        external_user_id=speaker.external_user_id,
+        external_display_name=speaker.external_display_name,
+    )
+
+
+def transcript_json(transcript: SessionTranscript) -> TranscriptJson:
+    """One session's transcript as the recording page renders it.
+
+    Times carry their offset like every other moment in this module, for
+    the same reason `_moment` gives: a string without one is read as
+    local time by a browser and every block silently moves by the
+    viewer's own timezone.
+    """
+    return TranscriptJson(
+        session_id=str(transcript.session_id),
+        started_at=transcript.started_at.isoformat(),
+        ended_at=_moment(transcript.ended_at),
+        audio_available=transcript.audio_available,
+        pending_tracks=transcript.pending_tracks,
+        participants=[_speaker_json(speaker) for speaker in transcript.participants],
+        blocks=[
+            TranscriptBlockJson(
+                discord_user_id=str(block.speaker.discord_user_id),
+                display_name=block.speaker.discord_display_name,
+                started_at=block.start.isoformat(),
+                text=block.text,
+            )
+            for block in transcript.blocks
         ],
     )
 

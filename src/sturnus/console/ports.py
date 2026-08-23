@@ -28,7 +28,13 @@ from sturnus.application.directory_mirror import (
 )
 from sturnus.console.filters import SessionFilter
 from sturnus.console.reporting import RecordedSession
-from sturnus.console.statistics import AttendedSession, SessionPage, TagUse
+from sturnus.console.statistics import (
+    AttendedSession,
+    SessionName,
+    SessionPage,
+    SessionTranscript,
+    TagUse,
+)
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 
@@ -422,6 +428,66 @@ class TagWriter(Protocol):
     async def replace(
         self, session_id: int, *, owner: int, tags: Sequence[str], now: datetime
     ) -> tuple[str, ...] | None: ...
+
+
+class SessionNaming(Protocol):
+    """The one way a meeting's title and description are written.
+
+    Separate from `TagWriter` because they are separate features that
+    happen to look alike: a tag is one person's private label and a title
+    is the session's shared name (`sturnus.console.naming` argues why).
+    They share the authorisation rule and nothing else -- a participant of
+    the session, and there is no method here without one.
+
+    `by` is not optional and is checked by the statement, exactly as
+    `TagWriter.owner` is: `rename` answers `None` for a session that does
+    not exist *and* for one this person was not in, because from outside
+    those must look the same. It is not recorded anywhere on the row.
+    Who last renamed a meeting is a question this feature deliberately
+    does not answer -- it is a shared name, and a name with an author
+    attached is a name people argue about.
+
+    What is stored is what `sturnus.console.naming` produced, which is
+    what was typed with its whitespace tidied. The refusals live there,
+    at the edge, once.
+    """
+
+    #: The name as it now stands, or `None` for a session not theirs.
+    #: The stored pair rather than the submitted one, for the reason
+    #: `TagWriter.replace` returns the stored tags: trimming may have
+    #: changed what was sent, and a client shown its own input back would
+    #: keep displaying a title the database does not have.
+    async def rename(
+        self, session_id: int, *, by: int, title: str | None, description: str | None
+    ) -> SessionName | None: ...
+
+
+class TranscriptReader(Protocol):
+    """One session's assembled transcript, for somebody already entitled to it.
+
+    **The one port here that does not carry `requested_by`, and why that
+    is not the hole it looks like.** Every other read in this package is
+    scoped by its own statement, because an authorisation a handler
+    applies afterwards is one a handler can forget. This one is scoped by
+    `SessionReads.session_for`, called first, in the handler -- which is
+    not a second copy of the participant rule but literally the same call
+    the session's own metadata endpoint makes. That is the requirement:
+    the transcript is already inside the published document, so whoever
+    may read the session may read what it said, and expressing that as a
+    *second* `WHERE` on `session_participant` would be a second place for
+    the two answers to diverge.
+
+    The consequence is a method that must never be called without that
+    read having already succeeded. `sturnus.console.routes_recording` is
+    its only caller and says so at the call site.
+
+    `None` for a session that does not exist. A session that exists but
+    is still recording is not `None`: it answers with no blocks and with
+    the count of tracks still to come, because "not yet" and "never" are
+    different sentences on a transcript tab.
+    """
+
+    async def transcript_of(self, session_id: int) -> SessionTranscript | None: ...
 
 
 class KeyUnwrapper(Protocol):

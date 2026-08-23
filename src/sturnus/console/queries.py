@@ -240,14 +240,28 @@ class ConsoleQueries:
         return tuple(conditions)
 
     def _matching_text(self, discord_user_id: int, text: str) -> ColumnElement[bool]:
-        """Search text, against the three things a recording is known by.
+        """Search text, against the things a recording is known by.
 
-        The channel it happened in, the people who were in it, and the
-        labels this reader put on it -- and nothing else. All three are
-        already in the response this same person gets from
-        `/api/sessions`, so searching them narrows what they can see
-        rather than widening it. A transcript is not among them, and that
-        is the whole point of `sturnus.console.filters`.
+        The channel it happened in, what somebody called it and wrote
+        about it, the people who were in it, and the labels this reader
+        put on it -- and nothing else. Every one of them is already in
+        the response this same person gets from `/api/sessions`, so
+        searching them narrows what they can see rather than widening it.
+        A transcript is not among them, and that is the whole point of
+        `sturnus.console.filters`.
+
+        **Not indexed, deliberately, and this is where that decision is
+        paid for.** `ILIKE '%…%'` over free text is answered by a GIN
+        trigram index and by no btree, and a trigram index needs
+        `CREATE EXTENSION pg_trgm` -- a privileged statement, in a
+        migration the worker runs in-process at startup, on a deployment
+        whose database role may not be permitted to create extensions
+        (see migration 0013). A deployment that cannot start is a worse
+        outcome than a scan, and the scan here is small: the outer
+        statement has already narrowed to the sessions this one person
+        was in before any of these patterns is evaluated. If that ever
+        stops being true it is a follow-up that creates the extension
+        deliberately, outside a startup migration.
 
         Case-insensitive because nobody types a channel name the way it
         was written, and matched anywhere in the value because "retro" has
@@ -257,6 +271,13 @@ class ConsoleQueries:
         scope = self._attended_by(discord_user_id)
         return or_(
             Session.channel_name.ilike(pattern, escape=LIKE_ESCAPE),
+            # A title and a description are shared, so unlike the tag
+            # clause below neither is narrowed by the reader's own id:
+            # what a meeting is called is the same for everybody who was
+            # in it. The scope on the outer statement is what keeps this
+            # to their own meetings.
+            Session.title.ilike(pattern, escape=LIKE_ESCAPE),
+            Session.description.ilike(pattern, escape=LIKE_ESCAPE),
             select(SessionParticipant.id)
             .where(
                 SessionParticipant.session_id == Session.id,
@@ -314,6 +335,8 @@ class ConsoleQueries:
                         Session.id,
                         Session.channel_id,
                         Session.channel_name,
+                        Session.title,
+                        Session.description,
                         Session.started_at,
                         Session.ended_at,
                         Session.document_url,
@@ -359,6 +382,13 @@ class ConsoleQueries:
                         TranscriptionJob.audio_seconds,
                         TranscriptionJob.speech_seconds,
                         TranscriptionJob.segment_count,
+                        # What the file is, written down once by the
+                        # worker. Read here so a metadata tab costs the
+                        # same statement the page already issues instead
+                        # of a ranged GET and a chunk decrypt per track.
+                        TranscriptionJob.sample_rate,
+                        TranscriptionJob.channels,
+                        TranscriptionJob.stored_bytes,
                     )
                     .where(
                         TranscriptionJob.session_id.in_(found),
@@ -398,21 +428,28 @@ class ConsoleQueries:
             tagged[session_id].append(tag)
 
         tracks: dict[int, list[Track]] = defaultdict(list)
-        for session_id, speaker_id, audio_seconds, speech_seconds, segment_count in jobs:
-            tracks[session_id].append(
+        for job in jobs:
+            tracks[job.session_id].append(
                 Track(
-                    discord_user_id=speaker_id,
+                    discord_user_id=job.discord_user_id,
                     # `None` when the speaker has no participant row: a
                     # job that outlived one still has audio and still has
                     # measurements, and dropping it would hide a
                     # recording that exists.
-                    display_name=names[session_id].get(speaker_id),
+                    display_name=names[job.session_id].get(job.discord_user_id),
                     # Straight through, null included. Null means nobody
                     # ever measured; zero means somebody did, and it was
-                    # nothing (see `sturnus.console.statistics`).
-                    audio_seconds=audio_seconds,
-                    speech_seconds=speech_seconds,
-                    segment_count=segment_count,
+                    # nothing (see `sturnus.console.statistics`). The
+                    # three below follow the same rule: a job finished
+                    # before those columns existed has audio that may
+                    # already be deleted, so there is nothing left to
+                    # read them from.
+                    audio_seconds=job.audio_seconds,
+                    speech_seconds=job.speech_seconds,
+                    segment_count=job.segment_count,
+                    sample_rate=job.sample_rate,
+                    channels=job.channels,
+                    stored_bytes=job.stored_bytes,
                 )
             )
 
@@ -424,6 +461,8 @@ class ConsoleQueries:
                 started_at=row.started_at,
                 ended_at=row.ended_at,
                 document_url=row.document_url,
+                title=row.title,
+                description=row.description,
                 participants=tuple(attendees[row.id]),
                 tracks=tuple(tracks[row.id]),
                 tags=tuple(tagged[row.id]),

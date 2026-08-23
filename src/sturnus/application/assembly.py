@@ -31,6 +31,15 @@ is the one place both the worker that writes the column (Task 9,
 `sturnus.application.worker`) and `JobRepository.transcripts_for`, which
 reads it back, can agree on the format without either layer reaching into
 the other.
+
+`BoundLinks` and `merge_gap_from` are here for the same reason and are
+newer: `assemble` has two callers now, not one. The worker builds the
+published protocol with it, and the console serves
+`GET /api/sessions/{id}/transcript` with it -- and the two must produce
+the same reading of the same meeting. Anything either caller has to do
+*around* `assemble` to get there therefore belongs next to `assemble`
+rather than in one of them, because a second copy is a second place for
+the console to disagree with the document.
 """
 
 from __future__ import annotations
@@ -168,3 +177,70 @@ async def assemble(
         merge_gap,
         recorded=recorded,
     )
+
+
+class LinkRepository(Protocol):
+    """Where a speaker's external identity is read from, keyed by provider.
+
+    Unlike `LinkReader` above, `provider` is a parameter of
+    `external_identity` rather than something fixed at construction: one
+    process serves every guild, and which provider's account-link mapping
+    applies is itself per-guild configuration (Spec 11's
+    `document_provider`) that cannot be resolved until a session's guild
+    is known. `BoundLinks` below adapts one resolved provider back down to
+    the narrower `LinkReader` shape `assemble` actually calls.
+    """
+
+    async def external_identity(
+        self, discord_user_id: int, provider: str
+    ) -> tuple[str, str] | None: ...
+
+
+class BoundLinks:
+    """A `LinkReader` for one provider, over a repository that serves many.
+
+    `assemble` asks "who is this person elsewhere" and has no business
+    knowing that the answer depends on a guild's `document_provider`; the
+    repository cannot answer without one. This binds the two, and it lives
+    here rather than in either caller because both the worker writing a
+    protocol and the console serving `/api/sessions/{id}/transcript` need
+    the same binding -- and a second copy of it is a second place for the
+    console to resolve a speaker's identity differently from the document
+    that was published about the same meeting.
+    """
+
+    def __init__(self, links: LinkRepository, provider: str) -> None:
+        self._links = links
+        self._provider = provider
+
+    async def external_identity(self, discord_user_id: int) -> tuple[str, str] | None:
+        return await self._links.external_identity(discord_user_id, self._provider)
+
+
+def merge_gap_from(configured: str | None) -> timedelta:
+    """A guild's `merge_gap_seconds` as a `timedelta`, always.
+
+    Total rather than strict, for the reason `sturnus.infrastructure.db.
+    queue._parallel_track_limit` and `sturnus.application.worker.
+    _configured_language` are both total: `ConfigStore.set` refuses a
+    non-integer, but `docs/operations.md` section 4.1 tells operators they
+    may edit `guild_config` with SQL, and that write never sees the
+    validation. An unusable value falls back to `DEFAULT_MERGE_GAP` --
+    blocks merged by the default rule are a smaller loss than a protocol
+    that is never written and a transcript tab that answers 500.
+
+    One function rather than one expression in the worker and another in
+    the console adapter, because the two must agree: how long a pause may
+    be before a speaker's blocks split decides where the paragraph breaks
+    fall, and a console showing different paragraphs from the published
+    document is a console nobody trusts.
+    """
+    if configured is None:
+        return DEFAULT_MERGE_GAP
+    try:
+        seconds = int(configured.strip())
+    except (AttributeError, ValueError):
+        return DEFAULT_MERGE_GAP
+    if seconds < 0:
+        return DEFAULT_MERGE_GAP
+    return timedelta(seconds=seconds)
