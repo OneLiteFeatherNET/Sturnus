@@ -33,5 +33,16 @@
     "retry": "Erneut versuchen",
     "goToSignIn": "Zur Anmeldung",
     "status": "Status {code}"
+  },
+  "dashboard": {
+    "loadingFigures": "Zahlen werden geladen."
+  },
+  "recordings": {
+    "loadingList": "Aufnahmen werden geladen.",
+    "loadingOne": "Diese Aufnahme wird geladen."
+  },
+  "calendar": {
+    "loadingYear": "Kalender für {year} wird geladen.",
+    "loadingDay": "Aufnahmen vom {date} werden geladen."
   }
 }

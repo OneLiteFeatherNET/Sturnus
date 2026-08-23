@@ -173,13 +173,35 @@ onMounted(() => {
       </button>
     </div>
 
-    <p
-      v-else-if="loadingFirst"
-      class="rounded-2xl border p-6 text-sm"
-      :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
-    >
-      Loading your sessions…
-    </p>
+    <!-- The first load, and the only one that has nothing to keep on
+         screen. Blocks the size of the rows that are coming rather than a
+         sentence in a box: the sentence is seventy pixels tall and the
+         list is a thousand, so the page grew by an order of magnitude the
+         moment it arrived and took whatever was under the pointer with it.
+
+         The sentence survives as the `sr-only` one, because it is what a
+         screen reader is told alongside `aria-busy` -- and because "your
+         sessions are loading" is more use than a shape nobody can see.
+
+         Four rows rather than the twenty a full page holds. A list
+         skeleton cannot reserve a height it does not know, and twenty
+         cards of grey for somebody who has been in three meetings is a
+         worse lie than four. -->
+    <div v-else-if="loadingFirst" aria-busy="true" class="flex flex-col gap-4">
+      <p class="sr-only">{{ $t('recordings.loadingList') }}</p>
+      <div
+        class="h-5 w-64 max-w-full animate-pulse rounded motion-reduce:animate-none"
+        :style="{ background: 'var(--surface)' }"
+      />
+      <ul class="flex flex-col gap-4">
+        <li
+          v-for="n in 4"
+          :key="n"
+          class="h-[124px] animate-pulse rounded-2xl border motion-reduce:animate-none"
+          :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+        />
+      </ul>
+    </div>
 
     <!-- A page past the end, which is what a bookmark becomes once enough
          recordings have been erased. Distinguished from "no recordings"

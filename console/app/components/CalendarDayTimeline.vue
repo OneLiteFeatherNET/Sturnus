@@ -78,6 +78,46 @@ function placement(bar: TimelineBar): 'inside' | 'after' | 'before' {
 function percent(fraction: number): string {
   return `${(fraction * 100).toFixed(4)}%`
 }
+
+/**
+ * The paint on one bar.
+ *
+ * One hue at two strengths -- a fill mixed against the surface and a
+ * one-pixel inset edge of the same hue, harder. `color-mix` rather than a
+ * pair of hexes is what makes the same definition serve both themes: in
+ * light the bar is a pale cyan on white, in dark a deep one on the sunken
+ * panel, and in both the edge is the same colour a shade further from the
+ * background.
+ *
+ * **A session whose length was never recorded is hatched, not tinted.**
+ * It is drawn at the minimum width, which is otherwise indistinguishable
+ * from a two-minute meeting -- and the difference between "two minutes"
+ * and "nobody knows" is the whole question somebody opened this panel to
+ * ask. The stripes say "this is a mark, not a measurement" without asking
+ * anybody to tell two colours apart to read it.
+ *
+ * This is an inline binding rather than a stylesheet because the values
+ * are per-bar and the console keeps its CSS in one file -- see
+ * `test/stylesheets.spec.ts`.
+ */
+function paint(bar: TimelineBar): Record<string, string> {
+  if (bar.durationSeconds === null) {
+    return {
+      background:
+        'repeating-linear-gradient(45deg,'
+        + ' color-mix(in oklab, var(--color-brand-magenta) 45%, var(--surface)) 0 4px,'
+        + ' transparent 4px 8px)',
+      boxShadow:
+        'inset 0 0 0 1px color-mix(in oklab, var(--color-brand-magenta) 70%, var(--surface))',
+      color: 'var(--text)',
+    }
+  }
+  return {
+    background: 'color-mix(in oklab, var(--color-brand-cyan) 55%, var(--surface))',
+    boxShadow: 'inset 0 0 0 1px color-mix(in oklab, var(--color-brand-cyan) 80%, var(--surface))',
+    color: 'var(--text)',
+  }
+}
 </script>
 
 <template>
@@ -149,8 +189,8 @@ function percent(fraction: number): string {
             :style="{ left: percent(bar.offset), width: percent(bar.extent), top: `${bar.lane * LANE_HEIGHT}px` }"
           >
             <div
-              class="timeline-bar"
-              :class="{ 'is-unknown': bar.durationSeconds === null }"
+              class="flex h-7 items-center overflow-hidden rounded-md focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:[outline-color:var(--text)]"
+              :style="paint(bar)"
               tabindex="0"
               :title="describe(bar)"
             >
@@ -176,34 +216,3 @@ function percent(fraction: number): string {
     </div>
   </section>
 </template>
-
-<style scoped>
-.timeline-bar {
-  display: flex;
-  align-items: center;
-  height: 28px;
-  overflow: hidden;
-  border-radius: 6px;
-  background: color-mix(in oklab, var(--color-brand-cyan) 55%, var(--surface));
-  color: var(--text);
-  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-brand-cyan) 80%, var(--surface));
-}
-
-.timeline-bar:focus-visible {
-  outline: 2px solid var(--text);
-  outline-offset: 2px;
-}
-
-/* A session whose length was never recorded is drawn at the minimum width,
-   which would otherwise be indistinguishable from a two-minute meeting.
-   The hatching says "this is a mark, not a measurement" without relying on
-   a second colour to carry it. */
-.timeline-bar.is-unknown {
-  background: repeating-linear-gradient(
-    45deg,
-    color-mix(in oklab, var(--color-brand-magenta) 45%, var(--surface)) 0 4px,
-    transparent 4px 8px
-  );
-  box-shadow: inset 0 0 0 1px color-mix(in oklab, var(--color-brand-magenta) 70%, var(--surface));
-}
-</style>
