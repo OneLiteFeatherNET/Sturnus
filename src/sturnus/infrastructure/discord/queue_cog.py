@@ -70,6 +70,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sturnus.application.ports import Clock
 from sturnus.application.publishing import DOCUMENTED_STATUS
 from sturnus.application.requeue import RequeuePlan
+from sturnus.domain import transcription_models
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS
 from sturnus.infrastructure.db.requeue import (
     REPORTED_STATUSES,
@@ -546,7 +547,20 @@ class RequeueConfirmView(discord.ui.View):
         await interaction.response.defer(ephemeral=True, thinking=True)
         self.stop()
         await self._disable()
-        view = await apply_requeue(self._session_factory, self._guild_id, self._session_id)
+        # The fallback by name, not by omitting the argument. `/queue
+        # requeue` offers no choice of model -- a slash command has
+        # nowhere to show what each one costs, and choosing between them
+        # against a list of sizes and trade-offs is what the console's
+        # dropdown is for -- but "no choice was made" and "run whatever
+        # this worker was configured with" are different statements, and
+        # only the first is true here. Naming it is what makes
+        # `transcription_job.requested_model` readable afterwards.
+        view = await apply_requeue(
+            self._session_factory,
+            self._guild_id,
+            self._session_id,
+            model=transcription_models.FALLBACK,
+        )
         if view is None:
             await interaction.followup.send(NO_SUCH_SESSION, ephemeral=True)
             return

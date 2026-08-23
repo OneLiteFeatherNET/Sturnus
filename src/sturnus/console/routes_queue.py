@@ -5,6 +5,7 @@
 - `GET  /api/sessions/{session_id}/queue`
 - `GET  /api/sessions/{session_id}/queue/stream`
 - `POST /api/sessions/{session_id}/queue/requeue`
+- `GET  /api/models`
 
 **Why the guild-wide view is here rather than in a module of its own.**
 It is the same subject asked at a different scale: the per-session
@@ -12,6 +13,28 @@ endpoints answer "where has this one got to", and the guild one answers
 "what is outstanding, and which sessions is it outstanding in". Splitting
 them across two files would have put one authorisation rule in two places
 and invited them to drift.
+
+**Why `/api/models` is here too**, despite naming no guild and no session.
+It exists for exactly one caller: the dropdown beside the re-queue button.
+A module of its own would have been a file holding one handler that reads
+a domain constant, and it would have separated the list of what may be
+asked for from the endpoint that decides whether a request may ask for it.
+
+**Which model a re-queue runs, and who may say.** A re-queue may name a
+transcription model; it is validated against
+`sturnus.domain.transcription_models` here, at the boundary, and an
+unknown name is a 400. That refusal is the point of the registry: an
+unknown name used to travel unchecked into `WhisperModel(...)`, which
+raises rather than falling back, so a typo cost four failed attempts and
+one speaker left `dead` with no transcript, minutes later and nowhere near
+the request that caused it.
+
+Naming a model is not a permission of its own. It is part of a re-queue,
+and re-queueing already takes an administrator of the session's guild — so
+an administrator may name any registered model, and everybody else has
+their request refused whole rather than obeyed with the model discarded.
+Silently dropping an instruction is how a caller learns to distrust an
+API; the rule stays in one place by being the rule that was already there.
 
 **Why this exists at all.** The first pass over a recording can be wrong —
 a model that hallucinated, a worker that died, a bug since fixed — and
@@ -61,8 +84,10 @@ the answer would be a feature that takes one away.
 **No decision is made here.** Whether a session may be re-queued is
 `sturnus.application.requeue.plan_requeue`, and the write is
 `sturnus.infrastructure.db.requeue.apply_requeue` — the same function, and
-the same row lock, that the Discord command uses. This module is the shape
-of two HTTP responses and nothing else.
+the same row lock, that the Discord command uses. What a model name means
+is `sturnus.domain.transcription_models`, which the Discord command and
+the worker read too. This module turns those answers into HTTP responses
+and holds none of its own.
 """
 
 from __future__ import annotations
@@ -83,6 +108,8 @@ from sturnus.console.ports import (
     QueueSnapshot,
     RequeueOutcome,
 )
+from sturnus.domain import transcription_models
+from sturnus.domain.transcription_models import UnknownTranscriptionModel
 from sturnus.observability.events import Event, log_event
 
 log = logging.getLogger(__name__)
@@ -102,6 +129,18 @@ _STATUS_STREAM_PATH = "/api/sessions/{session_id}/queue/stream"
 _REQUEUE_PATH = "/api/sessions/{session_id}/queue/requeue"
 _GUILD_PATH = "/api/guilds/{guild_id}/queue"
 _GUILD_STREAM_PATH = "/api/guilds/{guild_id}/queue/stream"
+#: Deliberately not under `/api/guilds/{guild_id}/`. The registry is a
+#: property of this deployment's build, not of a guild -- putting a guild
+#: in the path would promise a per-guild answer that does not exist and
+#: that a console would then be tempted to cache per guild.
+_MODELS_PATH = "/api/models"
+
+#: Refusal reasons for a malformed request. Fixed strings, so the console
+#: can key off them without the offending input being echoed back. The
+#: unknown-model refusal is not here: it is the registry's own message,
+#: which names both what was asked for and what there is.
+_MALFORMED_BODY = "malformed request body"
+_MODEL_MUST_BE_A_STRING = "model must be a string naming a transcription model"
 
 
 @dataclass(frozen=True)
@@ -468,6 +507,19 @@ async def requeue_session(request: web.Request) -> web.Response:
     and "try again when the queue is idle". The reason travels with it,
     because a button that greys out without saying why is a bug report
     waiting to be filed.
+
+    A model nobody has is the *other* kind of wrong and gets **400**: the
+    request itself is unusable and no state will ever make it work. That
+    refusal is issued here, before the session is even looked at, because
+    the failure it prevents is expensive and silent — an unknown name used
+    to travel into `WhisperModel(...)`, which raises rather than falling
+    back, so the job failed, retried, and left the speaker `dead` with no
+    transcript some minutes later and nowhere near this request.
+
+    **Body optional, and the model within it optional.** No body at all is
+    the console's existing button and means "no choice"; the fallback is
+    substituted at this line rather than deeper, so nothing below has to
+    know what an absent choice means.
     """
     from sturnus.console.app import current_user
 
@@ -476,7 +528,17 @@ async def requeue_session(request: web.Request) -> web.Response:
     if session_id is None:
         return _no_such_session()
 
-    outcome = await request.app[QUEUE_CONTROL].requeue(session_id, requested_by=viewer)
+    try:
+        model = transcription_models.resolve(await _requested_model(request))
+    except UnknownTranscriptionModel as exc:
+        # The exception's own message names the offending value, which is
+        # unbounded text a caller sent, so it goes into the response and
+        # never into a log line. There is nothing an operator would do
+        # with the news that a browser asked for a model this build does
+        # not have -- the same trade `routes_me._store` makes.
+        return _bad_request(str(exc))
+
+    outcome = await request.app[QUEUE_CONTROL].requeue(session_id, requested_by=viewer, model=model)
     if outcome is None:
         return _no_such_session()
 
@@ -505,8 +567,109 @@ async def requeue_session(request: web.Request) -> web.Response:
         requested_by=viewer,
         speakers=len(outcome.requeued_user_ids),
         skipped=len(outcome.erased_user_ids),
+        # Safe to log precisely because the registry is closed: this is
+        # one of a fixed set of literals from this repository's own
+        # source, which is the standard `observability.fields` holds
+        # `model` to. An unvalidated name would not have met it.
+        model=outcome.model,
     )
     return web.json_response(_outcome_json(outcome))
+
+
+async def known_models(request: web.Request) -> web.Response:
+    """Every transcription model a re-queue may name, and which is the default.
+
+    This is the dropdown's source. It exists because nothing in the system
+    could previously *list* the models — a name was a free string, so no
+    interface could have offered a choice even if it wanted to, and an
+    administrator picking one would have been typing from memory into a
+    field that fails four attempts later.
+
+    Each entry carries its approximate size and the trade it makes,
+    because the choice is between hours of worker time and whether the
+    transcript is worth reading, and neither is legible from a name like
+    `large-v3-turbo`. The order is the registry's own and means something:
+    fastest and roughest first.
+
+    **403, where the rest of this module answers 404.** Those 404s exist so
+    that a refusal cannot confirm a fact about somebody else — that a
+    session ran, that a guild exists. There is no such fact here: the body
+    is seven literals from this repository's own source, identical for
+    every caller. The only thing this refusal discloses is whether the
+    caller administers anything, which `/api/me` already tells them about
+    themselves.
+
+    Administrator-gated all the same, and not merely as tidiness: a person
+    who administers nothing can never re-queue anything, so the list would
+    be an offer this API would then refuse to honour.
+    """
+    from sturnus.console.app import _ADMINS, current_user
+
+    viewer = current_user(request).discord_user_id
+    if not await request.app[_ADMINS].is_admin_anywhere(viewer):
+        return web.json_response({"error": "not an administrator"}, status=403)
+
+    return web.json_response(
+        {
+            "fallback": transcription_models.FALLBACK,
+            "models": [
+                {
+                    "name": model.name,
+                    "approximate_size": model.approximate_size,
+                    "summary": model.summary,
+                }
+                for model in transcription_models.KNOWN_MODELS
+            ],
+        },
+        # The one response in this module that is the same for every
+        # caller and changes only when this repository does. It is still
+        # not cached: it is served from behind a session cookie, and a
+        # shared cache holding a body that took a cookie to obtain is a
+        # habit worth not starting for seven lines of JSON.
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
+async def _requested_model(request: web.Request) -> str | None:
+    """The `model` a request named, as a string and only as a string.
+
+    An absent body and an absent key both mean "no choice" — the console's
+    re-queue button sends no body at all, and must keep working. Anything
+    else is refused rather than interpreted: `{"model": 3}` is not coerced
+    to `"3"`, and `{"model": null}` is refused rather than read as the
+    fallback, because sending `null` is what a client does with an unset
+    form field and quietly accepting it would hide that bug for as long as
+    the fallback happened to be what they wanted.
+    """
+    if not request.body_exists:
+        return None
+    try:
+        body = await request.json()
+    except ValueError:
+        raise _bad_request_exception(_MALFORMED_BODY) from None
+    if not isinstance(body, dict):
+        raise _bad_request_exception(_MALFORMED_BODY)
+    if "model" not in body:
+        return None
+    model = body["model"]
+    if not isinstance(model, str):
+        raise _bad_request_exception(_MODEL_MUST_BE_A_STRING)
+    return model
+
+
+def _bad_request(reason: str) -> web.Response:
+    return web.json_response({"error": reason}, status=400)
+
+
+def _bad_request_exception(reason: str) -> web.HTTPException:
+    """A 400 with a JSON body, raised rather than returned.
+
+    aiohttp deprecated returning an `HTTPException` from a handler, and
+    raising lets `_requested_model` read as a straight line instead of
+    threading an optional response back to its caller — the same trade
+    `routes_me._refusal` makes.
+    """
+    return web.HTTPBadRequest(text=json.dumps({"error": reason}), content_type="application/json")
 
 
 def _session_id(request: web.Request) -> int | None:
@@ -550,6 +713,11 @@ def _outcome_json(outcome: RequeueOutcome) -> dict[str, object]:
         # assume the whole document had been regenerated.
         "skipped_erased": [str(user_id) for user_id in outcome.erased_user_ids],
         "refusal": outcome.refusal,
+        # Present-and-null rather than absent on a refusal, so a client
+        # never has to tell "nothing was written" from "this API predates
+        # the field" -- it would guess, and it would guess wrong on one of
+        # them. The same shape `/api/me` gives `display_name`.
+        "model": outcome.model,
     }
 
 
@@ -638,5 +806,6 @@ def register(app: web.Application) -> None:
             web.get(_STATUS_PATH, require_session(queue_status)),
             web.get(_STATUS_STREAM_PATH, require_session(queue_status_stream)),
             web.post(_REQUEUE_PATH, require_session(requeue_session)),
+            web.get(_MODELS_PATH, require_session(known_models)),
         ]
     )

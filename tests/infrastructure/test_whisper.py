@@ -17,6 +17,8 @@ from faster_whisper.transcribe import (  # type: ignore[import-untyped]
 )
 from opentelemetry.metrics import CallbackOptions
 
+from sturnus.domain import transcription_models
+from sturnus.domain.transcription_models import UnknownTranscriptionModel
 from sturnus.infrastructure.telemetry import TRANSCRIPTION_PROGRESS, TranscriptionProgress
 from sturnus.infrastructure.whisper import WhisperEngine, _on_the_frame_grid
 from sturnus.observability.events import Event
@@ -1676,11 +1678,52 @@ async def test_an_unknown_model_fails_the_job_rather_than_falling_back(
     reported success.
     """
     engine = _engine_with(_RecordingModel())
-    # Whatever the loader raises for a name it cannot resolve -- the point
-    # is that it propagates and fails the job, not which type it is.
-    with pytest.raises((OSError, ValueError, RuntimeError)):
+    with pytest.raises(UnknownTranscriptionModel):
         await engine.transcribe(_wav_with_speech(tmp_path), "de", None, "no-such-model")
     assert "no-such-model" not in engine._models
+
+
+async def test_an_unknown_model_says_what_was_asked_for_and_what_is_known(
+    tmp_path: Path,
+) -> None:
+    """The failure has to be readable from the job's `error` column.
+
+    A name that got past the boundary reaches here, and what an operator
+    then sees in `/queue status` or the console is `str(exc)`. Before the
+    registry that was whatever HuggingFace says about a repository that
+    does not exist, which names neither the deployment nor the
+    alternatives; now it names both halves, so the fix is one read away.
+    """
+    engine = _engine_with(_RecordingModel())
+    with pytest.raises(UnknownTranscriptionModel) as raised:
+        await engine.transcribe(_wav_with_speech(tmp_path), "de", None, "large-v4")
+
+    message = str(raised.value)
+    assert "large-v4" in message
+    assert transcription_models.FALLBACK in message
+
+
+async def test_the_workers_own_default_is_never_checked_against_the_registry(
+    tmp_path: Path,
+) -> None:
+    """`WHISPER_MODEL` is an operator's decision, not a caller's request.
+
+    The registry exists to bound what a *re-queue* may ask for. A cluster
+    that configured its workers with something the registry does not list
+    has said so deliberately, in a place only an operator can reach, and a
+    worker that refused to use the model it was started with would be
+    refusing its own configuration. `__init__` loads that model directly,
+    so it is always a cache hit here and the check never sees it.
+    """
+    model = _RecordingModel()
+    engine = _engine_with(model)
+    engine._models = {"some-private-conversion": model}
+    engine._default_model = "some-private-conversion"
+
+    result = await engine.transcribe(_wav_with_speech(tmp_path), "de", None)
+
+    assert result.measurements is not None
+    assert result.measurements.model == "some-private-conversion"
 
 
 async def test_a_second_model_is_loaded_once_and_kept(tmp_path: Path) -> None:

@@ -89,7 +89,7 @@ in the bot would read it.
 | `STURNUS_MASTER_KEY_ID` | **yes** | no | Label recorded as `encryption_key_id` when a data key is wrapped. Not key material. |
 | `STURNUS_OUTLINE_BASE_URL` | **yes** | no | Base URL of the Outline instance the finished protocol is posted to. |
 | `STURNUS_OUTLINE_SERVICE_KEY` | **yes** | **yes** | Outline API token `OutlineSink` authenticates with when creating documents, and — hourly — reads the collection list with, so the console can show `document_target` as a name instead of the UUID somebody pasted. Note the name — it is `OUTLINE_SERVICE_KEY`, not an `API_TOKEN` variant. A token that is invalid, lacks access, or points at a collection that does not exist surfaces as `PermanentDocumentError`; see section 5. A token that cannot list collections costs only the picker's names: the sweep leaves the previous mirror standing rather than emptying it, and nothing about transcription depends on it. |
-| `STURNUS_WHISPER_MODEL` | `large-v3` | no | faster-whisper model to load. Larger models are more accurate and markedly slower, and this deployment transcribes on CPU (see the chart's `worker.resources`), so the difference is measured in minutes per recording rather than seconds. It is deliberately not `large-v3-turbo`: turbo is a distilled decoder with four layers instead of thirty-two, and what it gives up is concentrated outside English. Transcription happens offline, per speaker, after the meeting, so the time it costs is time nobody is waiting on — the memory it costs is real, and the chart's `worker.resources` comment works it out. |
+| `STURNUS_WHISPER_MODEL` | `large-v3` | no | faster-whisper model to load. Larger models are more accurate and markedly slower, and this deployment transcribes on CPU (see the chart's `worker.resources`), so the difference is measured in minutes per recording rather than seconds. It is deliberately not `large-v3-turbo`: turbo is a distilled decoder with four layers instead of thirty-two, and what it gives up is concentrated outside English. Transcription happens offline, per speaker, after the meeting, so the time it costs is time nobody is waiting on — the memory it costs is real, and the chart's `worker.resources` comment works it out. This is the default for a *first* pass only; which models a re-queue may name, and which one it falls back to, is the closed registry in section 6.2.9. |
 | `STURNUS_WHISPER_DEFAULT_LANGUAGE` | `de` | no | Language reported when faster-whisper's own detection comes up empty. This is the floor under the per-guild `transcription_language` (section 4.1), not the usual setting to reach for — it is consulted only for a guild that asked for detection (`transcription_language auto`) and got nothing back. It still matters more than a fallback usually does: the first transcription for a speaker in such a session pins that speaker's language, and every later job for them reuses it. |
 | `STURNUS_MODEL_CACHE_DIR` | unset | no | Where model weights are cached. When set, the worker exports it as `HF_HOME` before loading the model, so the download lands on a persistent volume; left unset, every cold start re-downloads several gigabytes of weights. |
 | `STURNUS_WORK_DIR` | `/tmp` | no | Scratch directory the encrypted recording is downloaded and decrypted into before transcription. It must be large enough for the biggest single recording — the chart sizes the corresponding volume with `worker.tmpSizeLimit`. |
@@ -1444,6 +1444,98 @@ performance and conduct — in Germany and the EU a matter for a works
 council (BetrVG §87(1)(6)) rather than something a console adds because
 the columns happen to be there. The rows exist and the ranking is
 buildable; building it is a separate, deliberate act.
+
+### 6.2.9 Which transcription model a re-queue runs
+
+A re-queue may name the model the redo is transcribed with. Which names
+exist is not a matter of what faster-whisper can resolve — it will resolve
+any HuggingFace repository id — but of a closed registry in this
+repository, `sturnus/domain/transcription_models.py`. Changing it is a
+commit, a review and a deploy, which is the right amount of ceremony for
+"this cluster will now download and run a new model".
+
+| Name | Approximate size | What it trades |
+|---|---|---|
+| `tiny` | 75 MB | Fastest, least accurate. Good for confirming a recording contains speech at all. |
+| `base` | 145 MB | Very fast; visibly wrong on names and technical terms. |
+| `small` | 480 MB | The smallest that produces German a reader can follow without the audio. |
+| `medium` | 1.5 GB | Close to `large-v3` on clear speech, behind it on crosstalk and accents, for roughly half the time and memory. |
+| `large-v2` | 3.1 GB | The previous large model. Worth a second run when `large-v3` hallucinated on one particular recording. |
+| `large-v3-turbo` | 1.6 GB | A distillation of `large-v3` — four decoder layers instead of thirty-two. Much faster; what it gives up is concentrated outside English. |
+| `large-v3` | 3.1 GB | **The fallback.** Most accurate and slowest; this deployment's default. |
+
+Sizes are approximate on purpose. These are CTranslate2 conversions whose
+on-disk size depends on the compute type the worker was built with
+(`int8_float32` here), so a figure presented as exact would be exact about
+the wrong thing.
+
+**The English-only builds are deliberately absent** — the `.en` variants
+and `distil-large-v3`. Every guild this serves meets in German
+(`STURNUS_WHISPER_DEFAULT_LANGUAGE`), so offering them would be offering a
+choice that is wrong for this deployment's own material in a way the
+person choosing could not see from the name.
+
+**Who may choose.** An administrator of the session's guild, and nobody
+else — because nobody else may re-queue at all. `POST
+/api/sessions/{id}/queue/requeue` accepts an optional `{"model": "..."}`
+in its body; a request from somebody who does not administer that guild is
+refused whole (404, the same answer they get for a session that does not
+exist), never obeyed with the model quietly discarded. `GET /api/models`
+serves the table above for the console's dropdown, and answers 403 to
+somebody who administers nothing.
+
+`/queue requeue` in Discord offers no choice. A slash command has nowhere
+to show what each model costs, so it names the fallback explicitly.
+
+**What a re-queue records, and what it does not.** Two columns, and the
+difference matters when reading them:
+
+- `transcription_job.requested_model` — what was asked for. Written by the
+  re-queue, always a name and never `NULL`. It used to be `NULL` for every
+  re-queue this system had ever performed, which meant "whichever model
+  the worker that happens to claim this job was configured with" — not a
+  record of anything, and possibly different between two workers of one
+  fleet.
+- `transcription_job.model` — what actually ran. Written by
+  `JobQueue.complete` from the engine's own measurements, after the fact.
+
+A first-pass job (never re-queued) has `requested_model` `NULL` and runs
+whatever `STURNUS_WHISPER_MODEL` says. That is unchanged.
+
+**Note one behaviour change** if this cluster overrides
+`STURNUS_WHISPER_MODEL`: a re-queue that names nothing now runs the
+registry's fallback (`large-v3`) rather than that override. The two are
+pinned equal in `tests/entrypoints/test_worker_entrypoint.py` for the
+declared default; a deployment that genuinely wants a different one has to
+say so in the registry, because "run whatever that worker was configured
+with" is not something a stored row can express.
+
+**What happens to a job whose model cannot be loaded.** It fails, and it
+is meant to. There is no fallback at the engine: `WhisperEngine._model_for`
+raises rather than quietly substituting, because a job that ran one model
+and recorded another would make `transcription_job.model` a lie, and that
+column exists precisely so "what ran" is knowable.
+
+Three places can produce that failure, and they look different:
+
+- **An unknown name in a request** never becomes a job. The API refuses it
+  with `400` and a message naming both what was asked for and what this
+  deployment runs.
+- **An unknown name that got past the boundary** — a row edited by hand, a
+  caller nobody has added the validation to — fails the job at claim time
+  with that same message in `transcription_job.error`. `attempts` climbs,
+  the job is retried, and at `STURNUS_MAX_JOB_ATTEMPTS` it is `dead` with
+  no transcript. Fix the row (or re-queue the session) rather than waiting.
+- **A registered name the worker cannot fetch** — no network, no
+  `STURNUS_MODEL_CACHE_DIR`, a full disk — fails with whatever
+  huggingface_hub says, in the same column. That is an infrastructure
+  fault, not a bad request, and section 5 is where to look.
+
+The worker's own `STURNUS_WHISPER_MODEL` is never checked against the
+registry. It is loaded eagerly at startup and is therefore always a cache
+hit; an operator who configured a private conversion has said so
+deliberately, and a worker that refused the model it was started with
+would be refusing its own configuration.
 
 ### 6.3 Listening to a recording by hand
 

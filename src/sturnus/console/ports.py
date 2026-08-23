@@ -464,6 +464,14 @@ class RequeueOutcome:
     #: been regenerated.
     erased_user_ids: tuple[int, ...]
     refusal: str | None
+    #: The transcription model this re-queue asked the worker for, and
+    #: `None` when nothing was written. It is the *request*
+    #: (`transcription_job.requested_model`), never a claim about what ran
+    #: -- no worker has necessarily touched the job yet, and there may be
+    #: none running at all. What actually ran is `transcription_job.model`,
+    #: written by `JobQueue.complete` afterwards, and the two columns exist
+    #: separately precisely so that they can disagree and be seen to.
+    model: str | None
 
 
 class QueueControl(Protocol):
@@ -479,11 +487,21 @@ class QueueControl(Protocol):
     Unlike audio, the rule here is administrator-of-the-guild rather than
     participant-of-the-session: re-running a transcription is an operation
     on the system, not a use of one's own recording.
+
+    `model` is likewise not optional, and it is a name rather than
+    `str | None`. Turning "nobody chose" into a concrete registered name is
+    `sturnus.domain.transcription_models.resolve`'s job, at the HTTP
+    boundary where a caller who named something nobody has can still be
+    told so; below that line an absent choice does not exist, which is what
+    keeps `transcription_job.requested_model` a record of what was asked
+    for rather than of what was not.
     """
 
     async def status_for(self, session_id: int, *, requested_by: int) -> QueueSnapshot | None: ...
 
-    async def requeue(self, session_id: int, *, requested_by: int) -> RequeueOutcome | None: ...
+    async def requeue(
+        self, session_id: int, *, requested_by: int, model: str
+    ) -> RequeueOutcome | None: ...
 
 
 @dataclass(frozen=True)
