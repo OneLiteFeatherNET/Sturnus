@@ -197,3 +197,25 @@ async def test_clearing_it_puts_the_guild_back_to_not_offering_it(store: ConfigS
     await store.set(GUILD, settings.VIDEO_CONSENT_OFFERED, None, T0)
 
     assert settings.is_true(await store.get(GUILD, settings.VIDEO_CONSENT_OFFERED)) is False
+
+
+async def test_a_guild_that_was_never_asked_does_not_offer_administrator_downloads(
+    store: ConfigStore,
+) -> None:
+    """The second key built the same way, and for a heavier reason.
+
+    Turning it on grants access rather than withholding it: it says an
+    administrator may obtain a copy of a recording of a meeting they were
+    not in. Software cannot read the document at `policy_url` to check
+    that participants were told so, and the honest form of "cannot check"
+    is a switch that starts off.
+    """
+    assert settings.is_true(await store.get(GUILD, settings.ADMIN_AUDIO_DOWNLOAD_OFFERED)) is False
+
+
+@pytest.mark.parametrize("value", ["yes", "1", "True", "off", ""])
+async def test_the_download_switch_refuses_anything_but_its_two_spellings(
+    store: ConfigStore, value: str
+) -> None:
+    with pytest.raises(ValueError):
+        await store.set(GUILD, settings.ADMIN_AUDIO_DOWNLOAD_OFFERED, value, T0)

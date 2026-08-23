@@ -304,6 +304,29 @@ class Track:
     wrapped_data_key: bytes
 
 
+@dataclass(frozen=True)
+class DownloadableTrack:
+    """A recording somebody may take a copy of, and how they came by it.
+
+    More than a `Track` because a download is audited and a playback is
+    not enough of an event to need it: the log line has to say which guild
+    the recording belongs to and whether the person taking the copy was in
+    the room. Neither is recoverable afterwards -- `session_participant`
+    can change, and nothing else records that a copy was ever made.
+
+    `by_participant` is deliberately an answer from the query rather than
+    a second question a handler asks. The statement already knows: it is
+    what decided that the person may have the track at all.
+    """
+
+    track: Track
+    guild_id: int
+    #: Whether the person who asked was in the session. False is the case
+    #: this whole capability exists for, and the case worth reading a log
+    #: for: an administrator reaching a meeting they were not part of.
+    by_participant: bool
+
+
 class TrackDirectory(Protocol):
     """One speaker's recording, if the person asking is allowed to hear it.
 
@@ -317,11 +340,30 @@ class TrackDirectory(Protocol):
     Consequently there is no `track` method without a `requested_by`, and
     no way to filter afterwards in a handler. A filter that can be
     forgotten is a filter that will be.
+
+    **Two methods, because there are two rules.** `track_for` is playback
+    and its rule has not moved: participants of the session, nobody else.
+    `downloadable_track_for` is the wider one the repository owner decided
+    to add -- an administrator of the guild may take a copy of any of its
+    recordings, and a guild has to switch the capability on first. They
+    are separate methods rather than one method with a flag so that a
+    handler cannot ask the wide question by accident, and so that the two
+    read as the two different acts they are.
     """
 
     async def track_for(
         self, session_id: int, speaker_id: int, *, requested_by: int
     ) -> Track | None: ...
+
+    #: `None` for every reason a download can be refused, and the caller
+    #: must not be able to tell them apart: no such session, no such
+    #: recording, the audio was swept, this person is neither a
+    #: participant nor an administrator, or the guild has not switched the
+    #: capability on. "You are not an administrator" and "there is no such
+    #: recording" are the same answer on this path.
+    async def downloadable_track_for(
+        self, session_id: int, speaker_id: int, *, requested_by: int
+    ) -> DownloadableTrack | None: ...
 
 
 class TagWriter(Protocol):

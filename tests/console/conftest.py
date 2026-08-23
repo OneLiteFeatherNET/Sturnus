@@ -26,6 +26,7 @@ from sturnus.console.ports import (
     CollectionNames,
     ConsentDirectory,
     ConsentHolder,
+    DownloadableTrack,
     GuildDirectory,
     GuildNames,
     GuildQueue,
@@ -361,16 +362,33 @@ class FakeTracks:
     Scoped by the asking user in `track_for` rather than by a filter the
     caller applies afterwards -- the same shape the real adapter has, so a
     handler that forgot to pass `requested_by` would fail here too.
+
+    `downloadable_track_for` is the second, wider rule and is kept as a
+    second method for the same reason the real adapter does: the two
+    questions are different acts, and a fake that answered both from one
+    branch would let a handler ask the wrong one and still pass.
     """
 
     def __init__(
         self,
         tracks: dict[tuple[int, int], Track] | None = None,
         participants: dict[int, set[int]] | None = None,
+        *,
+        administrators: set[int] | None = None,
+        download_offered: bool = False,
+        guild_id: int = GUILD,
     ) -> None:
         self.tracks = tracks if tracks is not None else {}
         self.participants = participants if participants is not None else {}
+        #: Who administers `guild_id`, as `admin_member` would say.
+        self.administrators = administrators if administrators is not None else set()
+        #: The guild's `admin_audio_download_offered`. Off by default, so a
+        #: test that wants the capability has to say so -- exactly what a
+        #: guild has to do.
+        self.download_offered = download_offered
+        self.guild_id = guild_id
         self.asked: list[tuple[int, int, int]] = []
+        self.asked_to_download: list[tuple[int, int, int]] = []
 
     async def track_for(
         self, session_id: int, speaker_id: int, *, requested_by: int
@@ -379,6 +397,20 @@ class FakeTracks:
         if requested_by not in self.participants.get(session_id, set()):
             return None
         return self.tracks.get((session_id, speaker_id))
+
+    async def downloadable_track_for(
+        self, session_id: int, speaker_id: int, *, requested_by: int
+    ) -> DownloadableTrack | None:
+        self.asked_to_download.append((session_id, speaker_id, requested_by))
+        if not self.download_offered:
+            return None
+        was_there = requested_by in self.participants.get(session_id, set())
+        if not was_there and requested_by not in self.administrators:
+            return None
+        track = self.tracks.get((session_id, speaker_id))
+        if track is None:
+            return None
+        return DownloadableTrack(track=track, guild_id=self.guild_id, by_participant=was_there)
 
 
 async def collect(pieces: AsyncIterator[bytes]) -> bytes:

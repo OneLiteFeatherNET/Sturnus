@@ -566,6 +566,14 @@ anything else, deliberately: readers treat an unrecognised value as false,
 so `yes` would fail nowhere at all and quietly mean the opposite of what
 whoever typed it meant.
 
+`admin_audio_download_offered` is the second key built this way, and it
+also defaults to `false`. It decides whether an administrator of this
+guild may **download** its recordings — including sessions they were not
+in — from the console. Turning it on asserts that the document at
+`policy_url`, at the current `policy_version`, says so. **Read section
+6.2.10 before setting it**: unlike `video_consent_offered`, this one grants
+access rather than withholding it.
+
 ### 4.0 `voice_channel_ids`, and the key it replaced
 
 `voice_channel_ids` names every voice channel Sturnus is allowed to record
@@ -639,7 +647,8 @@ recording earlier but never discards it. `/config set` warns explicitly
 when it detects this.
 
 **Live immediately, and never were stale.** `admin_role_id`,
-`policy_version`, `policy_url`, `video_consent_offered` (read per command
+`policy_version`, `policy_url`, `video_consent_offered`,
+`admin_audio_download_offered` (read per command
 invocation, per API request, and by the consent cache with a five-second
 TTL), and `transcription_language`,
 `transcription_prompt`, `document_target`, `document_provider`,
@@ -1102,7 +1111,9 @@ the first two:
 1. **Only participants of the same session may play its audio.** Checked
    per request against `session_participant`, scoped in the query rather
    than filtered afterwards. Not administrators-in-general, not anyone
-   with a link.
+   with a link. (**Playing back.** *Downloading* a recording is a second,
+   wider route with a rule of its own, off by default — see §6.2.10. It
+   changes nothing here.)
 2. **Everyone in a session already heard everyone else in it.** The
    console gives back what was in the room, to the people who were in it.
 3. **It is stated in the policy.** `policy_version` must be bumped and the
@@ -1536,6 +1547,111 @@ registry. It is loaded eagerly at startup and is therefore always a cache
 hit; an operator who configured a private conversion has said so
 deliberately, and a worker that refused the model it was started with
 would be refusing its own configuration.
+
+### 6.2.10 `admin_audio_download_offered`: letting administrators download recordings
+
+**Default `false`. Read this section before setting it to `true`, because
+turning it on is an assertion you are making and not a feature you are
+enabling.**
+
+#### What it does
+
+While it is `false`, `GET
+/api/sessions/{id}/tracks/{discord_user_id}/download` answers 404 to
+**everyone** in that guild — administrators and participants alike. The
+capability does not exist for a guild that has not claimed it does.
+
+While it is `true`, that route serves a `.wav` file to a participant of
+the session **or to any administrator of the guild**, including
+administrators who were in none of the guild's meetings. Playing a
+recording back (`…/audio`) is unaffected and stays participants-only.
+
+This is a deliberate widening of what the console originally promised. The
+design document records the decision, who took it, and what the old rule
+was: `docs/superpowers/specs/2026-08-21-sturnus-console-design.md`
+§1.1.1.
+
+#### What you assert by setting it to `true`
+
+That **the document at `policy_url`, at this guild's current
+`policy_version`, tells participants that guild administrators may obtain
+copies of their recordings.**
+
+Nothing in Sturnus can read that document, and it does not pretend to have
+checked. The switch is off by default for exactly that reason — the same
+construction `video_consent_offered` uses (§3.2.1), and it carries more
+weight here because this one *grants* access rather than withholding it.
+The cost of asserting it wrongly is a copy of somebody's voice leaving the
+console under wording that never mentioned it.
+
+#### The order of operations, and it is not negotiable
+
+1. Change the document at `policy_url` so it says administrators of the
+   guild may obtain copies of recordings.
+2. Bump `policy_version`. This **invalidates every consent naming the old
+   version** (§6) — which is the mechanism working, not a side effect:
+   people re-consent under wording that covers what the system now does.
+3. Only then set `admin_audio_download_offered` to `true`.
+
+**Enabling it does not retroactively make old consents cover it.** A
+consent recorded under the previous `policy_version` was given against
+wording that said nothing about administrators taking copies, and no
+setting written afterwards changes what that person was told. Doing step 3
+without steps 1 and 2 leaves a working download button and no lawful basis
+for it — the same failure §6.2.1 describes for playback, with a wider
+blast radius.
+
+**Turning it back off stops future downloads and nothing else.** A copy
+already taken is in somebody's Downloads folder: retention cannot sweep
+it, a withdrawn consent cannot reach it, and no part of this system knows
+where it is. That is why every download is logged (below) and why it is
+logged at WARNING.
+
+#### What it leaves behind
+
+Every download emits `console.track_downloaded` at **WARNING**:
+
+| Field | What it says |
+|---|---|
+| `session_id` | Which meeting |
+| `guild_id` | Which guild it belonged to |
+| `discord_user_id` | **Whose voice** was copied |
+| `requested_by` | **Who took the copy** |
+| `by_participant` | `false` if the downloader was not in that session — the case this setting exists for, and the one worth alerting on |
+| `bytes` | How much was actually delivered |
+
+No display name, here or in the filename: display names are in
+`DENIED_NAMES` (§7.1), and the file is called
+`sturnus-session-{session_id}-speaker-{discord_user_id}.wav` for the same
+reason — a filename outlives the page that produced it and is read
+wherever the file ends up.
+
+A refused download logs `console.track_refused` with `reason` =
+`download_not_permitted`, at INFO. That covers the guild not having the
+setting on and the person not being entitled, undistinguished — the HTTP
+response cannot tell them apart and neither should the log suggest it can.
+
+Worth an alert:
+
+```logql
+{namespace="sturnus", app="sturnus-api"} | json
+  | sturnus_event="console.track_downloaded" | by_participant="false"
+```
+
+#### Setting it
+
+```
+/config set key:admin_audio_download_offered value:true
+```
+
+or the console's settings page. Values are `true` and `false` and nothing
+else — `yes`, `1` and `True` are refused at write time, because
+`settings.is_true` reads anything it does not recognise as `false` and an
+unvalidated `yes` would silently mean the opposite of what was typed
+(§4.1). `/config clear` restores the default, which is `false`.
+
+It takes effect **immediately**: the API reads it per request, and nothing
+caches it.
 
 ### 6.3 Listening to a recording by hand
 

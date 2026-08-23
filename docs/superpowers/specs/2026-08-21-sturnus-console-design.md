@@ -26,7 +26,11 @@ Three things make it defensible, and all three are load-bearing:
 
 - **Only participants of the same session may play its audio.** Not
   administrators-in-general, not anyone with a link. The check is on
-  `session_participant`, evaluated per request, per session.
+  `session_participant`, evaluated per request, per session. *(Still true
+  of playback, and only of playback: §1.1.1 records a later, deliberate
+  decision to let an administrator **download** a recording of their
+  guild. Read it — this bullet no longer describes the whole of who can
+  reach a recording.)*
 - **Everyone in a session already heard everyone else in it.** The console
   gives back what was in the room, to the people who were in it, and to
   nobody else.
@@ -42,6 +46,65 @@ An operator switching this on without doing the third of those has a
 working console and no lawful basis for its second section. The
 implementation cannot enforce that; this document is where it is written
 down.
+
+### 1.1.1 Amendment: administrators may download recordings
+
+**What this document promised.** The first bullet of §1.1 said, and still
+says of playback: *only participants of the same session may play its
+audio — not administrators-in-general, not anyone with a link*. §3.3's
+table gave "a session's audio" to participants and to nobody else. That
+was the rule the console shipped with, and it is still the rule for
+playing a recording back.
+
+**What has changed, and who changed it.** The repository owner decided,
+deliberately and after being shown that it contradicts the paragraph
+above, that **an administrator of a guild may download any recording of
+that guild, including sessions they were not in.** This section records
+that decision rather than quietly leaving the code and the specification
+disagreeing: a specification caught contradicting an earlier version of
+itself earns no belief in the rest of it.
+
+**The rule now, stated in full:**
+
+- **Playing a recording back is unchanged.** `GET …/audio` and
+  `…/spectrogram` still authorise on `session_participant` alone,
+  evaluated per request, per session. Nothing in this amendment moved it.
+- **Downloading is a separate route with a wider rule.** `GET
+  /api/sessions/{session_id}/tracks/{discord_user_id}/download` is served
+  to a participant of the session **or** to an administrator of the guild
+  the session belongs to, decided inside the query that fetches the
+  decryption key.
+- **A guild has to switch it on, and switching it on is an assertion.**
+  The per-guild setting `admin_audio_download_offered` defaults to
+  `false`, and while it is false the download route refuses *everyone*,
+  participants included — the capability does not exist for that guild.
+  Turning it on asserts that the document at `policy_url`, at the guild's
+  current `policy_version`, tells participants that guild administrators
+  may obtain copies of their recordings. Software cannot read that
+  document and does not pretend to have checked it. This is the same
+  construction `video_consent_offered` uses, and it carries more weight
+  here, because this switch grants access rather than withholding it.
+- **A refusal is a 404 with the same body as every other refusal on this
+  path.** "You are not an administrator" and "there is no such recording"
+  stay indistinguishable, for the reason the next paragraph of §1.1 gives.
+- **Every download is audited**, at WARNING, as
+  `console.track_downloaded`: who asked, which session, which guild, whose
+  track, how many bytes, and `by_participant` — whether the person taking
+  the copy was in the room. A participant keeping a copy of their own
+  meeting and an administrator obtaining a recording of a meeting they
+  missed are the same route and different events, and the log can tell
+  them apart.
+
+**What is not defensible about this, said plainly.** The second bullet of
+§1.1 — *everyone in a session already heard everyone else in it* — does
+not hold for a download by an administrator who was not there. It is the
+one read in this system that reaches another person's voice without the
+reader having been in the room with them, and a downloaded file outlives
+every control this system has: retention cannot sweep it, and a withdrawn
+consent cannot reach it. That is why the capability arrives off, why
+turning it on requires a `policy_version` bump and a matching change to
+the document at `policy_url` first (`docs/operations.md` §6.2.9), and why
+every use of it is logged at WARNING.
 
 ## 2. Architecture
 
@@ -135,13 +198,21 @@ forgotten open tab is not a standing grant.
 |---|---|
 | Own statistics | The signed-in user, always |
 | A session's metadata | Only if the user is in its `session_participant` |
-| A session's audio | Same, evaluated per request |
-| A transcript link | Same |
+| A session's audio, played back | Same, evaluated per request |
+| A session's audio, **downloaded** | A participant, **or an administrator of the session's guild** — and only while that guild's `admin_audio_download_offered` is `true`. See §1.1.1 |
+| A transcript link | Same as the metadata |
 | Settings | Administrators only |
+
+The download row is an amendment. This table used to give "a session's
+audio" to participants and nobody else; §1.1.1 records who changed that,
+why, and what the new rule is. Playback did not move — the row above the
+download row is the original rule, unaltered.
 
 There is no "list every session" endpoint. Every query is scoped by the
 signed-in Discord id at the repository layer, not filtered afterwards in a
-handler — a filter that can be forgotten is a filter that will be.
+handler — a filter that can be forgotten is a filter that will be. The
+administrator half of the download rule is inside the same statement that
+fetches the decryption key, for the same reason.
 
 ### 3.4 Administrators
 
@@ -349,6 +420,46 @@ the ten-minute ceiling is for. The page says in a
 sentence which of the two it is doing — "live" and "checking every few
 seconds" look identical whenever the figures happen not to be changing,
 which is exactly when somebody is deciding whether to believe them.
+
+## 5.3 Downloading a track
+
+`GET /api/sessions/{id}/tracks/{discord_user_id}/download`
+
+A separate path rather than `…/audio?download=1`, because it is a separate
+act under a separate rule (§1.1.1) and the two should be separable in the
+router, in the tests, in a rate limit and in the audit log alike.
+
+- **The rule** is `ConsoleTrackDirectory.downloadable_track_for`: a
+  participant of the session, or an administrator of the session's guild,
+  and in both cases only while that guild's `admin_audio_download_offered`
+  is `true`. All of it is inside the statement that fetches the decryption
+  key — there is no method on that class that fetches a key without a rule
+  attached to it.
+- **The bytes** are exactly `…/audio`'s: the same decryption path, the
+  same `Range` support, the same "no plaintext ever touches disk". A
+  download of an hour-long meeting is the transfer most likely to be
+  interrupted, so being resumable matters more here than for playback.
+- **The headers** are the only other difference: `Content-Type:
+  audio/wav`, `Cache-Control: private, no-store`, and
+  `Content-Disposition: attachment;
+  filename="sturnus-session-{session_id}-speaker-{discord_user_id}.wav"`.
+  The filename names the speaker by **Discord snowflake and never by
+  display name**: the filename is the one part of this response that
+  outlives the request, and it will be read in a Downloads folder, in a
+  mail client and over somebody's shoulder, with none of the context the
+  console gave it. A display name there is a statement about a person to
+  everybody who ever sees the file; a snowflake says nothing to a
+  bystander and is exact for anybody entitled to resolve it — the same
+  reasoning that puts display names in `DENIED_NAMES` for logs.
+- **Refusals** are `404 {"error": "no such recording"}` — byte for byte
+  what `…/audio` answers, for every reason: the guild has not enabled the
+  capability, this person is neither participant nor administrator, the
+  session does not exist, the recording does not exist, the retention
+  sweep has erased the audio.
+- **For a front end:** offer the control only where the guild's settings
+  say the capability is on, and treat a 404 as "not available" rather than
+  as an error worth reporting — a disabled control that explains itself
+  would confirm the recording exists.
 
 ### 5.1 What is deliberately not built
 

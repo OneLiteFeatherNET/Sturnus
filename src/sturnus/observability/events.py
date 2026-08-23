@@ -131,6 +131,20 @@ class Event(StrEnum):
     #: are the three that make the line answer the question anyone would
     #: ask of it afterwards.
     CONSOLE_TRACK_SERVED = "console.track_served"
+    #: A copy of somebody's voice left the console as a file. **WARNING,
+    #: and deliberately so:** a download outlives every control this
+    #: system has -- it is in a Downloads folder, and nothing here can
+    #: expire it, sweep it or take it back, so the line saying it happened
+    #: is the only record there will ever be.
+    #:
+    #: A different event from `CONSOLE_TRACK_SERVED` because it is a
+    #: different act, and `by_participant` separates the two acts *this*
+    #: event covers: a participant keeping a copy of their own meeting,
+    #: and an administrator obtaining a recording of a meeting they were
+    #: not in. The second is the one read in this system that reaches
+    #: another person's voice without the reader having been in the room
+    #: with them, and it is the reason the field exists.
+    CONSOLE_TRACK_DOWNLOADED = "console.track_downloaded"
     #: A recording that was asked for and not handed over -- because the
     #: asker was not in the session, or because the retention sweep has
     #: already erased the audio. `reason` says which.

@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import Row, delete, func, select
+from sqlalchemy import Row, delete, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -41,6 +41,7 @@ from sturnus.console.ports import (
     AdminDirectory,
     CollectionListing,
     ConsentHolder,
+    DownloadableTrack,
     GuildDirectory,
     GuildQueue,
     GuildRecording,
@@ -64,6 +65,7 @@ from sturnus.domain.consent import (
 )
 from sturnus.infrastructure.db.models import (
     AccountLink,
+    AdminMember,
     Consent,
     ConsoleState,
     GuildChannel,
@@ -190,10 +192,24 @@ class ConsoleTrackDirectory:
     stamps the row second, so a row without the stamp is the only claim
     that the object is still there. Offering a stamped row would send a
     participant to S3 for a key that was deleted on purpose.
+
+    **`downloadable_track_for` is the second rule, and it is wider.** An
+    administrator of the guild may take a copy of any of its recordings,
+    including sessions they were not in -- a decision the repository owner
+    took deliberately, and a change to what the design document promised
+    (see its §1.1, which now says so). It is a second method rather than a
+    parameter on the first because it is a second act: `track_for` must
+    stay exactly what it was, and a caller must not be able to ask the
+    wide question by writing `True`.
     """
 
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        config: SettingsStore,
+    ) -> None:
         self._session_factory = session_factory
+        self._config = config
 
     async def track_for(
         self, session_id: int, speaker_id: int, *, requested_by: int
@@ -225,6 +241,94 @@ class ConsoleTrackDirectory:
                 encryption_key_id=row.encryption_key_id,
                 wrapped_data_key=row.wrapped_data_key,
             )
+
+    async def downloadable_track_for(
+        self, session_id: int, speaker_id: int, *, requested_by: int
+    ) -> DownloadableTrack | None:
+        """One speaker's recording, if this person may take a copy away.
+
+        The rule, in the order it is decided:
+
+        1. The guild must offer the capability at all. Read through
+           `SettingsStore` rather than joined into the statement below,
+           because that port is the one reading of a setting in this
+           process -- a join here would be a second one, layering the
+           default `false` by hand, and two readings of "may this guild do
+           X" is how the two eventually disagree.
+        2. The person must be a participant of the session **or** an
+           administrator of the guild the session belongs to. Both halves
+           are in the one statement, alongside the columns they authorise,
+           for the reason `track_for`'s docstring gives: an authorisation
+           a caller applies afterwards is one a caller can forget.
+
+        Every failure is the same `None`. A caller cannot tell "you are
+        not an administrator" from "there is no such recording", and must
+        not be able to: the second would confirm the meeting exists.
+
+        `guild_id` is selected rather than inferred, which is the column
+        `track_for` never had to fetch -- an administrator check is about
+        a guild, and the only trustworthy statement of which guild a
+        session belongs to is the session's own row.
+        """
+        async with self._session_factory() as session:
+            was_there = (
+                select(SessionParticipant.id)
+                .where(
+                    SessionParticipant.session_id == session_id,
+                    SessionParticipant.discord_user_id == requested_by,
+                )
+                .exists()
+            )
+            administers = (
+                select(AdminMember.discord_user_id)
+                .where(
+                    AdminMember.guild_id == SessionRow.guild_id,
+                    AdminMember.discord_user_id == requested_by,
+                )
+                .exists()
+            )
+            row = (
+                await session.execute(
+                    select(
+                        TranscriptionJob.s3_key,
+                        TranscriptionJob.encryption_key_id,
+                        TranscriptionJob.wrapped_data_key,
+                        SessionRow.guild_id,
+                        was_there.label("was_there"),
+                    )
+                    .join(SessionRow, SessionRow.id == TranscriptionJob.session_id)
+                    .where(
+                        TranscriptionJob.session_id == session_id,
+                        TranscriptionJob.discord_user_id == speaker_id,
+                        TranscriptionJob.audio_deleted_at.is_(None),
+                        or_(was_there, administers),
+                    )
+                )
+            ).first()
+            if row is None:
+                return None
+
+        # After the row, because the setting is about the guild and the
+        # guild's id is what the row just established. Asking first would
+        # mean reading a configuration for a guild named by nothing.
+        stored = await self._config.snapshot(row.guild_id)
+        if not settings.is_true(stored.get(settings.ADMIN_AUDIO_DOWNLOAD_OFFERED)):
+            # The guild has asserted nothing about its policy document, so
+            # the capability does not exist for it -- for its
+            # administrators and for its participants alike. A route that
+            # quietly worked for participants would be half a capability
+            # nobody switched on.
+            return None
+
+        return DownloadableTrack(
+            track=Track(
+                s3_key=row.s3_key,
+                encryption_key_id=row.encryption_key_id,
+                wrapped_data_key=row.wrapped_data_key,
+            ),
+            guild_id=row.guild_id,
+            by_participant=bool(row.was_there),
+        )
 
 
 class ConsoleTagWriter:

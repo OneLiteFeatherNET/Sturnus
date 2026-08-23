@@ -61,6 +61,31 @@ TRANSCRIPTION_PROMPT = "transcription_prompt"
 #: §1.1 for audio playback, and honest for the same reason.
 VIDEO_CONSENT_OFFERED = "video_consent_offered"
 
+#: Whether an administrator of this guild may **download** a recording of
+#: it -- including a session they were not in.
+#:
+#: This is a deliberate widening of what the console design promised. Its
+#: §1.1 said audio reaches participants of a session and nobody else, and
+#: playback still works exactly that way; the download route is a second,
+#: wider rule, taken as a decision by the repository owner and written
+#: down in that document rather than left as a surprise in the code.
+#:
+#: Built the same way `VIDEO_CONSENT_OFFERED` is, and the argument is the
+#: same one with more weight behind it. Turning this on asserts that the
+#: document at `policy_url`, at the guild's current `policy_version`,
+#: tells participants that guild administrators may obtain copies of
+#: their recordings. Software cannot read that document and must not
+#: pretend to have checked it -- and here the switch *grants* access
+#: rather than withholding it, so the cost of assuming is a copy of
+#: somebody's voice leaving the console under wording that never
+#: mentioned it.
+#:
+#: While it is false the download route refuses everyone, participants
+#: included: a capability nobody has claimed exists for that guild should
+#: not half-exist. Enabling it changes nothing about consents already
+#: recorded -- see `docs/operations.md` §6.2.9.
+ADMIN_AUDIO_DOWNLOAD_OFFERED = "admin_audio_download_offered"
+
 #: The one value of `TRANSCRIPTION_LANGUAGE` that is not a language: it
 #: asks the engine to detect one per speaker and pin what it found for the
 #: rest of the session, which is what the worker did unconditionally before
@@ -92,6 +117,11 @@ DEFAULTS: dict[str, str] = {
     # been asked is true. A default of `true` would assert something
     # about somebody else's wording.
     VIDEO_CONSENT_OFFERED: FALSE,
+    # Off for the same reason and one more: a default of `true` here
+    # would not merely assert something about somebody else's wording, it
+    # would hand every administrator of every guild a copy of every
+    # recording the moment this key shipped.
+    ADMIN_AUDIO_DOWNLOAD_OFFERED: FALSE,
     # Protocols are read by the people who were in the room, so the
     # times in them are theirs, not the cluster's. A wrong offset is
     # not obviously wrong to a reader -- 15:08 looks like a plausible
@@ -180,6 +210,7 @@ INTEGER_KEYS: frozenset[str] = frozenset(
 BOOLEAN_KEYS: frozenset[str] = frozenset(
     {
         VIDEO_CONSENT_OFFERED,
+        ADMIN_AUDIO_DOWNLOAD_OFFERED,
     }
 )
 

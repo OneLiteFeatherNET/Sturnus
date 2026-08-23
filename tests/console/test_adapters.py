@@ -20,6 +20,9 @@ from sturnus.console.adapters import (
     ConsoleTagWriter,
     ConsoleTrackDirectory,
 )
+from sturnus.domain import settings
+from sturnus.infrastructure.db.admin_members import AdminMemberStore
+from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.models import (
     Base,
     Session,
@@ -31,6 +34,9 @@ from sturnus.infrastructure.db.repositories import AccountLinkRepository
 
 T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 ANNA, BEN = 100, 200
+#: Administers the guild and was in none of its meetings.
+CARA = 300
+GUILD = 4711
 ANNA_OUTLINE = "c9a1b2e3-4f5a-4b3c-8d2e-1a2b3c4d5e6f"
 
 
@@ -198,7 +204,7 @@ async def seed_session(
 ) -> int:
     """One closed session, its participants, and optionally one recording."""
     async with factory() as db:
-        session = Session(guild_id=1, channel_id=2, started_at=T0, status="closed")
+        session = Session(guild_id=GUILD, channel_id=2, started_at=T0, status="closed")
         db.add(session)
         await db.flush()
         for user in participants:
@@ -232,7 +238,9 @@ async def test_a_participant_finds_the_recording_of_someone_in_the_room(
 ) -> None:
     session_id = await seed_session(factory, participants=(ANNA, BEN), speaker=ANNA)
 
-    track = await ConsoleTrackDirectory(factory).track_for(session_id, ANNA, requested_by=BEN)
+    track = await ConsoleTrackDirectory(factory, ConfigStore(factory)).track_for(
+        session_id, ANNA, requested_by=BEN
+    )
 
     assert track is not None
     assert track.s3_key == f"sessions/{session_id}/speakers/{ANNA}.enc"
@@ -252,7 +260,10 @@ async def test_somebody_who_was_not_in_the_session_finds_nothing(
     session_id = await seed_session(factory, participants=(ANNA,), speaker=ANNA)
 
     assert (
-        await ConsoleTrackDirectory(factory).track_for(session_id, ANNA, requested_by=BEN) is None
+        await ConsoleTrackDirectory(factory, ConfigStore(factory)).track_for(
+            session_id, ANNA, requested_by=BEN
+        )
+        is None
     )
 
 
@@ -262,7 +273,10 @@ async def test_a_speaker_with_no_recording_in_that_session_yields_nothing(
     session_id = await seed_session(factory, participants=(ANNA, BEN), speaker=ANNA)
 
     assert (
-        await ConsoleTrackDirectory(factory).track_for(session_id, BEN, requested_by=ANNA) is None
+        await ConsoleTrackDirectory(factory, ConfigStore(factory)).track_for(
+            session_id, BEN, requested_by=ANNA
+        )
+        is None
     )
 
 
@@ -276,14 +290,151 @@ async def test_a_recording_the_retention_sweep_erased_is_not_offered(
     session_id = await seed_session(factory, participants=(ANNA,), speaker=ANNA, erased=True)
 
     assert (
-        await ConsoleTrackDirectory(factory).track_for(session_id, ANNA, requested_by=ANNA) is None
+        await ConsoleTrackDirectory(factory, ConfigStore(factory)).track_for(
+            session_id, ANNA, requested_by=ANNA
+        )
+        is None
     )
 
 
 async def test_a_session_that_does_not_exist_yields_nothing(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    assert await ConsoleTrackDirectory(factory).track_for(9_999, ANNA, requested_by=ANNA) is None
+    assert (
+        await ConsoleTrackDirectory(factory, ConfigStore(factory)).track_for(
+            9_999, ANNA, requested_by=ANNA
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# The same directory's second, wider rule: who may take a copy away
+# ---------------------------------------------------------------------------
+#
+# The decision this implements is the repository owner's and it is a real
+# widening: an administrator of a guild may download any recording of that
+# guild, including sessions they were not in. It is a second method rather
+# than a flag on the first, because it is a second rule -- and because
+# `track_for` must stay exactly what it was.
+
+
+async def directory(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    offered: bool,
+    administrators: tuple[int, ...] = (),
+) -> ConsoleTrackDirectory:
+    """The real adapter over a guild that has, or has not, switched it on."""
+    config = ConfigStore(factory)
+    await config.set(
+        GUILD,
+        settings.ADMIN_AUDIO_DOWNLOAD_OFFERED,
+        settings.TRUE if offered else settings.FALSE,
+        T0,
+    )
+    await AdminMemberStore(factory).replace(GUILD, administrators, T0)
+    return ConsoleTrackDirectory(factory, config)
+
+
+async def test_an_administrator_reaches_a_recording_of_a_meeting_they_missed(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA, BEN), speaker=ANNA)
+    tracks = await directory(factory, offered=True, administrators=(CARA,))
+
+    found = await tracks.downloadable_track_for(session_id, ANNA, requested_by=CARA)
+
+    assert found is not None
+    assert found.track.s3_key == f"sessions/{session_id}/speakers/{ANNA}.enc"
+    assert found.guild_id == GUILD
+    # The one thing the audit line cannot recover afterwards, and the
+    # difference between the two acts this route can perform.
+    assert found.by_participant is False
+
+
+async def test_a_participant_of_the_session_is_told_that_they_were_there(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA, BEN), speaker=ANNA)
+    tracks = await directory(factory, offered=True, administrators=(CARA,))
+
+    found = await tracks.downloadable_track_for(session_id, ANNA, requested_by=BEN)
+
+    assert found is not None
+    assert found.by_participant is True
+
+
+async def test_a_guild_that_has_not_switched_it_on_hands_nothing_over(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Nobody, not "administrators only".
+
+    Turning the setting on is an administrator asserting that the document
+    at `policy_url` tells participants their recordings can be copied out.
+    Until somebody asserts that, the capability does not exist for the
+    guild -- for its administrators or for anybody else.
+    """
+    session_id = await seed_session(factory, participants=(ANNA, BEN), speaker=ANNA)
+    tracks = await directory(factory, offered=False, administrators=(CARA,))
+
+    assert await tracks.downloadable_track_for(session_id, ANNA, requested_by=CARA) is None
+    assert await tracks.downloadable_track_for(session_id, ANNA, requested_by=BEN) is None
+
+
+async def test_a_guild_nobody_has_configured_at_all_hands_nothing_over(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The default, read through the store rather than restated here."""
+    session_id = await seed_session(factory, participants=(ANNA,), speaker=ANNA)
+    await AdminMemberStore(factory).replace(GUILD, (CARA,), T0)
+    tracks = ConsoleTrackDirectory(factory, ConfigStore(factory))
+
+    assert await tracks.downloadable_track_for(session_id, ANNA, requested_by=CARA) is None
+
+
+async def test_an_administrator_of_another_guild_is_nobody_here(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`is_admin` is per guild, and so is this. An administrator of one
+    guild has no standing in another, and the query says so by naming the
+    session's own `guild_id` rather than asking whether this person
+    administers anything at all."""
+    session_id = await seed_session(factory, participants=(ANNA,), speaker=ANNA)
+    config = ConfigStore(factory)
+    await config.set(GUILD, settings.ADMIN_AUDIO_DOWNLOAD_OFFERED, settings.TRUE, T0)
+    await AdminMemberStore(factory).replace(GUILD + 1, (CARA,), T0)
+
+    tracks = ConsoleTrackDirectory(factory, config)
+
+    assert await tracks.downloadable_track_for(session_id, ANNA, requested_by=CARA) is None
+
+
+async def test_somebody_who_is_neither_an_administrator_nor_a_participant_finds_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await seed_session(factory, participants=(ANNA,), speaker=ANNA)
+    tracks = await directory(factory, offered=True, administrators=(CARA,))
+
+    assert await tracks.downloadable_track_for(session_id, ANNA, requested_by=BEN) is None
+
+
+async def test_a_recording_the_retention_sweep_erased_is_not_offered_to_an_administrator(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The widening is about who may ask, never about what is still there."""
+    session_id = await seed_session(factory, participants=(ANNA,), speaker=ANNA, erased=True)
+    tracks = await directory(factory, offered=True, administrators=(CARA,))
+
+    assert await tracks.downloadable_track_for(session_id, ANNA, requested_by=CARA) is None
+
+
+async def test_a_session_that_does_not_exist_yields_nothing_to_download(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    tracks = await directory(factory, offered=True, administrators=(CARA,))
+
+    assert await tracks.downloadable_track_for(9_999, ANNA, requested_by=CARA) is None
 
 
 # ---------------------------------------------------------------------------

@@ -196,8 +196,15 @@ async def _run() -> None:
         redirect_uri=settings.console_redirect_uri,
     )
 
+    admins = AdminMemberStore(session_factory)
+    config = ConfigStore(session_factory)
+
     audio = AudioDelivery(
-        tracks=ConsoleTrackDirectory(session_factory),
+        # The configuration store, because the download route's rule
+        # includes a per-guild switch the guild has to have turned on
+        # (`settings.ADMIN_AUDIO_DOWNLOAD_OFFERED`). Playback's rule is
+        # unchanged and reads none of it.
+        tracks=ConsoleTrackDirectory(session_factory, config),
         source=S3AudioStore(
             endpoint=settings.s3_endpoint,
             bucket=settings.s3_bucket,
@@ -209,9 +216,6 @@ async def _run() -> None:
             settings.master_key_id,
         ),
     )
-
-    admins = AdminMemberStore(session_factory)
-    config = ConfigStore(session_factory)
 
     def now() -> datetime:
         """The one clock this process reads.

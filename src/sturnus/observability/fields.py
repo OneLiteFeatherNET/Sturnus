@@ -137,12 +137,21 @@ _LITERALS = frozenset(
         #: one clicking "withdraw" both leave a perfectly ordinary date
         #: in the column, and only this field says which act it was.
         "effective_at_given",
-        #: A key of `sturnus.domain.settings` -- one of seventeen literals
-        #: from this repository's own source, and checked against the
-        #: registry before anything logs it. The *value* is not here and
-        #: must not be: `transcription_prompt` is free text an
-        #: administrator typed, and `policy_url` is a URL.
+        #: A key of `sturnus.domain.settings` -- one of the literals in
+        #: `KNOWN_KEYS`, from this repository's own source, and checked
+        #: against the registry before anything logs it. The *value* is
+        #: not here and must not be: `transcription_prompt` is free text
+        #: an administrator typed, and `policy_url` is a URL.
         "config_key",
+        #: Whether the person who downloaded a recording was in the
+        #: session it belongs to. A boolean, and the whole difference
+        #: between two acts that leave otherwise identical lines: somebody
+        #: keeping a copy of their own meeting, and an administrator
+        #: obtaining a recording of a meeting they were not part of.
+        #: Nothing else can recover it afterwards -- `session_participant`
+        #: is not frozen at the moment of the download, and no other row
+        #: records that a copy was made at all.
+        "by_participant",
     }
 )
 
