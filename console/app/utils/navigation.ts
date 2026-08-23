@@ -88,6 +88,17 @@ export const ADMIN_VIEW: NavSection = {
   adminOnly: true,
   entries: [
     {
+      to: '/admin/onboarding',
+      labelKey: 'nav.onboarding',
+      // A door with an arrow going into it: a bot being let into a server,
+      // which is the one step of this page that happens anywhere else.
+      // Deliberately not a cog — the cog is Bot Settings, and this page is
+      // not a second place to configure a guild but the place where a
+      // guild becomes configurable at all.
+      icon: 'M10 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h5v-2H5V5h5V3Zm5.6 3.6-1.4 1.4 3 3H8v2h9.2l-3 3 1.4 1.4L21 12l-5.4-5.4Z',
+      adminOnly: true,
+    },
+    {
       to: '/admin/bot-settings',
       labelKey: 'nav.botSettings',
       icon: 'M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm9.4 4a7.4 7.4 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7.6 7.6 0 0 0-2-1.2L16.5 3h-4l-.4 2.6c-.7.3-1.4.7-2 1.2l-2.4-1-2 3.4 2 1.6a7.4 7.4 0 0 0 0 2.4l-2 1.6 2 3.4 2.4-1c.6.5 1.3.9 2 1.2l.4 2.6h4l.4-2.6c.7-.3 1.4-.7 2-1.2l2.4 1 2-3.4-2-1.6c.1-.4.1-.8.1-1.2Z',
