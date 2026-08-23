@@ -197,8 +197,16 @@ by duration, labelled by channel.
 
 The runtime configuration from `sturnus.domain.settings`, per guild, with
 the same validation the `ConfigStore` write path already applies —
-`INTEGER_KEYS` are checked before storage, `REQUIRED_KEYS` cannot be
-cleared.
+`INTEGER_KEYS` are checked before storage, and a key with no default to
+restore cannot be cleared.
+
+That last rule is sent, as `may_clear`, and never derived on the front
+end. `!required` used to be the same question and stopped being it once
+`voice_channel_id` became a deprecated third class: no default, required
+of nobody, still serving every guild that has not moved to
+`voice_channel_ids`. A console reading clearability off `required` offers
+a Clear beside that key and answers it with "this key is required" on a
+field the same page rendered as optional.
 
 Changing `policy_version` warns, in the interface, that it invalidates
 every consent naming the old one. That is documented behaviour and not a
@@ -360,7 +368,7 @@ exists.
 | `transcription_job.speech_seconds` | What the gate handed the decoder | The dashboard's central number |
 | `transcription_job.segment_count` | Segments the decoder produced | Distinguishes "said little" from "was not transcribed" |
 | `admin_member` | Discord admins, mirrored | Section 3.4 |
-| `guild_channel` | A guild's voice and text channels: id, name, kind, position | `voice_channel_id` is a snowflake an administrator pasted, and `api` has no Discord token to ask what it is called (Section 2.1) |
+| `guild_channel` | A guild's voice and text channels: id, name, kind, position | `voice_channel_ids` is a list of snowflakes an administrator pasted, and `api` has no Discord token to ask what any of them is called (Section 2.1) |
 | `guild_role` | A guild's roles: id, name, position | The same, for `consent_role_id` and `admin_role_id` |
 | `guild_member` | Display names of the holders of the consent role and the admin role — **and nobody else** | The bounded set the console ever names: consent rosters, queue speakers, admin lists. Mirroring the whole guild would copy a Discord user directory into a database that exists to hold recordings |
 | `outline_collection` | Outline's collections: id, name | `document_target` is a collection UUID, and the Outline token belongs to `worker`, not to `api` |
