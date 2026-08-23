@@ -154,21 +154,16 @@ export function personLabel(row: ConsentRow): string {
 }
 
 /**
- * The line under a nameless row, or `null` when there is a name.
+ * There is no `identityNote` here any more.
  *
- * A bare snowflake where every other row has a name reads as a fault in the
- * console. It is not one: consent is given in a Discord command, and a
- * display name is only learned when somebody turns up in a session that was
- * recorded. Saying so is the difference between "this row is broken" and
- * "this person has consented and has not been in a meeting yet".
+ * The sentence under a nameless row used to be built from the consent
+ * record alone, and it therefore claimed Sturnus had "never had a name to
+ * learn". That is no longer true: the roster consults the guild directory,
+ * which holds display names for exactly these people, and the three
+ * outcomes of asking it -- a name, no entry, no directory to ask -- are
+ * three different facts needing three different sentences. `nameNote` in
+ * `~/utils/consentRoster` says them, in keys rather than in English.
  */
-export function identityNote(row: ConsentRow): string | null {
-  if (row.display_name) return null
-  return (
-    'No display name on record: this is their Discord user id. They gave consent but have not '
-    + 'been in a recorded session since, so Sturnus has never had a name to learn.'
-  )
-}
 
 /* -------------------------------------------------------------------- */
 /* What state a consent is in                                            */
@@ -348,13 +343,20 @@ export const ROLE_STAYS_NOTE =
 
 /**
  * Nothing already recorded is deleted, and the count says how much that is
- * for this person specifically. A general sentence about retention is easy
+ * for this person specifically.
+ *
+ * The name is a parameter with `personLabel` as its default, here and in
+ * the two functions below it. The roster resolves the nameless against the
+ * guild directory, and a confirmation that said "Withdraw Discord user
+ * 100000000000000001's consent?" under a row headed "Ada Lovelace" would be
+ * a confirmation the reader cannot match to the thing they clicked. The
+ * default keeps every caller that has no better name unchanged. A general sentence about retention is easy
  * to read past; "and the four recordings that already contain their audio
  * stay" is not.
  */
-export function recordingsKeptNote(row: ConsentRow): string {
+export function recordingsKeptNote(row: ConsentRow, label: string = personLabel(row)): string {
   const held = row.recordings_with_audio
-  const who = personLabel(row)
+  const who = label
   if (held === 0) {
     return (
       `Nothing already recorded is deleted. Sturnus holds no recordings containing ${who}’s audio `
@@ -394,10 +396,13 @@ export interface RevokeConfirmation {
  * cannot be undone from this console: only the person themselves can grant
  * consent again, with `/consent grant` in Discord.
  */
-export function revokeConfirmation(row: ConsentRow): RevokeConfirmation {
+export function revokeConfirmation(
+  row: ConsentRow,
+  label: string = personLabel(row),
+): RevokeConfirmation {
   return {
-    title: `Withdraw ${personLabel(row)}’s consent?`,
-    consequences: [ROLE_STAYS_NOTE, recordingsKeptNote(row), AUDIT_LOG_NOTE],
+    title: `Withdraw ${label}’s consent?`,
+    consequences: [ROLE_STAYS_NOTE, recordingsKeptNote(row, label), AUDIT_LOG_NOTE],
     confirmLabel: 'Yes, withdraw this consent',
   }
 }
@@ -497,7 +502,11 @@ export interface RevokeOutcome {
  * moment somebody is most likely to believe more happened than did is the
  * moment they have just watched a row change state.
  */
-export function revokeOutcome(row: ConsentRow, result: RevokeResult): RevokeOutcome {
+export function revokeOutcome(
+  row: ConsentRow,
+  result: RevokeResult,
+  label: string = personLabel(row),
+): RevokeOutcome {
   if (!result.revoked) {
     return {
       tone: 'refused',
@@ -513,7 +522,7 @@ export function revokeOutcome(row: ConsentRow, result: RevokeResult): RevokeOutc
         + 'their audio are untouched'
   return {
     tone: 'done',
-    headline: `${personLabel(row)}’s consent is withdrawn.`,
+    headline: `${label}’s consent is withdrawn.`,
     detail:
       'Recording of them stops within about five seconds, mid-session if a meeting is running. '
       + `Their Discord consent role is unchanged, ${recordings}, and this is in the audit log. `
@@ -561,6 +570,19 @@ export function isStaleRow(error: unknown): boolean {
  */
 export function describeConsentError(error: unknown): string {
   switch (statusOf(error)) {
+    case 400:
+      // Two requests on this page can earn a 400, and this sentence has to
+      // be true of both: a page of the roster the API will not serve — a
+      // hand-edited `?page=`, or a bookmark to a page that has since gone —
+      // and a withdrawal naming nobody, the same person twice, or more
+      // people than one request may carry. Both are the console asking for
+      // something malformed rather than the guild being in a state that
+      // refuses it, and in neither case did anything change.
+      return (
+        'Sturnus will not serve that request: it asks for a page of the roster that does not '
+        + 'exist, or names a set of people it cannot accept. Nothing was changed — go back to the '
+        + 'first page and start again.'
+      )
     case 401:
       return 'Your session has ended. Sign in again, then retry — nothing was withdrawn.'
     case 403:

@@ -1,4 +1,4 @@
-<script setup lang="ts">
+<script setup lang="ts" generic="Row extends UiRow">
 /**
  * A list whose rows open, with checkboxes for the actions that apply to
  * more than one of them.
@@ -20,6 +20,13 @@
  * - **A row's summary and its revealed actions are the caller's markup**,
  *   so they arrive as slots. This component owns the disclosure, not what
  *   is disclosed.
+ *
+ * It is generic in its row type, and that is not decoration. A caller has
+ * more to say about a row than an id — a consent, a person, a job — and a
+ * list that narrowed every row to `UiRow` on the way into the slot would
+ * force the page to look the row back up by index in a second array. That
+ * lookup is exactly how one name ends up beside somebody else's record the
+ * first time the two arrays stop being the same length.
  */
 import {
   type UiRow,
@@ -35,7 +42,7 @@ import {
 
 const props = withDefaults(
   defineProps<{
-    rows: readonly UiRow[]
+    rows: readonly Row[]
     /** The ids ticked, across every page. Absent means no checkboxes. */
     selected?: readonly string[] | null
     /** The word for the bulk action, which goes into the sentence saying

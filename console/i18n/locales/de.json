@@ -436,6 +436,20 @@
       "errorStatus": "Sturnus hat mit {status} geantwortet und konnte die Zahlen dieses Servers nicht erstellen. Über den Grund ist nichts bekannt."
     },
     "consents": {
+      "roster": {
+        "server": "Welcher Server",
+        "list": "Einwilligungsliste",
+        "showing": "Angezeigt: {from}–{to} von {total}",
+        "showingOne": "Angezeigt: {from} von {total}",
+        "total": "{count} Person hat in diesem Server einen Einwilligungseintrag. | {count} Personen haben in diesem Server einen Einwilligungseintrag.",
+        "inForce": "{count} der {shown} auf dieser Seite ist derzeit gültig. | {count} der {shown} auf dieser Seite sind derzeit gültig.",
+        "beyondEnd": "Diese Seite der Liste gibt es nicht mehr — die Liste hat sich geändert, seit dieser Link entstanden ist. Es fehlt niemand; alle stehen auf einer früheren Seite.",
+        "backToFirst": "Zurück zur ersten Seite",
+        "userId": "Discord-Benutzer-ID",
+        "fromDirectory": "Name aus dem Discord-Verzeichnis dieses Servers; der Einwilligungseintrag selbst trägt keinen.",
+        "unresolved": "Nirgends ein Name: Der Einwilligungseintrag trägt keinen, und das Discord-Verzeichnis dieses Servers kennt diese ID nicht — deshalb steht hier die blanke Discord-Benutzer-ID. Eine Einwilligung entsteht per Discord-Befehl, und einen Namen lernt Sturnus erst, wenn jemand in einer aufgezeichneten Sitzung auftaucht.",
+        "unlisted": "Kein Name im Einwilligungseintrag, und das Discord-Verzeichnis dieses Servers war gerade nicht lesbar — deshalb steht hier die blanke Discord-Benutzer-ID."
+      },
       "scope": {
         "label": "Umfang",
         "audio": "Nur Audio",
@@ -446,7 +460,6 @@
         "legend": "Wirksam ab",
         "nowNote": "Sofort, sofern hier kein anderer Zeitpunkt gewählt wird. Ohne diesen Bereich zu öffnen, verhält sich das Zurücknehmen genau wie bisher.",
         "help": "Ein Zeitpunkt in der Vergangenheit ist eine Aussage über bereits vorhandene Aufnahmen. Ein Zeitpunkt in der Zukunft ist ein vorgemerktes Zurücknehmen: bis dahin wird weiter aufgenommen, danach endet es innerhalb von etwa fünf Sekunden.",
-        "zone": "Gilt als Ortszeit und wird als {offset} gegenüber UTC gesendet. Einen Zeitpunkt ohne Zeitzonenangabe weist Sturnus zurück.",
         "reset": "Zurück auf sofort",
         "unreadable": "Das ist kein Zeitpunkt, den diese Konsole lesen kann. Datum und Uhrzeit wählen oder zurück auf sofort.",
         "beforeGrant": "Diese Einwilligung wurde am {granted} erteilt. Ein Zurücknehmen kann nicht vor der Einwilligung wirken, die es zurücknimmt — diesen oder einen späteren Zeitpunkt wählen.",
@@ -459,6 +472,29 @@
         "fromNone": "Keine Aufnahme mit dieser Stimme fällt auf {when} oder danach.",
         "fromOne": "{count} Aufnahme mit dieser Stimme fällt auf {when} oder danach. Gelöscht wurde sie nicht.",
         "fromMany": "{count} Aufnahmen mit dieser Stimme fallen auf {when} oder danach. Gelöscht wurde keine davon."
+      },
+      "bulk": {
+        "action": "Einwilligung widerrufen",
+        "title": "Einwilligung von {count} Person widerrufen? | Einwilligung von {count} Personen widerrufen?",
+        "lead": "Betrifft genau diese Person und sonst niemanden: | Betrifft genau diese Personen und sonst niemanden:",
+        "roleStays": "Damit werden die von Sturnus gespeicherten Einwilligungseinträge widerrufen. Die Discord-Rolle für Einwilligung wird niemandem entzogen — die API hält bewusst kein Discord-Token und kann keine Rollen ändern. Die Aufzeichnung jeder dieser Personen endet trotzdem innerhalb von etwa fünf Sekunden, auch mitten in einer laufenden Sitzung, denn bei jedem Frame wird der gespeicherte Eintrag geprüft. Sollen auch die Rollen weg, dann in Discord entfernen.",
+        "recordingsKept": "Nichts bereits Aufgezeichnetes wird gelöscht. Jede Aufnahme, die deren Ton schon enthält, bleibt genau dort, wo sie ist; das Löschen ist ein eigener Schritt — /audio purge in Discord.",
+        "audit": "Das geht ins Audit-Log, eine Zeile je Person: das eigene Discord-Konto, wessen Einwilligung widerrufen wurde, und wann.",
+        "confirm": "Ja, diese Einwilligungen widerrufen",
+        "cancel": "Abbrechen",
+        "none": "Nichts ausgewählt, also gibt es nichts zu widerrufen.",
+        "tooMany": "Sturnus widerruft höchstens {max} Einwilligungen pro Anfrage, ausgewählt sind {count}. Diese Grenze entspricht genau einer Seite dieser Liste — also einen Teil der Auswahl aufheben und die Liste Seite für Seite abarbeiten.",
+        "effectiveLegend": "Wirksam ab, für alle oben genannten Personen",
+        "effectiveNote": "Jetzt, sofern hier kein anderer Zeitpunkt gewählt wird. Derselbe Zeitpunkt gilt für jede Person in diesem Widerruf.",
+        "working": "Wird widerrufen …",
+        "tally": "{count} der {requested} genannten Personen wurde widerrufen. | {count} der {requested} genannten Personen wurden widerrufen.",
+        "perPerson": "Was mit jeder einzelnen Person geschehen ist:",
+        "dismiss": "Ausblenden",
+        "outcomeWithdrawn": "Widerrufen.",
+        "outcomeAlready": "Bereits widerrufen — von jemand anderem oder in einem anderen Tab. Gerade hat sich nichts geändert, und es musste sich auch nichts ändern.",
+        "outcomeNoRecord": "Sturnus hat zu dieser Person überhaupt keinen Einwilligungseintrag, es gab also nichts zu widerrufen. Diese Person wird nicht aufgezeichnet.",
+        "outcomeBeforeGrant": "Abgelehnt: Der gewählte Zeitpunkt liegt vor der Einwilligung dieser Person, und ein Widerruf kann nicht vor der Einwilligung wirksam werden, die er widerruft.",
+        "outcomeRefused": "Abgelehnt, ohne dass Sturnus einen Grund genannt hat. Bei dieser Person hat sich nichts geändert."
       }
     },
     "settings": {

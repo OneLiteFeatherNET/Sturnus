@@ -436,6 +436,20 @@
       "errorStatus": "Sturnus answered {status} and could not produce this server's figures. Nothing is known about why."
     },
     "consents": {
+      "roster": {
+        "server": "Which server",
+        "list": "Consent roster",
+        "showing": "Showing {from}–{to} of {total}",
+        "showingOne": "Showing {from} of {total}",
+        "total": "{count} person has a consent record in this server. | {count} people have a consent record in this server.",
+        "inForce": "{count} of the {shown} on this page is in force right now. | {count} of the {shown} on this page are in force right now.",
+        "beyondEnd": "This page of the roster does not exist any more — the list has changed since this link was made. Nobody is missing; everybody is on an earlier page.",
+        "backToFirst": "Back to the first page",
+        "userId": "Discord user id",
+        "fromDirectory": "Name taken from this server's Discord directory; the consent record itself carries none.",
+        "unresolved": "No name anywhere: the consent record carries none, and this server's Discord directory has no entry for this id — so this row shows the bare Discord user id. Consent is given by a Discord command, and a name is only learned when somebody turns up in a session that was recorded.",
+        "unlisted": "No name on the consent record, and this server's Discord directory could not be read just now — so this row shows the bare Discord user id."
+      },
       "scope": {
         "label": "Scope",
         "audio": "Audio only",
@@ -446,7 +460,6 @@
         "legend": "Effective from",
         "nowNote": "Now, unless another moment is chosen here. Withdrawing without opening this behaves exactly as it always has.",
         "help": "A moment in the past is a statement about recordings that already exist. A moment in the future is a scheduled withdrawal: recording continues until then, and stops within about five seconds of it.",
-        "zone": "Read as your local time and sent as {offset} from UTC. Sturnus rejects a moment that carries no offset.",
         "reset": "Back to now",
         "unreadable": "That is not a moment this console can read. Pick a date and a time, or go back to now.",
         "beforeGrant": "This consent was granted {granted}. A withdrawal cannot take effect before the consent it withdraws — pick that moment or a later one.",
@@ -459,6 +472,29 @@
         "fromNone": "No recording containing their audio falls on or after {when}.",
         "fromOne": "{count} recording containing their audio falls on or after {when}. It was not deleted.",
         "fromMany": "{count} recordings containing their audio fall on or after {when}. None of them were deleted."
+      },
+      "bulk": {
+        "action": "Withdraw consent",
+        "title": "Withdraw consent for {count} person? | Withdraw consent for {count} people?",
+        "lead": "It applies to this person and to nobody else: | It applies to these people and to nobody else:",
+        "roleStays": "This withdraws the consent records Sturnus stores. It removes the Discord consent role from nobody — the API holds no Discord token, by design, and cannot change anybody's roles. Recording of each of them still stops within about five seconds, in the middle of a running session if there is one, because the stored record is what is checked on every frame. If the roles should go too, remove them in Discord.",
+        "recordingsKept": "Nothing already recorded is deleted. Every recording that already contains any of their audio stays exactly where it is; erasing one is a separate act — /audio purge in Discord.",
+        "audit": "This is written to the audit log, one line per person: your Discord account, whose consent you withdrew, and when.",
+        "confirm": "Yes, withdraw these consents",
+        "cancel": "Cancel",
+        "none": "Nothing is selected, so there is nothing to withdraw.",
+        "tooMany": "Sturnus withdraws at most {max} consents in one request, and {count} are selected. That bound is one page of this roster, so clear part of the selection and work through it a page at a time.",
+        "effectiveLegend": "Effective from, for everybody named above",
+        "effectiveNote": "Now, unless another moment is chosen here. The same moment applies to every person in this withdrawal.",
+        "working": "Withdrawing…",
+        "tally": "{count} of the {requested} named was withdrawn. | {count} of the {requested} named were withdrawn.",
+        "perPerson": "What happened to each of them:",
+        "dismiss": "Hide this",
+        "outcomeWithdrawn": "Withdrawn.",
+        "outcomeAlready": "Already withdrawn — by somebody else, or in another tab. Nothing changed just now, and nothing needed to.",
+        "outcomeNoRecord": "Sturnus holds no consent record for this person at all, so there was nothing to withdraw. They are not being recorded.",
+        "outcomeBeforeGrant": "Refused: the moment chosen falls before this person's consent was granted, and a withdrawal cannot take effect before the consent it withdraws.",
+        "outcomeRefused": "Refused, and Sturnus did not say why. Nothing of theirs was changed."
       }
     },
     "settings": {
