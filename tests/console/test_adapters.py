@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from sturnus.console.adapters import (
     ConsoleLinkDirectory,
+    ConsoleProfileDirectory,
     ConsoleStateStore,
     ConsoleTagWriter,
     ConsoleTrackDirectory,
@@ -139,6 +140,48 @@ async def test_the_most_recent_link_wins_when_an_account_is_relinked(
     await links.save(ANNA, "outline", ANNA_OUTLINE, "Anna")
     await links.save(BEN, "outline", ANNA_OUTLINE, "Anna")
     assert await ConsoleLinkDirectory(factory).discord_user_for("outline", ANNA_OUTLINE) == BEN
+
+
+# ---------------------------------------------------------------------------
+# The profile directory: the same row, read for the name instead of the id
+# ---------------------------------------------------------------------------
+
+
+async def test_a_linked_person_is_named_by_the_link_they_made(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await AccountLinkRepository(factory).save(ANNA, "outline", ANNA_OUTLINE, "Anna Example")
+    assert await ConsoleProfileDirectory(factory).display_name_for(ANNA) == "Anna Example"
+
+
+async def test_somebody_with_no_link_row_has_no_name(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A session outlives the link it was issued from -- somebody can run
+    `/unlink` with a cookie still in a tab. That is a name this endpoint
+    does not have, not an error.
+    """
+    assert await ConsoleProfileDirectory(factory).display_name_for(ANNA) is None
+
+
+async def test_a_link_with_another_provider_does_not_name_anybody(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`account_link` is keyed by provider and the console signs people
+    in through Outline. A name from a provider this console does not
+    authenticate against is a name for a different account entirely.
+    """
+    await AccountLinkRepository(factory).save(ANNA, "confluence", ANNA_OUTLINE, "Anna Example")
+    assert await ConsoleProfileDirectory(factory).display_name_for(ANNA) is None
+
+
+async def test_a_relink_renames_the_person_it_belongs_to(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    links = AccountLinkRepository(factory)
+    await links.save(ANNA, "outline", ANNA_OUTLINE, "Anna Example")
+    await links.save(ANNA, "outline", ANNA_OUTLINE, "Anna Rename")
+    assert await ConsoleProfileDirectory(factory).display_name_for(ANNA) == "Anna Rename"
 
 
 # ---------------------------------------------------------------------------

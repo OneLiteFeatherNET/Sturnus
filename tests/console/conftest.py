@@ -22,13 +22,19 @@ from sturnus.console.audio import AudioDelivery
 from sturnus.console.filters import SessionFilter
 from sturnus.console.ports import (
     AdminDirectory,
+    CollectionListing,
+    CollectionNames,
     ConsentDirectory,
     ConsentHolder,
+    GuildDirectory,
+    GuildNames,
     GuildQueue,
     GuildRecording,
     GuildReports,
     LinkDirectory,
     OAuthClient,
+    PreferenceDirectory,
+    ProfileDirectory,
     QueueControl,
     QueueOverview,
     QueueSnapshot,
@@ -42,6 +48,7 @@ from sturnus.console.ports import (
 )
 from sturnus.console.session import SessionCookie
 from sturnus.console.statistics import AttendedSession, SessionPage, TagUse
+from sturnus.domain import preferences
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
 
@@ -550,6 +557,95 @@ class FakeReports:
         return self.recording
 
 
+class FakeProfile:
+    """The name behind a Discord id, in memory.
+
+    Defaults to knowing the one person the other test modules sign in as,
+    because `/api/me` is answered on every page load and a double that
+    knew nobody would make every unrelated test assert against a null
+    name.
+    """
+
+    def __init__(self, names: dict[int, str] | None = None) -> None:
+        self.names = {ANNA: "Anna Example"} if names is None else dict(names)
+        #: Every Discord id this was asked about, in order. The route
+        #: tests assert on it: "the name came from the cookie and not
+        #: from anything the request could name" is not visible in a body.
+        self.asked: list[int] = []
+
+    async def display_name_for(self, discord_user_id: int) -> str | None:
+        self.asked.append(discord_user_id)
+        return self.names.get(discord_user_id)
+
+
+class FakePreferences:
+    """A preference store for tests that are not about preferences.
+
+    Deliberately does not validate. The refusals the preference endpoints
+    enforce are `PreferenceStore.set`'s, and a double that reimplemented
+    `sturnus.domain.preferences.is_allowed` would be a second copy of the
+    registry -- which is the drift the endpoints exist to avoid. The
+    preference routes are therefore tested against the real store on the
+    real database (`tests/console/test_me_routes.py`), exactly as the
+    settings routes are against the real `ConfigStore`.
+
+    This exists only so `build_test_api` can construct an application for
+    the other test modules. A test reaching for it to assert something
+    about a refusal is asking the wrong object.
+    """
+
+    def __init__(self, values: dict[int, dict[str, str]] | None = None) -> None:
+        self.values: dict[int, dict[str, str]] = values or {}
+
+    async def snapshot(self, discord_user_id: int) -> dict[str, str]:
+        return {**preferences.DEFAULTS, **self.values.get(discord_user_id, {})}
+
+    async def set(self, discord_user_id: int, key: str, value: str | None, now: datetime) -> None:
+        del now
+        held = self.values.setdefault(discord_user_id, {})
+        if value is None:
+            held.pop(key, None)
+        else:
+            held[key] = value
+
+
+class FakeNames:
+    """A guild directory nobody administers, until a test says otherwise.
+
+    Defaults to `None`, which is what the real directory answers for "no
+    such guild or not yours" -- so a test with no interest in names gets
+    404s rather than a fake that quietly authorises everything.
+    """
+
+    def __init__(self, directory: GuildDirectory | None = None) -> None:
+        self.directory = directory
+        #: Every guild this was asked about, with who asked. The route
+        #: tests assert on it: "the handler passed the signed-in id, not
+        #: one from the URL" cannot be seen in a response body.
+        self.asked: list[tuple[int, int]] = []
+
+    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildDirectory | None:
+        self.asked.append((guild_id, requested_by))
+        return self.directory
+
+
+class FakeCollections:
+    """An Outline mirror nobody may read, until a test says otherwise.
+
+    Defaults to `None`, which is what the real directory answers for
+    somebody who administers no guild at all.
+    """
+
+    def __init__(self, listing: CollectionListing | None = None) -> None:
+        self.listing = listing
+        #: Everybody who asked, in order.
+        self.asked: list[int] = []
+
+    async def mirrored(self, *, requested_by: int) -> CollectionListing | None:
+        self.asked.append(requested_by)
+        return self.listing
+
+
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
@@ -564,6 +660,10 @@ def build_test_api(
     queues: QueueOverview | None = None,
     consents: ConsentDirectory | None = None,
     reports: GuildReports | None = None,
+    profile: ProfileDirectory | None = None,
+    prefs: PreferenceDirectory | None = None,
+    names: GuildNames | None = None,
+    collections: CollectionNames | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -602,6 +702,10 @@ def build_test_api(
         tags=tags or FakeTags(),
         queues=queues or FakeQueueOverview(),
         reports=reports or FakeReports(),
+        profile=profile or FakeProfile(),
+        prefs=prefs or FakePreferences(),
+        names=names or FakeNames(),
+        collections=collections or FakeCollections(),
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,

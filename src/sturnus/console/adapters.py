@@ -19,7 +19,7 @@ own makes that unrepresentable rather than merely unlikely.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -28,11 +28,20 @@ from sqlalchemy import Row, delete, func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sturnus.application.collection_mirror import MirroredCollection
+from sturnus.application.directory_mirror import (
+    MirroredChannel,
+    MirroredMember,
+    MirroredRole,
+)
 from sturnus.application.linking import new_state
 from sturnus.application.publishing import DOCUMENTED_STATUS
+from sturnus.console.auth import PROVIDER
 from sturnus.console.ports import (
     AdminDirectory,
+    CollectionListing,
     ConsentHolder,
+    GuildDirectory,
     GuildQueue,
     GuildRecording,
     QueuedSession,
@@ -50,13 +59,17 @@ from sturnus.infrastructure.db.models import (
     AccountLink,
     Consent,
     ConsoleState,
+    GuildChannel,
+    GuildMember,
+    GuildRole,
+    OutlineCollection,
     SessionParticipant,
     SessionTag,
     TranscriptionJob,
 )
 from sturnus.infrastructure.db.models import Session as SessionRow
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS
-from sturnus.infrastructure.db.repositories import ConsentRepository
+from sturnus.infrastructure.db.repositories import AccountLinkRepository, ConsentRepository
 from sturnus.infrastructure.db.requeue import (
     ActiveSession,
     SessionView,
@@ -895,3 +908,194 @@ def _zone(name: str) -> tuple[tzinfo, str]:
         return ZoneInfo(name), name
     except (ZoneInfoNotFoundError, ValueError):
         return UTC, "UTC"
+
+
+class ConsoleProfileDirectory:
+    """The Outline display name behind a Discord id.
+
+    Built on `AccountLinkRepository` rather than on a query of its own.
+    That repository already reads `account_link` by Discord id and
+    provider -- it is what `/link status` answers from -- and the console
+    has no different question to ask of the row. A fourth `select` over
+    the same two columns would be a second place to remember that
+    `account_link` is keyed by provider.
+
+    The provider is fixed at construction, because there is exactly one
+    identity provider for the console and a caller that could name it
+    could name the wrong one.
+    """
+
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._links = AccountLinkRepository(session_factory, provider=PROVIDER)
+
+    async def display_name_for(self, discord_user_id: int) -> str | None:
+        """What to call this person, or `None` if nothing links them.
+
+        The name is what the person's Outline account is called, which is
+        what they saw on screen when they linked. It is never logged:
+        `display_name` is in `sturnus.observability.fields.DENIED_NAMES`,
+        and a name reaching a log line is a name in a log aggregator
+        nobody consented to being in.
+        """
+        found = await self._links.external_identity(discord_user_id)
+        return None if found is None else found[1]
+
+
+class ConsoleGuildNames:
+    """A guild's mirrored channels, roles and named people, for an administrator.
+
+    Three statements over the three mirrors, with the administrator check
+    where every other directory in this module puts it: inside the one
+    call, so a handler cannot serve a guild by forgetting to ask.
+
+    **Read here rather than through `DirectoryStore`.** That store is the
+    bot's writer and its readers exist to let a sweep compare; they order
+    rows the way Discord stores them and they do not carry `synced_at`.
+    What a console needs is the order a human scans in and the age of what
+    they are scanning, and bending the writer's readers to serve both
+    would give the sweep an ordering it has no use for.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        admins: AdminDirectory,
+    ) -> None:
+        self._session_factory = session_factory
+        self._admins = admins
+
+    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildDirectory | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+
+        async with self._session_factory() as db:
+            # Ordered in the statement and never afterwards. A handler
+            # that sorted the answer would be a second ordering to keep
+            # in step with this one, and the database is where the rows
+            # already are.
+            channels = (
+                await db.execute(
+                    select(
+                        GuildChannel.channel_id,
+                        GuildChannel.name,
+                        GuildChannel.kind,
+                        GuildChannel.position,
+                        GuildChannel.synced_at,
+                    )
+                    .where(GuildChannel.guild_id == guild_id)
+                    # Kind first: somebody looking for a voice channel is
+                    # not reading past the text ones. Then position,
+                    # which is the order in the other window. Then name,
+                    # and finally id, so two channels sharing a position
+                    # never swap places between two page loads.
+                    .order_by(
+                        GuildChannel.kind,
+                        GuildChannel.position,
+                        GuildChannel.name,
+                        GuildChannel.channel_id,
+                    )
+                )
+            ).all()
+            roles = (
+                await db.execute(
+                    select(
+                        GuildRole.role_id,
+                        GuildRole.name,
+                        GuildRole.position,
+                        GuildRole.synced_at,
+                    )
+                    .where(GuildRole.guild_id == guild_id)
+                    # Descending, which is Discord's own sense of
+                    # importance: the role at the top of the server
+                    # settings is the one an administrator means first.
+                    .order_by(GuildRole.position.desc(), GuildRole.name, GuildRole.role_id)
+                )
+            ).all()
+            members = (
+                await db.execute(
+                    select(
+                        GuildMember.discord_user_id,
+                        GuildMember.display_name,
+                        GuildMember.synced_at,
+                    )
+                    .where(GuildMember.guild_id == guild_id)
+                    # By name rather than by id: a person scanning this
+                    # list is reading names, and an id order is a shuffle
+                    # to everybody but the database.
+                    .order_by(GuildMember.display_name, GuildMember.discord_user_id)
+                )
+            ).all()
+
+        return GuildDirectory(
+            channels=tuple(
+                MirroredChannel(row.channel_id, row.name, row.kind, row.position)
+                for row in channels
+            ),
+            roles=tuple(MirroredRole(row.role_id, row.name, row.position) for row in roles),
+            members=tuple(MirroredMember(row.discord_user_id, row.display_name) for row in members),
+            # Read off all three lists rather than queried separately:
+            # the rows are already here, and a fourth statement to
+            # aggregate what three statements just returned is a round
+            # trip bought for nothing.
+            synced_at=_oldest(
+                [
+                    *(row.synced_at for row in channels),
+                    *(row.synced_at for row in roles),
+                    *(row.synced_at for row in members),
+                ]
+            ),
+        )
+
+
+class ConsoleCollectionNames:
+    """Outline's mirrored collections, for anybody who administers a guild.
+
+    The only authorisation question this can ask, because the mirror is
+    not per guild: one deployment talks to one Outline instance. Somebody
+    who administers nothing never configures a `document_target`, so they
+    get the same `None` a guild directory gives -- and the endpoint turns
+    it into the same 404.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        admins: AdminDirectory,
+    ) -> None:
+        self._session_factory = session_factory
+        self._admins = admins
+
+    async def mirrored(self, *, requested_by: int) -> CollectionListing | None:
+        if not await self._admins.is_admin_anywhere(requested_by):
+            return None
+
+        async with self._session_factory() as db:
+            rows = (
+                await db.execute(
+                    select(
+                        OutlineCollection.collection_id,
+                        OutlineCollection.name,
+                        OutlineCollection.synced_at,
+                    )
+                    # By name, which is what somebody choosing a
+                    # collection is reading and what Outline's own sidebar
+                    # is ordered by. Ties break on id so the same mirror
+                    # renders identically on every page load.
+                    .order_by(OutlineCollection.name, OutlineCollection.collection_id)
+                )
+            ).all()
+
+        return CollectionListing(
+            collections=tuple(MirroredCollection(row.collection_id, row.name) for row in rows),
+            synced_at=_oldest(row.synced_at for row in rows),
+        )
+
+
+def _oldest(moments: Iterable[datetime]) -> datetime | None:
+    """The stalest of several mirror timestamps, or `None` if there are none.
+
+    The oldest rather than the newest, deliberately: see `GuildDirectory`
+    on why a freshness claim is only as good as the stalest part of what
+    it describes.
+    """
+    return min(moments, default=None)
