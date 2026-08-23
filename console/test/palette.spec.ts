@@ -40,24 +40,59 @@ function contrast(a: string, b: string): number {
 }
 
 /**
- * The value a token has in one theme.
+ * The three blocks the role tokens are written in, by the selector that
+ * opens each.
  *
- * The light theme is the bare `:root` block and the dark theme is the one
- * inside the media query, which overrides it — so a token the dark block
- * does not mention keeps its light value, exactly as the cascade says.
+ * Since the console gained a theme chooser there is more than one way to be
+ * dark, and both have to be checked. `:root` is light. The media block is
+ * dark because the operating system is, and yields to somebody who asked
+ * for light. The attribute block is dark because somebody asked for it,
+ * under any operating system.
+ *
+ * `[data-theme="system"]` is deliberately absent: it means "let the media
+ * query decide", so it matches no rule and has no palette of its own.
  */
-function tokens(theme: 'light' | 'dark'): Record<string, string> {
-  const darkBlock = CSS.slice(CSS.indexOf('@media (prefers-color-scheme: dark)'))
-  const source = theme === 'light' ? CSS.slice(0, CSS.indexOf('@media')) : darkBlock
-  const found: Record<string, string> = theme === 'light' ? {} : { ...tokens('light') }
-  for (const [, name, value] of source.matchAll(/(--[a-z-]+):\s*(#[0-9a-f]{6});/gi)) {
+const FORMS = {
+  light: ':root {',
+  'dark by system': ':root:not([data-theme="light"]) {',
+  'dark by choice': ':root[data-theme="dark"] {',
+} as const
+
+type Form = keyof typeof FORMS
+
+/**
+ * The declarations one block makes, and only that block.
+ *
+ * Deliberately not "what a token resolves to": the point of parsing each
+ * block on its own is to be able to see that a token is missing from one of
+ * them, which is invisible the moment the cascade has filled it in.
+ */
+function declared(form: Form): Record<string, string> {
+  const anchor = FORMS[form]
+  const at = CSS.indexOf(anchor)
+  if (at < 0) throw new Error(`main.css has no \`${anchor}\` block`)
+  // None of these blocks nests, so the first closing brace ends it.
+  const body = CSS.slice(at + anchor.length, CSS.indexOf('}', at))
+  const found: Record<string, string> = {}
+  for (const [, name, value] of body.matchAll(/(--[a-z-]+):\s*(#[0-9a-f]{6});/gi)) {
     if (name && value) found[name] = value
   }
   return found
 }
 
+/**
+ * What a token actually resolves to in one form.
+ *
+ * Both dark forms sit on top of `:root`, so a token they do not mention
+ * keeps its light value — exactly as the cascade says, and exactly the way
+ * an unreadable control gets made.
+ */
+function tokens(form: Form): Record<string, string> {
+  return form === 'light' ? declared('light') : { ...declared('light'), ...declared(form) }
+}
+
 const SURFACES = ['--surface', '--surface-raised', '--surface-sunken']
-const THEMES = ['light', 'dark'] as const
+const THEMES = Object.keys(FORMS) as readonly Form[]
 
 /** The AA floor for text, and for anything the size of body copy. */
 const READABLE = 4.5
@@ -108,24 +143,66 @@ describe.each(THEMES)('the %s palette', (theme) => {
   })
 })
 
+/** Every token the console draws itself with, as opposed to the brand
+ *  colours in `@theme`, which are an identity rather than a role. */
+const ROLE_TOKENS = [
+  '--surface',
+  '--surface-raised',
+  '--surface-sunken',
+  '--border',
+  '--text',
+  '--text-muted',
+  '--action',
+  '--action-contrast',
+  '--danger',
+  '--danger-contrast',
+  '--positive',
+  '--positive-contrast',
+  '--control-border',
+]
+
 describe('the stylesheet', () => {
-  it('defines every role token in both themes', () => {
-    // A token defined only under `prefers-color-scheme: dark` renders as
-    // nothing at all in light mode — an invisible button rather than an
-    // unreadable one.
-    const light = tokens('light')
-    const dark = tokens('dark')
-    for (const role of [
-      '--action',
-      '--action-contrast',
-      '--danger',
-      '--danger-contrast',
-      '--positive',
-      '--positive-contrast',
-      '--control-border',
-    ]) {
-      expect(light[role], `${role} is missing from the light palette`).toBeDefined()
-      expect(dark[role], `${role} is missing from the dark palette`).toBeDefined()
+  it.each(THEMES)('defines every role token in the %s block itself', (form) => {
+    // A token defined in one form and not the others is the failure this
+    // whole file exists for. In its first shape it was a colour defined
+    // only under `prefers-color-scheme: dark`, which renders as nothing at
+    // all in light mode — an invisible button rather than an unreadable
+    // one. Since the theme chooser it has a second shape: a token updated
+    // in the media block and forgotten in the attribute block, so that
+    // choosing dark explicitly gives a *different* dark from the one the
+    // operating system gives.
+    const block = declared(form)
+    for (const role of ROLE_TOKENS) {
+      expect(block[role], `${role} is missing from the ${form} block`).toBeDefined()
+    }
+  })
+
+  it('gives the same dark to somebody who chose it as to somebody whose system did', () => {
+    // The two dark blocks are two copies of the same eleven values, which
+    // is a duplication somebody will eventually half-update. This is the
+    // half-update failing.
+    expect(declared('dark by choice')).toEqual(declared('dark by system'))
+  })
+
+  it('lets an explicit choice of dark outrank the system default', () => {
+    // `:root[data-theme="dark"]` and `:root:not([data-theme="light"])`
+    // have the same specificity, so which of them wins under a dark
+    // operating system is decided by source order alone. Moving the
+    // attribute block above the media query would leave a chosen dark that
+    // works everywhere except where it is redundant — and would be
+    // invisible to anybody testing on a dark machine.
+    expect(CSS.indexOf(FORMS['dark by choice'])).toBeGreaterThan(
+      CSS.indexOf(FORMS['dark by system']),
+    )
+  })
+
+  it('defines no colour only inside a media query', () => {
+    // A media query is a condition, not a definition. Anything whose only
+    // value is inside one is a value that does not exist for the readers
+    // the condition excludes.
+    const outsideMedia = CSS.slice(0, CSS.indexOf('@media'))
+    for (const role of ROLE_TOKENS) {
+      expect(outsideMedia, `${role} is only defined inside a media query`).toContain(`${role}:`)
     }
   })
 })

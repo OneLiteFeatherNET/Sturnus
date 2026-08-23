@@ -63,8 +63,28 @@
   --control-border: #7c8099;
 }
 
+/* The dark palette exists in two forms, and they are byte-for-byte the same
+   values on purpose.
+
+   The first is the system default: dark because the operating system is
+   dark. It yields to `[data-theme="light"]`, so somebody who explicitly
+   asked for light at midnight gets light. The second is an explicit choice
+   of dark, which has to win under a light system -- same specificity as the
+   first, so it is placed after it and the cascade does the rest.
+
+   Two copies of eleven values is a duplication somebody will eventually
+   half-update. That is what `test/palette.spec.ts` is for: it parses all
+   three blocks, fails when a token is defined in one form and not the
+   others, and fails when the two dark forms disagree. A theme switch that
+   produces an unreadable control is worse than no theme switch, and that
+   test is the only thing standing between the two.
+
+   There is no `:root[data-theme="light"]` block: light is what `:root`
+   already says, and the media query above yields to the attribute rather
+   than needing to be undone by it. `[data-theme="system"]` matches nothing
+   here at all, which is precisely what "let the media query decide" means. */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     --surface: #0b0b1f;
     --surface-raised: #14152e;
     --surface-sunken: #090917;
@@ -81,6 +101,26 @@
     --positive-contrast: #0b0b1f;
     --control-border: #63678f;
   }
+}
+
+/* An explicit choice of dark, honoured whatever the operating system says.
+   Outside a media query, and after it, so that it also wins where the
+   system is light. */
+:root[data-theme="dark"] {
+  --surface: #0b0b1f;
+  --surface-raised: #14152e;
+  --surface-sunken: #090917;
+  --border: #262845;
+  --text: #eceefa;
+  --text-muted: #9a9cba;
+
+  --action: #06c5e8;
+  --action-contrast: #0b0b1f;
+  --danger: #ff8a82;
+  --danger-contrast: #0b0b1f;
+  --positive: #1bc755;
+  --positive-contrast: #0b0b1f;
+  --control-border: #63678f;
 }
 
 body {

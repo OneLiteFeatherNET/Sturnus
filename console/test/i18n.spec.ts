@@ -62,6 +62,8 @@ const IDENTICAL_BY_RIGHT: Record<string, string> = {
   'common.brand': 'a product name, and not ours to translate',
   'error.status': '"Status" is the same word in German, and the rest is a number',
   'recordings.solo': 'the word every mixing desk prints on that button, in German too',
+  'settings.appearance.system':
+    'German calls the operating system "das System" too, and this label names it',
 }
 
 describe('the two locale files', () => {
