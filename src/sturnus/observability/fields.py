@@ -286,7 +286,7 @@ _PAYLOAD_NAMES: Final[frozenset[str]] = frozenset(
 #: over Sturnus's own field names can see -- is scrubbed on its way to the
 #: formatter. Applying the payload half there too would redact the word
 #: after every "text:" and "body:" an English sentence contains, which is
-#: how a control earns itself a `# noqa`.
+#: how a control earns itself a suppression.
 #:
 #: Derived, not restated: `DENIED_NAMES` below is the union, so the static
 #: rule in `tests/test_logging_discipline.py` still sees one list and the
