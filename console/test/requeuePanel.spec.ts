@@ -91,6 +91,25 @@ const BUSY = {
   ],
 }
 
+/** The same session once the redo has finished: nothing left to watch,
+ *  and a redo that may be asked for again. */
+const FINISHED = {
+  ...SNAPSHOT,
+  speakers: [
+    { discord_user_id: '2', display_name: 'Anna', status: 'done', attempts: 1, error: null },
+  ],
+}
+
+const ACCEPTED = { accepted: true, requeued: ['2'], skipped_erased: [], refusal: null }
+
+/** An API that answers the re-queue POST and the status read separately,
+ *  with whichever snapshot the test is up to. */
+function apiServing(snapshot: () => unknown) {
+  return vi.fn((_path: string, options?: { method?: string }) =>
+    Promise.resolve(options?.method === 'POST' ? ACCEPTED : snapshot()),
+  )
+}
+
 beforeEach(() => vi.useFakeTimers())
 afterEach(() => {
   vi.useRealTimers()
@@ -329,5 +348,93 @@ describe('when the live feed works', () => {
     await flushPromises()
 
     expect(api.mock.calls.length).toBeGreaterThan(afterMount)
+  })
+})
+
+describe('pressing "Transcribe again" a second time in one page visit', () => {
+  it('watches the second redo exactly as closely as the first', async () => {
+    // The failure this panel exists to prevent, committed by the panel
+    // itself. `rest` is the *ordinary* end of a stream -- the server says
+    // the queue has come to rest and hangs up -- and nothing then cleared
+    // the one slot the panel checks before opening a feed. So the second
+    // press found a finished handle sitting there, decided it was already
+    // watching, and opened neither a stream nor a timer: the speakers read
+    // `queued` until somebody refreshed the page by hand.
+    const sources = withEventSource()
+    let served: unknown = BUSY
+    const api = apiServing(() => served)
+    stubAutoImports(api as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+    expect(sources.opened).toHaveLength(1)
+
+    // The redo finishes. The last snapshot arrives on the stream, and the
+    // server hangs up with the terminal event that stops the browser
+    // reconnecting.
+    served = FINISHED
+    sources.opened[0]!.emit('message', JSON.stringify(FINISHED))
+    sources.opened[0]!.emit('rest', '{"reason":"at rest"}')
+    await flushPromises()
+    expect(sources.opened[0]!.closed).toBe(true)
+
+    // Press it again.
+    served = BUSY
+    await panel.find('button').trigger('click')
+    await flushPromises()
+
+    expect(sources.opened).toHaveLength(2)
+    expect(sources.opened[1]!.url).toBe('/api/sessions/1/queue/stream')
+
+    // And it is a feed this panel is actually listening to, rather than a
+    // socket it opened and forgot about.
+    sources.opened[1]!.emit(
+      'message',
+      JSON.stringify({
+        ...BUSY,
+        speakers: [
+          {
+            discord_user_id: '2',
+            display_name: 'Anna',
+            status: 'running',
+            attempts: 3,
+            error: null,
+          },
+        ],
+      }),
+    )
+    await flushPromises()
+
+    expect(panel.text()).toContain('3 attempts')
+    expect(panel.text()).toContain('watching live')
+  })
+
+  it('watches the second redo on the timer when that is all there is', async () => {
+    // The same defect on the fallback path, where it is easier to miss:
+    // the timer stops itself the moment there is nothing left to watch, so
+    // after a finished redo neither the stream slot nor the timer is doing
+    // anything -- and the slot still looked occupied.
+    withoutEventSource()
+    let served: unknown = BUSY
+    const api = apiServing(() => served)
+    stubAutoImports(api as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+
+    served = FINISHED
+    await vi.advanceTimersByTimeAsync(3000)
+    await flushPromises()
+
+    served = BUSY
+    await panel.find('button').trigger('click')
+    await flushPromises()
+    const afterPress = api.mock.calls.length
+
+    await vi.advanceTimersByTimeAsync(3000)
+    await flushPromises()
+
+    expect(api.mock.calls.length).toBeGreaterThan(afterPress)
+    expect(panel.text()).toContain('checking every few seconds')
   })
 })

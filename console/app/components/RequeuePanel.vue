@@ -53,6 +53,7 @@ import {
   type RequeueOutcome,
 } from '~/utils/recordings'
 import {
+  isQueueStreamFinished,
   openQueueStream,
   queueWatchWords,
   type QueueStreamHandle,
@@ -141,6 +142,28 @@ function stopWatching() {
 }
 
 /**
+ * Whether anything is currently keeping this panel current.
+ *
+ * Two things can be, and only one of them at a time: an open feed, or the
+ * timer such a feed fell back to. Asked as a question rather than read off
+ * `stream` because a handle that has finished — the queue rested, the
+ * session went, the feed handed over to the timer — is still sitting in
+ * that variable, and `if (stream) return` read it as "already watching".
+ * That was the double-press bug this panel exists to prevent, committed by
+ * the panel itself: press "Transcribe again", let the redo finish, press it
+ * again, and the second press found a rested handle in the slot, opened
+ * nothing, and left the speakers reading `queued` until a manual refresh.
+ */
+function watching(): boolean {
+  if (stream && !isQueueStreamFinished(stream.mode)) return true
+  // The fallback loop. It clears its own handle the moment there is
+  // nothing left to watch, so a null timer beside a `polling` stream means
+  // the last redo finished — and a fresh press deserves a fresh attempt at
+  // the live feed rather than inheriting the proxy verdict of an hour ago.
+  return timer !== null
+}
+
+/**
  * Opens the live feed while there is work in flight, and closes it when
  * there is not.
  *
@@ -159,7 +182,12 @@ function watchIfBusy() {
   // Already watching, including a feed that has fallen back to the timer.
   // Reopening one on every event it delivers would be worse than the
   // polling this replaces.
-  if (stream) return
+  if (watching()) return
+  // Whatever is left in the slot is finished, and finished is not the same
+  // as released: its `stop()` has never been called. Let it go before
+  // opening another rather than overwriting the variable and losing the
+  // only reference to it.
+  stopWatching()
 
   watchMode.value = 'connecting'
   stream = openQueueStream({

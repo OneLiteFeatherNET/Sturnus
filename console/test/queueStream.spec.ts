@@ -18,6 +18,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 
 import {
   describeQueueMode,
+  isQueueStreamFinished,
   openQueueStream,
   parseStreamPayload,
   shouldFallBack,
@@ -250,6 +251,55 @@ describe('deciding that the live feed has failed', () => {
     })
 
     expect(handle.mode).toBe('polling')
+  })
+})
+
+describe('whether a handle is still watching anything', () => {
+  // The question both callers ask before believing they are still being
+  // told when the queue moves. Each keeps one slot for a handle, and each
+  // used to guard with `if (stream) return` -- which reads a finished
+  // handle as a working one, and is the whole of the double-press bug in
+  // the Transcription panel and the un-revivable `gone` feed on the Queue
+  // page.
+  it('says a connecting or live handle is still watching', () => {
+    expect(isQueueStreamFinished('connecting')).toBe(false)
+    expect(isQueueStreamFinished('live')).toBe(false)
+  })
+
+  it('says every mode a stream never leaves is finished', () => {
+    // `polling` belongs here with the other three: the source behind it is
+    // closed and its listeners are dead. Something else -- the caller's
+    // timer -- is doing the watching, and a caller that reads this handle
+    // as "watching" is a caller that will never notice when that timer
+    // runs out.
+    for (const mode of ['rested', 'gone', 'polling', 'stopped'] as QueueStreamMode[]) {
+      expect(isQueueStreamFinished(mode)).toBe(true)
+    }
+  })
+
+  it('agrees with the mode a real handle ends up in', () => {
+    const { source, handle } = watch()
+    expect(isQueueStreamFinished(handle.mode)).toBe(false)
+
+    source.emit('rest', '{"reason":"at rest"}')
+
+    expect(isQueueStreamFinished(handle.mode)).toBe(true)
+  })
+})
+
+describe('a stream that has handed over to the timer', () => {
+  it('closes its source, so the server stops paying for a reader that left', async () => {
+    // The buffering proxy is the case that matters, and the case that
+    // makes this easy to get wrong: the fallback is announced from a timer
+    // rather than from an error, and a source left open there would keep
+    // this browser's ten-minute server-side stream reading the database
+    // for a page that had already gone back to polling.
+    const { source, handle } = watch({ firstEventMs: 8000 })
+
+    await vi.advanceTimersByTimeAsync(8000)
+
+    expect(handle.mode).toBe('polling')
+    expect(source.closed).toBe(true)
   })
 })
 

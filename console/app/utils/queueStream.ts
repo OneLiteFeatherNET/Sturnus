@@ -135,9 +135,37 @@ export interface QueueStreamHandle {
   /** Closes the source and stops for good. Safe to call more than once,
    *  and safe to call from inside a listener. */
   stop: () => void
-  /** The current mode. Exposed for the tests, which is the whole reason
-   *  this is a function and not fifteen lines in a component. */
+  /** The current mode, and the thing a caller asks before believing it is
+   *  still being watched -- see `isQueueStreamFinished`. */
   readonly mode: QueueStreamMode
+}
+
+/**
+ * Whether this handle will ever deliver another snapshot.
+ *
+ * **Read this before treating a handle as "already watching".** Four of
+ * the six modes are ones a stream never leaves: `rested` and `gone` are
+ * the server hanging up and meaning it, `polling` is the feed having
+ * handed over to a timer, and `stopped` is the caller having let go. A
+ * handle in any of them is a finished handle — the source behind it is
+ * closed and its listeners will never fire again — and it is only the
+ * *variable* holding it that still looks busy.
+ *
+ * That distinction was a bug in both callers rather than a nicety. Each
+ * kept one `stream` slot and guarded with `if (stream) return`, and
+ * nothing cleared the slot when a stream ended on its own. So the second
+ * press of "Transcribe again" in one page visit found a rested handle in
+ * the slot and opened nothing, and the Queue page's Refresh button could
+ * not revive a `gone` feed however often it was pressed: the figures
+ * updated once and then nothing watched them again.
+ *
+ * Written as the complement of the two modes that *are* still watching,
+ * so a mode added later is finished until somebody says otherwise — the
+ * failure that way round is one reconnection too many, and the other way
+ * round is a page that silently stops updating.
+ */
+export function isQueueStreamFinished(mode: QueueStreamMode): boolean {
+  return mode !== 'connecting' && mode !== 'live'
 }
 
 /* -------------------------------------------------------------------- */

@@ -70,6 +70,7 @@ import {
 } from '~/utils/queue'
 import {
   describeQueueMode,
+  isQueueStreamFinished,
   openQueueStream,
   type QueueStreamHandle,
   type QueueStreamMode,
@@ -233,6 +234,28 @@ function startWatching(guildId: string) {
   })
 }
 
+/**
+ * Whether this guild's figures are currently being kept current.
+ *
+ * Two things can be doing it, and only one at a time: an open feed, or the
+ * loop such a feed fell back to. Asked as a question rather than read off
+ * `stream` because a handle that has finished is still sitting in that
+ * variable with its source closed and its listeners dead — and
+ * `if (stream && watched === guildId) return` read it as "already
+ * watching". `rested` and `polling` were recovered by accident, because
+ * both drive `moving` or the loop, but **`gone` was not**: `moving` stayed
+ * true, the slot stayed occupied, and the page kept "This queue is no
+ * longer readable … Refresh the page" on screen for ever. Pressing Refresh
+ * updated the figures once and then left nothing watching them.
+ */
+function isWatching(guildId: string): boolean {
+  if (watched !== guildId) return false
+  if (stream && !isQueueStreamFinished(stream.mode)) return true
+  // `alive` and not merely `poll !== null`: a round that threw ends the
+  // loop for good, and a dead loop must not hold the slot either.
+  return poll?.alive === true
+}
+
 /** Watches while there is work in flight, and stops when there is not. */
 function syncWatcher() {
   // Never during a server render: a connection opened there would keep the
@@ -247,7 +270,7 @@ function syncWatcher() {
   // Already watching the right guild -- including a feed that has since
   // fallen back to polling, which must not be restarted on every event it
   // delivers.
-  if (stream && watched === guildId) return
+  if (isWatching(guildId)) return
   startWatching(guildId)
 }
 
