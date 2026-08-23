@@ -3,14 +3,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.domain import settings
 from sturnus.domain.measurements import JobMeasurements, RecordedAudio
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.models import Base, GuildConfig, Session, TranscriptionJob
-from sturnus.infrastructure.db.queue import JobQueue
+from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, JobQueue, claim_statement
 from sturnus.infrastructure.db.repositories import JobRepository, SessionRepository
 from sturnus.infrastructure.telemetry import JOB_OUTCOME, record
 
@@ -931,3 +931,138 @@ async def test_a_worker_that_lost_its_job_does_not_stamp_the_file_it_measured(
         assert stored is not None
         assert stored.sample_rate is None
         assert stored.stored_bytes is None
+
+
+# ---------------------------------------------------------------------------
+# `priority`: what an administrator said should run first
+#
+# The column and its index landed in migration 0013 with nothing reading
+# them. These are the tests that make the claim read them -- lower first,
+# ties still broken by id, and the plan still one forward scan of
+# `ix_job_claim_order` rather than a sort over the whole queue.
+# ---------------------------------------------------------------------------
+
+
+async def set_priority(
+    factory: async_sessionmaker[AsyncSession], session_id: int, priority: int
+) -> None:
+    """Puts one session's jobs at a priority, the way the console's write does."""
+    async with factory() as session:
+        await session.execute(
+            update(TranscriptionJob)
+            .where(TranscriptionJob.session_id == session_id)
+            .values(priority=priority)
+        )
+        await session.commit()
+
+
+async def test_a_raised_session_is_claimed_before_an_older_ordinary_one(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The whole point of the column, and the story it was asked for.
+
+    The retrospective was enqueued second, so oldest-first alone would put
+    it behind the recording nobody is waiting on. Lower first: the
+    ordinary session is held back to `1` and the retrospective, still at
+    the ordinary `0`, is claimed first.
+    """
+    ordinary = await seed(factory, [ANNA], guild=GUILD, channel=CHANNEL)
+    retrospective = await seed(factory, [BEN], guild=GUILD, channel=CHANNEL)
+    await set_priority(factory, ordinary, 1)
+    queue = JobQueue(factory)
+
+    claimed = [job for _ in range(2) if (job := await queue.claim()) is not None]
+
+    assert [job.session_id for job in claimed] == [retrospective, ordinary]
+
+
+async def test_a_session_held_back_runs_after_a_meeting_that_ended_later(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Holding one back is how going first is expressed; it must actually work.
+
+    The held-back session's jobs are the *oldest* in the queue, which is
+    the case a claim that merely ordered by id would get wrong.
+    """
+    held_back = await seed(factory, [ANNA, BEN], guild=GUILD, channel=CHANNEL)
+    await set_priority(factory, held_back, 2)
+    later = await seed(factory, [CARLA], guild=OTHER_GUILD, channel=OTHER_CHANNEL)
+    queue = JobQueue(factory)
+
+    claimed = [job for _ in range(3) if (job := await queue.claim()) is not None]
+
+    assert [job.session_id for job in claimed] == [later, held_back, held_back]
+
+
+async def test_two_sessions_at_the_same_priority_still_run_oldest_first(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """First-in-first-out within a priority, which the index gives for free."""
+    first = await seed(factory, [ANNA], guild=GUILD, channel=CHANNEL)
+    second = await seed(factory, [BEN], guild=GUILD, channel=CHANNEL)
+    await set_priority(factory, first, 5)
+    await set_priority(factory, second, 5)
+    queue = JobQueue(factory)
+
+    claimed = [job for _ in range(2) if (job := await queue.claim()) is not None]
+
+    assert [job.session_id for job in claimed] == [first, second]
+
+
+async def test_no_index_this_schema_has_can_order_a_claim_by_priority(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The plan, asked rather than assumed -- and it is not the one 0013 said.
+
+    Migration 0013 added `ix_job_claim_order (status, priority, id)` and
+    said `ORDER BY priority, id` would be one forward scan of it. It is
+    not: `status` leads that index and a claim matches two values of it,
+    so the scan yields two ordered runs and PostgreSQL sorts them. The
+    ordering is correct and costs exactly what ordering by `id` alone
+    already cost; the index is simply not earning it.
+
+    Sequential *and* bitmap scans are switched off here, which leaves the
+    ordered index scan as the only plan available -- so a `Sort` under
+    those conditions is not the planner preferring something on a
+    twelve-row table, it is the planner having no way to avoid one.
+
+    The assertion is deliberately about the sort and not about which index
+    is chosen. With a handful of rows and a predicate on `status` alone,
+    `ix_job_status` and `ix_job_claim_order` are equally good and the
+    cheaper one wins by size; that choice is noise and a test asserting it
+    would fail on the next row inserted. The sort is not noise.
+
+    **This test fails the day somebody adds the partial index
+    `claim_statement` recommends, and that is the point.** Read that
+    docstring before changing anything here: ordering by `status` first
+    would also make it pass, and would silently restore Defect 4.
+    """
+    await seed(factory, [ANNA, BEN], guild=GUILD, channel=CHANNEL)
+    await seed(factory, [CARLA], guild=OTHER_GUILD, channel=OTHER_CHANNEL)
+
+    plan = await explain_a_claim(factory)
+
+    assert "Sort Key: transcription_job.priority, transcription_job.id" in plan, plan
+
+
+async def explain_a_claim(factory: async_sessionmaker[AsyncSession]) -> str:
+    """PostgreSQL's plan for the statement `claim` runs, as text.
+
+    The statement comes from `JobQueue` itself rather than being rewritten
+    here, because a plan for a hand-copied query would settle something
+    about the copy.
+    """
+    statement = claim_statement(T0 - timedelta(seconds=DEFAULT_LEASE_SECONDS))
+    async with factory() as session:
+        connection = await session.connection()
+        # Compiled against the dialect that will run it, with the values
+        # written in: `EXPLAIN` takes a statement, not a statement and a
+        # bag of parameters, and a plan for the wrong dialect's rendering
+        # of `FOR UPDATE SKIP LOCKED` would be a plan for another query.
+        compiled = statement.compile(
+            dialect=connection.dialect, compile_kwargs={"literal_binds": True}
+        )
+        await session.execute(text("SET LOCAL enable_seqscan = off"))
+        await session.execute(text("SET LOCAL enable_bitmapscan = off"))
+        rows = await session.execute(text(f"EXPLAIN {compiled}"))
+        return "\n".join(str(row[0]) for row in rows)

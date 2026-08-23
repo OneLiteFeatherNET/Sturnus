@@ -463,16 +463,28 @@ class TranscriptionJob(Base):
     #: an order, and writes what that order implies.
     #:
     #: Lower-first is not arbitrary. The claim reads
-    #: `ORDER BY priority, id`, and mixed directions cannot be served by
-    #: one btree scan: `priority DESC, id ASC` would need an index with a
-    #: descending column, where `priority ASC, id ASC` is a plain forward
-    #: scan of `ix_job_claim_order` that also keeps first-in-first-out
-    #: within a priority for free.
+    #: `ORDER BY priority, id`, both ascending, and mixed directions could
+    #: never be served by a plain btree at all: `priority DESC, id ASC`
+    #: would need an index with a descending column. `priority ASC, id
+    #: ASC` also keeps first-in-first-out within a priority for free.
     #:
-    #: Nothing reads it yet -- `JobQueue.claim` is unchanged in the
-    #: migration that adds this. The column and its index land first so
-    #: that the branch which adds the ordering adds a query and not a
-    #: schema.
+    #: **The claim does not, however, get that ordering out of
+    #: `ix_job_claim_order`, whatever the migration that added it says.**
+    #: `status` leads that index and a claim matches two values of it, so
+    #: PostgreSQL sorts. Measured, not assumed --
+    #: `sturnus.infrastructure.db.queue.claim_statement` has the plan, the
+    #: partial index that would fix it, and why the cheaper-looking fix
+    #: must not be used.
+    #:
+    #: One number is written to every outstanding job of a session at
+    #: once, and only by `sturnus.infrastructure.db.priority` -- the unit
+    #: an administrator reorders is a meeting, never a speaker. The
+    #: console never shows the number; it shows an order, and the server
+    #: writes what that order implies
+    #: (`sturnus.application.priorities`). It only ever raises one, so
+    #: nothing reachable from the console can move a guild's work ahead of
+    #: another guild's ordinary run; a negative number is an operator's to
+    #: write by hand.
     priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     #: What the recording is, as its own RIFF header declares it.
@@ -513,10 +525,11 @@ class TranscriptionJob(Base):
         UniqueConstraint("session_id", "discord_user_id", name="uq_job_per_speaker"),
         Index("ix_job_status", "status"),
         Index("ix_job_retention", "retention_until"),
-        # The claim's order, in the claim's order: status narrows to the
-        # pending jobs, priority orders them, and id breaks ties by age.
-        # All ascending, which is what keeps it one forward index scan --
-        # see `priority`.
+        # Narrows a claim to the outstanding jobs, which is what keeps a
+        # poll off this table's history -- it keeps every job the
+        # deployment has ever run. It does *not* supply the claim's
+        # ordering, despite its name and despite what the migration that
+        # added it says: see `priority` above and `claim_statement`.
         Index("ix_job_claim_order", "status", "priority", "id"),
     )
 

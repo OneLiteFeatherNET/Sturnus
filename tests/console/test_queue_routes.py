@@ -275,6 +275,7 @@ def queued(**over: object) -> QueuedSession:
         "running": 1,
         "done": 0,
         "dead": 0,
+        "priority": 0,
     }
     base.update(over)
     return QueuedSession(**base)  # type: ignore[arg-type]
@@ -313,6 +314,37 @@ async def test_an_administrator_sees_what_their_guild_still_owes(
     body = await response.json()
     assert body["counts"] == {"pending": 2, "running": 1, "done": 40, "dead": 1}
     assert body["sessions"][0]["counts"]["pending"] == 2
+
+
+async def test_the_overview_says_where_each_session_sits_in_the_queue(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The number an administrator just wrote has to come back, or the page
+    cannot render the order it set."""
+    overview = FakeQueueOverview(queue=guild_queue(sessions=(queued(priority=2),)))
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    body = await (await client.get(guild_url())).json()
+
+    assert body["sessions"][0]["priority"] == 2
+
+
+async def test_a_session_with_nothing_queued_has_no_place_rather_than_the_ordinary_one(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Null, not zero, and the difference is what a page acts on.
+
+    Zero is the ordinary priority and a real place in the queue. A meeting
+    that is still recording has no jobs at all, so it has no place -- and
+    a row reported as `0` would be a row offering a drag handle that
+    nothing can be reordered about.
+    """
+    overview = FakeQueueOverview(queue=guild_queue(sessions=(queued(priority=None),)))
+    client = await signed_in(aiohttp_client, build_test_api(queues=overview))
+
+    body = await (await client.get(guild_url())).json()
+
+    assert body["sessions"][0]["priority"] is None
 
 
 async def test_the_overview_asks_on_behalf_of_the_signed_in_person(

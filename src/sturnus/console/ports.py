@@ -26,6 +26,7 @@ from sturnus.application.directory_mirror import (
     MirroredMember,
     MirroredRole,
 )
+from sturnus.application.priorities import Placement
 from sturnus.console.filters import SessionFilter
 from sturnus.console.reporting import RecordedSession
 from sturnus.console.statistics import (
@@ -728,6 +729,10 @@ class QueueControl(Protocol):
         self, session_id: int, *, requested_by: int, model: str
     ) -> RequeueOutcome | None: ...
 
+    async def place(
+        self, session_id: int, *, requested_by: int, placement: Placement
+    ) -> QueueOrder | None: ...
+
 
 @dataclass(frozen=True)
 class ConsentHolder:
@@ -1007,6 +1012,47 @@ class QueuedSession:
     running: int
     done: int
     dead: int
+    #: Where this session sits in its guild's queue, lower first, or
+    #: `None` when it has no outstanding jobs to sit anywhere. Zero is the
+    #: ordinary priority and a real place; `None` is a meeting that is
+    #: still recording, or one that is only still listed because a job of
+    #: it died. The distinction is what tells a page which rows can be
+    #: dragged.
+    priority: int | None
+
+
+@dataclass(frozen=True)
+class QueuePosition:
+    """One session's place in its guild's queue, after a reorder."""
+
+    session_id: int
+    priority: int
+
+
+@dataclass(frozen=True)
+class QueueOrder:
+    """A guild's queue order, and what a reorder did to it.
+
+    `sessions` is the whole outstanding queue in claim order, always --
+    on a refusal as much as on a success. A drag is aimed at a list the
+    browser was showing, and the two ways it fails (the session finished,
+    the session it was dropped beside finished) are both "your list is out
+    of date": sending the current one back with the refusal is what lets a
+    page redraw instead of asking again and failing again.
+
+    `changed` names the sessions whose priority was written, and is empty
+    when the order asked for was the order that already held. It is not
+    derivable from `sessions`, and it is the difference between "done" and
+    "there was nothing to do" -- which an administrator who dragged
+    something two pixels deserves to be told apart.
+    """
+
+    accepted: bool
+    #: Why it was refused, in one sentence, or `None`. A fixed string, so
+    #: a console can key off it without any input being echoed back.
+    refusal: str | None
+    sessions: tuple[QueuePosition, ...]
+    changed: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -1063,6 +1109,10 @@ class QueueOverview(Protocol):
     """
 
     async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildQueue | None: ...
+
+    async def reprioritise(
+        self, guild_id: int, *, requested_by: int, rule: str
+    ) -> QueueOrder | None: ...
 
 
 @dataclass(frozen=True)

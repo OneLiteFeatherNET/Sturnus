@@ -192,6 +192,18 @@ class Event(StrEnum):
     #: not in a state a redo is safe from. INFO: this is the feature
     #: working, not failing.
     CONSOLE_REQUEUE_REFUSED = "console.requeue_refused"
+    #: An administrator changed the order a guild's transcription work
+    #: will be done in -- a session dragged, or a quick action applied to
+    #: the whole queue. **WARNING for the same reason
+    #: `CONSOLE_REQUEUE_APPLIED` is:** the effect is felt by everybody
+    #: waiting on a protocol from that guild, and this line is the only
+    #: record of who asked. Emitted only when something was actually
+    #: written; a reorder that changed nothing is not an event.
+    CONSOLE_QUEUE_REORDERED = "console.queue_reordered"
+    #: A reorder that was asked for and refused, because the session it
+    #: named -- or the one it was dropped beside -- had left the queue
+    #: since the page was drawn. INFO: this is the feature working.
+    CONSOLE_QUEUE_REORDER_REFUSED = "console.queue_reorder_refused"
     #: A stored recording that this reader cannot make sense of. **A human
     #: must act:** the object is there, the person is entitled to it, and
     #: it will not decrypt -- which is either a truncated upload or a

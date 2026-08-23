@@ -161,6 +161,12 @@ _LITERALS = frozenset(
         #: one clicking "withdraw" both leave a perfectly ordinary date
         #: in the column, and only this field says which act it was.
         "effective_at_given",
+        #: Which quick action reordered a guild's queue -- one of the
+        #: names in `sturnus.application.priorities.KNOWN_RULES`, checked
+        #: against that registry before anything logs it, and `None` for a
+        #: drag, which names no rule. Fixed literals of this repository's
+        #: own source, the same standard `model` is held to.
+        "rule",
         #: A key of `sturnus.domain.settings` -- one of the literals in
         #: `KNOWN_KEYS`, from this repository's own source, and checked
         #: against the registry before anything logs it. The *value* is
@@ -198,6 +204,11 @@ _MEASUREMENTS = frozenset(
         "speakers",
         "skipped",
         "participants",
+        #: How many sessions a reorder actually moved. A count of rows
+        #: written, never which ones -- the ids are in the response the
+        #: administrator got, and a log line naming which meetings a guild
+        #: has outstanding is a log line about a guild's calendar.
+        "sessions",
         "blocks",
         "packets",
         "segments",

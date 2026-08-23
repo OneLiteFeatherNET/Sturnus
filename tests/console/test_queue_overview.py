@@ -18,6 +18,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.console.adapters import ConsoleQueueOverview
@@ -441,3 +442,126 @@ async def test_a_guild_with_nothing_outstanding_returns_an_empty_list(
 
     assert sessions == []
     assert truncated is False
+
+
+# ---------------------------------------------------------------------------
+# What runs first
+# ---------------------------------------------------------------------------
+
+
+async def test_a_session_reports_where_it_sits_in_the_queue(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    session_id = await a_session(factory, jobs={BEN: "pending"})
+    await hold_back(factory, session_id, 3)
+
+    queue = await overview(factory).for_guild(GUILD, requested_by=ANNA)
+
+    assert queue is not None
+    assert queue.sessions[0].priority == 3
+
+
+async def test_a_session_nobody_has_reordered_sits_at_the_ordinary_priority(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await a_session(factory, jobs={BEN: "pending"})
+
+    queue = await overview(factory).for_guild(GUILD, requested_by=ANNA)
+
+    assert queue is not None
+    assert queue.sessions[0].priority == 0
+
+
+async def test_a_recording_in_progress_has_no_place_in_the_queue_at_all(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Null, not zero -- there is nothing queued for it to have a place with.
+
+    Zero is the ordinary priority and a real position. Reporting it here
+    would put a drag handle on a row that nothing can be reordered about.
+    """
+    await a_session(factory, status="open", jobs={})
+
+    queue = await overview(factory).for_guild(GUILD, requested_by=ANNA)
+
+    assert queue is not None
+    assert queue.sessions[0].priority is None
+
+
+async def test_a_session_listed_only_for_a_dead_job_has_no_place_either(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Every job terminal means nothing will ever be claimed for it again."""
+    await a_session(factory, status="documented", document_url="u", jobs={BEN: "dead"})
+
+    queue = await overview(factory).for_guild(GUILD, requested_by=ANNA)
+
+    assert queue is not None
+    assert queue.sessions[0].priority is None
+
+
+async def test_a_place_is_read_from_the_outstanding_jobs_and_not_the_finished_ones(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A finished job's number describes a queue it has already left."""
+    session_id = await a_session(factory, jobs={ANNA: "done", BEN: "pending"})
+    await hold_back(factory, session_id, 7, status="done")
+
+    queue = await overview(factory).for_guild(GUILD, requested_by=ANNA)
+
+    assert queue is not None
+    assert queue.sessions[0].priority == 0
+
+
+# ---------------------------------------------------------------------------
+# Reordering a guild's queue by a rule
+# ---------------------------------------------------------------------------
+
+
+async def test_an_administrator_can_put_the_biggest_meetings_first(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    small = await a_session(factory, jobs={BEN: "pending"})
+    large = await a_session(factory, jobs={ANNA: "pending", BEN: "pending", CARL: "pending"})
+
+    order = await overview(factory).reprioritise(
+        GUILD, requested_by=ANNA, rule="many-participants-first"
+    )
+
+    assert order is not None
+    assert order.accepted is True
+    assert [position.session_id for position in order.sessions] == [large, small]
+    assert order.changed == (small,)
+
+
+async def test_somebody_who_does_not_administer_the_guild_cannot_reorder_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`None` for "no such guild" and "not yours" alike, as everywhere else."""
+    session_id = await a_session(factory, jobs={BEN: "pending"})
+
+    order = await overview(factory).reprioritise(
+        GUILD, requested_by=BEN, rule="many-participants-first"
+    )
+
+    assert order is None
+    async with factory() as db:
+        rows = await db.execute(
+            select(TranscriptionJob.priority).where(TranscriptionJob.session_id == session_id)
+        )
+        assert [row.priority for row in rows] == [0]
+
+
+async def hold_back(
+    factory: async_sessionmaker[AsyncSession],
+    session_id: int,
+    priority: int,
+    status: str | None = None,
+) -> None:
+    """Puts a session's jobs at a priority, as a reorder does."""
+    async with factory() as db:
+        statement = update(TranscriptionJob).where(TranscriptionJob.session_id == session_id)
+        if status is not None:
+            statement = statement.where(TranscriptionJob.status == status)
+        await db.execute(statement.values(priority=priority))
+        await db.commit()
