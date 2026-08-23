@@ -18,6 +18,7 @@
  * "nothing will happen until somebody restarts the deployment" says so.
  */
 import type { KeyValueStore } from '~/utils/preferences'
+import type { UiOption } from '~/utils/uiOption'
 
 /** Read at each use. Storing it is applying it. */
 export const TAKES_EFFECT_IMMEDIATELY = 'immediately'
@@ -159,6 +160,23 @@ export function guildLabel(guild: GuildRef): string {
   return guild.name ?? `Server ${guild.id}`
 }
 
+/**
+ * The guilds as rows of a dropdown.
+ *
+ * The id goes in `detail` — the subtext line the control was built for —
+ * and only where there is a name above it to disambiguate. A guild the API
+ * sent no name for is already labelled `Server 100000000000000001` by
+ * `guildLabel`, and repeating the snowflake underneath it would render the
+ * same eighteen digits twice in two type sizes.
+ */
+export function guildOptions(guilds: readonly GuildRef[]): UiOption[] {
+  return guilds.map((guild) => ({
+    value: guild.id,
+    label: guildLabel(guild),
+    ...(guild.name === null ? {} : { detail: guild.id }),
+  }))
+}
+
 /* -------------------------------------------------------------------- */
 /* When a change actually lands                                          */
 /* -------------------------------------------------------------------- */
@@ -232,29 +250,44 @@ export function effectBadge(view: SettingView): EffectBadge {
   return effectFacts(view)
 }
 
-/** The sentence shown after a write succeeded. Never merely "Saved". */
+/**
+ * The sentence shown after a write succeeded. Never merely "Saved".
+ *
+ * **It names the key.** Every one of these panels used to read
+ * "Saved, and in effect now." and there is one per key on a page that has
+ * twenty of them; grouped onto tabs there can be two open panels a screen
+ * apart, one of them left over from the key somebody wrote a minute ago. A sentence that
+ * does not say which key it is about is a sentence that can be read against
+ * the wrong one — and the reading that costs something is the cheerful
+ * `live` sentence being taken for the `restart` key underneath it.
+ *
+ * The key is named the way the heading above it names it, rather than as
+ * the raw key: the two sit within a few centimetres of each other and a
+ * reader should not have to notice they are the same word twice.
+ */
 export function writeOutcome(view: SettingView, action: 'saved' | 'cleared'): WriteOutcome {
   const facts = effectFacts(view)
   const verb = action === 'saved' ? 'Saved' : 'Cleared'
+  const name = keyLabel(view.key)
   switch (facts.tone) {
     case 'live':
-      return { tone: 'live', headline: `${verb}, and in effect now.`, detail: facts.detail }
+      return { tone: 'live', headline: `${verb}: ${name} is in effect now.`, detail: facts.detail }
     case 'soon':
       return {
         tone: 'soon',
-        headline: `${verb}. In effect within about ten seconds.`,
+        headline: `${verb}: ${name} is in effect within about ten seconds.`,
         detail: facts.detail,
       }
     case 'restart':
       return {
         tone: 'restart',
-        headline: `${verb}, but not in force.`,
+        headline: `${verb}, but ${name} is not in force.`,
         detail: facts.detail,
       }
     default:
       return {
         tone: 'unknown',
-        headline: `${verb}. When it is picked up is not known.`,
+        headline: `${verb}: when ${name} is picked up is not known.`,
         detail: facts.detail,
       }
   }

@@ -484,7 +484,17 @@
       "choose": "Choose one",
       "notSet": "Not set",
       "noChannelsChosen": "No channel chosen. Sturnus records nothing in this server until at least one is.",
-      "chosenIds": "Stored as"
+      "chosenIds": "Stored as",
+      "editingServer": "Editing which server",
+      "groupTabs": "Settings, grouped by what they are for",
+      "groupRecording": "Recording",
+      "groupConsent": "Consent and data",
+      "groupTranscription": "Transcription",
+      "groupPublishing": "Publishing",
+      "groupAdministration": "Administration",
+      "groupOther": "Everything else",
+      "groupNeedsAttention": "{group} · {count} to set | {group} · {count} to set",
+      "groupOtherNote": "These keys are in none of the groups above: they reached the API after those groups were written, and this page would rather show a key it cannot file than quietly leave it out. Nothing else about them is different — each is set, cleared and takes effect exactly as every other key here does."
     }
   },
   "ui": {

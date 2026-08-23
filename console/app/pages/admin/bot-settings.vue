@@ -26,7 +26,19 @@
  * served fall back to the text input this page has always had, with one
  * sentence saying why. A configuration page that cannot be used because a
  * name list is down would be worse than one that asks for ids.
+ *
+ * The keys are on tabs, one tab per subject — `~/utils/settingGroups` owns
+ * which key is about what, and owns the two rules that matter more than the
+ * grouping: an unfiled key still appears somewhere, and an empty group is
+ * not a tab. The per-key machinery underneath is unchanged; a tab decides
+ * which articles are on screen and nothing else.
+ *
+ * **The guild switcher stays above the tabs**, because it scopes the whole
+ * page. Everything below it belongs to one server, and a control that
+ * changes all of it must not look like part of one group.
  */
+import UiSelect from '~/components/ui/UiSelect.vue'
+import UiTabs from '~/components/ui/UiTabs.vue'
 import {
   type Choice,
   addToIdList,
@@ -43,6 +55,7 @@ import {
   type Freshness,
   type NamedRow,
 } from '~/utils/directory'
+import { UNFILED, groupSettings, groupTabLabel } from '~/utils/settingGroups'
 import {
   type SettingView,
   type WriteOutcome,
@@ -53,6 +66,7 @@ import {
   effectBadge,
   fieldHints,
   guildLabel,
+  guildOptions,
   inputKind,
   keyLabel,
   missingRequired,
@@ -64,10 +78,12 @@ import {
   writeOutcome,
   writeSelectedGuild,
 } from '~/utils/settings'
+import type { UiTab } from '~/utils/uiTabs'
 
 useHead({ title: 'Bot Settings' })
 
 const api = useApi()
+const say = useSay()
 
 const { data: guildData, error: guildError } = await useAsyncData('settings-guilds', async () =>
   parseGuilds(await api('/guilds')),
@@ -90,6 +106,16 @@ function selectGuild(guildId: string) {
   selected.value = guildId
   if (import.meta.client) writeSelectedGuild(window.localStorage, guildId)
 }
+
+/** The dropdown can in principle emit `null` — its model is nullable, so
+ *  that a page resetting a filter has a way to say so. This page has no such
+ *  state: there is always a guild being edited, and clearing the selection
+ *  would leave the panels below belonging to nothing. */
+function chooseGuildFromMenu(guildId: string | null) {
+  if (guildId !== null) selectGuild(guildId)
+}
+
+const guildChoices = computed(() => guildOptions(guilds.value))
 
 // The guild the rows belong to travels *with* the rows rather than in a
 // ref of its own. A ref set inside the fetcher would be null after
@@ -123,6 +149,25 @@ const views = computed(() =>
 )
 const missing = computed(() => missingRequired(views.value))
 const currentGuild = computed(() => guilds.value.find((guild) => guild.id === selected.value) ?? null)
+
+/* -------------------------------------------------------------------- */
+/* The tabs                                                              */
+/* -------------------------------------------------------------------- */
+
+const groups = computed(() => groupSettings(views.value))
+
+/**
+ * The tab strip.
+ *
+ * The label carries the count of required-and-unset keys behind the tab,
+ * because that is the one thing grouping could have made worse: in a flat
+ * column a key holding the whole guild back was at least on the screen, and
+ * behind a tab it is behind a tab. `groupTabLabel` decides the sentence;
+ * this only turns it into the reader's language.
+ */
+const groupTabs = computed<UiTab[]>(() =>
+  groups.value.map((group) => ({ id: group.id, label: say(groupTabLabel(group)) })),
+)
 
 /* -------------------------------------------------------------------- */
 /* The names behind the ids                                              */
@@ -430,40 +475,42 @@ const TONE_COLOUR: Record<string, string> = {
       >
         <!-- With more than one guild the switcher is the only thing
              standing between an administrator and editing the wrong
-             server, so the current one is named here and repeated in
-             every panel heading below. -->
-        <label
-          v-if="guilds.length > 1"
-          class="mb-2 block text-xs font-medium uppercase tracking-wide"
-          :style="{ color: 'var(--text-muted)' }"
-          for="guild-switcher"
-        >
-          Editing which server
-        </label>
-        <select
-          v-if="guilds.length > 1"
-          id="guild-switcher"
-          class="w-full rounded-lg border px-3 py-2 text-sm"
-          :style="{
-            borderColor: 'var(--border)',
-            background: 'var(--surface-raised)',
-            color: 'var(--text)',
-          }"
-          :value="selected"
-          @change="selectGuild(($event.target as HTMLSelectElement).value)"
-        >
-          <option v-for="guild in guilds" :key="guild.id" :value="guild.id">
-            {{ guildLabel(guild) }}
-          </option>
-        </select>
-        <p v-else class="text-sm">
-          <span :style="{ color: 'var(--text-muted)' }">Editing</span>
-          <span class="ml-1 font-medium">{{ currentGuild ? guildLabel(currentGuild) : '—' }}</span>
-        </p>
-        <p v-if="currentGuild" class="mt-2 text-xs" :style="{ color: 'var(--text-muted)' }">
-          Guild ID
-          <code class="rounded bg-[var(--surface-raised)] px-1 font-mono">{{ currentGuild.id }}</code>
-        </p>
+             server. It sits above the tabs and outside them: it scopes
+             every panel below rather than belonging to one of them. -->
+        <template v-if="guilds.length > 1">
+          <!-- A caption rather than a `<label for>`: the control is a
+               button wearing `role="combobox"`, and it carries its own
+               accessible name below. Two names for one control is how a
+               screen reader ends up reading the caption twice. -->
+          <p
+            class="mb-2 text-xs font-medium uppercase tracking-wide"
+            :style="{ color: 'var(--text-muted)' }"
+          >
+            {{ $t('admin.settings.editingServer') }}
+          </p>
+          <!-- The guild id rides along as each row's subtext, which is
+               what `detail` is for. That is also why the id is not
+               repeated in a paragraph underneath here -- it is on screen
+               already, under the name it belongs to. -->
+          <UiSelect
+            :model-value="selected"
+            :options="guildChoices"
+            :label="$t('admin.settings.editingServer')"
+            @update:model-value="chooseGuildFromMenu"
+          />
+        </template>
+        <template v-else>
+          <p class="text-sm">
+            <span :style="{ color: 'var(--text-muted)' }">Editing</span>
+            <span class="ml-1 font-medium">{{ currentGuild ? guildLabel(currentGuild) : '—' }}</span>
+          </p>
+          <p v-if="currentGuild" class="mt-2 text-xs" :style="{ color: 'var(--text-muted)' }">
+            Guild ID
+            <code class="rounded bg-[var(--surface-raised)] px-1 font-mono">{{
+              currentGuild.id
+            }}</code>
+          </p>
+        </template>
       </section>
 
       <p
@@ -501,349 +548,388 @@ const TONE_COLOUR: Record<string, string> = {
         Reading this server's configuration…
       </p>
 
-      <div class="flex flex-col gap-4">
-        <article
-          v-for="view in views"
-          :key="view.key"
-          class="rounded-xl border p-4"
-          :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
-        >
-          <header class="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
-            <div>
-              <h2 class="text-sm font-semibold">
-                {{ keyLabel(view.key) }}
+      <!-- One tab per subject. The strip wraps rather than scrolling
+           sideways, and that is the whole of the phone answer: a
+           horizontally scrolled strip can push a tab off the edge, and the
+           tab most worth pushing off is the one carrying "· 2 to set" --
+           which is exactly the thing tabs were about to hide. Wrapped, the
+           five tabs a full registry produces take three rows at 360 px --
+           six once an unfiled key brings the catch-all along -- and every
+           one of them is on the screen without a gesture. -->
+      <UiTabs v-if="groupTabs.length > 0" :tabs="groupTabs" :label="$t('admin.settings.groupTabs')">
+        <template v-for="group in groups" :key="group.id" #[group.id]>
+          <!-- The catch-all says what it is. Without the sentence it reads
+               as a group somebody could not be bothered to name, and the
+               keys under it read as second-class ones. -->
+          <p
+            v-if="group.id === UNFILED"
+            class="mb-4 rounded-xl border p-3 text-xs"
+            :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+          >
+            {{ $t('admin.settings.groupOtherNote') }}
+          </p>
+
+          <div class="flex flex-col gap-4">
+            <article
+              v-for="view in group.views"
+              :key="view.key"
+              class="rounded-xl border p-4"
+              :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+            >
+              <header class="mb-3 flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+                <div>
+                  <h2 class="text-sm font-semibold">
+                    {{ keyLabel(view.key) }}
+                    <span
+                      v-if="view.required"
+                      class="ml-1 align-middle text-xs font-normal"
+                      :style="{ color: 'var(--text-muted)' }"
+                      >· required</span
+                    >
+                  </h2>
+                  <code class="font-mono text-xs" :style="{ color: 'var(--text-muted)' }">{{
+                    view.key
+                  }}</code>
+                </div>
+                <!-- When a change lands is said before the edit as well as
+                     after it: knowing a key needs a pod restart is worth far
+                     more while deciding to change it. -->
                 <span
-                  v-if="view.required"
-                  class="ml-1 align-middle text-xs font-normal"
-                  :style="{ color: 'var(--text-muted)' }"
-                  >· required</span
+                  class="shrink-0 self-start rounded-full border px-2.5 py-1 text-xs font-medium"
+                  :style="{
+                    borderColor: TONE_COLOUR[effectBadge(view).tone],
+                    color: TONE_COLOUR[effectBadge(view).tone],
+                  }"
+                  :title="effectBadge(view).detail"
                 >
-              </h2>
-              <code class="font-mono text-xs" :style="{ color: 'var(--text-muted)' }">{{
-                view.key
-              }}</code>
-            </div>
-            <!-- When a change lands is said before the edit as well as
-                 after it: knowing a key needs a pod restart is worth far
-                 more while deciding to change it. -->
-            <span
-              class="shrink-0 self-start rounded-full border px-2.5 py-1 text-xs font-medium"
-              :style="{
-                borderColor: TONE_COLOUR[effectBadge(view).tone],
-                color: TONE_COLOUR[effectBadge(view).tone],
-              }"
-              :title="effectBadge(view).detail"
-            >
-              {{ effectBadge(view).label }}
-            </span>
-          </header>
-
-          <!-- A picker over names, for the keys that hold ids. The value
-               written is still the id: the checkbox list serialises back
-               into the same comma-separated string `voice_channel_ids` has
-               always held, and the selects hand over one id each. -->
-          <div
-            v-if="control(view) === 'channels'"
-            role="group"
-            :aria-label="keyLabel(view.key)"
-            class="max-h-64 overflow-y-auto rounded-lg border p-2"
-            :style="{ borderColor: 'var(--border)', background: 'var(--surface-raised)' }"
-          >
-            <fieldset
-              v-for="(group, index) in channelsFor(view).groups"
-              :key="`${group.kind}-${index}`"
-              class="mb-3 last:mb-0"
-            >
-              <!-- A kind this console has no word for is rendered as the
-                   kind Discord called it. Dropping the group would hide a
-                   recordable channel and say nothing about it. -->
-              <legend
-                class="mb-1 text-xs font-medium uppercase tracking-wide"
-                :style="{ color: group.unresolved ? 'var(--color-brand-yellow)' : 'var(--text-muted)' }"
-              >
-                {{ group.labelKey ? $t(group.labelKey) : group.raw }}
-              </legend>
-              <label
-                v-for="choice in group.choices"
-                :key="choice.id"
-                class="flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 hover:bg-[var(--surface)]"
-              >
-                <input
-                  type="checkbox"
-                  class="mt-1 shrink-0"
-                  :checked="idListHas(drafts[view.key] ?? '', choice.id)"
-                  :disabled="busy[view.key]"
-                  @change="toggleChannel(view, choice.id, ($event.target as HTMLInputElement).checked)"
-                >
-                <span class="min-w-0">
-                  <span class="block break-words text-sm">{{ choice.label }}</span>
-                  <code
-                    class="block break-all font-mono text-xs"
-                    :style="{ color: 'var(--text-muted)' }"
-                    >{{ choice.id }}</code
-                  >
+                  {{ effectBadge(view).label }}
                 </span>
-              </label>
-            </fieldset>
-          </div>
+              </header>
 
-          <!-- `:value` and `@change` rather than `v-model`: the option
-               values are the ids the mirror holds, and a stored value with
-               a stray space would match none of them and leave the select
-               showing the first role as though it were configured. -->
-          <select
-            v-else-if="control(view) === 'role' || control(view) === 'collection'"
-            :aria-label="keyLabel(view.key)"
-            :disabled="busy[view.key]"
-            class="w-full rounded-lg border px-3 py-2 text-sm"
-            :style="{
-              borderColor: 'var(--border)',
-              background: 'var(--surface-raised)',
-              color: 'var(--text)',
-            }"
-            :value="currentFor(view)?.id ?? ''"
-            @change="drafts[view.key] = ($event.target as HTMLSelectElement).value"
-          >
-            <!-- "Not set" is offered only where an empty value is one the
-                 API accepts. For a required or integer key it is a
-                 placeholder that disappears once something is chosen --
-                 this page does not offer an action it knows will fail. -->
-            <option
-              v-if="blankOption(view, currentFor(view)) === 'placeholder'"
-              value=""
-              disabled
-            >
-              {{ $t('admin.settings.choose') }}
-            </option>
-            <option v-else-if="blankOption(view, currentFor(view)) === 'offer'" value="">
-              {{ $t('admin.settings.notSet') }}
-            </option>
-            <option v-for="choice in singleFor(view).choices" :key="choice.id" :value="choice.id">
-              {{ choice.label }}
-            </option>
-          </select>
-
-          <textarea
-            v-else-if="inputKind(view) === 'multiline'"
-            v-model="drafts[view.key]"
-            :aria-label="keyLabel(view.key)"
-            :disabled="busy[view.key]"
-            rows="4"
-            class="w-full rounded-lg border px-3 py-2 font-mono text-sm"
-            :style="{
-              borderColor: 'var(--border)',
-              background: 'var(--surface-raised)',
-              color: 'var(--text)',
-            }"
-          />
-          <!-- `type="text"` with a numeric inputmode rather than
-               `type="number"`: `admin_role_id` is an integer key *and* a
-               Discord snowflake, and a number input rounds it through a
-               float and silently returns an id ending in other digits. -->
-          <input
-            v-else
-            v-model="drafts[view.key]"
-            :aria-label="keyLabel(view.key)"
-            :disabled="busy[view.key]"
-            type="text"
-            :inputmode="inputKind(view) === 'integer' ? 'numeric' : 'text'"
-            class="w-full rounded-lg border px-3 py-2 font-mono text-sm"
-            :style="{
-              borderColor: 'var(--border)',
-              background: 'var(--surface-raised)',
-              color: 'var(--text)',
-            }"
-          >
-
-          <!-- The id under the name, in the same monospace face the key
-               itself is rendered in. The name is what a human recognises;
-               the id is what is stored, and it stays on screen so that the
-               two are never in doubt. -->
-          <template v-if="control(view) === 'channels'">
-            <p class="mt-1.5 text-xs" :style="{ color: 'var(--text-muted)' }">
-              <template v-if="channelsFor(view).selected.length === 0">
-                {{ $t('admin.settings.noChannelsChosen') }}
-              </template>
-              <template v-else>
-                {{ $t('admin.settings.chosenIds') }}
-                <code
-                  v-for="choice in channelsFor(view).selected"
-                  :key="choice.id"
-                  class="ml-1 inline-block break-all rounded bg-[var(--surface-raised)] px-1 font-mono"
-                  >{{ choice.id }}</code
+              <!-- A picker over names, for the keys that hold ids. The value
+                   written is still the id: the checkbox list serialises back
+                   into the same comma-separated string `voice_channel_ids` has
+                   always held, and the selects hand over one id each. -->
+              <div
+                v-if="control(view) === 'channels'"
+                role="group"
+                :aria-label="keyLabel(view.key)"
+                class="max-h-64 overflow-y-auto rounded-lg border p-2"
+                :style="{ borderColor: 'var(--border)', background: 'var(--surface-raised)' }"
+              >
+                <!-- `kind` rather than `group`: the tab this article sits
+                     on is a group too, and one name for both would read as
+                     the same thing twice. -->
+                <fieldset
+                  v-for="(kind, index) in channelsFor(view).groups"
+                  :key="`${kind.kind}-${index}`"
+                  class="mb-3 last:mb-0"
                 >
+                  <!-- A kind this console has no word for is rendered as the
+                       kind Discord called it. Dropping it would hide a
+                       recordable channel and say nothing about it. -->
+                  <legend
+                    class="mb-1 text-xs font-medium uppercase tracking-wide"
+                    :style="{ color: kind.unresolved ? 'var(--color-brand-yellow)' : 'var(--text-muted)' }"
+                  >
+                    {{ kind.labelKey ? $t(kind.labelKey) : kind.raw }}
+                  </legend>
+                  <label
+                    v-for="choice in kind.choices"
+                    :key="choice.id"
+                    class="flex cursor-pointer items-start gap-2 rounded-md px-2 py-1.5 hover:bg-[var(--surface)]"
+                  >
+                    <input
+                      type="checkbox"
+                      class="mt-1 shrink-0"
+                      :checked="idListHas(drafts[view.key] ?? '', choice.id)"
+                      :disabled="busy[view.key]"
+                      @change="toggleChannel(view, choice.id, ($event.target as HTMLInputElement).checked)"
+                    >
+                    <span class="min-w-0">
+                      <span class="block break-words text-sm">{{ choice.label }}</span>
+                      <code
+                        class="block break-all font-mono text-xs"
+                        :style="{ color: 'var(--text-muted)' }"
+                        >{{ choice.id }}</code
+                      >
+                    </span>
+                  </label>
+                </fieldset>
+              </div>
+
+              <!-- `:value` and `@change` rather than `v-model`: the option
+                   values are the ids the mirror holds, and a stored value with
+                   a stray space would match none of them and leave the select
+                   showing the first role as though it were configured. -->
+              <select
+                v-else-if="control(view) === 'role' || control(view) === 'collection'"
+                :aria-label="keyLabel(view.key)"
+                :disabled="busy[view.key]"
+                class="w-full rounded-lg border px-3 py-2 text-sm"
+                :style="{
+                  borderColor: 'var(--border)',
+                  background: 'var(--surface-raised)',
+                  color: 'var(--text)',
+                }"
+                :value="currentFor(view)?.id ?? ''"
+                @change="drafts[view.key] = ($event.target as HTMLSelectElement).value"
+              >
+                <!-- "Not set" is offered only where an empty value is one the
+                     API accepts. For a required or integer key it is a
+                     placeholder that disappears once something is chosen --
+                     this page does not offer an action it knows will fail. -->
+                <option
+                  v-if="blankOption(view, currentFor(view)) === 'placeholder'"
+                  value=""
+                  disabled
+                >
+                  {{ $t('admin.settings.choose') }}
+                </option>
+                <option v-else-if="blankOption(view, currentFor(view)) === 'offer'" value="">
+                  {{ $t('admin.settings.notSet') }}
+                </option>
+                <option v-for="choice in singleFor(view).choices" :key="choice.id" :value="choice.id">
+                  {{ choice.label }}
+                </option>
+              </select>
+
+              <textarea
+                v-else-if="inputKind(view) === 'multiline'"
+                v-model="drafts[view.key]"
+                :aria-label="keyLabel(view.key)"
+                :disabled="busy[view.key]"
+                rows="4"
+                class="w-full rounded-lg border px-3 py-2 font-mono text-sm"
+                :style="{
+                  borderColor: 'var(--border)',
+                  background: 'var(--surface-raised)',
+                  color: 'var(--text)',
+                }"
+              />
+              <!-- `type="text"` with a numeric inputmode rather than
+                   `type="number"`: `admin_role_id` is an integer key *and* a
+                   Discord snowflake, and a number input rounds it through a
+                   float and silently returns an id ending in other digits. -->
+              <input
+                v-else
+                v-model="drafts[view.key]"
+                :aria-label="keyLabel(view.key)"
+                :disabled="busy[view.key]"
+                type="text"
+                :inputmode="inputKind(view) === 'integer' ? 'numeric' : 'text'"
+                class="w-full rounded-lg border px-3 py-2 font-mono text-sm"
+                :style="{
+                  borderColor: 'var(--border)',
+                  background: 'var(--surface-raised)',
+                  color: 'var(--text)',
+                }"
+              >
+
+              <!-- The id under the name, in the same monospace face the key
+                   itself is rendered in. The name is what a human recognises;
+                   the id is what is stored, and it stays on screen so that the
+                   two are never in doubt. -->
+              <template v-if="control(view) === 'channels'">
+                <p class="mt-1.5 text-xs" :style="{ color: 'var(--text-muted)' }">
+                  <template v-if="channelsFor(view).selected.length === 0">
+                    {{ $t('admin.settings.noChannelsChosen') }}
+                  </template>
+                  <template v-else>
+                    {{ $t('admin.settings.chosenIds') }}
+                    <code
+                      v-for="choice in channelsFor(view).selected"
+                      :key="choice.id"
+                      class="ml-1 inline-block break-all rounded bg-[var(--surface-raised)] px-1 font-mono"
+                      >{{ choice.id }}</code
+                    >
+                  </template>
+                </p>
+                <!-- A chosen channel the mirror has no row for. Said out loud
+                     rather than left as a tick beside a bare number: it is a
+                     configuration problem, and this is the only page that can
+                     show it. -->
+                <p
+                  v-if="channelsFor(view).selected.some((choice) => !choice.resolved)"
+                  class="mt-1.5 text-xs"
+                  :style="{ color: 'var(--color-brand-yellow)' }"
+                >
+                  {{ $t('admin.settings.unresolvedChannel') }}
+                </p>
               </template>
-            </p>
-            <!-- A chosen channel the mirror has no row for. Said out loud
-                 rather than left as a tick beside a bare number: it is a
-                 configuration problem, and this is the only page that can
-                 show it. -->
-            <p
-              v-if="channelsFor(view).selected.some((choice) => !choice.resolved)"
-              class="mt-1.5 text-xs"
-              :style="{ color: 'var(--color-brand-yellow)' }"
-            >
-              {{ $t('admin.settings.unresolvedChannel') }}
-            </p>
-          </template>
 
-          <template v-else-if="control(view) === 'role' || control(view) === 'collection'">
-            <p v-if="currentFor(view)" class="mt-1.5 text-xs" :style="{ color: 'var(--text-muted)' }">
-              <code class="break-all rounded bg-[var(--surface-raised)] px-1 font-mono">{{
-                currentFor(view)?.id
-              }}</code>
-            </p>
-            <p
-              v-if="currentFor(view) && currentFor(view)?.resolved === false"
-              class="mt-1.5 text-xs"
-              :style="{ color: 'var(--color-brand-yellow)' }"
-            >
-              {{
-                control(view) === 'collection'
-                  ? $t('admin.settings.unresolvedCollection')
-                  : $t('admin.settings.unresolvedRole')
-              }}
-            </p>
-          </template>
+              <template v-else-if="control(view) === 'role' || control(view) === 'collection'">
+                <p v-if="currentFor(view)" class="mt-1.5 text-xs" :style="{ color: 'var(--text-muted)' }">
+                  <code class="break-all rounded bg-[var(--surface-raised)] px-1 font-mono">{{
+                    currentFor(view)?.id
+                  }}</code>
+                </p>
+                <p
+                  v-if="currentFor(view) && currentFor(view)?.resolved === false"
+                  class="mt-1.5 text-xs"
+                  :style="{ color: 'var(--color-brand-yellow)' }"
+                >
+                  {{
+                    control(view) === 'collection'
+                      ? $t('admin.settings.unresolvedCollection')
+                      : $t('admin.settings.unresolvedRole')
+                  }}
+                </p>
+              </template>
 
-          <p
-            v-for="hint in fieldHints(view)"
-            :key="hint"
-            class="mt-1.5 text-xs"
-            :style="{ color: 'var(--text-muted)' }"
-          >
-            {{ hint }}
-          </p>
-
-          <p
-            v-if="liveIssue(view)"
-            class="mt-1.5 text-xs"
-            :style="{ color: 'var(--color-brand-yellow)' }"
-          >
-            {{ liveIssue(view) }}
-          </p>
-
-          <!-- How fresh the list is, or why there is no list. A picker
-               that silently offered a copy of last week is how somebody
-               configures a channel that was deleted on Tuesday. -->
-          <p
-            v-for="note in mirrorNotes(view)"
-            :key="note.key"
-            class="mt-1.5 text-xs"
-            :style="{ color: note.stale ? 'var(--color-brand-yellow)' : 'var(--text-muted)' }"
-          >
-            {{ $t(note.key, note.params) }}
-          </p>
-
-          <!-- The way past the picker. A mirror can be behind Discord, and
-               an administrator who already knows the id must not be locked
-               out by a list that has not caught up. -->
-          <p v-if="pickerAvailable(view)" class="mt-1.5 text-xs">
-            <button
-              type="button"
-              class="underline underline-offset-2 transition-colors hover:text-[var(--text)]"
-              :style="{ color: 'var(--text-muted)' }"
-              @click="manual[view.key] = !manual[view.key]"
-            >
-              {{
-                manual[view.key]
-                  ? $t('admin.settings.backToPicker')
-                  : $t('admin.settings.enterIdManually')
-              }}
-            </button>
-          </p>
-
-          <div class="mt-3 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
-              class="rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
-              :style="{
-                background:
-                  'linear-gradient(120deg, var(--color-brand-blue), var(--color-brand-magenta))',
-              }"
-              :disabled="busy[view.key] || !edited(view)"
-              @click="request(view, 'save')"
-            >
-              {{ busy[view.key] ? 'Writing…' : 'Save' }}
-            </button>
-
-            <button
-              v-if="clearability(view).clearable"
-              type="button"
-              class="rounded-lg border px-3 py-1.5 text-sm transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-40"
-              :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
-              :disabled="busy[view.key]"
-              @click="request(view, 'clear')"
-            >
-              Clear
-            </button>
-            <!-- No clear button for a key the API will not clear -- its
-                 own `may_clear`, not "not required" guessed here. The two
-                 differ for the deprecated voice_channel_id, which is
-                 optional and still answers 409; an interface that offers
-                 an action it knows will fail is worse than one that
-                 explains why it cannot. -->
-            <span v-else class="text-xs" :style="{ color: 'var(--text-muted)' }">
-              {{ clearReason(view) }}
-            </span>
-
-            <span v-if="edited(view)" class="text-xs" :style="{ color: 'var(--text-muted)' }">
-              Not written yet
-            </span>
-          </div>
-
-          <div
-            v-if="confirming && confirming.key === view.key"
-            class="mt-3 rounded-lg border p-3"
-            :style="{ borderColor: 'var(--danger)', background: 'var(--surface-raised)' }"
-          >
-            <p class="mb-1 text-sm font-semibold">{{ confirmation(view)?.title }}</p>
-            <p class="mb-3 text-sm" :style="{ color: 'var(--text-muted)' }">
-              {{ confirmation(view)?.consequence }}
-            </p>
-            <div class="flex flex-wrap gap-2">
-              <button
-                type="button"
-                class="rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
-                :style="{ background: 'var(--danger)' }"
-                @click="commit(view, confirming.action)"
+              <p
+                v-for="hint in fieldHints(view)"
+                :key="hint"
+                class="mt-1.5 text-xs"
+                :style="{ color: 'var(--text-muted)' }"
               >
-                {{ confirmation(view)?.confirmLabel }}
-              </button>
-              <button
-                type="button"
-                class="rounded-lg border px-3 py-1.5 text-sm transition-colors hover:bg-[var(--surface)]"
-                :style="{ borderColor: 'var(--border)' }"
-                @click="confirming = null"
+                {{ hint }}
+              </p>
+
+              <p
+                v-if="liveIssue(view)"
+                class="mt-1.5 text-xs"
+                :style="{ color: 'var(--color-brand-yellow)' }"
               >
-                Cancel
-              </button>
-            </div>
-          </div>
+                {{ liveIssue(view) }}
+              </p>
 
-          <div
-            v-if="outcomes[view.key]"
-            class="mt-3 rounded-lg border p-3"
-            :style="{
-              borderColor: TONE_COLOUR[outcomes[view.key]!.tone],
-              background: 'var(--surface-raised)',
-            }"
-          >
-            <p class="text-sm font-semibold">{{ outcomes[view.key]!.headline }}</p>
-            <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
-              {{ outcomes[view.key]!.detail }}
-            </p>
-          </div>
+              <!-- How fresh the list is, or why there is no list. A picker
+                   that silently offered a copy of last week is how somebody
+                   configures a channel that was deleted on Tuesday. -->
+              <p
+                v-for="note in mirrorNotes(view)"
+                :key="note.key"
+                class="mt-1.5 text-xs"
+                :style="{ color: note.stale ? 'var(--color-brand-yellow)' : 'var(--text-muted)' }"
+              >
+                {{ $t(note.key, note.params) }}
+              </p>
 
-          <p
-            v-if="failures[view.key]"
-            class="mt-3 rounded-lg border p-3 text-sm"
-            :style="{ borderColor: 'var(--danger)' }"
-          >
-            {{ failures[view.key] }}
-          </p>
-        </article>
-      </div>
+              <!-- The way past the picker. A mirror can be behind Discord, and
+                   an administrator who already knows the id must not be locked
+                   out by a list that has not caught up. -->
+              <p v-if="pickerAvailable(view)" class="mt-1.5 text-xs">
+                <button
+                  type="button"
+                  class="underline underline-offset-2 transition-colors hover:text-[var(--text)]"
+                  :style="{ color: 'var(--text-muted)' }"
+                  @click="manual[view.key] = !manual[view.key]"
+                >
+                  {{
+                    manual[view.key]
+                      ? $t('admin.settings.backToPicker')
+                      : $t('admin.settings.enterIdManually')
+                  }}
+                </button>
+              </p>
+
+              <div class="mt-3 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  class="rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
+                  :style="{
+                    background:
+                      'linear-gradient(120deg, var(--color-brand-blue), var(--color-brand-magenta))',
+                  }"
+                  :disabled="busy[view.key] || !edited(view)"
+                  @click="request(view, 'save')"
+                >
+                  {{ busy[view.key] ? 'Writing…' : 'Save' }}
+                </button>
+
+                <button
+                  v-if="clearability(view).clearable"
+                  type="button"
+                  class="rounded-lg border px-3 py-1.5 text-sm transition-colors hover:bg-[var(--surface-raised)] disabled:opacity-40"
+                  :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+                  :disabled="busy[view.key]"
+                  @click="request(view, 'clear')"
+                >
+                  Clear
+                </button>
+                <!-- No clear button for a key the API will not clear -- its
+                     own `may_clear`, not "not required" guessed here. The two
+                     differ for the deprecated voice_channel_id, which is
+                     optional and still answers 409; an interface that offers
+                     an action it knows will fail is worse than one that
+                     explains why it cannot. -->
+                <span v-else class="text-xs" :style="{ color: 'var(--text-muted)' }">
+                  {{ clearReason(view) }}
+                </span>
+
+                <span v-if="edited(view)" class="text-xs" :style="{ color: 'var(--text-muted)' }">
+                  Not written yet
+                </span>
+              </div>
+
+              <div
+                v-if="confirming && confirming.key === view.key"
+                class="mt-3 rounded-lg border p-3"
+                :style="{ borderColor: 'var(--danger)', background: 'var(--surface-raised)' }"
+              >
+                <p class="mb-1 text-sm font-semibold">{{ confirmation(view)?.title }}</p>
+                <p class="mb-3 text-sm" :style="{ color: 'var(--text-muted)' }">
+                  {{ confirmation(view)?.consequence }}
+                </p>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    class="rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                    :style="{ background: 'var(--danger)' }"
+                    @click="commit(view, confirming.action)"
+                  >
+                    {{ confirmation(view)?.confirmLabel }}
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded-lg border px-3 py-1.5 text-sm transition-colors hover:bg-[var(--surface)]"
+                    :style="{ borderColor: 'var(--border)' }"
+                    @click="confirming = null"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+
+              <!-- What the write actually achieved. A live region, because
+                   the panel was already coloured, already specific, and
+                   still entirely silent: the reader who most needs to hear
+                   "not in force" is the one whose attention is on the field
+                   they have just left, or who is not looking at the screen
+                   at all. The border is one of four colours and the
+                   headline names the key, so neither the tone nor the
+                   subject depends on which of these panels is nearest. -->
+              <div
+                v-if="outcomes[view.key]"
+                role="status"
+                aria-live="polite"
+                class="mt-3 rounded-lg border-2 p-3"
+                :style="{
+                  borderColor: TONE_COLOUR[outcomes[view.key]!.tone],
+                  background: 'var(--surface-raised)',
+                }"
+              >
+                <p class="text-sm font-semibold">{{ outcomes[view.key]!.headline }}</p>
+                <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+                  {{ outcomes[view.key]!.detail }}
+                </p>
+              </div>
+
+              <!-- `alert` rather than `status`: nothing was written at all,
+                   and that is worth interrupting for. -->
+              <p
+                v-if="failures[view.key]"
+                role="alert"
+                class="mt-3 rounded-lg border p-3 text-sm"
+                :style="{ borderColor: 'var(--danger)' }"
+              >
+                {{ failures[view.key] }}
+              </p>
+            </article>
+          </div>
+        </template>
+      </UiTabs>
     </template>
   </div>
 </template>
