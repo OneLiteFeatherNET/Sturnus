@@ -106,10 +106,19 @@ async def _publish_loop(
     """
     await client.wait_until_ready()
     announcer = DiscordAnnouncer(client)
+    # Read once, outside the loop and outside the `try` below: the count is
+    # fixed for the life of the connection, and reading it inside a block
+    # that swallows every exception would turn "this attribute moved" into
+    # a sweep that quietly announces nothing. Taken from the client rather
+    # than from `Settings` because the setting may be unset, in which case
+    # Discord chose the number and only the client knows it --
+    # `wait_until_ready()` above has returned, so `launch_shards` has
+    # already filled it in.
+    shard_count = client.shard_count
     while not stop.is_set():
         now = datetime.now(UTC)
         try:
-            await announce_ready_sessions(sessions, announcer, now)
+            await announce_ready_sessions(sessions, announcer, now, shard_count=shard_count)
         except Exception as exc:
             log_exception(
                 log,
@@ -291,6 +300,7 @@ async def _run() -> None:
         link_states=link_states,
         account_links=account_links,
         capture_diagnostics=settings.capture_diagnostics,
+        shard_count=settings.shard_count,
     )
 
     stop = asyncio.Event()

@@ -19,12 +19,14 @@ def session(
     announced: datetime | None = None,
     channel_id: int = 999,
     participant_ids: tuple[int, ...] = (),
+    guild_id: int = 7,
 ) -> dict[str, object]:
     return {
         "id": session_id,
         "status": status,
         "document_url": document_url,
         "announced_at": announced,
+        "guild_id": guild_id,
         "channel_id": channel_id,
         "participant_ids": participant_ids,
     }

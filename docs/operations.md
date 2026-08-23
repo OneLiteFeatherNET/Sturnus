@@ -59,6 +59,7 @@ the Kubernetes `Secret` rather than from plain manifest text (see section
 | `STURNUS_OUTLINE_BASE_URL` | **yes** | no | Base URL of the Outline instance. The bot needs it only to build the authorization URL `/link` sends a user's browser to; it never calls Outline's API itself. |
 | `STURNUS_OUTLINE_CLIENT_ID` | **yes** | no | OAuth client id of the Sturnus application registered in Outline. Public by design — it travels in the query string of the authorization URL every user's browser opens. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL that authorization returns to. Must be the same value `sturnus-link` is given, and must actually route to `link` — see section 1.5. |
+| `STURNUS_SHARD_COUNT` | unset | no | How many Discord gateway connections this one process opens. Unset or empty — the chart's default — means **let Discord decide**: `AutoShardedClient` asks `/gateway/bot` and uses the recommendation, which grows with the guild count on its own. An explicit value is for an operator who knows why; anything below `1` is refused at startup. It does **not** make the bot horizontally scalable — every shard lives in this one process and the Deployment stays at one replica. See section 3.6. |
 | `STURNUS_HEALTH_PORT` | `8080` | no | Port the `/healthz`, `/readyz`, `/metrics`, `/version` HTTP endpoints listen on. `/metrics` answers **`501 Not Implemented`**: metrics are *pushed* over OTLP, not scraped — see section 7. |
 | `STURNUS_SENTRY_DSN` | unset | no | Sentry DSN for error reporting. Empty disables it entirely: `sentry_sdk.init()` is never called, so no instrumentation is installed and the process runs exactly as it does without Sentry. Supplied through the `Secret`, and required to be present even when blank; see section 1.4 for why a value that is not a credential is stored like one. |
 | `STURNUS_SENTRY_ENVIRONMENT` | `production` | no | Names the deployment in Sentry's environment filter **and** supplies OpenTelemetry's `deployment.environment.name`. One variable for both on purpose — `OtelSettings.environment` reads this exact name rather than adding a second one, so the environment filter in Sentry and the one in Grafana can never disagree. |
@@ -471,6 +472,120 @@ way of it — a recording is keyed by the room it happens in, and the limit
 is one constant (`MAX_CONCURRENT_SESSIONS_PER_GUILD`) that the code asks
 rather than assumes — but raising that constant without supplying the
 second identity breaks the bot instead of improving it.
+
+### 3.6 Shards, and the four things they do not change
+
+A Discord bot's guilds are split across **shards**. A shard is one gateway
+connection, and Discord routes a guild to shard `(guild_id >> 22) %
+shard_count`. Sturnus's bot process holds all of them
+(`discord.AutoShardedClient`), and `STURNUS_SHARD_COUNT` is the only knob.
+
+**Leave it unset.** Unset means the bot asks Discord `/gateway/bot` and
+opens the number Discord recommends — which tracks the guild count by
+itself, where a number pinned in a values file does not. Discord *requires*
+sharding above 2500 guilds; below that, shards buy headroom and one
+concrete piece of resilience: a shard that has to reconnect stalls only its
+own guilds' events, instead of every guild's queueing behind one socket.
+
+Set it explicitly only with a reason — matching a `max_concurrency` bucket
+during a large-bot rollout, or reproducing a routing problem on a known
+shard layout. Values below `1` are refused when the process starts, naming
+the variable, rather than producing a bot that opens no connection and sits
+there looking alive.
+
+**What sharding changes about `/readyz`.** Readiness is now "every shard
+this process holds is up", rather than one boolean set at startup and never
+cleared. With four shards and one reconnecting, `/readyz` answers `503`
+with a body naming the missing shard:
+
+```json
+{"status": "not ready", "discord_connected": false, "database_reachable": true,
+ "shards_connected": 3, "shards_expected": 4, "shards_missing": [2]}
+```
+
+That is deliberate. Three shards up means a quarter of the servers Sturnus
+is in cannot be recorded in at all, and a probe reporting perfect health
+through that is worse than one that occasionally flaps. It does **not**
+flap on a routine reconnect: the probe polls every 10 s with
+`failureThreshold: 3`, so a shard has to be absent for 30 continuous
+seconds before Kubernetes marks the pod NotReady, and an ordinary RESUME
+takes a second or two. The bot's Service carries no traffic, so a NotReady
+pod here is a signal to go and look, not a load-shedding action.
+
+**What sharding changes about the logs.** `bot.shard_ready`,
+`bot.shard_resumed` and `bot.shard_disconnected` carry `shard_id` and
+`shard_count`. Per-guild lines — the guild tick, the voice lifecycle, the
+capture failures — carry `shard_id` **only when this process holds more
+than one shard**: with one shard it would be `0` in every line for ever,
+which is a key in every Loki stream that answers nothing. So, once a shard
+count above one is in use:
+
+```logql
+# Which guilds went with the shard that just dropped
+{app="sturnus-bot"} | json | shard_id="2"
+```
+
+**What sharding does not change.** All four are worth stating plainly,
+because the word invites the opposite conclusion:
+
+1. **The Deployment stays at `replicas: 1`, with `strategy: Recreate`.**
+   Four shards is still one process. Two pods would each open the same
+   shards, hold two gateway connections to the same guilds, and record
+   every session twice — exactly the situation `replicas: 1` exists to
+   prevent, shard count or not.
+2. **One voice connection per guild.** That is a platform limit and section
+   3.5 is unaffected: a guild with three allowed channels still records one
+   of them at a time.
+3. **One recording PVC.** In-progress recordings live on the pod's own
+   `ReadWriteOnce` volume, and the SIGTERM handler that flushes them is
+   still one handler in one process.
+4. **One announcement sweep.** The poll that posts a finished session's
+   document link reads `sessions` rows for every guild there is. With one
+   process that is exactly right; it is the one sweep in the bot that would
+   stop being right otherwise.
+
+#### What running one shard range per pod would actually take
+
+Written down so that it stays a decision rather than becoming an
+archaeology exercise. Sturnus has **not** built this. In rough dependency
+order:
+
+1. **A StatefulSet, not a Deployment.** Each pod needs a stable ordinal to
+   derive its shard range from; a Deployment's pods are interchangeable and
+   have no such identity. `sturnus.application.sharding.shards_this_process_owns`
+   is the one function that would read it — it returns every shard today,
+   and would return `range(ordinal * per_pod, (ordinal + 1) * per_pod)`.
+2. **`shard_ids` passed to `AutoShardedClient`** alongside `shard_count`.
+   discord.py requires both when shard ids are given by hand, and refuses
+   ids without a count outright.
+3. **A `volumeClaimTemplate` instead of the single shared PVC.** The
+   recording volume is `ReadWriteOnce` and holds in-progress audio; two
+   pods cannot share it, and a pod that restarts must come back to *its
+   own* unflushed recordings for `recover_orphans` to find them.
+4. **The announcement sweep scoped to the pod's shards.** Already asked:
+   `announce_ready_sessions` calls `process_serves_guild` for every
+   candidate session, so this half is a change to
+   `shards_this_process_owns` and nothing else. Without it, four pods post
+   the same document link four times.
+5. **A PodDisruptionBudget that means something at N replicas.**
+   `minAvailable: 1` at one replica blocks every voluntary eviction, which
+   is the point today; at four it would permit three quarters of the bot to
+   be drained at once, mid-recording.
+6. **Session-start rate limiting across pods.** Discord's `max_concurrency`
+   bounds how many shards may IDENTIFY per five seconds. One process
+   serialises its own launches; N pods starting together do not, so a
+   rollout would need `AutoShardedClient.fetch_session_start_limits` and a
+   `before_identity_hook` coordinating between them.
+7. **The console's mirrors read as though they were complete.** The
+   administrator and directory mirrors are written per guild off each
+   process's own gateway cache, so they stay correct — but a pod that is
+   down leaves its guilds' rows stale with nothing saying so, and the API
+   currently has no way to express that.
+
+Items 1, 3, 5 and 6 are deployment work with no code in this repository to
+change. Item 4 is one function body. Items 2 and 7 are small. The ordering
+is the useful part: none of it is hard, and none of it happens by raising
+`replicas`.
 
 ## 4. First run
 

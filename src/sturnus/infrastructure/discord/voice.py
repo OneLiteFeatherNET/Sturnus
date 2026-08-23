@@ -54,6 +54,7 @@ from discord.ext import voice_recv
 
 from sturnus.application.ports import Clock
 from sturnus.application.recording import RecordingService
+from sturnus.application.sharding import shard_id_for_logging
 from sturnus.domain import settings
 from sturnus.domain.session import EndReason
 from sturnus.infrastructure.db.config_store import ConfigStore
@@ -173,6 +174,25 @@ class VoiceReceiveAdapter:
         self._stopping = False
         self._message_errors = RateLimiter(_MESSAGE_ERROR_LOG_EVERY)
 
+    def _shard(self, guild_id: int | None) -> int | None:
+        """This guild's shard id, or `None` while this process holds only one shard.
+
+        The voice lifecycle is where "which shard is the unhealthy one"
+        gets asked in anger: a shard whose gateway keeps re-IDENTIFYing
+        drops the voice connections of its guilds and nobody else's, so
+        `voice.joined`/`voice.left` grouped by shard is the line the
+        pattern shows up in. The same conditional
+        `SturnusClient._shard` applies, from the same one function, so
+        the two cannot disagree about when the field is worth emitting.
+
+        `guild_id` is `None` only on a `leave()` for a connection that
+        never completed a `join()`, and a shard id for no guild is not a
+        fact -- the field is simply absent then.
+        """
+        if guild_id is None:
+            return None
+        return shard_id_for_logging(guild_id, self._client.shard_count)
+
     async def join(self, channel_id: int) -> None:
         """Connects to the voice channel and starts listening on a sink.
 
@@ -244,6 +264,7 @@ class VoiceReceiveAdapter:
             channel_id=channel_id,
             session_id=self._service.session_id,
             listening=True,
+            shard_id=self._shard(channel.guild.id),
         )
 
     async def leave(self) -> None:
@@ -289,6 +310,7 @@ class VoiceReceiveAdapter:
             guild_id=guild_id,
             session_id=self._service.session_id,
             listening=False,
+            shard_id=self._shard(guild_id),
         )
 
     # -- capture side: everything below runs on the extension's threads --
@@ -590,6 +612,7 @@ class VoiceReceiveAdapter:
             "No voice stream is decoding any longer; ending the session rather than "
             "recording silence.",
             guild_id=self._guild_id,
+            shard_id=self._shard(self._guild_id),
             session_id=self._service.session_id,
             end_reason=EndReason.DECODE_FAILURE.value,
         )
@@ -621,6 +644,7 @@ class VoiceReceiveAdapter:
                 "session rather than leaving it open with nothing arriving. This is the "
                 "failure mode that silently ended a recording in production.",
                 guild_id=self._guild_id,
+                shard_id=self._shard(self._guild_id),
                 session_id=self._service.session_id,
                 end_reason=EndReason.CAPTURE_FAILURE.value,
                 listening=False,
@@ -635,6 +659,7 @@ class VoiceReceiveAdapter:
                 "silently ended a recording in production.",
                 message.error,
                 guild_id=self._guild_id,
+                shard_id=self._shard(self._guild_id),
                 session_id=self._service.session_id,
                 end_reason=EndReason.CAPTURE_FAILURE.value,
                 listening=False,

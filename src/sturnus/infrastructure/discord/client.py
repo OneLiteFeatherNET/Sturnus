@@ -72,6 +72,7 @@ from sturnus.application.reconfigure import (
     plan_reconfigure,
 )
 from sturnus.application.recording import JobQueue, RecordingService
+from sturnus.application.sharding import shard_id_for_logging
 from sturnus.domain import settings
 from sturnus.domain.session import EndReason, SessionTimeouts
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
@@ -306,8 +307,40 @@ class _ChannelRecording:
         return self.config.role_id
 
 
-class SturnusClient(commands.Bot):
-    """The bot process's single Discord connection."""
+class SturnusClient(commands.AutoShardedBot):
+    """The bot process's Discord connection, or connections.
+
+    `commands.AutoShardedBot` rather than `commands.Bot`: one process, N
+    gateway connections, each carrying the guilds Discord routes to it.
+    **That changes no deployment invariant** -- there is still exactly one
+    bot process, one voice connection per guild, one recording directory --
+    and `sturnus.application.sharding` is where the difference between
+    "several shards in one process" and "several processes" is written
+    down. Read it before concluding that this class can now be scaled to
+    three replicas; it cannot.
+
+    Sharding does change three things about the gateway lifecycle, and each
+    is handled explicitly below rather than inherited by accident:
+
+    1. **`on_ready` stops being the recovery hook.** With a plain client it
+       fires again on every re-IDENTIFY, which is what made "reconcile
+       every guild in `on_ready`" a working repair for a gateway blip.
+       Under `AutoShardedClient` it fires only when the *whole set* of
+       shards becomes ready: `AutoShardedConnectionState._delay_ready`
+       clears `_ready_tasks` once it has fired, and `parse_ready` only
+       re-schedules it when every shard has a pending ready task again.
+       One shard re-IDENTIFYing therefore never re-fires it. The
+       reconcile lives in `on_shard_ready` now, where it fires per shard
+       and for exactly that shard's guilds.
+    2. **Readiness stops being one boolean.** See `on_shard_ready`,
+       `on_shard_resumed`, `on_shard_disconnect` and
+       `infrastructure.health.ReadinessState`.
+    3. **The tick loop must be started once, not once per connection.**
+       `setup_hook` still runs exactly once (discord.py calls it from
+       `login`, before any shard is launched), but the loop's creation is
+       behind `_ensure_tick_loop` so that being wrong about that would
+       cost nothing.
+    """
 
     def __init__(
         self,
@@ -336,6 +369,11 @@ class SturnusClient(commands.Bot):
         account_links: AccountLinkRepository,
         tick_interval_seconds: float = TICK_INTERVAL_SECONDS,
         capture_diagnostics: bool = False,
+        #: How many gateway connections this one process opens. `None`
+        #: means "let Discord decide" -- `AutoShardedClient` asks
+        #: `/gateway/bot` and takes the recommendation, which tracks the
+        #: guild count on its own. See `sturnus.config.Settings`.
+        shard_count: int | None = None,
     ) -> None:
         intents = discord.Intents.default()
         # `members` is a privileged intent and must also be turned on for
@@ -350,7 +388,14 @@ class SturnusClient(commands.Bot):
         # have to delete this line deliberately rather than lose voice
         # events by omission. There is no portal switch for this one.
         intents.voice_states = True
-        super().__init__(command_prefix=commands.when_mentioned, intents=intents)
+        # `shard_count=None` is discord.py's own "ask the gateway", not a
+        # missing value: `launch_shards` fills it in from `/gateway/bot`
+        # before the first connection opens.
+        super().__init__(
+            command_prefix=commands.when_mentioned,
+            intents=intents,
+            shard_count=shard_count,
+        )
 
         self._clock = clock
         self._config_store = config_store
@@ -449,6 +494,27 @@ class SturnusClient(commands.Bot):
         #: during SIGTERM cannot rebuild a pipeline (and reconnect a voice
         #: client) after `graceful_shutdown` has already left the channel.
         self._shutting_down = False
+
+    # -- Attributing a guild's line to the connection it arrived on ---------
+
+    def _shard(self, guild_id: int) -> int | None:
+        """This guild's shard id, or `None` while this process holds only one shard.
+
+        A one-line wrapper so no call site has to remember either half of
+        the decision -- which shard a guild is on, and whether saying so
+        is worth a key in every Loki stream. Both live in
+        `sturnus.application.sharding.shard_id_for_logging`; the reasoning
+        for the conditional is on that function and on the `shard_id`
+        entry in `sturnus.observability.fields`.
+
+        `None` rather than an omitted keyword because rule R3 in
+        `tests/test_logging_discipline.py` forbids `**kwargs` into a log
+        event -- every field name must stay readable at its call site --
+        and `redaction.scrub_fields` drops a `None` value rather than
+        writing `null`. So the field name is visible in the source and
+        still absent from the line.
+        """
+        return shard_id_for_logging(guild_id, self.shard_count)
 
     # -- The one-connection limit, in one place -----------------------------
 
@@ -567,29 +633,132 @@ class SturnusClient(commands.Bot):
         # LICENSE file in the repository does not reach them — /about does.
         await self.add_cog(AboutCog())
         await self.tree.sync()
+        self._ensure_tick_loop()
+
+    def _ensure_tick_loop(self) -> None:
+        """Starts the tick loop, once, however often this is called.
+
+        `setup_hook` runs exactly once -- discord.py calls it from
+        `login()`, before `connect()` launches any shard -- so under
+        sharding this is still one loop for N connections and not one per
+        connection. The guard is here anyway because the cost of being
+        wrong about that is a second loop closing sessions on a `_recordings`
+        dict the first one is also iterating, and the cost of the guard is
+        one comparison at startup.
+        """
+        if self._tick_task is not None and not self._tick_task.done():
+            return
         self._tick_task = asyncio.create_task(self._tick_loop())
 
-    async def on_ready(self) -> None:
-        """Reconciles every guild. Re-entrant, because Discord re-fires this.
+    async def on_shard_ready(self, shard_id: int) -> None:
+        """Reconciles the guilds this shard just handed over. Fires once per shard.
 
-        discord.py raises `on_ready` again whenever a RESUME fails and the
-        client has to re-IDENTIFY -- a routine gateway blip. The old
-        one-shot `_configure_guild` unconditionally overwrote the guild's
-        entry in `self._recordings`, so that blip dropped a recording guild's
-        `RecordingService` (unflushed writers, an orphaned plaintext WAV)
-        and its `VoiceReceiveAdapter` (a live voice connection nothing
-        would ever disconnect). `reconcile_guild` is idempotent, so this
-        path is now a no-op for a guild whose configuration is unchanged.
+        **This, not `on_ready`, is the gateway-blip repair.** With a plain
+        client `on_ready` fired again on every re-IDENTIFY, which is what
+        made reconciling everything there a working recovery. Under
+        `AutoShardedClient` it does not: `AutoShardedConnectionState.
+        _delay_ready` empties `_ready_tasks` after firing, and `parse_ready`
+        only re-schedules the whole-bot ready when *every* shard has a
+        pending ready task again -- so one shard coming back on its own
+        never re-fires it. Left in `on_ready`, the reconcile would have
+        silently stopped happening for exactly the guilds that had just
+        lost and rebuilt their caches.
+
+        Scoped to this shard's guilds, not all of them. `self.guilds` is
+        one cache across every connection, so the other shards' guilds are
+        sitting right there and reconciling them too would multiply the
+        startup database reads by the shard count for no gain -- their own
+        `shard_ready` is what covers them, exactly once each.
+
+        Idempotent, like every other caller of `reconcile_guild`: a guild
+        whose configuration is unchanged is a no-op, which is what makes
+        re-running this on every re-IDENTIFY safe rather than destructive.
         """
+        reconciled = 0
         for guild in self.guilds:
+            if guild.shard_id != shard_id:
+                continue
             await self.reconcile_guild(guild.id)
-        self._readiness.discord_connected = True
+            reconciled += 1
+        # After the reconcile, not before. `on_shard_connect` fires the
+        # moment the READY payload lands -- before the guild caches are
+        # filled -- and marking readiness there would turn the probe green
+        # on a shard that cannot yet answer for a single guild.
+        self._readiness.shard_connected(shard_id, shard_count=self.shard_count)
+        log_event(
+            log,
+            logging.INFO,
+            Event.BOT_SHARD_READY,
+            "A gateway shard is ready; reconciled the guilds it carries",
+            shard_id=shard_id,
+            shard_count=self.shard_count,
+            count=reconciled,
+        )
+
+    async def on_shard_resumed(self, shard_id: int) -> None:
+        """Marks a shard back up after a blip it resumed through.
+
+        No reconcile: a RESUME replays the events missed and keeps the
+        guild cache, so there is nothing to rebuild. That is the whole
+        difference between this and `on_shard_ready`, and reconciling here
+        anyway would put a database read per guild behind every routine
+        gateway hiccup.
+        """
+        self._readiness.shard_connected(shard_id, shard_count=self.shard_count)
+        log_event(
+            log,
+            logging.INFO,
+            Event.BOT_SHARD_RESUMED,
+            "A gateway shard resumed after a disconnect",
+            shard_id=shard_id,
+            shard_count=self.shard_count,
+        )
+
+    async def on_shard_disconnect(self, shard_id: int) -> None:
+        """Marks a shard down, so `/readyz` stops speaking for its guilds.
+
+        WARNING rather than ERROR: discord.py dispatches this for every
+        RESUME too, so most of these are followed by `bot.shard_resumed`
+        within seconds and nothing was ever wrong. What makes a genuine
+        outage visible is not the level of this line but the readiness
+        probe it feeds -- 10-second period, `failureThreshold: 3`, so a
+        shard has to stay down for half a minute before Kubernetes marks
+        the pod NotReady. A blip is invisible; a shard that is actually
+        gone is not.
+        """
+        self._readiness.shard_disconnected(shard_id)
+        log_event(
+            log,
+            logging.WARNING,
+            Event.BOT_SHARD_DISCONNECTED,
+            "A gateway shard disconnected; the guilds it carries are unreachable "
+            "until it comes back",
+            shard_id=shard_id,
+            shard_count=self.shard_count,
+        )
+
+    async def on_ready(self) -> None:
+        """Says the whole set of shards is up. Deliberately does no work.
+
+        The reconcile that used to live here moved to `on_shard_ready` --
+        read that method for why, because the move is the substance of
+        sharding this client and not a tidy-up. `_delay_ready` fires this
+        only after every shard's own ready task has completed, so by the
+        time this runs each shard has already reconciled its guilds
+        exactly once; repeating the sweep here would be a second database
+        read per guild that could not change anything.
+
+        Readiness is not touched here either. It is per shard now, and
+        four shards up is something this method cannot say more precisely
+        than the four `on_shard_ready` calls that preceded it.
+        """
         log_event(
             log,
             logging.INFO,
             Event.BOT_CONNECTED,
             "Connected to Discord",
             count=len(self._recordings),
+            shard_count=self.shard_count,
         )
 
     async def on_guild_join(self, guild: discord.Guild) -> None:
@@ -1350,6 +1519,7 @@ class SturnusClient(commands.Bot):
                     channel_id=recording.channel_id,
                     session_id=recording.service.session_id,
                     end_reason=EndReason.CAPTURE_FAILURE.value,
+                    shard_id=self._shard(recording.service.guild_id),
                     # The one join failure whose type name says nothing
                     # useful: `discord.ConnectionClosed` is what Discord
                     # raises for "session no longer valid", "you were
@@ -1399,6 +1569,7 @@ class SturnusClient(commands.Bot):
                 guild_id=guild_id,
                 channel_id=recording.channel_id,
                 session_id=recording.service.session_id,
+                shard_id=self._shard(guild_id),
             )
         recording.service.reset()
 
@@ -1695,6 +1866,16 @@ class SturnusClient(commands.Bot):
         Every guild's body is wrapped: this one task also carries the
         readiness heartbeat and every other guild's timeout enforcement,
         and one guild raising here must not take those with it.
+
+        **This sweep does not ask whether it serves a guild, and that is a
+        decision rather than an omission.** Its input is `self.guilds` --
+        the gateway cache -- which contains exactly the guilds this
+        process's shards carry and nothing else, today and under stage two
+        alike. The administrator mirror and the directory mirror inherit
+        that scoping by running inside it. `sturnus.application.sharding`
+        carries the full argument, and names the one sweep whose input is
+        the *database* instead and therefore does have to ask: the
+        announcement poll.
         """
         guild_ids = {guild.id for guild in self.guilds} | {
             guild_id for guild_id, _channel_id in self._recordings
@@ -1710,6 +1891,7 @@ class SturnusClient(commands.Bot):
                     "The periodic tick failed for this guild; every other guild is unaffected.",
                     exc,
                     guild_id=guild_id,
+                    shard_id=self._shard(guild_id),
                 )
 
     async def _tick_guild(self, guild_id: int, now: datetime) -> None:
@@ -1787,6 +1969,7 @@ class SturnusClient(commands.Bot):
                 "the membership it already had",
                 exc,
                 guild_id=guild_id,
+                shard_id=self._shard(guild_id),
             )
 
     async def _mirror_directory(self, guild_id: int, now: datetime) -> None:
@@ -1834,6 +2017,7 @@ class SturnusClient(commands.Bot):
                 "keeps the names it already had",
                 exc,
                 guild_id=guild_id,
+                shard_id=self._shard(guild_id),
             )
 
     async def _sweep_due_session(
@@ -1904,6 +2088,7 @@ class SturnusClient(commands.Bot):
                     exc,
                     guild_id=guild_id,
                     session_id=session_id,
+                    shard_id=self._shard(guild_id),
                 )
         if not closed:
             return
@@ -1948,6 +2133,7 @@ class SturnusClient(commands.Bot):
             channel_id=recording.channel_id,
             end_reason=reason.value,
             duration_seconds=REJOIN_COOLDOWN.total_seconds(),
+            shard_id=self._shard(recording.service.guild_id),
         )
 
     async def _end_capture_cooldown(self, guild_id: int) -> None:

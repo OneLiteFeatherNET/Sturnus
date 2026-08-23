@@ -374,6 +374,12 @@ class SessionRepository:
                 await session.execute(
                     select(
                         Session.id,
+                        # Selected so `announce_ready_sessions` can ask
+                        # whether this process serves the guild at all --
+                        # see `sturnus.application.sharding`. Always true
+                        # today; the column is what makes it possible to
+                        # stop being true without rewriting the sweep.
+                        Session.guild_id,
                         Session.channel_id,
                         Session.status,
                         Session.document_url,
@@ -400,6 +406,7 @@ class SessionRepository:
             return [
                 {
                     "id": row.id,
+                    "guild_id": row.guild_id,
                     "channel_id": row.channel_id,
                     "status": row.status,
                     "document_url": row.document_url,

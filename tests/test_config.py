@@ -152,3 +152,58 @@ def test_sentry_settings_do_not_require_the_rest_of_the_environment(
         monkeypatch.delenv(key, raising=False)
     monkeypatch.delenv("STURNUS_SENTRY_DSN", raising=False)
     assert SentrySettings().sentry_dsn is None
+
+
+def test_the_shard_count_is_unset_by_default_so_discord_decides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No shard count means "ask the gateway how many to open", which is the
+    only answer that stays right as the bot is added to more servers.
+    Discord's own `/gateway/bot` recommendation grows with the guild count;
+    a number pinned in a Helm values file does not.
+    """
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("STURNUS_SHARD_COUNT", raising=False)
+    assert Settings().shard_count is None
+
+
+@pytest.mark.parametrize("blank", ["", "   "])
+def test_a_blank_shard_count_means_unset_rather_than_a_failure(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    """The chart renders every optional value, so "not configured" arrives as
+    an empty string rather than an absent variable -- exactly as it does for
+    `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT`. An empty string must mean "let
+    Discord decide", not "refuse to start".
+    """
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("STURNUS_SHARD_COUNT", blank)
+    assert Settings().shard_count is None
+
+
+def test_an_explicit_shard_count_survives(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An operator who knows why may pin it; nothing about that is discouraged."""
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("STURNUS_SHARD_COUNT", "4")
+    assert Settings().shard_count == 4
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_a_shard_count_below_one_is_refused_at_startup(
+    monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """Zero shards is not a smaller deployment, it is a bot that never connects.
+
+    Refused here rather than left to the gateway: `discord.py` would build
+    an empty shard range, `on_ready` would never fire, and the process
+    would sit there looking alive with a readiness probe that never turns
+    green and no line saying why.
+    """
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("STURNUS_SHARD_COUNT", value)
+    with pytest.raises(ValidationError, match="STURNUS_SHARD_COUNT"):
+        Settings()
