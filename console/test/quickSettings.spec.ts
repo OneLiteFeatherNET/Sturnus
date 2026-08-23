@@ -39,6 +39,10 @@ function view(key: string, over: Partial<SettingView> = {}): SettingView {
     value: 'x',
     default: 'x',
     required: false,
+    // Defaulted false, matching `settings.spec.ts`: the API's verdict is
+    // what decides a Clear button, and a fixture that omitted the field
+    // would let a test agree with an older rule than the one that ships.
+    may_clear: false,
     integer: false,
     invalidates_consent: false,
     takes_effect: 'immediately',
@@ -48,7 +52,12 @@ function view(key: string, over: Partial<SettingView> = {}): SettingView {
 }
 
 const LANGUAGE = view('transcription_language', { value: 'de', default: 'de' })
-const RETENTION = view('audio_retention_days', { value: '30', default: '30', integer: true })
+const RETENTION = view('audio_retention_days', {
+  value: '30',
+  default: '30',
+  integer: true,
+  may_clear: true,
+})
 const CHANNEL = view('voice_channel_id', { value: '4711', default: null, required: true })
 
 describe('which settings the band offers', () => {
