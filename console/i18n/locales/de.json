@@ -18,9 +18,9 @@
     "recordings": "Aufnahmen",
     "calendar": "Kalender",
     "botSettings": "Bot-Einstellungen",
-    "userSettings": "Benutzereinstellungen",
     "queue": "Warteschlange",
-    "reporting": "Auswertung"
+    "reporting": "Auswertung",
+    "consents": "Einwilligungen"
   },
   "auth": {
     "signIn": "Anmelden",
@@ -56,6 +56,90 @@
     "security": {
       "title": "Sicherheit",
       "note": "Beides lässt sich noch nicht einschalten. Es steht hier und im Kontomenü, weil ein Vorhaben, das nirgendwo sichtbar ist, kein Vorhaben ist, auf das sich jemand verlassen kann."
+    },
+    "consent": {
+      "title": "Einwilligung",
+      "intro": "Was Sturnus von einer Person aufnehmen darf, und in welchen Discord-Servern. Erteilt wird eine Einwilligung in Discord mit /consent grant — hier lässt sie sich einschränken oder zurücknehmen.",
+      "serverIdNote": "Server stehen hier mit ihrer Discord-ID. Den Namen eines Servers kennt diese Konsole nur bei Servern, die dieses Konto verwaltet.",
+      "loading": "Einwilligungen werden gelesen…",
+      "server": "Discord-Server {guild}",
+      "unavailableHeading": "Einwilligungen sind noch nicht abrufbar",
+      "errorHeading": "Einwilligungen konnten nicht gelesen werden",
+      "emptyHeading": "Nirgends eine Einwilligung hinterlegt",
+      "emptyNote": "Sturnus hat in keinem Server eine Einwilligung zu diesem Konto gespeichert; damit wird nirgends etwas davon aufgenommen. Erteilt wird sie in Discord mit /consent grant und erscheint danach hier.",
+      "error": {
+        "signedOut": "Die Sitzung ist abgelaufen. Erneut anmelden — an der Einwilligung hat sich nichts geändert.",
+        "notDeployed": "Die Konsole hat die API nach den Einwilligungen gefragt, und die API kennt diesen Endpunkt noch nicht: sie ist älter als diese Seite. Deshalb steht hier nichts statt einer leeren Liste — eine leere Liste hieße „nirgends eingewilligt“, und das ist eine Aussage über eigene Daten, die diese Konsole gerade nicht treffen kann.",
+        "unreachable": "Die API war nicht erreichbar. Über die Einwilligung ist hier gerade nichts bekannt, und geändert hat sich an ihr nichts.",
+        "unknown": "Sturnus hat mit {status} geantwortet und konnte die Einwilligungen nicht ausliefern. Geändert hat sich nichts."
+      },
+      "badge": {
+        "active": "Gültig",
+        "scheduled": "Endet demnächst",
+        "revoked": "Zurückgenommen",
+        "policy_superseded": "Richtlinie überholt"
+      },
+      "now": {
+        "audio": "Derzeit nimmt Sturnus in diesem Server die Stimme auf, sobald eine Sitzung läuft. Mehr wird nicht erfasst.",
+        "audioVideo": "Derzeit umfasst die Einwilligung in diesem Server Stimme und Video.",
+        "nothing": "In diesem Server wird nichts davon aufgenommen."
+      },
+      "granted": {
+        "both": "Erteilt am {granted}, unter Richtlinienfassung {policy}.",
+        "noPolicy": "Erteilt am {granted}. Unter welcher Richtlinienfassung, wurde nicht festgehalten.",
+        "noDate": "Genannt wird Richtlinienfassung {policy}. Wann die Einwilligung erteilt wurde, ist nicht festgehalten.",
+        "neither": "Weder der Zeitpunkt der Erteilung noch die genannte Richtlinienfassung wurde festgehalten."
+      },
+      "state": {
+        "scheduled": "Vorgemerkt zum Ende am {when}. Bis dahin wird unverändert weiter aufgenommen, danach nicht mehr — innerhalb von etwa fünf Sekunden.",
+        "revoked": "Am {when} zurückgenommen. Seitdem wurde in diesem Server nichts mehr aufgenommen, und daran ändert sich nichts, bis in Discord mit /consent grant erneut eingewilligt wird.",
+        "superseded": "Diese Einwilligung nennt Richtlinienfassung {policy}, der Server führt inzwischen Fassung {current}. Eine Einwilligung, die eine ältere Fassung nennt, zählt nicht mehr; deshalb wird hier nichts aufgenommen. Erneut eingewilligt wird in Discord mit /consent grant — einem Dokument zuzustimmen kann diese Konsole für niemanden übernehmen.",
+        "supersededUnknown": "Diese Einwilligung nennt eine Richtlinienfassung, über die der Server hinaus ist; sie zählt nicht mehr, und aufgenommen wird hier nichts. Erneut eingewilligt wird in Discord mit /consent grant."
+      },
+      "scope": {
+        "title": "Was aufgenommen werden darf",
+        "note": "Eine Einschränkung greift innerhalb von etwa fünf Sekunden, auch mitten in einer laufenden Sitzung. Eine Erweiterung schreibt eine neue Einwilligung, die die aktuelle Richtlinienfassung dieses Servers nennt.",
+        "audio": "Nur Audio",
+        "audioVideo": "Audio und Video",
+        "audioOnly": "Dieser Server nimmt ausschließlich Audio auf. Eine Video-Einwilligung bietet er nicht an, deshalb gibt es hier auch keine Video-Option zum Erteilen oder Verweigern.",
+        "videoNotRecordedYet": "Sturnus nimmt heute kein Video auf. Eine Einwilligung dafür hält fest, dass es erlaubt wäre; sie startet nichts.",
+        "locked": "Der Umfang einer zurückgenommenen Einwilligung lässt sich nicht mehr ändern. Eine neue wird in Discord mit /consent grant erteilt.",
+        "saving": "Wird gespeichert…",
+        "unchangedHeadline": "Nichts geändert.",
+        "unchangedDetail": "Genau das stand ohnehin schon in der Einwilligung.",
+        "narrowedHeadline": "Auf Audio eingeschränkt.",
+        "narrowedDetail": "Wirksam innerhalb von etwa fünf Sekunden, auch mitten in einer laufenden Sitzung.",
+        "widenedHeadline": "Auf Audio und Video erweitert.",
+        "widenedDetail": "Dafür wurde eine neue Einwilligung geschrieben, die die aktuelle Richtlinienfassung {policy} dieses Servers nennt.",
+        "widenedDetailNoPolicy": "Dafür wurde eine neue Einwilligung geschrieben. Welche Richtlinienfassung sie nennt, wurde nicht zurückgemeldet.",
+        "refusedHeadline": "Sturnus hat abgelehnt."
+      },
+      "refusal": {
+        "videoNotOffered": "Dieser Server bietet keine Video-Einwilligung an, also lässt sie sich hier auch nicht erteilen. Geändert hat sich nichts.",
+        "noConsent": "Sturnus hat für dieses Konto in diesem Server gar keine Einwilligung gespeichert, also war nichts zu ändern. Aufgenommen wird dort nichts.",
+        "alreadyRevoked": "Diese Einwilligung ist bereits zurückgenommen, daran lässt sich nichts mehr ändern. Eine neue wird in Discord mit /consent grant erteilt.",
+        "noPolicyVersion": "Für diesen Server ist keine Richtlinienfassung gesetzt, damit gibt es kein Dokument, auf das sich eine Einwilligung beziehen könnte. Das setzt eine Administration, bevor eingewilligt oder erweitert werden kann.",
+        "unknown": "Sturnus hat abgelehnt, ohne einen Grund zu nennen. Geändert hat sich nichts."
+      },
+      "withdraw": {
+        "button": "Einwilligung zurücknehmen",
+        "busy": "Wird zurückgenommen…",
+        "cancel": "Abbrechen",
+        "title": "Einwilligung in diesem Server zurücknehmen?",
+        "confirm": "Ja, Einwilligung zurücknehmen",
+        "roleStays": "Damit wird die von Sturnus gespeicherte Einwilligung zurückgenommen. Die Discord-Rolle für die Einwilligung bleibt bestehen — die API hält bewusst kein Discord-Token und kann an Rollen nichts ändern. Die Aufnahme endet trotzdem innerhalb von etwa fünf Sekunden, auch mitten in einer laufenden Sitzung, denn geprüft wird bei jedem Frame der gespeicherte Eintrag. Soll die Rolle ebenfalls weg, muss das in Discord geschehen.",
+        "notDeletion": "Zurücknehmen ist kein Löschen. Jede Aufnahme, die diese Stimme bereits enthält, bleibt genau dort, wo sie ist. Löschen ist ein eigener Schritt: /audio delete in Discord.",
+        "grantAgain": "Erneut einwilligen kann nur die betroffene Person selbst, und nur in Discord mit /consent grant. Diese Konsole kann das nicht übernehmen.",
+        "alreadyScheduled": "Die Aufnahme hier ist ohnehin zum {when} vorgemerkt zu enden. Ein Zurücknehmen jetzt bittet darum, dass es stattdessen sofort wirkt.",
+        "alreadyDone": "Bereits am {when} zurückgenommen. Es bleibt nichts mehr zurückzunehmen.",
+        "doneHeadline": "Die Einwilligung in diesem Server ist zurückgenommen.",
+        "doneDetail": "Wirksam ab {when}. Die Aufnahme endet innerhalb von etwa fünf Sekunden, auch mitten in einer laufenden Sitzung.",
+        "doneDetailNoInstant": "Die Aufnahme endet innerhalb von etwa fünf Sekunden, auch mitten in einer laufenden Sitzung.",
+        "heldNone": "Sturnus hält keine Aufnahme, die diese Stimme enthält.",
+        "heldOne": "Sturnus hält weiterhin eine Aufnahme, die diese Stimme enthält. Dieses Zurücknehmen löscht sie nicht; /audio delete in Discord tut es.",
+        "heldMany": "Sturnus hält weiterhin {count} Aufnahmen, die diese Stimme enthalten. Dieses Zurücknehmen löscht keine davon; /audio delete in Discord tut es.",
+        "refusedHeadline": "Es wurde nichts zurückgenommen."
+      }
     }
   },
   "error": {
@@ -328,6 +412,32 @@
       "errorUnknownGuild": "Sturnus kennt diesen Server nicht, oder er wird von hier aus nicht mehr verwaltet — beides beantwortet Sturnus gleich. Die Seite neu laden; die Serverliste wird aus Discord neu aufgebaut.",
       "errorUnreachable": "Die API war nicht erreichbar. Nichts hier ist absichtlich veraltet; Verbindung prüfen und erneut versuchen.",
       "errorStatus": "Sturnus hat mit {status} geantwortet und konnte die Zahlen dieses Servers nicht erstellen. Über den Grund ist nichts bekannt."
+    },
+    "consents": {
+      "scope": {
+        "label": "Umfang",
+        "audio": "Nur Audio",
+        "audioVideo": "Audio und Video"
+      },
+      "effective": {
+        "toggle": "Zeitpunkt des Wirksamwerdens wählen",
+        "legend": "Wirksam ab",
+        "nowNote": "Sofort, sofern hier kein anderer Zeitpunkt gewählt wird. Ohne diesen Bereich zu öffnen, verhält sich das Zurücknehmen genau wie bisher.",
+        "help": "Ein Zeitpunkt in der Vergangenheit ist eine Aussage über bereits vorhandene Aufnahmen. Ein Zeitpunkt in der Zukunft ist ein vorgemerktes Zurücknehmen: bis dahin wird weiter aufgenommen, danach endet es innerhalb von etwa fünf Sekunden.",
+        "zone": "Gilt als Ortszeit und wird als {offset} gegenüber UTC gesendet. Einen Zeitpunkt ohne Zeitzonenangabe weist Sturnus zurück.",
+        "reset": "Zurück auf sofort",
+        "unreadable": "Das ist kein Zeitpunkt, den diese Konsole lesen kann. Datum und Uhrzeit wählen oder zurück auf sofort.",
+        "beforeGrant": "Diese Einwilligung wurde am {granted} erteilt. Ein Zurücknehmen kann nicht vor der Einwilligung wirken, die es zurücknimmt — diesen oder einen späteren Zeitpunkt wählen.",
+        "pastNone": "Wirksam ab {when}, also rückwirkend. Sturnus hält keine Aufnahme mit dieser Stimme, damit fällt nichts hinein.",
+        "pastOne": "Wirksam ab {when}, also rückwirkend. Sturnus hält {count} Aufnahme mit dieser Stimme; datiert auf diesen Zeitpunkt oder später, liegt sie innerhalb der Rücknahme.",
+        "pastMany": "Wirksam ab {when}, also rückwirkend. Sturnus hält {count} Aufnahmen mit dieser Stimme; welche davon auf diesen Zeitpunkt oder später datiert sind, liegen innerhalb der Rücknahme.",
+        "notDeletion": "Gelöscht wird dadurch keine davon. Eine Rücknahme regelt, was aufgenommen werden darf, nie das bereits Aufgenommene — Löschen ist ein eigener Schritt, /audio purge in Discord.",
+        "futureNote": "Das ist ein vorgemerktes Zurücknehmen, kein sofortiges. Bis {when} wird unverändert weiter aufgenommen, danach endet es innerhalb von etwa fünf Sekunden.",
+        "tookEffect": "Wirksam ab {when}.",
+        "fromNone": "Keine Aufnahme mit dieser Stimme fällt auf {when} oder danach.",
+        "fromOne": "{count} Aufnahme mit dieser Stimme fällt auf {when} oder danach. Gelöscht wurde sie nicht.",
+        "fromMany": "{count} Aufnahmen mit dieser Stimme fallen auf {when} oder danach. Gelöscht wurde keine davon."
+      }
     }
   }
 }

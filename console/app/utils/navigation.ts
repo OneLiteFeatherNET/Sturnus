@@ -94,12 +94,17 @@ export const ADMIN_VIEW: NavSection = {
       adminOnly: true,
     },
     {
-      to: '/admin/user-settings',
-      labelKey: 'nav.userSettings',
+      // Renamed from `/admin/user-settings`, which read as "settings for
+      // users" and is in fact a roster of other people's consent. The old
+      // address stays alive as a permanent redirect in `nuxt.config.ts`,
+      // because it is in browser histories and in at least one runbook.
+      to: '/admin/consents',
+      labelKey: 'nav.consents',
       // Two people rather than one: this page is about the members of a
       // server, never about the account of whoever is reading it. A single
-      // silhouette next to "User Settings" would read as "your profile",
-      // which is the one thing this page is not.
+      // silhouette would read as "your profile", which is the one thing
+      // this page is not -- and since `/settings` became the page that *is*
+      // that, the distinction matters more than it did.
       icon: 'M16 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-8 0a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5Zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5Z',
       adminOnly: true,
     },

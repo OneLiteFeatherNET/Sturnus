@@ -19,6 +19,22 @@
  *   only in a footnote nobody reads twice.
  * - **It never offers an action it knows will fail.** A consent already
  *   withdrawn has no button at all, only the sentence saying when it went.
+ *
+ * **The withdrawal now carries an effective instant, and its default is
+ * still now.** Pressing straight through the confirmation without opening
+ * the instant control sends no instant at all, exactly as this page always
+ * has, so no existing habit breaks. Opening it buys the two cases §5.4 of
+ * the personalisation spec makes expressible: a past instant, which is a
+ * statement about recordings that already exist, and a future one, which is
+ * a scheduled withdrawal the bot honours through the five-second consent
+ * cache it already has.
+ *
+ * **This file mixes two languages of string, and the mix is deliberate.**
+ * Everything already here is English prose, because the whole
+ * administrative area is and converting it belongs to the sweep that
+ * converts all four admin pages together. Everything *new* goes through
+ * `$t` under `admin.consents.*`, the namespace `i18n/README.md` already
+ * reserves for this page, so the sweep has less to do rather than more.
  */
 import {
   AUDIT_LOG_NOTE,
@@ -40,8 +56,20 @@ import {
   revocability,
   revokeConfirmation,
   revokeOutcome,
+  scopeLineKey,
   withdrawnLine,
 } from '~/utils/consents'
+import {
+  effectiveConsequence,
+  effectiveKind,
+  effectiveOutcome,
+  isoFromLocalInput,
+  localInputFromIso,
+  localOffsetMinutes,
+  offsetLabel,
+  validateEffectiveAt,
+} from '~/utils/effectiveInstant'
+import type { Line } from '~/utils/myConsents'
 import {
   chooseGuild,
   guildLabel,
@@ -50,7 +78,7 @@ import {
   writeSelectedGuild,
 } from '~/utils/settings'
 
-useHead({ title: 'User Settings' })
+useHead({ title: 'Consents' })
 
 const api = useApi()
 
@@ -116,6 +144,82 @@ const confirming = ref<string | null>(null)
 const busy = ref<Record<string, boolean>>({})
 const failures = ref<Record<string, string>>({})
 const outcomes = ref<Record<string, RevokeOutcome | null>>({})
+/** What the API said it actually did with the instant, as keyed lines.
+ *  Kept beside the English outcome rather than folded into it: the outcome
+ *  is `~/utils/consents`' prose and the instant is new, translated
+ *  material. */
+const instantOutcomes = ref<Record<string, Line[]>>({})
+
+/**
+ * The instant the open confirmation would take effect, as the browser's own
+ * control writes it -- wall-clock time with no zone.
+ *
+ * Empty means *now*, and empty is the default. One value rather than one
+ * per row because only one confirmation is ever open: two remembered
+ * instants would be one instant attached to the wrong person the moment a
+ * panel is closed and another opened.
+ */
+const effectiveLocal = ref('')
+
+// A moment chosen for one person must never survive into another's
+// confirmation. It is the single most dangerous piece of state on this
+// page: a withdrawal is destructive, back-dating it is more so, and an
+// instant that quietly carried over would be applied to somebody nobody
+// chose it for.
+watch(confirming, () => {
+  effectiveLocal.value = ''
+})
+
+/** The instant, with its offset, or null when the control was left alone.
+ *  The offset is the browser's *for the chosen wall clock*, not for today,
+ *  so a January instant chosen in July carries January's offset. */
+const chosenInstant = computed(() =>
+  effectiveLocal.value
+    ? isoFromLocalInput(effectiveLocal.value, localOffsetMinutes(effectiveLocal.value))
+    : null,
+)
+
+/** What the reader is told their local time will be sent as. Named rather
+ *  than implied: this is the field the API answers 400 to when it arrives
+ *  naive, and an administrator who can see the offset can see it is right. */
+const chosenOffset = computed(() => offsetLabel(localOffsetMinutes(effectiveLocal.value)))
+
+/** Why the chosen instant cannot be sent, or null when it can. Null while
+ *  the control is untouched: "now" is always legal. */
+function instantProblem(row: ConsentRow): Line | null {
+  if (!effectiveLocal.value) return null
+  const verdict = validateEffectiveAt(chosenInstant.value, row.granted_at)
+  return verdict.ok ? null : verdict.problem
+}
+
+/**
+ * What the confirmation gains because of the instant that was chosen.
+ *
+ * Nothing at all for "now", which is what keeps the unchanged path
+ * unchanged. `new Date()` is read here rather than held in a ref because
+ * this only ever runs in a browser -- the panel exists after a click --
+ * and because a clock captured once would call a future instant "past" for
+ * anybody who left the tab open.
+ */
+function instantConsequence(row: ConsentRow): Line[] {
+  if (!effectiveLocal.value || instantProblem(row)) return []
+  return effectiveConsequence(
+    effectiveKind(chosenInstant.value),
+    chosenInstant.value,
+    row.recordings_with_audio,
+  )
+}
+
+/** The earliest instant the control will offer, in the reader's own zone.
+ *  A bound they can see beats one they discover by tripping over it, and
+ *  the offset is read from the grant instant itself so a date in another
+ *  daylight-saving period is not an hour out. */
+function grantedFloor(row: ConsentRow): string | undefined {
+  if (!row.granted_at) return undefined
+  const at = new Date(row.granted_at)
+  if (Number.isNaN(at.getTime())) return undefined
+  return localInputFromIso(row.granted_at, at.getTimezoneOffset()) ?? undefined
+}
 
 // Every guild has its own people, and a panel or an outcome left over from
 // the previous selection would sit on whichever row happened to land in the
@@ -125,24 +229,39 @@ watch(selected, () => {
   busy.value = {}
   failures.value = {}
   outcomes.value = {}
+  instantOutcomes.value = {}
 })
 
 async function commit(row: ConsentRow) {
+  if (instantProblem(row)) return
+  const instant = chosenInstant.value
   confirming.value = null
   failures.value[row.discord_user_id] = ''
   outcomes.value[row.discord_user_id] = null
+  instantOutcomes.value[row.discord_user_id] = []
   busy.value[row.discord_user_id] = true
   const guildId = selected.value
   try {
     const answer = await api<unknown>(
       `/guilds/${guildId}/consents/${row.discord_user_id}/revoke`,
-      { method: 'POST' },
+      // No instant, no body. An administrator who never opened the control
+      // sends byte for byte the request this page has always sent, which is
+      // what makes "the default is now" a fact about the wire rather than a
+      // claim about the interface.
+      instant ? { method: 'POST', body: { effective_at: instant } } : { method: 'POST' },
     )
     // The endpoint's own answer decides what is reported, never the fact
     // that the call did not throw. A body this console cannot read counts
     // as a refusal: the only person who would find out otherwise is the one
     // still being recorded.
-    outcomes.value[row.discord_user_id] = revokeOutcome(row, parseRevokeResult(answer))
+    const result = parseRevokeResult(answer)
+    outcomes.value[row.discord_user_id] = revokeOutcome(row, result)
+    // Only when the write went through. Repeating "it takes effect on
+    // Tuesday" under a refusal would describe a withdrawal that does not
+    // exist.
+    instantOutcomes.value[row.discord_user_id] = result.revoked
+      ? effectiveOutcome(result.effective_at, result.recordings_from_effective_at)
+      : []
     await refresh()
   } catch (error) {
     failures.value[row.discord_user_id] = describeConsentError(error)
@@ -181,7 +300,7 @@ const TONE_COLOUR: Record<string, string> = {
 
 <template>
   <div class="max-w-3xl">
-    <h1 class="mb-1 text-2xl font-semibold">User Settings</h1>
+    <h1 class="mb-1 text-2xl font-semibold">Consents</h1>
     <p class="mb-6 text-sm" :style="{ color: 'var(--text-muted)' }">
       Everybody who has ever given consent to be recorded in one server, whether that consent still
       counts, and how much of them Sturnus still holds. Consent is given by the person, in Discord,
@@ -380,6 +499,18 @@ const TONE_COLOUR: Record<string, string> = {
                     {{ grantedLine(row) }}
                   </dd>
                 </div>
+                <!-- On the roster so that "who agreed to video" is a
+                     question an administrator can answer by reading rather
+                     than by opening anything. It is not editable here:
+                     narrowing somebody else's scope stops short of stopping
+                     the recording, and widening it would be granting
+                     consent on their behalf. -->
+                <div>
+                  <dt class="inline font-medium">{{ $t('admin.consents.scope.label') }} ·</dt>
+                  <dd class="inline" :style="{ color: 'var(--text-muted)' }">
+                    {{ $t(scopeLineKey(row)) }}
+                  </dd>
+                </div>
                 <div v-if="withdrawnLine(row)">
                   <dt class="inline font-medium">Withdrawn ·</dt>
                   <dd class="inline" :style="{ color: 'var(--text-muted)' }">
@@ -439,11 +570,89 @@ const TONE_COLOUR: Record<string, string> = {
                 >
                   {{ consequence }}
                 </p>
+
+                <!-- The effective instant, folded away by default. Closed,
+                     this confirmation is the one that has always been here
+                     and the button below sends the request it has always
+                     sent. Open, it is where a withdrawal becomes a
+                     statement about a moment rather than about now.
+
+                     A native `datetime-local`: it is the control every
+                     phone already knows how to present, and reimplementing
+                     a date picker to look the same on three platforms is
+                     how a date picker ends up unusable on one of them. -->
+                <details class="mt-3 rounded-lg border p-3" :style="{ borderColor: 'var(--border)' }">
+                  <summary class="cursor-pointer text-sm font-medium">
+                    {{ $t('admin.consents.effective.toggle') }}
+                  </summary>
+                  <p class="mt-2 text-xs" :style="{ color: 'var(--text-muted)' }">
+                    {{ $t('admin.consents.effective.nowNote') }}
+                  </p>
+                  <p class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
+                    {{ $t('admin.consents.effective.help') }}
+                  </p>
+                  <label
+                    class="mt-3 mb-1 block text-xs font-medium uppercase tracking-wide"
+                    :style="{ color: 'var(--text-muted)' }"
+                    :for="`effective-${row.discord_user_id}`"
+                  >
+                    {{ $t('admin.consents.effective.legend') }}
+                  </label>
+                  <input
+                    :id="`effective-${row.discord_user_id}`"
+                    v-model="effectiveLocal"
+                    type="datetime-local"
+                    class="w-full rounded-lg border px-3 py-2 text-sm"
+                    :min="grantedFloor(row)"
+                    :style="{
+                      borderColor: 'var(--control-border)',
+                      background: 'var(--surface)',
+                      color: 'var(--text)',
+                    }"
+                  >
+                  <!-- The offset is said out loud. It is the field the API
+                       answers 400 to when it arrives naive, and an
+                       administrator who can read it can see it is right. -->
+                  <p class="mt-1 text-xs" :style="{ color: 'var(--text-muted)' }">
+                    {{ $t('admin.consents.effective.zone', { offset: chosenOffset }) }}
+                  </p>
+                  <button
+                    v-if="effectiveLocal"
+                    type="button"
+                    class="mt-2 rounded-lg border px-3 py-1.5 text-xs transition-colors hover:bg-[var(--surface)]"
+                    :style="{ borderColor: 'var(--border)' }"
+                    @click="effectiveLocal = ''"
+                  >
+                    {{ $t('admin.consents.effective.reset') }}
+                  </button>
+                </details>
+
+                <!-- Said before the confirmation is pressed, never after.
+                     Choosing a past instant and being shown nothing would
+                     let somebody believe they had erased something. -->
+                <p
+                  v-for="line in instantConsequence(row)"
+                  :key="line.key"
+                  class="mt-2 text-sm"
+                  :style="{ color: 'var(--text-muted)' }"
+                >
+                  {{ $t(line.key, line.values ?? {}) }}
+                </p>
+
+                <p
+                  v-if="instantProblem(row)"
+                  class="mt-2 rounded-lg border p-2 text-sm"
+                  :style="{ borderColor: 'var(--danger)', color: 'var(--danger)' }"
+                >
+                  {{ $t(instantProblem(row)!.key, instantProblem(row)!.values ?? {}) }}
+                </p>
+
                 <div class="mt-3 flex flex-wrap gap-2">
                   <button
                     type="button"
-                    class="rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90"
+                    class="rounded-lg px-3 py-1.5 text-sm font-medium text-white transition-opacity hover:opacity-90 disabled:opacity-40"
                     :style="{ background: 'var(--color-brand-red)' }"
+                    :disabled="Boolean(instantProblem(row))"
                     @click="commit(row)"
                   >
                     {{ revokeConfirmation(row).confirmLabel }}
@@ -470,6 +679,18 @@ const TONE_COLOUR: Record<string, string> = {
                 <p class="text-sm font-semibold">{{ outcomes[row.discord_user_id]!.headline }}</p>
                 <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
                   {{ outcomes[row.discord_user_id]!.detail }}
+                </p>
+                <!-- What the API says it did with the instant, from its own
+                     answer rather than from the request: the console's
+                     arithmetic and the API's are two arithmetics, and only
+                     one of them has the recordings table. -->
+                <p
+                  v-for="line in instantOutcomes[row.discord_user_id] ?? []"
+                  :key="line.key"
+                  class="mt-1 text-sm"
+                  :style="{ color: 'var(--text-muted)' }"
+                >
+                  {{ $t(line.key, line.values ?? {}) }}
                 </p>
               </div>
 

@@ -106,8 +106,17 @@ describe('who is offered the Admin View', () => {
     expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.botSettings')
   })
 
-  it('offers the user settings to an administrator', () => {
-    expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.userSettings')
+  it('offers the consent roster to an administrator', () => {
+    expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.consents')
+  })
+
+  it('names the consent roster for what it is rather than for whom it is about', () => {
+    // It was `/admin/user-settings`, labelled "User Settings", which reads
+    // as "settings for users" and is in fact a roster of other people's
+    // consent -- and which since `/settings` became a real page competes
+    // with the one address that *is* a person's own settings.
+    const entry = ADMIN_VIEW.entries.find((e) => e.labelKey === 'nav.consents')!
+    expect(entry.to).toBe('/admin/consents')
   })
 
   it('offers the queue to an administrator', () => {
@@ -148,7 +157,7 @@ describe('who is offered the Admin View', () => {
     // this server actually uses Sturnus, and never in a hurry.
     expect(ADMIN_VIEW.entries.map((e) => e.labelKey)).toEqual([
       'nav.botSettings',
-      'nav.userSettings',
+      'nav.consents',
       'nav.queue',
       'nav.reporting',
     ])

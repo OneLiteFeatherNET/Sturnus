@@ -35,6 +35,7 @@ import {
   revocability,
   revokeConfirmation,
   revokeOutcome,
+  scopeLineKey,
   withdrawnLine,
   type ConsentRow,
 } from '../app/utils/consents'
@@ -48,6 +49,7 @@ function row(overrides: Partial<ConsentRow> & { discord_user_id: string }): Cons
     granted_at: '2026-08-21T12:00:00+00:00',
     revoked_at: null,
     active: true,
+    scope: 'audio',
     recordings_with_audio: 0,
     ...overrides,
   }
@@ -110,6 +112,23 @@ describe('reading the consents payload', () => {
     expect(parseConsents([{ discord_user_id: '1', recordings_with_audio: 'many' }])[0]!.recordings_with_audio).toBe(0)
   })
 
+  it('reads the scope a person consented to', () => {
+    expect(parseConsents([{ discord_user_id: '1', scope: 'audio_video' }])[0]!.scope).toBe(
+      'audio_video',
+    )
+  })
+
+  it('treats anything that is not audio_video as audio', () => {
+    // A row from an API that predates the column, and a row carrying a
+    // scope this console has never heard of, both read as audio -- which
+    // is exactly what those consents were given for. Erring the other way
+    // would show an administrator a video consent nobody gave.
+    expect(parseConsents([{ discord_user_id: '1' }])[0]!.scope).toBe('audio')
+    expect(parseConsents([{ discord_user_id: '1', scope: 'audio_hologram' }])[0]!.scope).toBe(
+      'audio',
+    )
+  })
+
   it('drops an entry that names nobody', () => {
     expect(parseConsents([{ display_name: 'Anna' }, { discord_user_id: '100' }])).toHaveLength(1)
   })
@@ -117,6 +136,21 @@ describe('reading the consents payload', () => {
   it('yields nothing for a payload it cannot make sense of', () => {
     expect(parseConsents(null)).toEqual([])
     expect(parseConsents('nonsense')).toEqual([])
+  })
+})
+
+describe('the scope on a roster row', () => {
+  it('tells the two scopes apart', () => {
+    const audio = scopeLineKey(row({ discord_user_id: '1', scope: 'audio' }))
+    const video = scopeLineKey(row({ discord_user_id: '1', scope: 'audio_video' }))
+    expect(audio).not.toBe(video)
+  })
+
+  it('returns a key rather than a sentence', () => {
+    // `i18n/README.md`: a pure module returns data, and the template turns
+    // data into words. The rest of this module is still English prose
+    // because the whole administrative area is; anything new is not.
+    expect(scopeLineKey(row({ discord_user_id: '1' }))).toMatch(/^admin\.consents\./)
   })
 })
 
@@ -357,6 +391,30 @@ describe('what the revoke endpoint answered', () => {
     expect(parseRevokeResult({ revoked: true, refusal: null })).toEqual({
       revoked: true,
       refusal: null,
+      // An API that predates the effective instant says nothing about one,
+      // and the console must report nothing rather than invent a moment.
+      effective_at: null,
+      recordings_from_effective_at: 0,
+    })
+  })
+
+  it('carries the instant the withdrawal took effect, and what falls after it', () => {
+    // The two fields the effective-instant work added. They are echoed from
+    // the answer rather than from the request, because a scheduled
+    // withdrawal reported as an immediate one is an administrator believing
+    // recording has stopped when it has not.
+    expect(
+      parseRevokeResult({
+        revoked: true,
+        refusal: null,
+        effective_at: '2026-08-01T09:00:00+00:00',
+        recordings_from_effective_at: 12,
+      }),
+    ).toEqual({
+      revoked: true,
+      refusal: null,
+      effective_at: '2026-08-01T09:00:00+00:00',
+      recordings_from_effective_at: 12,
     })
   })
 

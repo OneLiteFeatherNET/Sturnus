@@ -105,6 +105,21 @@ export default defineNuxtConfig({
   // `/admin/bot-settings` until they clear it. The Admin View entry in the
   // sidebar is the way there, and it has never moved.
 
+  routeRules: {
+    // `/admin/user-settings` is now `/admin/consents`. The old name read as
+    // "settings for users" and the page is in fact a roster of other
+    // people's consent -- a distinction that stopped being cosmetic the
+    // moment `/settings` became the page that really is a person's own
+    // settings.
+    //
+    // The address stays alive because it is in browser histories, in
+    // bookmarks and in at least one runbook, and because this console has
+    // kept old addresses working for exactly that reason before. A 301
+    // rather than a 302: the page has moved, and it is not moving back, so
+    // a browser is welcome to remember it.
+    '/admin/user-settings': { redirect: { to: '/admin/consents', statusCode: 301 } },
+  },
+
   nitro: {
     // The container runs this as a plain Node server behind a Service.
     preset: 'node-server',

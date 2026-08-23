@@ -18,9 +18,9 @@
     "recordings": "Recordings",
     "calendar": "Calendar",
     "botSettings": "Bot Settings",
-    "userSettings": "User Settings",
     "queue": "Queue",
-    "reporting": "Reporting"
+    "reporting": "Reporting",
+    "consents": "Consents"
   },
   "auth": {
     "signIn": "Sign in",
@@ -56,6 +56,90 @@
     "security": {
       "title": "Security",
       "note": "Neither of these can be switched on yet. They are listed here, and in the account menu, because a plan that is not written down anywhere a person can see is not a plan they can rely on."
+    },
+    "consent": {
+      "title": "Consent",
+      "intro": "What Sturnus may record of you, and in which Discord servers. Consent is given by you, in Discord, with /consent grant — this page is where it can be narrowed or taken back.",
+      "serverIdNote": "Servers are named here by their Discord id. This console only learns a server's name for the servers this account administers.",
+      "loading": "Reading your consent records…",
+      "server": "Discord server {guild}",
+      "unavailableHeading": "Consent cannot be read yet",
+      "errorHeading": "Consent could not be read",
+      "emptyHeading": "No consent record anywhere",
+      "emptyNote": "Sturnus holds no consent record for you in any server it runs in, so nothing of you is being recorded anywhere. Consent is given in Discord, with /consent grant, and appears here once it exists.",
+      "error": {
+        "signedOut": "Your session has ended. Sign in again — nothing about your consent has changed.",
+        "notDeployed": "This console asked the API for your consent records, and the API has no such endpoint yet: it is older than this page. Nothing is listed here rather than an empty list, because an empty list would say you have consented nowhere — and that is a statement about your own data this console cannot currently make.",
+        "unreachable": "The API could not be reached. Nothing is known here about your consent right now, and nothing about it has changed.",
+        "unknown": "Sturnus answered {status} and could not produce your consent records. Nothing has changed."
+      },
+      "badge": {
+        "active": "In force",
+        "scheduled": "Scheduled to stop",
+        "revoked": "Withdrawn",
+        "policy_superseded": "Policy superseded"
+      },
+      "now": {
+        "audio": "Right now, Sturnus records your voice in this server whenever a session runs. Nothing else of you is captured.",
+        "audioVideo": "Right now, your consent in this server covers your voice and your video.",
+        "nothing": "Nothing of you is being recorded in this server."
+      },
+      "granted": {
+        "both": "Granted {granted}, under policy version {policy}.",
+        "noPolicy": "Granted {granted}. The policy version it was given under was not recorded.",
+        "noDate": "It names policy version {policy}. When it was given was not recorded.",
+        "neither": "Neither the moment it was given nor the policy version it names was recorded."
+      },
+      "state": {
+        "scheduled": "It is scheduled to stop on {when}. Until that moment recording continues exactly as it does now; from that moment it does not, within about five seconds.",
+        "revoked": "Withdrawn on {when}. Nothing of you has been recorded in this server since, and nothing will be until consent is granted again with /consent grant in Discord.",
+        "superseded": "This record names policy version {policy}, and this server now runs policy version {current}. A consent naming an older version stops counting, so nothing of you is being recorded here. Granting again happens in Discord, with /consent grant: agreeing to a document is not something this console can do on anybody's behalf.",
+        "supersededUnknown": "This record names a policy version this server has moved past, so it stopped counting and nothing of you is being recorded here. Granting again happens in Discord, with /consent grant."
+      },
+      "scope": {
+        "title": "What may be recorded",
+        "note": "Narrowing takes effect within about five seconds, mid-session if a meeting is running. Widening writes a new consent record naming this server's current policy version.",
+        "audio": "Audio only",
+        "audioVideo": "Audio and video",
+        "audioOnly": "This server records audio only. It does not offer video consent, so there is no video option here to give or withhold.",
+        "videoNotRecordedYet": "Sturnus records no video today. Consenting to it records that it would be allowed to; it starts nothing.",
+        "locked": "The scope of a withdrawn consent cannot be changed. A new one is granted in Discord, with /consent grant.",
+        "saving": "Saving…",
+        "unchangedHeadline": "Nothing changed.",
+        "unchangedDetail": "That was already what the record said.",
+        "narrowedHeadline": "Narrowed to audio only.",
+        "narrowedDetail": "It takes effect within about five seconds, mid-session if a meeting is running.",
+        "widenedHeadline": "Widened to audio and video.",
+        "widenedDetail": "A new consent record was written, naming this server's current policy version {policy}.",
+        "widenedDetailNoPolicy": "A new consent record was written. The policy version it names was not reported back.",
+        "refusedHeadline": "Sturnus refused."
+      },
+      "refusal": {
+        "videoNotOffered": "This server does not offer video consent, so it cannot be consented to here. Nothing changed.",
+        "noConsent": "Sturnus holds no consent record for you in this server, so there was nothing to change. Nothing of you is being recorded there.",
+        "alreadyRevoked": "This consent has already been withdrawn, so there is nothing left to change. A new one is granted in Discord, with /consent grant.",
+        "noPolicyVersion": "This server has no policy version set, so there is no document a consent could name. An administrator sets one before consent can be given or widened.",
+        "unknown": "Sturnus refused and did not say why. Nothing changed."
+      },
+      "withdraw": {
+        "button": "Withdraw consent",
+        "busy": "Withdrawing…",
+        "cancel": "Cancel",
+        "title": "Withdraw your consent in this server?",
+        "confirm": "Yes, withdraw my consent",
+        "roleStays": "This withdraws the consent record Sturnus stores. It does not remove the Discord consent role from you — the API holds no Discord token, by design, and cannot change anybody's roles. Recording of you still stops within about five seconds, in the middle of a running session if there is one, because the stored record is what is checked on every frame. If the role should go too, it has to be removed in Discord.",
+        "notDeletion": "Withdrawing is not deletion. Every recording that already contains your audio stays exactly where it is. Erasing them is a separate act: /audio delete in Discord.",
+        "grantAgain": "Only you can grant consent again, and only in Discord, with /consent grant. This console cannot do it for you.",
+        "alreadyScheduled": "Recording here is already scheduled to stop on {when}. Withdrawing now asks for it to take effect immediately instead.",
+        "alreadyDone": "Already withdrawn on {when}. There is nothing left to withdraw.",
+        "doneHeadline": "Your consent in this server is withdrawn.",
+        "doneDetail": "It takes effect {when}. Recording of you stops within about five seconds, mid-session if a meeting is running.",
+        "doneDetailNoInstant": "Recording of you stops within about five seconds, mid-session if a meeting is running.",
+        "heldNone": "Sturnus holds no recording containing your audio.",
+        "heldOne": "Sturnus still holds one recording containing your audio. This withdrawal does not delete it; /audio delete in Discord does.",
+        "heldMany": "Sturnus still holds {count} recordings containing your audio. This withdrawal deletes none of them; /audio delete in Discord does.",
+        "refusedHeadline": "Nothing was withdrawn."
+      }
     }
   },
   "error": {
@@ -328,6 +412,32 @@
       "errorUnknownGuild": "Sturnus does not know this server, or you no longer administer it — it answers the same way to both. Reload the page; the list of servers is rebuilt from Discord.",
       "errorUnreachable": "Could not reach the API. Nothing here is out of date on purpose; check the connection and retry.",
       "errorStatus": "Sturnus answered {status} and could not produce this server's figures. Nothing is known about why."
+    },
+    "consents": {
+      "scope": {
+        "label": "Scope",
+        "audio": "Audio only",
+        "audioVideo": "Audio and video"
+      },
+      "effective": {
+        "toggle": "Choose when this takes effect",
+        "legend": "Effective from",
+        "nowNote": "Now, unless another moment is chosen here. Withdrawing without opening this behaves exactly as it always has.",
+        "help": "A moment in the past is a statement about recordings that already exist. A moment in the future is a scheduled withdrawal: recording continues until then, and stops within about five seconds of it.",
+        "zone": "Read as your local time and sent as {offset} from UTC. Sturnus rejects a moment that carries no offset.",
+        "reset": "Back to now",
+        "unreadable": "That is not a moment this console can read. Pick a date and a time, or go back to now.",
+        "beforeGrant": "This consent was granted {granted}. A withdrawal cannot take effect before the consent it withdraws — pick that moment or a later one.",
+        "pastNone": "This takes effect {when}, which is in the past. Sturnus holds no recording containing their audio, so nothing falls inside it.",
+        "pastOne": "This takes effect {when}, which is in the past. Sturnus holds {count} recording containing their audio; it falls inside the withdrawal if it is dated on or after that moment.",
+        "pastMany": "This takes effect {when}, which is in the past. Sturnus holds {count} recordings containing their audio; whichever of them are dated on or after that moment fall inside the withdrawal.",
+        "notDeletion": "None of them are deleted by this. A withdrawal governs what may be recorded, never what already was — erasing a recording is a separate act, /audio purge in Discord.",
+        "futureNote": "This is a scheduled withdrawal rather than an immediate one. Recording continues exactly as it does now until {when}, and stops within about five seconds of it.",
+        "tookEffect": "It takes effect {when}.",
+        "fromNone": "No recording containing their audio falls on or after {when}.",
+        "fromOne": "{count} recording containing their audio falls on or after {when}. It was not deleted.",
+        "fromMany": "{count} recordings containing their audio fall on or after {when}. None of them were deleted."
+      }
     }
   }
 }
