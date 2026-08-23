@@ -2335,6 +2335,51 @@ pictures gone sooner than their recordings, shorten
 `audio_retention_days` — that moves the recording and the picture
 together, which is the only way this system moves them.
 
+### 6.2.14 Setting a guild up from the console
+
+Every step of setting a guild up that matters needs a Discord token —
+creating the consent role, denying `Speak` to `@everyone` and allowing it
+for that role, registering the command tree — and `api` holds none. So the
+console does not write `guild_config` for onboarding. It writes an
+**intent**, the mirrors run backwards: `api` writes down what should be
+true, and the bot's ordinary ten-second tick makes it true through the
+same planner `/setup` uses and writes back what happened.
+
+| Route | What it does |
+|---|---|
+| `GET /api/invite` | The `bot`-scope authorize URL, built from `STURNUS_DISCORD_CLIENT_ID`. The one step that is genuinely web-doable. `url` is `null` when the variable is unset |
+| `POST /api/guilds/{id}/setup` | Asks: `{"channel_ids": ["…"], "consent_role_name": "…"}`. Answers 202 with the guild's setup state |
+| `GET /api/guilds/{id}/setup` | The same state. The console polls it until `request.status` stops being `pending` |
+
+Three things an operator should know about the behaviour.
+
+**A failure is terminal.** The tick runs six times a minute forever, so an
+intent left unapplied after failing would retry a permission error against
+Discord's rate limiter just as often. One attempt settles the intent; the
+reason is in `request.error`, and an administrator who has fixed the
+permission asks again, which is a new row saying who asked and when. There
+is no back-off to tune.
+
+**The newest ask wins.** Two administrators submitting different requests
+thirty seconds apart leave two rows; the bot applies the newer and settles
+the older as `superseded` without acting on it. An intent states what
+should be true, and two statements of what should be true do not compose —
+applying both in order would finish on the older one, which is the
+correction being overwritten by the mistake it corrected.
+
+**`pending` for more than a tick means the bot is not there.** A guild the
+bot has not joined has no gateway object to iterate, so its intents are
+never attempted. `bot.has_arrived` in the payload says so outright — it is
+`false` exactly while nothing about the guild has been mirrored, which is
+what separates "this server has no voice channels" from "nobody has looked
+yet". A channel picker that could not tell those apart would send somebody
+hunting for a bug that is not there.
+
+The permission the invite link asks for that fails latest is **Manage
+Roles**, and no bitmask covers the other half of it: the bot's own role
+must sit above the consent role in Server Settings → Roles, or Discord
+refuses the edit. See `docs/first-deployment.md` section 2.
+
 ### 6.3 Listening to a recording by hand
 
 Every automated check this system has can describe a track — its level,

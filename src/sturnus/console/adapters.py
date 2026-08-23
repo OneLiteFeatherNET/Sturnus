@@ -54,6 +54,7 @@ from sturnus.console.ports import (
     GuildDirectory,
     GuildQueue,
     GuildRecording,
+    GuildSetupState,
     GuildSignIn,
     OAuthClient,
     OwnConsent,
@@ -118,6 +119,7 @@ from sturnus.infrastructure.db.requeue import (
     load_session,
     load_status,
 )
+from sturnus.infrastructure.db.setup_intents import SetupIntentStore
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.observability.events import Event, log_exception
 
@@ -2342,6 +2344,82 @@ class ConsoleGuildNames:
                 ]
             ),
         )
+
+
+class ConsoleGuildSetup:
+    """Asking the bot to set a guild up, and reading back what it did.
+
+    The only write in this module that is not a write about the console
+    itself, and it is deliberately not a write to `guild_config`. `api`
+    holds no Discord token (Spec 13.2), so it cannot create the consent
+    role or set the Speak overwrites; a `guild_config` row saying a guild
+    allows a channel whose `@everyone` may still Speak would be a guild
+    that looks configured and is not. So this writes an *intent*, and the
+    bot's ten-second tick does all of it or none of it.
+
+    **No contradiction rule lives here, and that is the design.** Two
+    administrators asking thirty seconds apart both get their row: an
+    administrator asking twice asked twice, and collapsing the two would
+    lose who asked for which and when. Which one the guild ends up
+    configured from is settled where the guild is configured -- the bot
+    applies the newest and settles the rest as superseded
+    (`sturnus.domain.onboarding.select_intent`). Refusing the second
+    write here would have needed a lock this process cannot hold across
+    two replicas, and would have left a guild whose bot has not arrived
+    unable to correct a typo until it did.
+
+    `seen_at` comes from the guild mirror rather than from the intent,
+    because it answers a different question: whether the bot has ever
+    looked at this server. `None` there is the difference between "this
+    guild has no channels" and "the bot is not there yet", and an empty
+    channel picker means the first only when this says the bot has been.
+    """
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        admins: AdminDirectory,
+        intents: SetupIntentStore,
+    ) -> None:
+        self._session_factory = session_factory
+        self._admins = admins
+        self._intents = intents
+
+    async def state(self, guild_id: int, *, requested_by: int) -> GuildSetupState | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+        return await self._state(guild_id)
+
+    async def request(
+        self,
+        guild_id: int,
+        *,
+        requested_by: int,
+        channel_ids: str,
+        consent_role_name: str | None,
+        now: datetime,
+    ) -> GuildSetupState | None:
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+        await self._intents.request(
+            guild_id,
+            requested_by=requested_by,
+            channel_ids=channel_ids,
+            consent_role_name=consent_role_name,
+            now=now,
+        )
+        # Read back rather than assembled from what was just written. If a
+        # second administrator wrote a newer intent between the two
+        # statements, the newer one is the guild's answer and the one this
+        # response has to show -- inventing a payload from the row this
+        # call wrote would tell somebody their request is what the bot
+        # will apply when it is not.
+        return await self._state(guild_id)
+
+    async def _state(self, guild_id: int) -> GuildSetupState:
+        async with self._session_factory() as db:
+            seen_at = await db.scalar(select(Guild.synced_at).where(Guild.guild_id == guild_id))
+        return GuildSetupState(seen_at=seen_at, intent=await self._intents.latest_for(guild_id))
 
 
 class ConsoleCollectionNames:

@@ -32,6 +32,13 @@ role needs creating, what is still missing -- are computed by
 a guild. This module only reads Discord state into that function's
 parameters and turns its result into Discord API calls, reporting exactly
 what succeeded and what did not.
+
+**Both halves are shared with the console's intent applier.** `plan_setup`
+decides, and `sturnus.infrastructure.discord.setup_apply` reads and writes
+the overwrites; this cog owns neither. One planner and one applier, two
+callers -- a second implementation of the consent protection that got
+either overwrite backwards would let somebody be recorded without having
+consented.
 """
 
 from __future__ import annotations
@@ -44,22 +51,18 @@ from discord.ext import commands
 
 from sturnus.application.ports import Clock
 from sturnus.application.reconfigure import Reconfigure, ReconfigureResult
-from sturnus.application.setup_plan import (
-    ChannelPermissions,
-    PermissionChange,
-    RoleAction,
-    SetupPlan,
-    plan_setup,
-)
+from sturnus.application.setup_plan import RoleAction, SetupPlan, plan_setup
 from sturnus.domain import settings
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.discord.config_cog import render_write_result
 from sturnus.infrastructure.discord.permissions import require_admin
+from sturnus.infrastructure.discord.setup_apply import (
+    AUDIT_REASON,
+    apply_permission_changes,
+    read_channel_permissions,
+)
 
 log = logging.getLogger(__name__)
-
-#: Reason recorded on the audit log for every permission change setup makes.
-_AUDIT_REASON = "Sturnus /setup: consent protection (Spec 3.1)"
 
 
 class SetupCog(commands.Cog):
@@ -157,13 +160,16 @@ class SetupCog(commands.Cog):
         # Every channel the guild will allow after this call, the new one
         # included -- so the plan can report which of them still need the
         # consent protection applied, not merely this one.
-        channel_permissions = self._read_permissions(
+        channel_permissions = read_channel_permissions(
             guild, role, (*stored_channel_ids, channel.id), named=channel
         )
 
         plan = plan_setup(
             current=current,
-            channel_id=channel.id,
+            # One room per call: Discord renders one channel picker per
+            # command parameter. The console names the whole list at once,
+            # which is why the planner takes a tuple.
+            added_channel_ids=(channel.id,),
             stored_channel_ids=stored_channel_ids,
             channel_permissions=channel_permissions,
             role_id=consent_role.id if consent_role is not None else None,
@@ -175,7 +181,7 @@ class SetupCog(commands.Cog):
         role_error: str | None = None
         if plan.role_to_create is not None:
             try:
-                role = await guild.create_role(name=plan.role_to_create, reason=_AUDIT_REASON)
+                role = await guild.create_role(name=plan.role_to_create, reason=AUDIT_REASON)
             except discord.Forbidden:
                 role_error = (
                     "I am missing the Manage Roles permission, so I could not create "
@@ -208,7 +214,7 @@ class SetupCog(commands.Cog):
             log.exception("Reconcile after /setup failed for guild %d", guild.id)
             result = None
 
-        applied, permission_errors = await self._apply_permission_changes(
+        applied, permission_errors = await apply_permission_changes(
             guild, guild.default_role, role, plan.permission_changes, named=channel
         )
 
@@ -231,121 +237,6 @@ class SetupCog(commands.Cog):
             ),
             ephemeral=True,
         )
-
-    def _resolve(
-        self, guild: discord.Guild, channel_id: int, named: discord.VoiceChannel
-    ) -> discord.VoiceChannel | None:
-        """The voice channel with this id, or `None` if there is no such thing.
-
-        `named` is the channel Discord's own picker resolved for this call,
-        and it is returned for its own id without a cache lookup -- the
-        object in hand is at least as good as anything the cache would
-        yield, and it is the one the administrator actually chose.
-        """
-        if channel_id == named.id:
-            return named
-        channel = guild.get_channel(channel_id)
-        return channel if isinstance(channel, discord.VoiceChannel) else None
-
-    def _read_permissions(
-        self,
-        guild: discord.Guild,
-        role: discord.Role | None,
-        channel_ids: tuple[int, ...],
-        *,
-        named: discord.VoiceChannel,
-    ) -> list[ChannelPermissions]:
-        """Reads each allowed channel's Speak overwrites, skipping what it cannot see.
-
-        A stored list can name a channel that has since been deleted, or one
-        this bot has no view of. Such an entry is left out rather than
-        guessed at: planning an overwrite for a channel that is not there
-        would only produce an error the administrator can do nothing about,
-        and it must not stop the channels that *do* exist from being fixed.
-        """
-        permissions: list[ChannelPermissions] = []
-        for channel_id in sorted(set(channel_ids)):
-            channel = self._resolve(guild, channel_id, named)
-            if channel is None:
-                continue
-            permissions.append(
-                ChannelPermissions(
-                    channel_id=channel_id,
-                    everyone_may_speak=(
-                        channel.overwrites_for(guild.default_role).speak is not False
-                    ),
-                    role_may_speak=(
-                        role is not None and channel.overwrites_for(role).speak is True
-                    ),
-                )
-            )
-        return permissions
-
-    async def _apply_permission_changes(
-        self,
-        guild: discord.Guild,
-        everyone: discord.Role,
-        consent_role: discord.Role | None,
-        changes: list[PermissionChange],
-        *,
-        named: discord.VoiceChannel,
-    ) -> tuple[list[str], list[str]]:
-        """Applies each overwrite independently; one failure never blocks the other.
-
-        Returns the human-readable description of every change that
-        succeeded, and of every one that did not -- a permission failure is
-        reported, never swallowed, because a half-applied setup that claims
-        success is worse than one that admits it stopped. That now holds
-        per *channel* as well as per overwrite: a guild whose second
-        meeting room the bot has no Manage Permissions on must still have
-        its first one configured, and must be told which one failed.
-        """
-        applied: list[str] = []
-        errors: list[str] = []
-        for change in changes:
-            verb = "allow" if change.allow_speak else "deny"
-            channel = self._resolve(guild, change.channel_id, named)
-            if channel is None:
-                errors.append(
-                    f"Could not {verb} Speak in <#{change.channel_id}>: it is not a voice "
-                    "channel I can see. Remove it with "
-                    f"`/config set {settings.VOICE_CHANNEL_IDS} <the remaining ids>`."
-                )
-                continue
-            target: discord.Role | None
-            label: str
-            if change.target == "everyone":
-                target, label = everyone, "@everyone"
-            else:
-                target, label = consent_role, "the consent role"
-                if target is None:
-                    errors.append(
-                        f"Could not {verb} Speak for the consent role in "
-                        f"{channel.mention}: no consent role exists yet. Create one and "
-                        "run /setup again, or set it manually and run "
-                        f"`/config set {settings.CONSENT_ROLE_ID} <role id>`."
-                    )
-                    continue
-
-            overwrite = channel.overwrites_for(target)
-            # `.update()` rather than `overwrite.speak = ...`: PermissionOverwrite
-            # defines its permission attributes only under `TYPE_CHECKING`, which
-            # mypy strict does not accept as a real `__slots__` member for plain
-            # attribute assignment.
-            overwrite.update(speak=change.allow_speak)
-            try:
-                await channel.set_permissions(target, overwrite=overwrite, reason=_AUDIT_REASON)
-            except discord.Forbidden:
-                errors.append(
-                    f"Could not {verb} Speak for {label} in {channel.mention}: I am "
-                    "missing the Manage Permissions permission on that channel. Set it "
-                    "manually."
-                )
-            except discord.HTTPException as exc:
-                errors.append(f"Could not {verb} Speak for {label} in {channel.mention}: {exc}")
-            else:
-                applied.append(f"{verb.capitalize()}ed Speak for {label} in {channel.mention}.")
-        return applied, errors
 
 
 def _render_summary(

@@ -92,6 +92,23 @@ class Event(StrEnum):
     VOICE_LEFT_FAILED = "voice.left_failed"
     VOICE_REJOIN_BLOCKED = "voice.rejoin_blocked"
     GUILD_TICK_FAILED = "guild.tick_failed"
+    #: The bot acted on what the console wrote into `guild_setup_intent`:
+    #: the consent role, the Speak overwrites, the configuration keys.
+    #: WARNING when `outcome` is `failed`, because the request came from a
+    #: person who is watching a page for an answer and the answer is that
+    #: it did not work. There is no retry to wait for -- an attempt settles
+    #: the intent either way -- so this line is the whole event.
+    SETUP_INTENT_APPLIED = "setup.intent_applied"
+    #: A pending setup request that a newer one replaced before the tick
+    #: reached either. Logged rather than silent because it is the visible
+    #: half of the rule: two administrators asking thirty seconds apart
+    #: leave one application and one of these.
+    SETUP_INTENT_SUPERSEDED = "setup.intent_superseded"
+    #: The console wrote a setup request for the bot to apply. The only
+    #: record that a person asked, as opposed to that the bot acted: the
+    #: two are separated by up to a tick, and by a guild the bot has not
+    #: joined for as long as that takes.
+    CONSOLE_SETUP_REQUESTED = "console.setup_requested"
     SESSION_CLOSE_FAILED = "session.close_failed"
     SESSION_OPENED = "session.opened"
     SESSION_SPEAKER_FIRST_PACKET = "session.speaker_first_packet"

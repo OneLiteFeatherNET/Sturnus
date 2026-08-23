@@ -49,6 +49,8 @@ from sturnus.console.ports import (
     GuildQueue,
     GuildRecording,
     GuildReports,
+    GuildSetup,
+    GuildSetupState,
     GuildSignIn,
     LinkDirectory,
     OAuthClient,
@@ -85,6 +87,7 @@ from sturnus.console.statistics import (
 from sturnus.domain import preferences
 from sturnus.domain.exports import ExportTarget, SessionDocument
 from sturnus.domain.oauth_clients import GuildOAuthClient, SlugUnavailable, is_valid_slug
+from sturnus.domain.onboarding import SetupIntent
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
 
@@ -1011,6 +1014,61 @@ class FakeNames:
         )
 
 
+class FakeSetup:
+    """A guild nobody administers, until a test says otherwise.
+
+    Defaults to `None` from both methods, which is what the real adapter
+    answers for "no such guild or not yours" -- so a test with no interest
+    in onboarding gets 404s rather than a fake that quietly authorises
+    everything.
+
+    Writing a request mutates the state it will answer with next, because
+    the endpoint's whole contract is that `POST` and `GET` return the same
+    thing: a double that answered a fixed payload could not tell a
+    round-trip apart from a handler that never wrote anything.
+    """
+
+    def __init__(self, state: GuildSetupState | None = None) -> None:
+        self.state_to_answer = state
+        #: Every state read, with who asked.
+        self.asked: list[tuple[int, int]] = []
+        #: Every request written: guild, who, the channel list as stored,
+        #: the role name, and when.
+        self.written: list[tuple[int, int, str, str | None, datetime]] = []
+
+    async def state(self, guild_id: int, *, requested_by: int) -> GuildSetupState | None:
+        self.asked.append((guild_id, requested_by))
+        return self.state_to_answer
+
+    async def request(
+        self,
+        guild_id: int,
+        *,
+        requested_by: int,
+        channel_ids: str,
+        consent_role_name: str | None,
+        now: datetime,
+    ) -> GuildSetupState | None:
+        if self.state_to_answer is None:
+            return None
+        self.written.append((guild_id, requested_by, channel_ids, consent_role_name, now))
+        self.state_to_answer = GuildSetupState(
+            seen_at=self.state_to_answer.seen_at,
+            intent=SetupIntent(
+                id=len(self.written),
+                guild_id=guild_id,
+                requested_by=requested_by,
+                requested_at=now,
+                channel_ids=channel_ids,
+                consent_role_name=consent_role_name,
+                applied_at=None,
+                outcome=None,
+                error=None,
+            ),
+        )
+        return self.state_to_answer
+
+
 class FakeCollections:
     """An Outline mirror nobody may read, until a test says otherwise.
 
@@ -1227,6 +1285,8 @@ def build_test_api(
     documents: SessionDocumentDirectory | None = None,
     artefacts: DocumentArtefacts | None = None,
     oauth_clients: GuildOAuthClients | None = None,
+    setup: GuildSetup | None = None,
+    discord_client_id: str | None = None,
     sessions: SessionCookie | None = None,
     now: Callable[[], datetime] | None = None,
     schema_ready: bool = True,
@@ -1285,6 +1345,8 @@ def build_test_api(
         documents=documents or FakeSessionDocuments(),
         artefacts=artefacts or FakeArtefacts(),
         oauth_clients=oauth_clients or FakeGuildOAuthClients(admins=administrators),
+        setup=setup or FakeSetup(),
+        discord_client_id=discord_client_id,
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),
         now=now or now_at(),
         schema_ready=lambda: schema_ready,

@@ -73,9 +73,19 @@ There is no Sturnus bot application yet. At
    yet. `Speak` itself is not needed — the bot only listens.
 5. Open the generated URL and invite the bot to the server.
 
+   The console can generate that URL for you once it is running, from the
+   application id alone: set `STURNUS_DISCORD_CLIENT_ID` (the **Application
+   ID** on the same page, not the token — it is public, and it goes in
+   `api.env`, never in the `Secret`) and `GET /api/invite` serves exactly
+   this link with exactly these scopes and this bitmask. Leaving it unset
+   costs nothing but that button; the endpoint answers `url: null` and the
+   console says so.
+
 **Role position matters.** Discord will not let the bot edit a role
 positioned above its own. Drag the bot's role above the consent role in
-**Server Settings → Roles**, or `/setup` fails with a permissions error.
+**Server Settings → Roles**, or `/setup` fails with a permissions error —
+and so does a setup requested from the console, which is the same planner
+run from the other side (`docs/operations.md` section 6.2.14).
 
 ## 3. Collect the eight secret values
 

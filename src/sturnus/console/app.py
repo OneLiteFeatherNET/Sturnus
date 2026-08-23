@@ -50,6 +50,7 @@ from sturnus.console.ports import (
     GuildNames,
     GuildOAuthClients,
     GuildReports,
+    GuildSetup,
     LinkDirectory,
     PersonalConsents,
     PreferenceDirectory,
@@ -81,6 +82,8 @@ from sturnus.console.routes_queue import QUEUE_CONTROL, QUEUE_OVERVIEW
 from sturnus.console.routes_queue import register as register_queue
 from sturnus.console.routes_report import GUILD_REPORTS
 from sturnus.console.routes_report import register as register_report
+from sturnus.console.routes_setup import DISCORD_CLIENT_ID, GUILD_SETUP
+from sturnus.console.routes_setup import register as register_setup
 from sturnus.console.session import (
     ExpiredSession,
     InvalidSession,
@@ -325,6 +328,14 @@ def build_api(
     documents: SessionDocumentDirectory,
     artefacts: DocumentArtefacts,
     oauth_clients: GuildOAuthClients,
+    setup: GuildSetup,
+    #: This deployment's Discord application id, or `None` where the
+    #: operator has not configured one -- the invite link is then served
+    #: as `null` rather than as a refusal. Not a credential: an
+    #: application id is public by design and appears in every invite
+    #: link ever clicked, which is exactly why the one genuinely
+    #: web-doable onboarding step can be done from here at all.
+    discord_client_id: str | None = None,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
 
@@ -365,6 +376,8 @@ def build_api(
     app[SESSION_DOCUMENTS] = documents
     app[DOCUMENT_ARTEFACTS] = artefacts
     app[routes_oauth.GUILD_OAUTH_CLIENTS] = oauth_clients
+    app[GUILD_SETUP] = setup
+    app[DISCORD_CLIENT_ID] = discord_client_id
     app.add_routes(
         [
             web.get("/healthz", healthz),
@@ -382,6 +395,7 @@ def build_api(
     register_report(app)
     register_me(app)
     register_directory(app)
+    register_setup(app)
     routes_settings.register(app)
     routes_tags.register(app)
     routes_recording.register(app)

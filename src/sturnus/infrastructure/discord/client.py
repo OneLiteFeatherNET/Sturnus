@@ -84,6 +84,7 @@ from sturnus.infrastructure.db.repositories import (
     ConsentRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.db.setup_intents import SetupIntentStore
 from sturnus.infrastructure.discord.about_cog import AboutCog
 from sturnus.infrastructure.discord.admin_sync import sync_administrators
 from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
@@ -93,6 +94,7 @@ from sturnus.infrastructure.discord.consent_cog import ConsentCog
 from sturnus.infrastructure.discord.directory_sync import sync_directory
 from sturnus.infrastructure.discord.link_cog import LinkCog
 from sturnus.infrastructure.discord.queue_cog import QueueCog
+from sturnus.infrastructure.discord.setup_apply import apply_setup_intents
 from sturnus.infrastructure.discord.setup_cog import SetupCog
 from sturnus.infrastructure.discord.voice import VoiceReceiveAdapter, voice_close_code
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
@@ -349,6 +351,7 @@ class SturnusClient(commands.AutoShardedBot):
         config_store: ConfigStore,
         admin_mirror: AdminMemberStore | None = None,
         directory_mirror: DirectoryStore | None = None,
+        setup_intents: SetupIntentStore | None = None,
         consent_repo: ConsentRepository,
         session_repo: SessionRepository,
         # Typed against the narrow `JobQueue` port rather than the concrete
@@ -408,6 +411,12 @@ class SturnusClient(commands.AutoShardedBot):
         #: with no interest in the console gets. In production
         #: `sturnus.entrypoints.bot` always supplies it.
         self._directory_mirror = directory_mirror
+        #: The inverse of the two mirrors above: what the console asked
+        #: this process to do to a guild, because `api` holds no Discord
+        #: token and cannot do it itself. Optional on the same terms --
+        #: a client built without one applies nothing, which is what a
+        #: test with no interest in onboarding gets.
+        self._setup_intents = setup_intents
         self._consent_repo = consent_repo
         self._session_repo = session_repo
         self._job_repo = job_repo
@@ -1929,6 +1938,11 @@ class SturnusClient(commands.AutoShardedBot):
             # is swept, closed and put back to idle on its own terms.
             for recording in self._recordings_of(guild_id):
                 await self._sweep_due_session(guild_id, recording, now)
+            # Before the reconcile, deliberately: an intent writes the very
+            # configuration keys the reconcile reads, so applying it first
+            # is what lets a guild set up from the console start recording
+            # on this tick instead of the next one.
+            await self._apply_setup_intents(guild_id, now)
             await self._reconcile(guild_id)
             await self._mirror_administrators(guild_id, now)
             await self._mirror_directory(guild_id, now)
@@ -1938,6 +1952,51 @@ class SturnusClient(commands.AutoShardedBot):
             blocked_until = self._capture_cooldowns.get(guild_id)
             if blocked_until is not None and now >= blocked_until:
                 await self._end_capture_cooldown(guild_id)
+
+    async def _apply_setup_intents(self, guild_id: int, now: datetime) -> None:
+        """Does to this guild what the console wrote down that it wanted.
+
+        The mirror arrangement run backwards. `api` must never hold a
+        Discord token (Spec 13.2), so it cannot create the consent role,
+        write the Speak overwrites or register the command tree; it writes
+        an intent and this applies it, through the same `plan_setup`
+        `/setup` uses.
+
+        On the ordinary tick and not a sweep of its own, for the reason
+        the mirrors are: it costs one indexed read of one guild's rows,
+        and does nothing at all unless somebody has asked for something.
+
+        A guild this process cannot currently see is skipped, and its
+        intents stay pending. That is the honest state during onboarding
+        -- the bot has not been invited yet, or has not finished joining
+        -- and it is what the console renders as "waiting for the bot to
+        arrive" rather than as a failure.
+
+        Failures are logged and swallowed, like the mirrors': a guild
+        whose setup could not be applied keeps the configuration it had,
+        and letting this raise would take the session timeout enforcement
+        in the same tick down with it. The intent itself is settled by
+        `apply_setup_intents`, so a raise here does not leave a row that
+        the next tick retries -- see its docstring on the retry bound.
+        """
+        if self._setup_intents is None:
+            return
+        guild = self.get_guild(guild_id)
+        if guild is None:
+            return
+        try:
+            await apply_setup_intents(guild, self._config_store, self._setup_intents, now)
+        except Exception as exc:
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.GUILD_TICK_FAILED,
+                "Could not apply this guild's setup request; the guild keeps the "
+                "configuration it already had",
+                exc,
+                guild_id=guild_id,
+                shard_id=self._shard(guild_id),
+            )
 
     async def _mirror_administrators(self, guild_id: int, now: datetime) -> None:
         """Writes this guild's administrators where the console's API can read them.

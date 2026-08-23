@@ -25,8 +25,12 @@ them to exercise the lifecycle logic.
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import logging
+import textwrap
+from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
@@ -41,6 +45,7 @@ from sturnus.application.ports import AudioStore, AudioWriter, Clock, SessionKey
 from sturnus.application.reconfigure import GuildRuntimeConfig, ReconfigureAction
 from sturnus.application.recording import RecordingService
 from sturnus.domain import settings
+from sturnus.domain.onboarding import SetupIntent
 from sturnus.domain.session import EndReason, SessionTimeouts
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.directory import DirectoryStore
@@ -51,6 +56,7 @@ from sturnus.infrastructure.db.repositories import (
     JobRepository,
     SessionRepository,
 )
+from sturnus.infrastructure.db.setup_intents import SetupIntentStore
 from sturnus.infrastructure.discord import client as client_module
 from sturnus.infrastructure.discord.announcer import _ALLOWED_MENTIONS
 from sturnus.infrastructure.discord.client import (
@@ -357,6 +363,7 @@ def _client(
     recording_dir: Path | None = None,
     audio_store: AudioStore | None = None,
     directory_mirror: object | None = None,
+    setup_intents: object | None = None,
     shard_count: int | None = None,
 ) -> _TestClient:
     """A `SturnusClient` with every dependency these tests do not touch stubbed out.
@@ -367,8 +374,9 @@ def _client(
     assert on what that pipeline actually persisted. `audio_store` joins
     them for the tests that need the upload inside `close()` to fail, and
     `directory_mirror` for the tests that assert the tick writes the names
-    the console needs -- left `None` everywhere else, which is a client
-    that does not mirror at all.
+    the console needs, and `setup_intents` for the ones that assert it
+    applies what the console asked for -- both left `None` everywhere
+    else, which is a client that neither mirrors nor is asked anything.
 
     `shard_count` is `None` -- discord.py's "let the gateway decide" --
     for everything except `test_client_shards`, which is the one suite
@@ -378,6 +386,7 @@ def _client(
     client = _TestClient(
         clock=clock,
         directory_mirror=cast(DirectoryStore, directory_mirror),
+        setup_intents=cast(SetupIntentStore, setup_intents),
         config_store=cast(ConfigStore, config_store)
         if config_store is not None
         else MagicMock(spec=ConfigStore),
@@ -2817,3 +2826,134 @@ async def test_a_failed_name_sweep_does_not_take_the_tick_down(
         await client._mirror_directory(GUILD_ID, T0)
 
     assert getattr(caplog.records[-1], "sturnus_event", None) == str(Event.GUILD_TICK_FAILED)
+
+
+# ---------------------------------------------------------------------------
+# The mirrors, run backwards: what the console asked this process to do
+# ---------------------------------------------------------------------------
+
+
+class _RecordingSetupIntents:
+    """The intent table, remembering what the tick did with it."""
+
+    def __init__(self, *pending: SetupIntent, fails: bool = False) -> None:
+        self._pending = list(pending)
+        self._fails = fails
+        self.settled: list[tuple[int, str]] = []
+
+    async def pending_for(self, guild_id: int) -> Sequence[SetupIntent]:
+        if self._fails:
+            raise RuntimeError("the database said no")
+        del guild_id
+        return tuple(self._pending)
+
+    async def record_outcome(
+        self, intent_id: int, *, outcome: str, error: str | None, now: datetime
+    ) -> bool:
+        del error, now
+        self.settled.append((intent_id, outcome))
+        return True
+
+
+def _a_pending_intent() -> SetupIntent:
+    return SetupIntent(
+        id=1,
+        guild_id=GUILD_ID,
+        requested_by=1234,
+        requested_at=T0,
+        channel_ids=str(CHANNEL_ID),
+        consent_role_name=None,
+        applied_at=None,
+        outcome=None,
+        error=None,
+    )
+
+
+async def test_the_tick_applies_what_the_console_asked_for(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`api` holds no Discord token, so this tick is the only thing that can.
+
+    The console writes down what should be true; the bot's existing
+    ten-second sweep makes it true and writes back what happened. What is
+    asserted here is the wiring -- that the sweep reaches the applier with
+    this guild, this configuration store and this table. What the applier
+    then does to a guild is `tests/infrastructure/discord/
+    test_setup_apply.py`, against real Discord objects rather than the
+    stubs this suite is built from.
+    """
+    applied: list[tuple[object, object, object]] = []
+
+    async def _record(guild: object, config: object, intents: object, now: object) -> None:
+        del now
+        applied.append((guild, config, intents))
+
+    monkeypatch.setattr(client_module, "apply_setup_intents", _record)
+    intents = _RecordingSetupIntents(_a_pending_intent())
+    config = FakeConfigStore()
+    client = _client(FakeClock(T0), config_store=config, setup_intents=intents)
+    guild = _named_guild()
+    _in_guild(client, guild)
+
+    await client._apply_setup_intents(GUILD_ID, T0)
+
+    assert applied == [(guild, config, intents)]
+
+
+async def test_a_guild_the_bot_has_not_joined_leaves_its_request_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Which is the honest state during onboarding, and not a failure.
+
+    An intent settled as failed here could never be retried -- an attempt
+    settles it -- so a guild whose invite is still being clicked would
+    have to be asked about a second time for no reason.
+    """
+    applied: list[object] = []
+
+    async def _record(guild: object, config: object, intents: object, now: object) -> None:
+        del config, intents, now
+        applied.append(guild)
+
+    monkeypatch.setattr(client_module, "apply_setup_intents", _record)
+    intents = _RecordingSetupIntents(_a_pending_intent())
+    client = _client(FakeClock(T0), config_store=FakeConfigStore(), setup_intents=intents)
+
+    await client._apply_setup_intents(GUILD_ID, T0)
+
+    assert applied == []
+    assert intents.settled == []
+
+
+async def test_a_failed_setup_application_does_not_take_the_tick_down(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The same tick enforces session timeouts. Losing those because one
+    guild's onboarding could not be read would trade a setup button for a
+    meeting that never stops recording.
+    """
+    intents = _RecordingSetupIntents(fails=True)
+    client = _client(FakeClock(T0), config_store=FakeConfigStore(), setup_intents=intents)
+    _in_guild(client, _named_guild())
+
+    with caplog.at_level(logging.WARNING, logger=CLIENT_LOGGER):
+        await client._apply_setup_intents(GUILD_ID, T0)
+
+    assert getattr(caplog.records[-1], "sturnus_event", None) == str(Event.GUILD_TICK_FAILED)
+
+
+def test_setup_is_applied_before_the_reconcile_that_reads_what_it_wrote() -> None:
+    """An intent writes the very keys the reconcile reads.
+
+    Applying it afterwards would leave a guild set up from the console
+    waiting a further ten seconds before it could record -- and the order
+    is the only thing that decides it, so it is asserted rather than
+    left to a comment.
+    """
+    source = textwrap.dedent(inspect.getsource(SturnusClient._tick_guild))
+    calls = [
+        node.func.attr
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    ]
+    assert calls.index("_apply_setup_intents") < calls.index("_reconcile")

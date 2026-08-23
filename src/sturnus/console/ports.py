@@ -38,6 +38,7 @@ from sturnus.console.statistics import (
 )
 from sturnus.domain.exports import ExportTarget, SessionDocument
 from sturnus.domain.oauth_clients import GuildOAuthClient
+from sturnus.domain.onboarding import SetupIntent
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity
 
 
@@ -260,6 +261,60 @@ class AdministeredGuild:
     guild_id: int
     name: str | None
     icon_url: str | None
+
+
+@dataclass(frozen=True)
+class GuildSetupState:
+    """What the console needs to draw one guild's onboarding page.
+
+    `seen_at` is when the bot last mirrored anything about this guild, and
+    `None` means it never has. That is the field the interface has to have.
+    A guild the bot has not joined yet has **empty mirrors** -- no
+    channels, no roles -- and an empty channel picker rendered for that
+    reason reads exactly like a server that genuinely has no voice
+    channels. One sends somebody to wait for the bot to arrive; the other
+    sends them hunting for a bug that is not there. The payload separates
+    them so the console never has to guess which it is looking at.
+
+    `intent` is the most recent thing anybody asked for, settled or not,
+    or `None` if nobody ever has. The most recent and not a list, because
+    that is the guild's current answer: an older unapplied request is
+    superseded rather than queued (`sturnus.domain.onboarding`), so what
+    an administrator is waiting on is always the last one asked.
+    """
+
+    seen_at: datetime | None
+    intent: SetupIntent | None
+
+
+class GuildSetup(Protocol):
+    """Asking the bot to configure a guild, and reading what came of it.
+
+    `api` holds no Discord token and never will (Spec 13.2), so neither
+    method here touches Discord. `request` writes down what should be
+    true; the bot's ten-second tick makes it true and writes back what
+    happened, which `state` reads.
+
+    `requested_by` is not optional and neither method exists without it,
+    for the reason `GuildNames` and `ConsentDirectory` have none: the
+    authorisation rule lives inside the call rather than in a handler that
+    could forget to apply it. `None` covers "no such guild" and "you do
+    not administer it" alike -- writing a setup request is an act on
+    somebody else's server, and a 403 would confirm to somebody just
+    established as having no business with that guild that it exists.
+    """
+
+    async def state(self, guild_id: int, *, requested_by: int) -> GuildSetupState | None: ...
+
+    async def request(
+        self,
+        guild_id: int,
+        *,
+        requested_by: int,
+        channel_ids: str,
+        consent_role_name: str | None,
+        now: datetime,
+    ) -> GuildSetupState | None: ...
 
 
 class GuildNames(Protocol):
