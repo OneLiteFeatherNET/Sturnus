@@ -231,5 +231,15 @@ const rest = computed(() => figures.value.slice(1))
         </ul>
       </section>
     </template>
+
+    <!-- The thing a reader came to do, on the page they land on: their
+         consent, and — for an administrator — the settings their server
+         changes often. Below the figures rather than above them, so a band
+         whose height nobody can predict never moves what is already on
+         screen; for somebody who is neither it renders nothing at all.
+         Outside the state chain above on purpose: whether Sturnus has
+         recorded anybody, and whether their figures loaded, says nothing
+         about whether they have a consent to withdraw. -->
+    <QuickSettingsBand />
   </div>
 </template>
