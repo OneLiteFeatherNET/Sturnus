@@ -764,6 +764,75 @@ async def test_an_unparseable_value_neither_raises_nor_un_configures_a_guild(
     assert client._guilds[GUILD_ID].config.timeouts.idle_timeout_minutes == 5
 
 
+CLIENT_LOGGER = "sturnus.infrastructure.discord.client"
+
+
+async def test_a_refused_channel_list_is_reported_without_the_text_it_refused(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The complaint names the type and the key. The value stays behind.
+
+    `InvalidChannelList`'s message embeds the text it would not parse, and
+    that text is a stored configuration value put there by whoever ran the
+    direct `UPDATE` this notice exists to report. `routes_settings._write`
+    already refuses to log it for the same exception class:
+    `SturnusClient._notice` renders its arguments into the message, so
+    handing it the exception is the same mistake with one frame in front
+    of it.
+    """
+    clock = FakeClock(T0)
+    store = _configured_store()
+    client = _client(clock, config_store=store, recording_dir=tmp_path)
+    _in_guild(client, _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[])))
+
+    await client._tick_all(clock.now())
+    store.write(GUILD_ID, settings.VOICE_CHANNEL_IDS, "lounge, 42")
+    with caplog.at_level(logging.WARNING, logger=CLIENT_LOGGER):
+        await client._tick_all(clock.now())
+
+    complaints = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == CLIENT_LOGGER and "recording channels" in record.getMessage()
+    ]
+    assert complaints, "an unusable list must still be reported"
+    assert "lounge" not in "\n".join(complaints), "the refused value must not reach the log"
+    assert "InvalidChannelList" in "\n".join(complaints), "the type travels"
+    assert settings.VOICE_CHANNEL_IDS in "\n".join(complaints), "and so does the key"
+
+
+async def test_an_unusable_number_is_reported_by_key_rather_than_by_value(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Same rule, the other unusable-value path.
+
+    `int("prompt: summarise everything")` raises a `ValueError` whose
+    message quotes the whole string back, so interpolating the exception
+    puts a stored value in the log. Naming the key instead is strictly
+    more useful to the operator anyway: `/config show` renders the value,
+    and "an unusable configuration value" without a key left them reading
+    five rows by hand.
+    """
+    clock = FakeClock(T0)
+    store = _configured_store()
+    client = _client(clock, config_store=store, recording_dir=tmp_path)
+    _in_guild(client, _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[])))
+
+    await client._tick_all(clock.now())
+    store.write(GUILD_ID, settings.IDLE_TIMEOUT_MINUTES, "half an hour")
+    with caplog.at_level(logging.WARNING, logger=CLIENT_LOGGER):
+        await client._tick_all(clock.now())
+
+    complaints = "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name == CLIENT_LOGGER and "unusable configuration value" in record.getMessage()
+    )
+    assert complaints, "an unusable value must still be reported"
+    assert "half an hour" not in complaints, "the refused value must not reach the log"
+    assert settings.IDLE_TIMEOUT_MINUTES in complaints, "the key that holds it does"
+
+
 async def test_a_reconcile_during_shutdown_cannot_resurrect_a_guild(tmp_path: Path) -> None:
     """`graceful_shutdown` leaves the channel; nothing may rejoin behind it."""
     clock = FakeClock(T0)

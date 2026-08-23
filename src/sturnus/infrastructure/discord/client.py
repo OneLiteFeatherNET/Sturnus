@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
@@ -125,6 +125,38 @@ CAPTURE_FAILURE_REASONS = frozenset({EndReason.CAPTURE_FAILURE, EndReason.DECODE
 #: announcing to each room in turn that it is being recorded, and
 #: recording none of them.
 REJOIN_COOLDOWN = timedelta(minutes=15)
+
+#: The keys `_desired_config` reads as integers, in the order it reads
+#: them. Named here so a value that will not parse can be reported by
+#: *key*: the value itself must never reach a log line -- it is free text
+#: somebody stored, and `str(ValueError)` quotes it back verbatim -- and
+#: "an unusable configuration value" with no key at all leaves the
+#: operator reading every row of `/config show` by hand.
+_RUNTIME_INTEGER_KEYS: tuple[str, ...] = (
+    settings.CONSENT_ROLE_ID,
+    settings.EMPTY_GRACE_SECONDS,
+    settings.IDLE_TIMEOUT_MINUTES,
+    settings.MAX_SESSION_HOURS,
+    settings.AUDIO_RETENTION_DAYS,
+)
+
+
+def _unparseable_keys(snapshot: Mapping[str, str | None]) -> tuple[str, ...]:
+    """Which of a guild's integer keys cannot be read as an integer.
+
+    Asked only after one of them has already raised, so the cost of
+    parsing them all a second time is paid on the failing path alone. A
+    key that is absent counts too: `int(None)` is a `TypeError`, and a
+    missing row and an unreadable one leave the guild equally unusable.
+    """
+    unusable: list[str] = []
+    for key in _RUNTIME_INTEGER_KEYS:
+        value = snapshot.get(key)
+        try:
+            int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            unusable.append(key)
+    return tuple(unusable)
 
 
 @dataclass
@@ -398,12 +430,21 @@ class SturnusClient(commands.Bot):
         try:
             channel_ids = settings.recording_channel_ids(snapshot)
         except settings.InvalidChannelList as exc:
+            # The type and the key travel; the value does not.
+            # `InvalidChannelList`'s own message embeds the text it
+            # refused, and `_notice` renders its arguments *into* the
+            # message before logging it -- so passing `exc` here would put
+            # a stored configuration value into `LogRecord`'s output, which
+            # is precisely what `routes_settings._write` refuses to do for
+            # this same exception class. `/config show` is where the value
+            # may be read, by somebody who is allowed to.
             self._notice(
                 guild_id,
                 "Guild %d has an unusable list of recording channels (%s); keeping the "
-                "configuration already in force. Fix it with /config set %s.",
+                "configuration already in force. Read it with /config show and fix it "
+                "with /config set %s.",
                 guild_id,
-                exc,
+                type(exc).__name__,
                 settings.VOICE_CHANNEL_IDS,
             )
             return current
@@ -444,13 +485,21 @@ class SturnusClient(commands.Bot):
                 retention_days=int(snapshot[settings.AUDIO_RETENTION_DAYS]),
             )
         except (ValueError, TypeError, KeyError) as exc:
+            # Same rule as the channel list above, and the same reason:
+            # `int("half an hour")` raises a `ValueError` that quotes the
+            # whole string back. Naming the *keys* that will not parse is
+            # more use to the operator than the value would have been
+            # anyway -- "an unusable configuration value" with no key left
+            # them reading five rows of `/config show` by hand.
+            unusable = _unparseable_keys(snapshot)
             self._notice(
                 guild_id,
-                "Guild %d has an unusable configuration value (%s: %s); keeping the "
-                "configuration already in force. Fix it with /config set.",
+                "Guild %d has an unusable configuration value (%s) for %s; keeping the "
+                "configuration already in force. Read it with /config show and fix it "
+                "with /config set.",
                 guild_id,
                 type(exc).__name__,
-                exc,
+                ", ".join(unusable) if unusable else "one of its settings",
             )
             return current
         self._clear_notice(guild_id)
@@ -471,6 +520,13 @@ class SturnusClient(commands.Bot):
         string: `LogRecord.msg` stays a literal, which is the one thing
         `sturnus.infrastructure.observability.scrub_event` forwards to
         Sentry.
+
+        Which makes every `*args` a caller passes part of what is logged,
+        one frame away from where it looks like it is. Ids, key names and
+        exception *types* are fine here; a stored configuration value or
+        an exception carrying one is not, and `tests/test_logging_
+        discipline.py`'s rule R7 fails the build for the latter rather
+        than letting the indirection hide it.
         """
         rendered = message % args
         if self._config_notices.get(guild_id) == rendered:
