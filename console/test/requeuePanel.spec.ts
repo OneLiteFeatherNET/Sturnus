@@ -1,10 +1,16 @@
 /**
- * Who the Transcription panel reveals itself to, and when it stops polling.
+ * Who the Transcription panel reveals itself to, and how it watches a redo.
  *
- * Both properties were broken in ways that a passing build cannot show.
- * The panel decides its own visibility from an HTTP status, and it drives
- * a timer that outlives nothing but its own component — neither is
- * visible in a type check, a lint pass or a render.
+ * Every property here was, or could be, broken in a way that a passing
+ * build cannot show. The panel decides its own visibility from an HTTP
+ * status; it holds a connection and a timer that outlive nothing but their
+ * own component; and it has two ways of watching, only one of which will
+ * work through a given administrator's proxy.
+ *
+ * `EventSource` is stubbed in every test rather than left to the
+ * environment, and deliberately: which of the two paths runs is the thing
+ * under test in half of this file, and a test that let the DOM
+ * implementation decide would pass or fail on a dependency bump.
  */
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest'
 import { mount, flushPromises } from '@vue/test-utils'
@@ -20,6 +26,47 @@ function stubAutoImports(api: (path: string, options?: unknown) => Promise<unkno
   vi.stubGlobal('onMounted', onMounted)
   vi.stubGlobal('onBeforeUnmount', onBeforeUnmount)
   vi.stubGlobal('useApi', () => api)
+  vi.stubGlobal('useRuntimeConfig', () => ({ public: { apiBase: '/api' } }))
+}
+
+/** A browser with no `EventSource`, which is what a server render and an
+ *  old browser both look like — and the state in which the panel must fall
+ *  back to its timer. */
+function withoutEventSource() {
+  vi.stubGlobal('EventSource', undefined)
+}
+
+/** A source the test drives by hand, standing in for the browser's. */
+class FakeEventSource {
+  static opened: FakeEventSource[] = []
+  listeners = new Map<string, ((event: { data?: unknown }) => void)[]>()
+  closed = false
+  readyState = 1
+
+  constructor(readonly url: string) {
+    FakeEventSource.opened.push(this)
+  }
+
+  addEventListener(type: string, listener: (event: { data?: unknown }) => void) {
+    const existing = this.listeners.get(type) ?? []
+    existing.push(listener)
+    this.listeners.set(type, existing)
+  }
+
+  close() {
+    this.closed = true
+    this.readyState = 2
+  }
+
+  emit(type: string, data?: unknown) {
+    for (const listener of this.listeners.get(type) ?? []) listener({ data })
+  }
+}
+
+function withEventSource() {
+  FakeEventSource.opened = []
+  vi.stubGlobal('EventSource', FakeEventSource)
+  return FakeEventSource
 }
 
 function failWith(status: number) {
@@ -34,6 +81,16 @@ const SNAPSHOT = {
   refusal: null,
 }
 
+/** A session with a speaker a worker still has in hand — the state in
+ *  which the panel watches rather than merely reads once. */
+const BUSY = {
+  ...SNAPSHOT,
+  session_status: 'closed',
+  speakers: [
+    { discord_user_id: '2', display_name: 'Anna', status: 'running', attempts: 1, error: null },
+  ],
+}
+
 beforeEach(() => vi.useFakeTimers())
 afterEach(() => {
   vi.useRealTimers()
@@ -41,6 +98,8 @@ afterEach(() => {
 })
 
 describe('who the panel shows itself to', () => {
+  beforeEach(withoutEventSource)
+
   it('stays hidden when the queue cannot be read for any reason other than 404', async () => {
     // The bug this replaces: `visible` was set to true on every failure
     // that was not a 404, so one 500 revealed the Transcription section --
@@ -71,28 +130,52 @@ describe('who the panel shows itself to', () => {
   })
 })
 
-describe('when the panel stops reading the queue', () => {
-  it('makes no further request after it is unmounted mid-poll', async () => {
-    // `clearTimeout` cannot stop a timer that has already fired, and the
-    // continuation after its `await` installed a fresh one. Navigating
-    // away during a poll left twenty database reads a minute running for
-    // the life of the tab.
-    const busy = {
-      ...SNAPSHOT,
-      speakers: [
-        { discord_user_id: '2', display_name: 'Anna', status: 'running', attempts: 1, error: null },
-      ],
-    }
-    const api = vi.fn().mockResolvedValue(busy)
+describe('when there is no live feed to be had', () => {
+  beforeEach(withoutEventSource)
+
+  it('falls back to the timer, so the redo is still watched', async () => {
+    // The fallback is not optional. An event stream is the one response an
+    // intermediary can break without breaking anything else, and somebody
+    // who has just pressed "Transcribe again" behind such a proxy must
+    // still watch it happen.
+    const api = vi.fn().mockResolvedValue(BUSY)
     stubAutoImports(api as never)
 
-    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    mount(RequeuePanel, { props: { sessionId: '1' } })
     await flushPromises()
     const afterMount = api.mock.calls.length
 
     await vi.advanceTimersByTimeAsync(3000)
     await flushPromises()
+
     expect(api.mock.calls.length).toBeGreaterThan(afterMount)
+  })
+
+  it('says which of the two ways it is watching', async () => {
+    // "Live" and "checking every few seconds" look identical whenever the
+    // speakers happen not to be changing state, and one of them is several
+    // seconds behind.
+    stubAutoImports(vi.fn().mockResolvedValue(BUSY) as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+
+    expect(panel.text()).toContain('checking every few seconds')
+  })
+
+  it('makes no further request after it is unmounted mid-poll', async () => {
+    // `clearTimeout` cannot stop a timer that has already fired, and the
+    // continuation after its `await` installed a fresh one. Navigating
+    // away during a poll left twenty database reads a minute running for
+    // the life of the tab.
+    const api = vi.fn().mockResolvedValue(BUSY)
+    stubAutoImports(api as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+
+    await vi.advanceTimersByTimeAsync(3000)
+    await flushPromises()
 
     const beforeUnmount = api.mock.calls.length
     panel.unmount()
@@ -100,5 +183,151 @@ describe('when the panel stops reading the queue', () => {
     await flushPromises()
 
     expect(api.mock.calls.length).toBe(beforeUnmount)
+  })
+})
+
+describe('when the live feed works', () => {
+  it('watches the stream instead of asking again and again', async () => {
+    const sources = withEventSource()
+    const api = vi.fn().mockResolvedValue(BUSY)
+    stubAutoImports(api as never)
+
+    mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+
+    expect(sources.opened).toHaveLength(1)
+    expect(sources.opened[0]!.url).toBe('/api/sessions/1/queue/stream')
+
+    const afterMount = api.mock.calls.length
+    // The server sends a snapshot the moment a stream connects, which is
+    // what proves the path works and what keeps the panel from deciding,
+    // eight seconds later, that it is talking to a proxy.
+    sources.opened[0]!.emit('message', JSON.stringify(BUSY))
+    await vi.advanceTimersByTimeAsync(30_000)
+    await flushPromises()
+
+    // Not one further request in thirty seconds, where the timer would
+    // have made ten. This is the whole change, and counting is the only
+    // way to see it.
+    expect(api.mock.calls.length).toBe(afterMount)
+  })
+
+  it('renders what arrives on the stream without being asked', async () => {
+    const sources = withEventSource()
+    stubAutoImports(vi.fn().mockResolvedValue(BUSY) as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+    expect(panel.text()).toContain('transcribing')
+
+    sources.opened[0]!.emit(
+      'message',
+      JSON.stringify({
+        ...BUSY,
+        speakers: [
+          {
+            discord_user_id: '2',
+            display_name: 'Anna',
+            status: 'running',
+            attempts: 2,
+            error: null,
+          },
+        ],
+      }),
+    )
+    await flushPromises()
+
+    expect(panel.text()).toContain('2 attempts')
+    expect(panel.text()).toContain('watching live')
+  })
+
+  it('stops calling itself a watcher once the last speaker has finished', async () => {
+    const sources = withEventSource()
+    stubAutoImports(vi.fn().mockResolvedValue(BUSY) as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+
+    sources.opened[0]!.emit(
+      'message',
+      JSON.stringify({
+        ...BUSY,
+        session_status: 'documented',
+        speakers: [
+          { discord_user_id: '2', display_name: 'Anna', status: 'done', attempts: 1, error: null },
+        ],
+      }),
+    )
+    await flushPromises()
+
+    expect(panel.text()).toContain('finished')
+    // "Watching" beside a finished queue reads as a fault rather than as
+    // the end of one.
+    expect(panel.text()).not.toContain('watching live')
+  })
+
+  it('keeps the last good snapshot when a frame is unreadable', async () => {
+    // An event arrives in a listener with no caller to throw at, so the
+    // first sign of a malformed frame would otherwise be a render failing
+    // inside `speakers.length`.
+    const sources = withEventSource()
+    stubAutoImports(vi.fn().mockResolvedValue(BUSY) as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+
+    sources.opened[0]!.emit('message', 'not json at all')
+    await flushPromises()
+
+    expect(panel.text()).toContain('transcribing')
+  })
+
+  it('closes the connection when the panel goes', async () => {
+    // The same defect as the timer's, in another costume: something that
+    // outlives its component and keeps reading for the life of the tab.
+    const sources = withEventSource()
+    stubAutoImports(vi.fn().mockResolvedValue(BUSY) as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+    panel.unmount()
+
+    expect(sources.opened[0]!.closed).toBe(true)
+  })
+
+  it('opens nothing for a session whose work has already finished', async () => {
+    // Nothing pending and nothing running. A connection held open for a
+    // finished queue is the polling problem with an extra socket.
+    const sources = withEventSource()
+    stubAutoImports(vi.fn().mockResolvedValue(SNAPSHOT) as never)
+
+    mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+
+    expect(sources.opened).toHaveLength(0)
+  })
+
+  it('goes back to the timer once the feed has failed often enough', async () => {
+    const sources = withEventSource()
+    const api = vi.fn().mockResolvedValue(BUSY)
+    stubAutoImports(api as never)
+
+    const panel = mount(RequeuePanel, { props: { sessionId: '1' } })
+    await flushPromises()
+    const afterMount = api.mock.calls.length
+
+    const source = sources.opened[0]!
+    source.emit('error')
+    source.emit('error')
+    source.emit('error')
+    await flushPromises()
+
+    expect(source.closed).toBe(true)
+    expect(panel.text()).toContain('checking every few seconds')
+
+    await vi.advanceTimersByTimeAsync(3000)
+    await flushPromises()
+
+    expect(api.mock.calls.length).toBeGreaterThan(afterMount)
   })
 })

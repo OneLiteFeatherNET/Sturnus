@@ -13,15 +13,23 @@
  * them up when it gets to them. A control that reports nothing after
  * being pressed is one people press twice, and the second press lands
  * while the first redo is `running` — which is exactly the state the
- * server refuses. So the queue is polled while it is moving and the
+ * server refuses. So the queue is watched while it is moving and the
  * speakers are shown changing state.
  *
- * **Polling stops when the work does.** Every poll is a database read, and
- * a page left open overnight must not keep making them. The loop is driven
- * by `isQueueBusy`, which reads the jobs rather than the session status —
- * a session flips to `documented` only after the document is written, so
- * stopping at the last `done` would stop one step early and never show the
- * finished document.
+ * **The watching is a stream, and the timer is the fallback.** This panel
+ * used to re-read the endpoint every three seconds and be told "nothing
+ * changed" almost every time. It now holds one `EventSource` open and is
+ * told when something does. The three-second loop is still here, still
+ * tested, and still reachable: an event stream is the one response an
+ * intermediary can break silently, and somebody who has just pressed
+ * "Transcribe again" behind such a proxy must still watch it happen.
+ *
+ * **Watching stops when the work does.** Every re-read is a database read,
+ * and a page left open overnight must not keep making them. Both the
+ * stream and the loop are driven by `isQueueBusy`, which reads the jobs
+ * rather than the session status — a session flips to `documented` only
+ * after the document is written, so stopping at the last `done` would stop
+ * one step early and never show the finished document.
  *
  * **And it stops on the way out, including mid-request.** `clearTimeout`
  * alone was not enough: a timer that had already fired was past clearing,
@@ -29,23 +37,33 @@
  * one that nothing was left to cancel. Navigating away during any of the
  * three seconds a poll is in flight left a loop making twenty database
  * reads a minute for the life of the tab, per panel, invisibly. So every
- * continuation asks `mounted` before it acts.
+ * continuation asks `mounted` before it acts, and the stream is closed in
+ * the same breath.
  */
 import {
+  asQueueSnapshot,
   isQueueBusy,
   queueProgress,
   queueSpeakerLabel,
   queueStatusPath,
   queueStatusWords,
   requeuePath,
+  sessionQueueStreamPath,
   type QueueSnapshot,
   type RequeueOutcome,
 } from '~/utils/recordings'
+import {
+  openQueueStream,
+  queueWatchWords,
+  type QueueStreamHandle,
+  type QueueStreamMode,
+} from '~/utils/queueStream'
 import { ApiError } from '~/utils/apiError'
 
 const props = defineProps<{ sessionId: string }>()
 
 const api = useApi()
+const runtime = useRuntimeConfig()
 const snapshot = ref<QueueSnapshot | null>(null)
 /** `null` until the first load settles; `false` means "not an administrator". */
 const visible = ref<boolean | null>(null)
@@ -53,11 +71,15 @@ const working = ref(false)
 const outcome = ref<RequeueOutcome | null>(null)
 const failure = ref<string | null>(null)
 
-/** How often the queue is re-read while it is moving. Three seconds is
- *  fast enough to feel live and slow enough that a forgotten tab is not a
- *  load-generator. */
+/** How often the queue is re-read **when the live feed is unavailable**.
+ *  Three seconds is fast enough to feel live and slow enough that a
+ *  forgotten tab is not a load-generator. */
 const POLL_MS = 3000
 let timer: ReturnType<typeof setTimeout> | null = null
+/** The open feed, or `null` when nothing is being watched. */
+let stream: QueueStreamHandle | null = null
+/** How the panel is watching, for the line that says so. */
+const watchMode = ref<QueueStreamMode>('stopped')
 /** Whether this panel is still on the page. Checked after every `await`,
  *  because that is where an unmount can happen without the code that
  *  resumes afterwards knowing about it. */
@@ -91,11 +113,16 @@ async function readStatus(): Promise<void> {
   }
 }
 
-function scheduleIfBusy() {
+function stopTimer() {
   if (timer !== null) {
     clearTimeout(timer)
     timer = null
   }
+}
+
+/** The fallback loop, reached only when the live feed cannot be had. */
+function scheduleIfBusy() {
+  stopTimer()
   if (snapshot.value && isQueueBusy(snapshot.value)) {
     timer = setTimeout(async () => {
       await readStatus()
@@ -105,6 +132,55 @@ function scheduleIfBusy() {
       scheduleIfBusy()
     }, POLL_MS)
   }
+}
+
+function stopWatching() {
+  stream?.stop()
+  stream = null
+  stopTimer()
+}
+
+/**
+ * Opens the live feed while there is work in flight, and closes it when
+ * there is not.
+ *
+ * Called from every path that has just learned something new about the
+ * queue -- the first read, a press of the button, a retry -- because
+ * whether there is anything left to watch is a fact about the answer that
+ * just came back.
+ */
+function watchIfBusy() {
+  if (!mounted) return
+  if (!snapshot.value || !isQueueBusy(snapshot.value)) {
+    stopWatching()
+    watchMode.value = 'stopped'
+    return
+  }
+  // Already watching, including a feed that has fallen back to the timer.
+  // Reopening one on every event it delivers would be worse than the
+  // polling this replaces.
+  if (stream) return
+
+  watchMode.value = 'connecting'
+  stream = openQueueStream({
+    url: `${runtime.public.apiBase}${sessionQueueStreamPath(props.sessionId)}`,
+    onSnapshot: (payload) => {
+      if (!mounted) return
+      const fresh = asQueueSnapshot(payload)
+      // A frame that is not a snapshot is discarded and the last good one
+      // left on screen. It arrives in a listener with no caller to throw
+      // at, so the first sign of trouble would otherwise be a render
+      // failing inside `speakers.length`.
+      if (!fresh) return
+      snapshot.value = fresh
+      failure.value = null
+    },
+    onMode: (mode) => {
+      if (!mounted) return
+      watchMode.value = mode
+      if (mode === 'polling') scheduleIfBusy()
+    },
+  })
 }
 
 async function requeue() {
@@ -128,7 +204,7 @@ async function requeue() {
     if (mounted) {
       working.value = false
       await readStatus()
-      if (mounted) scheduleIfBusy()
+      if (mounted) watchIfBusy()
     }
   }
 }
@@ -137,22 +213,35 @@ async function requeue() {
  *  The failed state used to carry no control at all: one transient fault
  *  and the panel was a sentence saying so until somebody pressed F5. */
 async function retry() {
+  // A failed feed is let go rather than kept: this is somebody asking for
+  // a fresh start, and reusing a connection that has already given up
+  // would make the button do nothing visible.
+  stopWatching()
   await readStatus()
-  if (mounted) scheduleIfBusy()
+  if (mounted) watchIfBusy()
 }
 
 onMounted(async () => {
+  // The first read goes through the ordinary endpoint and not the stream,
+  // and that ordering carries the whole visibility rule: a 200 is the only
+  // proof that this person administers this guild, and a 404 is what
+  // everybody else gets. A stream that opened first would have to decide
+  // the same thing from a connection error, which is also what a proxy
+  // that eats event streams produces -- and the panel would then hide
+  // itself from an administrator whose network is merely unlucky.
   await readStatus()
-  scheduleIfBusy()
+  watchIfBusy()
 })
 
 onBeforeUnmount(() => {
   mounted = false
-  if (timer !== null) clearTimeout(timer)
+  stopWatching()
 })
 
 const progress = computed(() => (snapshot.value ? queueProgress(snapshot.value) : null))
 const busy = computed(() => (snapshot.value ? isQueueBusy(snapshot.value) : false))
+/** Which way the panel is watching, or `null` when it is not. */
+const watchWords = computed(() => (busy.value ? queueWatchWords(watchMode.value) : null))
 
 const STATUS_COLOUR: Record<string, string> = {
   done: 'var(--positive)',
@@ -292,7 +381,7 @@ function statusColour(status: string): string {
            administrator using a screen reader presses "Transcribe again"
            and is told nothing at all. -->
       <p class="mt-3 text-xs" :style="{ color: 'var(--text-muted)' }" role="status" aria-live="polite">
-        Session status: {{ snapshot.session_status }}<span v-if="busy"> · watching for changes</span>
+        Session status: {{ snapshot.session_status }}<span v-if="watchWords"> · {{ watchWords }}</span>
       </p>
     </template>
   </section>

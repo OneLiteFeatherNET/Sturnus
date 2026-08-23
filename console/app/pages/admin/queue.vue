@@ -26,12 +26,24 @@
  *   the endpoint behind it. A second control here would be a second
  *   definition of when a redo is safe, and the two would drift. So every
  *   row links to `/recordings/{id}` and stops there.
- * - **It stops polling when the work does.** Every poll is a database read
- *   across a whole guild, and a page left open overnight must not keep
- *   making them. The loop is driven by `isQueueMoving`, which reads
+ * - **It stops watching when the work does.** Every re-read is a database
+ *   read across a whole guild, and a page left open overnight must not
+ *   keep making them. Watching is driven by `isQueueMoving`, which reads
  *   `pending` and `running` and deliberately ignores `dead`: a dead job
- *   never changes on its own, so polling for it would be a page waiting
+ *   never changes on its own, so waiting for it would be a page waiting
  *   for ever on news that cannot arrive.
+ *
+ * **The timer moved to the server.** This page used to ask the API every
+ * five seconds and be told "nothing changed" almost every time. It now
+ * holds one `EventSource` open and is told when something does. The
+ * polling loop is still here and still tested, because it is the fallback:
+ * an event stream is the one response an intermediary can break silently,
+ * and an administrator behind a proxy that buffers or drops one must still
+ * see their queue move. Which of the two is in use is a sentence on the
+ * page rather than something to discover in developer tools — "live" and
+ * "checking every few seconds" look identical whenever the figures happen
+ * not to be changing, which is exactly when somebody is deciding whether
+ * to believe them.
  */
 import {
   CLEAR_QUEUE_HEADING,
@@ -49,12 +61,19 @@ import {
   queueChannelNote,
   queuePath,
   queueSessionState,
+  queueStreamPath,
   sessionCounts,
   sessionStartLine,
   sessionsSummaryLine,
   startQueuePolling,
   truncationNotice,
 } from '~/utils/queue'
+import {
+  describeQueueMode,
+  openQueueStream,
+  type QueueStreamHandle,
+  type QueueStreamMode,
+} from '~/utils/queueStream'
 import { recordingPath } from '~/utils/recordings'
 import {
   chooseGuild,
@@ -141,31 +160,45 @@ const truncation = computed(() => (queue.value ? truncationNotice(queue.value) :
 const clear = computed(() => Boolean(queue.value && isQueueClear(queue.value)))
 const moving = computed(() => Boolean(queue.value && isQueueMoving(queue.value)))
 
-/** How often the queue is re-read while it is moving. Five seconds rather
- *  than the three `RequeuePanel` uses: that panel is watched by somebody
- *  who has just pressed a button and is waiting for it, this page is a
- *  guild-wide read that somebody leaves open. */
+/** How often the queue is re-read **when the live feed is unavailable**.
+ *  Five seconds rather than the three `RequeuePanel` uses: that panel is
+ *  watched by somebody who has just pressed a button and is waiting for
+ *  it, this page is a guild-wide read that somebody leaves open. */
 const POLL_MS = 5000
 
-/** The running loop, or `null` when nothing is scheduled.
- *
- *  The loop itself lives in `~/utils/queue`, where it can be tested with
- *  fake timers -- see `startQueuePolling` on the defect that makes an
- *  inline chain of timeouts the wrong shape. What is left here is when to
- *  start one and when to let it go. */
+const runtime = useRuntimeConfig()
+
+/** The open feed, or `null` when nothing is being watched. Both this and
+ *  the loop below live in `~/utils/queueStream` and `~/utils/queue`, where
+ *  they can be driven by a fake source and fake timers; what is left here
+ *  is when to start one and when to let it go. */
+let stream: QueueStreamHandle | null = null
+/** Which guild `stream` is watching, so a re-render does not tear down and
+ *  reopen a perfectly good connection every time an event lands on it. */
+let watched: string | null = null
+/** The fallback loop, or `null` when nothing is scheduled. */
 let poll: ReturnType<typeof startQueuePolling> | null = null
+
+/** How the page is keeping itself current, in the reader's words. */
+const streamMode = ref<QueueStreamMode>('stopped')
 
 function stopPolling() {
   poll?.stop()
   poll = null
 }
 
-/** Re-reads while there is work in flight, and stops when there is not. */
-function scheduleIfMoving() {
+function stopWatching() {
+  stream?.stop()
+  stream = null
+  watched = null
   stopPolling()
-  // Never during a server render: a timer started there would keep the
-  // render alive and would fetch for a reader who already has their HTML.
-  if (!import.meta.client) return
+}
+
+/** The fallback, and it is not optional. An event stream is the one
+ *  response an intermediary can break without breaking anything else, and
+ *  an administrator behind such a proxy must still see their queue move. */
+function fallBackToPolling() {
+  stopPolling()
   poll = startQueuePolling({
     // Re-asked each round rather than captured now, because whether there
     // is anything left to watch is a fact about the data that just came
@@ -174,6 +207,48 @@ function scheduleIfMoving() {
     run: reload,
     delayMs: POLL_MS,
   })
+}
+
+function startWatching(guildId: string) {
+  stopWatching()
+  watched = guildId
+  streamMode.value = 'connecting'
+  stream = openQueueStream({
+    url: `${runtime.public.apiBase}${queueStreamPath(guildId)}`,
+    onSnapshot: (payload) => {
+      // Guarded against the guild having been switched while an event was
+      // in flight. Reading one server's backlog under another server's
+      // heading is the exact mistake the switcher exists to prevent.
+      if (selected.value !== guildId) return
+      queueData.value = { guildId, queue: parseGuildQueue(payload) }
+      // The clock moves with the data rather than on a ticker of its own:
+      // an age that crept forward beside a figure that had not been
+      // re-read would be an age of the wrong thing.
+      now.value = Date.now()
+    },
+    onMode: (mode) => {
+      streamMode.value = mode
+      if (mode === 'polling') fallBackToPolling()
+    },
+  })
+}
+
+/** Watches while there is work in flight, and stops when there is not. */
+function syncWatcher() {
+  // Never during a server render: a connection opened there would keep the
+  // render alive and would read for a reader who already has their HTML.
+  if (!import.meta.client) return
+  const guildId = selected.value
+  if (!guildId || !moving.value) {
+    stopWatching()
+    streamMode.value = 'stopped'
+    return
+  }
+  // Already watching the right guild -- including a feed that has since
+  // fallen back to polling, which must not be restarted on every event it
+  // delivers.
+  if (stream && watched === guildId) return
+  startWatching(guildId)
 }
 
 /** Whether a re-read is in flight. `useAsyncData`'s own status settles
@@ -198,8 +273,20 @@ async function reload() {
 
 async function refreshNow() {
   await reload()
-  scheduleIfMoving()
+  syncWatcher()
 }
+
+/** The one sentence that says how current these figures are.
+ *
+ *  Said plainly rather than as a spinner. "Live", "checking every few
+ *  seconds" and "not watching at all" look identical whenever the figures
+ *  happen not to be changing, and two of those three mean the page is
+ *  behind. */
+const watchLine = computed(() =>
+  moving.value
+    ? describeQueueMode(streamMode.value)
+    : 'Nothing is queued or running, so this page has stopped reading this server’s queue. Refresh it to check again.',
+)
 
 onMounted(() => {
   // The clock arrives here and nowhere earlier. Until it does, the
@@ -207,16 +294,16 @@ onMounted(() => {
   // what the server rendered too -- so the two agree and Vue has nothing
   // to report.
   now.value = Date.now()
-  scheduleIfMoving()
+  syncWatcher()
 })
 
-// A guild switched, or a poll that finished, changes what there is to
-// watch. Watching the data rather than calling this from every path is
-// what keeps a switch to a quiet server from leaving the previous
-// server's loop running.
-watch(queueData, () => scheduleIfMoving())
+// A guild switched, or the work stopped, changes what there is to watch.
+// Both are watched rather than either alone: switching between two busy
+// servers never changes `moving`, and a server going quiet never changes
+// `selected`.
+watch([selected, moving], () => syncWatcher())
 
-onBeforeUnmount(stopPolling)
+onBeforeUnmount(stopWatching)
 
 /** Three tones, three colours. Rendering "a speaker failed for good" and
  *  "a worker has it in hand" in the same grey would hide the one
@@ -323,17 +410,20 @@ const TONE_COLOUR: Record<string, string> = {
 
         <template v-else-if="queue">
           <div class="mb-6 flex flex-wrap items-center justify-between gap-3">
-            <!-- Said plainly rather than as a spinner. "Watching" and
-                 "not watching" look identical when the figures happen not
-                 to be changing, and one of them means the page is stale. -->
-            <p class="text-xs" :style="{ color: 'var(--text-muted)' }">
-              <template v-if="moving">
-                Work is moving in this server; these figures re-read themselves every few seconds.
-              </template>
-              <template v-else>
-                Nothing is queued or running, so this page has stopped re-reading itself. Refresh it
-                to check again.
-              </template>
+            <!-- Said plainly rather than as a spinner, and it names which
+                 of the two ways of watching is in use: "live" and
+                 "checking every few seconds" look identical when the
+                 figures happen not to be changing, and one of them is
+                 several seconds behind. In a live region because it
+                 changes on its own, without anything on the page having
+                 been pressed. -->
+            <p
+              class="text-xs"
+              :style="{ color: 'var(--text-muted)' }"
+              role="status"
+              aria-live="polite"
+            >
+              {{ watchLine }}
             </p>
             <button
               type="button"

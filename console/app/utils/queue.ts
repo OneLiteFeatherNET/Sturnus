@@ -205,6 +205,15 @@ export function queuePath(guildId: string): string {
   return `/guilds/${encodeURIComponent(guildId)}/queue`
 }
 
+/** The same answer as `queuePath`, sent again whenever it changes.
+ *
+ *  Derived from the polling path rather than written out beside it: the
+ *  two are the same resource read two ways, and a second literal is a
+ *  second thing to forget when the first one moves. */
+export function queueStreamPath(guildId: string): string {
+  return `${queuePath(guildId)}/stream`
+}
+
 /* -------------------------------------------------------------------- */
 /* Naming a session                                                      */
 /* -------------------------------------------------------------------- */
