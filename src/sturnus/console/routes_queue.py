@@ -1,7 +1,9 @@
 """A guild's transcription queue, and re-running one session's part of it.
 
 - `GET  /api/guilds/{guild_id}/queue`
+- `GET  /api/guilds/{guild_id}/queue/stream`
 - `GET  /api/sessions/{session_id}/queue`
+- `GET  /api/sessions/{session_id}/queue/stream`
 - `POST /api/sessions/{session_id}/queue/requeue`
 
 **Why the guild-wide view is here rather than in a module of its own.**
@@ -37,6 +39,25 @@ a button people press twice, and pressing this one twice is not harmless:
 the second press lands while the first redo is `running`, which is exactly
 the state `plan_requeue` refuses. Better to show the queue moving.
 
+**Why each queue endpoint has a `/stream` twin.** The console used to ask
+these two endpoints the same question every few seconds and be told
+"nothing changed" almost every time. The timer has moved to the server:
+`/stream` re-reads the *same* snapshot the polling endpoint serves,
+serialises it with the *same* function, and sends a `data:` event only when
+that serialisation differs from the one it last sent. An unchanged queue
+costs the browser nothing and the network nothing.
+
+It does not, however, cost the *database* nothing, and `StreamTiming`
+spells out what it does cost. The interval was chosen so that a stream
+reads no more often than the polling it replaces; what is saved is the
+per-request overhead of asking, and what is gained is that a change
+arrives when it happens rather than on the client's next tick.
+
+The polling endpoints are unchanged and stay. A client that cannot hold an
+`EventSource` — an old browser, a proxy that eats event streams, a script —
+must still be able to ask, and a stream that became the only way to learn
+the answer would be a feature that takes one away.
+
 **No decision is made here.** Whether a session may be re-queued is
 `sturnus.application.requeue.plan_requeue`, and the write is
 `sturnus.infrastructure.db.requeue.apply_requeue` — the same function, and
@@ -46,7 +67,11 @@ of two HTTP responses and nothing else.
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 
 from aiohttp import web
 
@@ -73,8 +98,101 @@ QUEUE_CONTROL = web.AppKey("queue_control", QueueControl)
 QUEUE_OVERVIEW: web.AppKey[QueueOverview] = web.AppKey("queue_overview")
 
 _STATUS_PATH = "/api/sessions/{session_id}/queue"
+_STATUS_STREAM_PATH = "/api/sessions/{session_id}/queue/stream"
 _REQUEUE_PATH = "/api/sessions/{session_id}/queue/requeue"
 _GUILD_PATH = "/api/guilds/{guild_id}/queue"
+_GUILD_STREAM_PATH = "/api/guilds/{guild_id}/queue/stream"
+
+
+@dataclass(frozen=True)
+class StreamTiming:
+    """How often an open stream re-reads, breathes, and gives up.
+
+    Every one of these three is a cost or a failure mode rather than a
+    preference, so each says what it is paying for.
+
+    Held on the application rather than written in as constants, for one
+    reason: they *are* the behaviour of a stream, and a test that had to
+    wait fifteen real seconds to watch a heartbeat arrive is a test nobody
+    runs. So `register` installs these defaults and a test replaces them.
+    """
+
+    #: **Five seconds, and here is the actual bill.** A "read" here is not
+    #: one query. `ConsoleQueueOverview.for_guild`, which the guild stream
+    #: calls, issues **seven** statements over three pooled connections --
+    #: `is_admin` is one, `load_status` is four (the status counts, the
+    #: expired leases, the oldest pending session, the stuck-closed count)
+    #: and `load_active_sessions` is two. `ConsoleQueueControl.status_for`,
+    #: which the session stream calls, issues **eight** over four --
+    #: `_administered_guild` is two, and `load_requeue_view` and
+    #: `load_session` are three each. So two administrators watching two
+    #: guilds is not "one query a second": it is about 2.8 statements a
+    #: second, and one administrator watching one guild is about 1.4.
+    #:
+    #: Five rather than the two this shipped with, because two was 2.5x
+    #: *more* database work than the polling it replaced, not less. The
+    #: guild page polled every five seconds and the panel every three, so
+    #: at five the guild stream costs exactly what its polling cost and the
+    #: panel's stream costs rather less. What is genuinely saved is
+    #: per-*request* overhead, which the browser paid on every tick whether
+    #: or not the answer had changed: a TLS handshake, a Cloudflare Tunnel
+    #: hop, a cookie signature check and a whole request cycle. That saving
+    #: is real and worth having; it is not a saving in reads, and the
+    #: argument for this endpoint must not be made as though it were.
+    #:
+    #: The improvement in *latency* is not paid for at all: a change is
+    #: sent when it happens rather than on the client's next tick, so five
+    #: seconds here is not five seconds of staleness the way five seconds
+    #: of polling was.
+    #:
+    #: A queue at rest costs nothing, because the stream ends rather than
+    #: waiting for news that cannot arrive.
+    poll_seconds: float = 5.0
+    #: A comment line when nothing has changed, so that nothing in the
+    #: middle decides the connection is dead. Fifteen seconds sits well
+    #: inside both an nginx `proxy_read_timeout` (sixty by default) and a
+    #: Cloudflare Tunnel's idle timeout, with room for a slow hop.
+    heartbeat_seconds: float = 15.0
+    #: The server hangs up after ten minutes and the client reconnects on
+    #: its own -- which is what `EventSource` does without being asked. An
+    #: unbounded server-side loop is how a process quietly accumulates
+    #: tasks belonging to browsers that were closed hours ago.
+    #:
+    #: **This is also the worst case for an abandoned stream**, and the
+    #: reason it is not longer. A client that falls back to polling closes
+    #: its `EventSource` -- `openQueueStream` closes the source in the same
+    #: breath as it announces `polling`, so the browser is not paying for
+    #: both -- but this loop learns nothing from that until its next write
+    #: fails. On a direct connection that is at most `heartbeat_seconds`
+    #: away, fifteen seconds, and sooner if the queue changes meanwhile.
+    #: Behind the buffering proxy that *caused* the fallback there is no
+    #: such luck: the proxy holds its own connection to this process open
+    #: and swallows the writes, so the loop keeps re-reading for the full
+    #: ten minutes. That is the ceiling on what one abandoned stream can
+    #: cost -- 120 reads, about 840 statements for a guild stream, once --
+    #: and it is why the ceiling exists rather than being left to the
+    #: client to enforce by hanging up.
+    max_seconds: float = 600.0
+
+
+#: The timings an open stream runs on. See `StreamTiming` on why they are
+#: injected rather than written in.
+QUEUE_STREAM_TIMING: web.AppKey[StreamTiming] = web.AppKey("queue_stream_timing")
+
+#: Job statuses that mean a worker may still act on this session. The same
+#: "is it moving" predicate the console used to drive its own timer with --
+#: one definition of it, now applied on the side that does the reading.
+_IN_FLIGHT = frozenset({"pending", "running"})
+
+#: A `data:` event carries a snapshot; the two named events below are
+#: terminal and mean "stop, and do not reconnect". A named event still
+#: needs a `data:` line of its own, or a browser will not dispatch it.
+_REST_EVENT = b'event: rest\ndata: {"reason": "at rest"}\n\n'
+_GONE_EVENT = b'event: gone\ndata: {"reason": "no longer readable"}\n\n'
+
+#: A comment line. It reaches no listener and exists only to put bytes on
+#: an idle connection before something in the middle reclaims it.
+_HEARTBEAT = b": keep-alive\n\n"
 
 
 async def guild_queue(request: web.Request) -> web.Response:
@@ -125,6 +243,220 @@ async def queue_status(request: web.Request) -> web.Response:
         # worker picks a job up.
         headers={"Cache-Control": "private, no-store"},
     )
+
+
+async def guild_queue_stream(request: web.Request) -> web.StreamResponse:
+    """The same answer as `guild_queue`, sent again whenever it changes.
+
+    Same authorisation, and expressed by making the same call: the reader
+    below is `QUEUE_OVERVIEW.for_guild` with this request's signed-in id,
+    exactly as the polling handler above calls it, and `None` still means
+    404 for "no such guild" and "not yours" alike. A second copy of the
+    rule here is a second rule, and the copy is the one that would be left
+    behind when the original changed.
+    """
+    from sturnus.console.app import current_user
+
+    viewer = current_user(request).discord_user_id
+    try:
+        guild_id = int(request.match_info["guild_id"])
+    except ValueError:
+        return _no_such_guild()
+
+    async def read() -> _Reading | None:
+        queue = await request.app[QUEUE_OVERVIEW].for_guild(guild_id, requested_by=viewer)
+        if queue is None:
+            return None
+        # `isQueueMoving` in the console, said here instead: `pending` and
+        # `running`, and deliberately not `dead`. A dead job never changes
+        # on its own, so a stream held open for one would be a page
+        # waiting for ever on news that cannot arrive.
+        return _Reading(
+            payload=_guild_queue_json(guild_id, queue),
+            moving=queue.pending > 0 or queue.running > 0,
+        )
+
+    return await _stream_queue(request, read=read, refuse=_no_such_guild)
+
+
+async def queue_status_stream(request: web.Request) -> web.StreamResponse:
+    """The same answer as `queue_status`, sent again whenever it changes.
+
+    Same authorisation as the polling endpoint, by calling the same
+    method: `QUEUE_CONTROL.status_for` with the signed-in id, `None`
+    answering 404 for both of the reasons it answers `None`.
+    """
+    from sturnus.console.app import current_user
+
+    viewer = current_user(request).discord_user_id
+    session_id = _session_id(request)
+    if session_id is None:
+        return _no_such_session()
+
+    async def read() -> _Reading | None:
+        snapshot = await request.app[QUEUE_CONTROL].status_for(session_id, requested_by=viewer)
+        if snapshot is None:
+            return None
+        # Read from the jobs and not from `session_status`, because the
+        # session flips to `documented` only after the document is
+        # written -- a stream that ended at the last `done` would end one
+        # step early and never show the finished document.
+        return _Reading(
+            payload=_snapshot_json(snapshot),
+            moving=any(speaker.status in _IN_FLIGHT for speaker in snapshot.speakers),
+        )
+
+    return await _stream_queue(request, read=read, refuse=_no_such_session)
+
+
+@dataclass(frozen=True)
+class _Reading:
+    """One re-read of a queue: what to send, and whether to stay."""
+
+    payload: dict[str, object]
+    #: Whether a worker may still act on this queue. The stream ends when
+    #: this goes false, which is the whole reason it is carried alongside
+    #: the payload rather than derived from the JSON: the predicate reads
+    #: a typed value, not a dictionary of `object`.
+    moving: bool
+
+
+async def _stream_queue(
+    request: web.Request,
+    *,
+    read: Callable[[], Awaitable[_Reading | None]],
+    refuse: Callable[[], web.Response],
+) -> web.StreamResponse:
+    """Server-sent events for one queue, until it stops moving.
+
+    **The first read happens before the response is prepared**, and that
+    ordering is not incidental: once headers are on the wire there is no
+    status left to send, so a stream that prepared first and read second
+    would have to answer "you do not administer this guild" with a 200 and
+    an empty stream. Read first, and a refusal is the same 404 the polling
+    endpoint gives.
+    """
+    first = await read()
+    if first is None:
+        return refuse()
+
+    response = web.StreamResponse()
+    response.headers["Content-Type"] = "text/event-stream"
+    # It names when a guild met and who spoke, and it is stale the moment
+    # a worker claims a job. `no-store` for the same reason the polling
+    # endpoints send it.
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Connection"] = "keep-alive"
+    # **The header this deployment cannot do without.** Sturnus sits behind
+    # a Cloudflare Tunnel and a reverse proxy, and a proxy that buffers a
+    # response holds every event until the response ends -- which for a
+    # stream is ten minutes later, all at once, long after anybody cared.
+    # A buffered event stream is a stream that never arrives. nginx and
+    # everything that copied its conventions turn buffering off for a
+    # response carrying this header.
+    response.headers["X-Accel-Buffering"] = "no"
+    await response.prepare(request)
+
+    timing = request.app[QUEUE_STREAM_TIMING]
+    loop = asyncio.get_running_loop()
+    give_up_at = loop.time() + timing.max_seconds
+
+    # Sent immediately rather than on the first change, so that a page
+    # renders the moment it connects. A client that had to wait for
+    # something to happen before it could draw anything would be worse
+    # than the timer this replaces.
+    sent = _encode(first.payload)
+    if not await _send(response, _data_event(sent)):
+        return response
+    spoke_at = loop.time()
+
+    reading: _Reading | None = first
+    while True:
+        if reading is None:
+            # The guild or session stopped being readable underneath us --
+            # deleted, or this person is no longer an administrator. Not an
+            # error and not a refusal at this point; the stream simply has
+            # nothing further to say, and says so rather than reconnecting
+            # forever into a 404.
+            await _send(response, _GONE_EVENT)
+            break
+        if not reading.moving:
+            # Nothing pending and nothing running. A stream that stayed
+            # open for a finished queue is the polling problem with extra
+            # sockets, so it says it is done and hangs up -- and the named
+            # event is what stops the client reconnecting, since a browser
+            # cannot tell a deliberate close from a dropped one.
+            await _send(response, _REST_EVENT)
+            break
+        if loop.time() >= give_up_at:
+            # No terminal event on purpose: the queue is still moving, so
+            # the client *should* reconnect, and `EventSource` does that on
+            # its own when the connection ends without being told to stop.
+            break
+
+        await asyncio.sleep(timing.poll_seconds)
+        reading = await read()
+        if reading is None:
+            continue
+
+        payload = _encode(reading.payload)
+        if payload != sent:
+            sent = payload
+            if not await _send(response, _data_event(payload)):
+                return response
+            spoke_at = loop.time()
+        elif loop.time() - spoke_at >= timing.heartbeat_seconds:
+            if not await _send(response, _HEARTBEAT):
+                return response
+            spoke_at = loop.time()
+
+    await _finish(response)
+    return response
+
+
+def _encode(payload: dict[str, object]) -> str:
+    """The snapshot as one line of JSON.
+
+    `sort_keys` is what makes "has it changed" a string comparison rather
+    than a structural one. Two dictionaries built from the same rows must
+    encode identically or every re-read would look like a change, which is
+    precisely the traffic this endpoint exists to stop sending.
+    """
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def _data_event(payload: str) -> bytes:
+    return f"data: {payload}\n\n".encode()
+
+
+async def _send(response: web.StreamResponse, chunk: bytes) -> bool:
+    """Writes one event, and reports whether the reader is still there.
+
+    A browser closing a tab, navigating away or losing its connection ends
+    a stream mid-write, and that is the *ordinary* end of one rather than a
+    fault. Unhandled, aiohttp logs the `ConnectionResetError` at ERROR with
+    a traceback -- which is how leaving an admin page became an exception
+    in the log of a service that is working perfectly. DEBUG, no traceback,
+    and the loop ends rather than writing into a closed transport for the
+    remaining nine minutes.
+
+    `asyncio.CancelledError` is deliberately not caught: it descends from
+    `BaseException`, and swallowing it would break graceful shutdown.
+    """
+    try:
+        await response.write(chunk)
+    except ConnectionError:
+        log.debug("A queue stream's reader disconnected before it was finished")
+        return False
+    return True
+
+
+async def _finish(response: web.StreamResponse) -> None:
+    """Ends the response, forgiving a reader who left first."""
+    try:
+        await response.write_eof()
+    except ConnectionError:
+        log.debug("A queue stream's reader disconnected before it could be closed")
 
 
 async def requeue_session(request: web.Request) -> web.Response:
@@ -295,10 +627,16 @@ def register(app: web.Application) -> None:
     """Adds the queue routes to an application that already has its collaborators."""
     from sturnus.console.app import require_session
 
+    # The defaults. A test that wants to watch a heartbeat inside a second
+    # replaces this on the application before it starts; see
+    # `StreamTiming` on why they are not constants.
+    app[QUEUE_STREAM_TIMING] = StreamTiming()
     app.add_routes(
         [
             web.get(_GUILD_PATH, require_session(guild_queue)),
+            web.get(_GUILD_STREAM_PATH, require_session(guild_queue_stream)),
             web.get(_STATUS_PATH, require_session(queue_status)),
+            web.get(_STATUS_STREAM_PATH, require_session(queue_status_stream)),
             web.post(_REQUEUE_PATH, require_session(requeue_session)),
         ]
     )

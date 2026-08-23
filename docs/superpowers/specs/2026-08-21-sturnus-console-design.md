@@ -256,7 +256,8 @@ scanning for a protocol link.
 
 ## 5.2 Re-queueing, for administrators
 
-`GET /api/sessions/{id}/queue` and `POST /api/sessions/{id}/queue/requeue`
+`GET /api/sessions/{id}/queue`, `GET /api/sessions/{id}/queue/stream` and
+`POST /api/sessions/{id}/queue/requeue`
 
 The rule here is **administrator of the session's guild**, not participant
 of the session — the only place in the console where those differ.
@@ -281,8 +282,65 @@ anywhere.
 The progress half is not decoration. A re-queue is not instantaneous, and
 a control that reports nothing after being pressed is one people press
 twice — the second press landing while the first redo is `running`, which
-is exactly the state `plan_requeue` refuses. So the queue is polled while
-it is moving, and the poll stops when the jobs do.
+is exactly the state `plan_requeue` refuses. So the queue is watched while
+it is moving, and the watching stops when the jobs do.
+
+**The watching is a stream, and the timer moved to the server.** Both queue
+views — this panel and the guild-wide page over `GET
+/api/guilds/{id}/queue` — used to re-read their endpoint on a timer in the
+browser, every three seconds here and every five there, and be told
+"nothing changed" almost every time. Each endpoint now has a `/stream`
+twin serving `text/event-stream`, under the same authorisation rule and
+reached by calling the same method: the server re-reads the
+same snapshot on its own five-second interval, serialises it with the same
+function, and sends a `data:` event only when that serialisation differs
+from the one it last sent. An unchanged queue produces nothing. A stream
+sends the current snapshot on connect, so a page renders the moment it
+connects rather than waiting for something to happen; emits a comment line
+every fifteen seconds while nothing changes, so no intermediary decides an
+idle connection is dead; ends with a named terminal event when the queue
+comes to rest, because a browser cannot tell a deliberate close from a
+dropped one and would otherwise reconnect for ever; and closes itself after
+ten minutes regardless, because an unbounded server-side loop is how a
+process accumulates tasks belonging to browsers that were closed hours ago.
+
+The cost is stated rather than assumed, and it is not a saving in reads.
+One read of a guild's overview is seven SQL statements over three pooled
+connections; one read of a session's queue is eight over four. At five
+seconds that is about 1.4 statements a second per open guild stream — the
+same rate the five-second browser poll it replaces was already costing —
+and the panel's stream is cheaper than the three-second poll it replaces.
+A queue at rest costs nothing at all, because the stream ends rather than
+waiting for news that cannot arrive.
+
+What is genuinely saved is the per-*request* overhead the browser paid on
+every tick whether or not the answer had changed: a TLS handshake, a
+Cloudflare Tunnel hop, a cookie signature check and a whole request cycle.
+What is genuinely gained is latency — a change is sent when it happens
+rather than on the client's next tick, so five seconds of interval here is
+not five seconds of staleness the way five seconds of polling was.
+
+`X-Accel-Buffering: no` travels with every stream and is not optional here.
+Sturnus is served through a Cloudflare Tunnel and a reverse proxy, and a
+proxy that buffers a response holds every event until the response ends —
+which for these streams is ten minutes later, all at once, long after
+anybody cared.
+
+**The polling endpoints stay, and the console keeps its timer.** An event
+stream is the one response shape an intermediary can break without breaking
+anything else, and the browser cannot tell a buffering proxy from a server
+with nothing to say: the connection is open, no error is raised, and
+nothing arrives. So the console treats silence as a failure on a deadline
+and falls back to re-reading the polling endpoint, closing its
+`EventSource` as it goes so that it is never paying for both. The server
+cannot be told, only discovered: it learns the reader has gone when its
+next write fails, which on a direct connection is within fifteen seconds
+and behind the buffering proxy that caused the fallback is never — the
+proxy holds its own connection open and swallows the writes. That is what
+the ten-minute ceiling is for. The page says in a
+sentence which of the two it is doing — "live" and "checking every few
+seconds" look identical whenever the figures happen not to be changing,
+which is exactly when somebody is deciding whether to believe them.
 
 ### 5.1 What is deliberately not built
 

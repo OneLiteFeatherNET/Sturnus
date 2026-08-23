@@ -359,6 +359,41 @@ export function requeuePath(sessionId: string): string {
   return `/sessions/${encodeURIComponent(sessionId)}/queue/requeue`
 }
 
+/** The same answer as `queueStatusPath`, sent again whenever it changes.
+ *
+ *  Derived from the polling path rather than written out beside it: a
+ *  second literal is a second thing to forget when the first one moves.
+ *  Named for the session rather than called `queueStreamPath`, because
+ *  `~/utils/queue` has a guild-wide one of that name and both modules are
+ *  auto-imported -- two exports sharing a name means one of them silently
+ *  wins, and the loser is whichever file was added second. */
+export function sessionQueueStreamPath(sessionId: string): string {
+  return `${queueStatusPath(sessionId)}/stream`
+}
+
+/**
+ * A snapshot that arrived over the live feed, or `null` if it did not.
+ *
+ * The polling path takes the endpoint's word for the shape, because a
+ * failed parse there is an exception a caller can see. An event on a
+ * stream has no caller: it arrives in a listener, and a payload that is
+ * not what it claims to be would first be noticed as a render throwing
+ * inside `speakers.length`. So the one field the panel dereferences is
+ * checked, and anything else is discarded and the last good snapshot left
+ * on screen.
+ *
+ * Deliberately not a full validation. Everything here was serialised by
+ * the same function that serves the polling endpoint; the check exists to
+ * keep a malformed frame from taking the page down, not to second-guess
+ * the API.
+ */
+export function asQueueSnapshot(payload: unknown): QueueSnapshot | null {
+  if (typeof payload !== 'object' || payload === null) return null
+  const candidate = payload as Partial<QueueSnapshot>
+  if (!Array.isArray(candidate.speakers)) return null
+  return candidate as QueueSnapshot
+}
+
 /** Job statuses that mean a worker may still act on this session. */
 const IN_FLIGHT = new Set(['pending', 'running'])
 
