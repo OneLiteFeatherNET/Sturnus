@@ -36,10 +36,14 @@ from sturnus.console.auth import (
 )
 from sturnus.console.ports import (
     AdminDirectory,
+    CollectionNames,
     ConsentDirectory,
+    GuildNames,
     GuildReports,
     LinkDirectory,
     OAuthClient,
+    PreferenceDirectory,
+    ProfileDirectory,
     QueueControl,
     QueueOverview,
     SessionReads,
@@ -51,6 +55,10 @@ from sturnus.console.routes_audio import AUDIO_DELIVERY
 from sturnus.console.routes_audio import register as register_audio
 from sturnus.console.routes_consent import CONSENT_DIRECTORY
 from sturnus.console.routes_consent import register as register_consent
+from sturnus.console.routes_directory import COLLECTION_NAMES, GUILD_NAMES
+from sturnus.console.routes_directory import register as register_directory
+from sturnus.console.routes_me import PREFERENCES, PROFILE_DIRECTORY
+from sturnus.console.routes_me import register as register_me
 from sturnus.console.routes_queue import QUEUE_CONTROL, QUEUE_OVERVIEW
 from sturnus.console.routes_queue import register as register_queue
 from sturnus.console.routes_report import GUILD_REPORTS
@@ -245,23 +253,6 @@ async def logout(_request: web.Request) -> web.Response:
     return response
 
 
-@require_session
-async def me(request: web.Request) -> web.Response:
-    """Who the caller is, and whether the settings section applies to them.
-
-    `is_admin` is a rendering hint and never a control. The settings
-    endpoints check administrator status themselves -- a hidden section is
-    a courtesy to the person looking at it, not a boundary.
-    """
-    session = current_user(request)
-    return web.json_response(
-        {
-            "discord_user_id": str(session.discord_user_id),
-            "is_admin": await request.app[_ADMINS].is_admin_anywhere(session.discord_user_id),
-        }
-    )
-
-
 def build_api(
     *,
     oauth: OAuthClient,
@@ -280,6 +271,10 @@ def build_api(
     queues: QueueOverview,
     consents: ConsentDirectory,
     reports: GuildReports,
+    profile: ProfileDirectory,
+    prefs: PreferenceDirectory,
+    names: GuildNames,
+    collections: CollectionNames,
 ) -> web.Application:
     """Builds the application, with every collaborator injected.
 
@@ -309,6 +304,10 @@ def build_api(
     app[QUEUE_OVERVIEW] = queues
     app[CONSENT_DIRECTORY] = consents
     app[GUILD_REPORTS] = reports
+    app[PROFILE_DIRECTORY] = profile
+    app[PREFERENCES] = prefs
+    app[GUILD_NAMES] = names
+    app[COLLECTION_NAMES] = collections
     app.add_routes(
         [
             web.get("/healthz", healthz),
@@ -316,7 +315,6 @@ def build_api(
             web.get("/api/auth/login", login),
             web.get("/api/auth/callback", callback),
             web.post("/api/auth/logout", logout),
-            web.get("/api/me", me),
         ]
     )
     routes_read.register(app)
@@ -324,6 +322,8 @@ def build_api(
     register_queue(app)
     register_consent(app)
     register_report(app)
+    register_me(app)
+    register_directory(app)
     routes_settings.register(app)
     routes_tags.register(app)
     return app

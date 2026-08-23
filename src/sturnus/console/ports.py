@@ -20,6 +20,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, tzinfo
 from typing import Protocol
 
+from sturnus.application.collection_mirror import MirroredCollection
+from sturnus.application.directory_mirror import (
+    MirroredChannel,
+    MirroredMember,
+    MirroredRole,
+)
 from sturnus.console.filters import SessionFilter
 from sturnus.console.reporting import RecordedSession
 from sturnus.console.statistics import AttendedSession, SessionPage, TagUse
@@ -55,6 +61,143 @@ class LinkDirectory(Protocol):
     """
 
     async def discord_user_for(self, provider: str, external_user_id: str) -> int | None: ...
+
+
+class ProfileDirectory(Protocol):
+    """The name to greet a signed-in person by.
+
+    Deliberately not a second direction on `LinkDirectory`. That protocol
+    exists to answer *who is this*, which is an authorisation question and
+    the only bridge between an authenticated identity and a Discord id.
+    This one answers *what do we call them*, which decides nothing at all
+    -- and keeping them apart is what stops a handler that wanted a name
+    holding an object that can also resolve identities.
+
+    The provider is the adapter's business. There is exactly one identity
+    provider for the console (`sturnus.console.auth.PROVIDER`), so a
+    caller that had to name it would be a caller that could name the
+    wrong one.
+
+    `None` for somebody with no link row. That should not arise -- a
+    session exists because a link was found -- but a link can be removed
+    while a cookie is still valid, and a missing name is not an error.
+    """
+
+    async def display_name_for(self, discord_user_id: int) -> str | None: ...
+
+
+class PreferenceDirectory(Protocol):
+    """One person's own console preferences, read whole and written one key at a time.
+
+    `guild_config`'s arrangement one layer down, and narrow for the same
+    reasons `SettingsStore` is: `snapshot` is read while a page is being
+    rendered, so it answers every known key in one query rather than
+    inviting a handler to loop over `KNOWN_KEYS`; and the values it
+    answers are already layered over `sturnus.domain.preferences.DEFAULTS`,
+    so no caller has to know the defaults and none of them can forget to.
+
+    **`set` is where validation lives, and it must stay there.** It
+    refuses a key nobody reads and a value outside `ALLOWED_VALUES`, and
+    the API's job is to turn that `ValueError` into a 400 -- never to
+    check the same thing first. Two copies of a rule is how the two
+    drift.
+
+    `None` as a value removes the preference and restores the default. It
+    is not the same as storing the default string: an absent row means
+    "never expressed", which is what lets a future change to `DEFAULTS`
+    reach everybody who never disagreed with it.
+
+    **There is no `discord_user_id` that does not come from a session.**
+    Every method names whose preferences these are, and the only caller
+    passes the id out of the signed cookie -- see
+    `sturnus.console.routes_me` on why no endpoint takes one in a path.
+    """
+
+    async def snapshot(self, discord_user_id: int) -> dict[str, str]: ...
+
+    async def set(
+        self, discord_user_id: int, key: str, value: str | None, now: datetime
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class GuildDirectory:
+    """The names behind one guild's ids, as the bot last saw them.
+
+    The three mirrors read together and answered as one value, because
+    the console renders them together: a settings page resolves a channel
+    id, two role ids and a list of people in one paint, and three
+    endpoints would be three round trips to draw one form.
+
+    The entries are `sturnus.application.directory_mirror`'s own values
+    rather than copies. The mirror was written for this reader -- its
+    docstrings say "as the console will eventually offer it" -- and a
+    parallel set of identical dataclasses would be two definitions of one
+    channel, drifting the first time Discord adds a field.
+
+    `synced_at` is **the oldest** of the three mirrors, not the newest.
+    One sweep writes all three on one tick, so they normally agree; when
+    they do not, it is because a write failed and the next sweep has not
+    come round, and a payload claiming the freshness of its freshest part
+    would tell a reader the whole directory is minutes old when half of
+    it is a day old. `None` for a guild nothing has been mirrored for
+    yet, which is a real state and not an error: the bot sweeps on a
+    timer and a freshly configured guild has not had its turn.
+    """
+
+    channels: tuple[MirroredChannel, ...]
+    roles: tuple[MirroredRole, ...]
+    members: tuple[MirroredMember, ...]
+    synced_at: datetime | None
+
+
+class GuildNames(Protocol):
+    """A guild's mirrored names, if the person asking administers it.
+
+    `requested_by` is not optional and there is no method here without
+    it, for the reason `TrackDirectory`, `QueueControl`, `ConsentDirectory`
+    and `QueueOverview` have none: the authorisation rule lives inside the
+    call rather than in a handler that could forget to apply it. `None`
+    covers "no such guild" and "you do not administer it" alike, because
+    from outside those must look the same -- this names the people who
+    consented to being recorded.
+    """
+
+    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildDirectory | None: ...
+
+
+@dataclass(frozen=True)
+class CollectionListing:
+    """Outline's collections, as the worker last saw them.
+
+    One `synced_at` for the whole listing rather than one per entry,
+    because the mirror is replaced wholesale on every sweep: every row
+    carries the same instant, and repeating it per collection would
+    suggest they could differ. `None` before the first sweep lands.
+    """
+
+    collections: tuple[MirroredCollection, ...]
+    synced_at: datetime | None
+
+
+class CollectionNames(Protocol):
+    """The mirrored Outline collections, for somebody who administers a guild.
+
+    The one directory here whose rule is not per guild, because the thing
+    it describes is not per guild: one deployment talks to one Outline
+    instance, so a collection is a fact about that instance. The question
+    that remains is whether the caller administers anything at all -- a
+    person who administers nothing never configures a `document_target`
+    and has no use for the list.
+
+    `None` rather than an empty sequence for that person, and it is the
+    same `None` a directory gives for a guild that does not exist: an
+    empty listing is a real answer meaning "the worker has not swept
+    yet", and folding the two together would make a refusal look like a
+    fresh install.
+    """
+
+    async def mirrored(self, *, requested_by: int) -> CollectionListing | None: ...
 
 
 class AdminDirectory(Protocol):

@@ -39,9 +39,12 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 
 from sturnus.config import StrictSettings
 from sturnus.console.adapters import (
+    ConsoleCollectionNames,
     ConsoleConsentDirectory,
+    ConsoleGuildNames,
     ConsoleGuildReports,
     ConsoleLinkDirectory,
+    ConsoleProfileDirectory,
     ConsoleQueueControl,
     ConsoleQueueOverview,
     ConsoleStateStore,
@@ -59,8 +62,14 @@ from sturnus.infrastructure.db.models import (
     AccountLink,
     AdminMember,
     ConsoleState,
+    GuildChannel,
     GuildConfig,
+    GuildMember,
+    GuildRole,
+    OutlineCollection,
+    UserPreference,
 )
+from sturnus.infrastructure.db.preferences import PreferenceStore
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.objectstore import S3AudioStore
 from sturnus.infrastructure.observability import init_sentry
@@ -91,6 +100,16 @@ _REQUIRED_TABLES = frozenset(
         # The settings section reads and writes this one. Without it here,
         # `/readyz` would pass while the first settings page 500s.
         GuildConfig.__tablename__,
+        # A person's own preferences, and the four mirrors the console
+        # resolves ids through. Every one of them is read while a page is
+        # being rendered, so leaving them out would let `/readyz` pass
+        # while the first profile menu 500s -- the same argument
+        # `guild_config` is on this list for.
+        UserPreference.__tablename__,
+        GuildChannel.__tablename__,
+        GuildRole.__tablename__,
+        GuildMember.__tablename__,
+        OutlineCollection.__tablename__,
         "session",
         "session_participant",
         "transcription_job",
@@ -220,6 +239,10 @@ async def _run() -> None:
         queues=ConsoleQueueOverview(session_factory, admins, now),
         consents=ConsoleConsentDirectory(session_factory, admins, config, now),
         reports=ConsoleGuildReports(session_factory, admins, config),
+        profile=ConsoleProfileDirectory(session_factory),
+        prefs=PreferenceStore(session_factory),
+        names=ConsoleGuildNames(session_factory, admins),
+        collections=ConsoleCollectionNames(session_factory, admins),
     )
 
     runner = web.AppRunner(app)
