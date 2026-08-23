@@ -35,6 +35,8 @@ from sturnus.console.adapters import (
     ConsoleConsentDirectory,
     ConsolePersonalConsents,
 )
+from sturnus.console.paging import MAX_PAGE_SIZE
+from sturnus.console.ports import ConsentHolder
 from sturnus.domain import settings
 from sturnus.domain.consent import ConsentScope
 from sturnus.infrastructure.db.config_store import ConfigStore
@@ -100,6 +102,27 @@ def directory(
         ConfigStore(factory),
         lambda: now,
     )
+
+
+async def roster(
+    consents: ConsoleConsentDirectory,
+    *,
+    guild_id: int = GUILD,
+    requested_by: int = ANNA,
+    limit: int = MAX_PAGE_SIZE,
+    offset: int = 0,
+) -> tuple[ConsentHolder, ...] | None:
+    """The people on one page of a guild's roster, or `None` for a refusal.
+
+    A helper rather than the call itself, because almost every test below
+    is about *which* people the statements return and not about the
+    window. Asking for `MAX_PAGE_SIZE` is asking for "everything a
+    request may have", which is what these tests meant before the
+    endpoint was paged at all -- and the tests that do care about the
+    window say so by naming one.
+    """
+    page = await consents.holders(guild_id, requested_by=requested_by, limit=limit, offset=offset)
+    return None if page is None else page.holders
 
 
 async def set_policy(
@@ -199,7 +222,7 @@ async def test_an_administrator_of_the_guild_sees_who_consented(
     await set_policy(factory)
     await grant(factory, BEN)
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert [holder.discord_user_id for holder in holders] == [BEN]
@@ -213,14 +236,16 @@ async def test_an_administrator_of_another_guild_is_nobody_here(
     await grant(factory, BEN)
     admins = Admins({OTHER_GUILD: {CARL}})
 
-    assert await directory(factory, admins=admins).holders(GUILD, requested_by=CARL) is None
+    assert (
+        await roster(directory(factory, admins=admins), guild_id=GUILD, requested_by=CARL) is None
+    )
 
 
 async def test_a_participant_who_administers_nothing_gets_no_listing(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     await grant(factory, BEN)
-    assert await directory(factory).holders(GUILD, requested_by=BEN) is None
+    assert await roster(directory(factory), guild_id=GUILD, requested_by=BEN) is None
 
 
 async def test_a_guild_nobody_administers_answers_the_same_as_one_that_is_not_yours(
@@ -229,7 +254,7 @@ async def test_a_guild_nobody_administers_answers_the_same_as_one_that_is_not_yo
     # A guild the bot does not serve has no administrators, so "no such
     # guild" needs no separate check -- and must not have one, because a
     # distinct answer is an oracle for which guilds exist.
-    assert await directory(factory).holders(123456, requested_by=ANNA) is None
+    assert await roster(directory(factory), guild_id=123456, requested_by=ANNA) is None
 
 
 async def test_a_revocation_by_somebody_who_does_not_administer_the_guild_writes_nothing(
@@ -242,7 +267,7 @@ async def test_a_revocation_by_somebody_who_does_not_administer_the_guild_writes
 
     # The refusal is not merely a return value: nothing may have been
     # written on the way to it.
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
     assert holders is not None
     assert holders[0].revoked_at is None
 
@@ -267,7 +292,7 @@ async def test_the_newest_grant_is_the_one_reported(
     )
     await grant(factory, BEN, granted_at=T0 - timedelta(days=1))
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert len(holders) == 1
@@ -282,7 +307,7 @@ async def test_a_person_appears_once_however_often_they_consented(
     for day in range(4):
         await grant(factory, BEN, granted_at=T0 - timedelta(days=day))
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert [holder.discord_user_id for holder in holders] == [BEN]
@@ -294,7 +319,7 @@ async def test_consent_in_another_guild_is_not_this_guild_s_business(
     await set_policy(factory)
     await grant(factory, CARL, guild_id=OTHER_GUILD)
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders == ()
 
@@ -317,7 +342,7 @@ async def test_a_grant_naming_a_superseded_policy_version_is_not_active(
     await set_policy(factory, "2026-02")
     await grant(factory, BEN, policy_version="2026-01")
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].revoked_at is None
@@ -332,7 +357,7 @@ async def test_a_guild_with_no_policy_version_has_no_active_consent(
     # recorded at all.
     await grant(factory, BEN)
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].active is False
@@ -344,7 +369,7 @@ async def test_a_withdrawn_grant_is_not_active(
     await set_policy(factory)
     await grant(factory, BEN, revoked_at=T0)
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].active is False
@@ -363,7 +388,7 @@ async def test_a_name_comes_from_the_person_s_most_recent_meeting(
     await a_recorded_session(factory, started_at=T0 - timedelta(days=9), people={BEN: "old name"})
     await a_recorded_session(factory, started_at=T0 - timedelta(days=1), people={BEN: "ben"})
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].display_name == "ben"
@@ -377,7 +402,7 @@ async def test_somebody_who_has_never_been_recorded_has_no_name_to_show(
     await set_policy(factory)
     await grant(factory, BEN)
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].display_name is None
@@ -392,7 +417,7 @@ async def test_a_name_is_not_borrowed_from_another_guild(
     await grant(factory, BEN)
     await a_recorded_session(factory, guild_id=OTHER_GUILD, people={BEN: "elsewhere"})
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].display_name is None
@@ -411,7 +436,7 @@ async def test_the_recordings_still_held_are_counted(
     await a_recorded_session(factory, started_at=T0 - timedelta(days=2), people={BEN: "ben"})
     await a_recorded_session(factory, started_at=T0 - timedelta(days=1), people={BEN: "ben"})
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].recordings_with_audio == 2
@@ -427,7 +452,7 @@ async def test_a_recording_the_sweep_erased_is_not_counted_as_still_held(
     await grant(factory, BEN)
     await a_recorded_session(factory, people={BEN: "ben"}, audio_deleted=True)
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].recordings_with_audio == 0
@@ -440,7 +465,7 @@ async def test_recordings_from_another_guild_are_not_counted(
     await grant(factory, BEN)
     await a_recorded_session(factory, guild_id=OTHER_GUILD, people={BEN: "ben"})
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert holders[0].recordings_with_audio == 0
@@ -463,7 +488,7 @@ async def test_a_revocation_stamps_the_newest_grant(
     assert outcome is not None
     assert outcome.revoked is True
     assert outcome.effective_at == revoked_at
-    holders = await directory(factory, now=revoked_at).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory, now=revoked_at), guild_id=GUILD, requested_by=ANNA)
     assert holders is not None
     assert holders[0].revoked_at == revoked_at
     assert holders[0].active is False
@@ -530,8 +555,10 @@ async def test_a_revocation_does_not_reach_the_same_person_in_another_guild(
 
     await directory(factory).revoke(GUILD, BEN, requested_by=ANNA)
 
-    elsewhere = await directory(factory, admins=Admins({OTHER_GUILD: {CARL}})).holders(
-        OTHER_GUILD, requested_by=CARL
+    elsewhere = await roster(
+        directory(factory, admins=Admins({OTHER_GUILD: {CARL}})),
+        guild_id=OTHER_GUILD,
+        requested_by=CARL,
     )
     assert elsewhere is not None
     assert elsewhere[0].revoked_at is None
@@ -620,10 +647,10 @@ async def test_a_withdrawal_dated_for_the_end_of_the_month_leaves_consent_in_for
 
     assert outcome is not None
     assert outcome.revoked is True
-    still_recording = await directory(factory).holders(GUILD, requested_by=ANNA)
+    still_recording = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
     assert still_recording is not None
     assert still_recording[0].active is True
-    after = await directory(factory, now=end_of_month).holders(GUILD, requested_by=ANNA)
+    after = await roster(directory(factory, now=end_of_month), guild_id=GUILD, requested_by=ANNA)
     assert after is not None
     assert after[0].active is False
 
@@ -648,7 +675,7 @@ async def test_a_backdated_revocation_says_how_many_recordings_it_did_not_delete
 
     assert outcome is not None
     assert outcome.recordings_from_effective_at == 2
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
     assert holders is not None
     # And every one of them is still there.
     assert holders[0].recordings_with_audio == 3
@@ -673,7 +700,7 @@ async def test_an_instant_before_the_grant_is_refused_rather_than_clamped(
     assert outcome is not None
     assert outcome.revoked is False
     assert outcome.refusal == EFFECTIVE_BEFORE_GRANT
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
     assert holders is not None
     assert holders[0].revoked_at is None
 
@@ -701,7 +728,7 @@ async def test_the_roster_says_what_each_grant_covers(
     await grant(factory, BEN, scope=ConsentScope.AUDIO_VIDEO)
     await grant(factory, CARL)
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
 
     assert holders is not None
     assert {holder.discord_user_id: holder.scope for holder in holders} == {
@@ -974,6 +1001,370 @@ async def test_a_person_withdrawing_their_own_consent_deletes_nothing(
 
     await mine(factory).revoke_own(BEN, GUILD)
 
-    holders = await directory(factory).holders(GUILD, requested_by=ANNA)
+    holders = await roster(directory(factory), guild_id=GUILD, requested_by=ANNA)
     assert holders is not None
     assert holders[0].recordings_with_audio == 1
+
+
+# ---------------------------------------------------------------------------
+# The order the roster comes back in
+# ---------------------------------------------------------------------------
+
+
+async def names(
+    consents: ConsoleConsentDirectory,
+    *,
+    limit: int = MAX_PAGE_SIZE,
+    offset: int = 0,
+) -> list[str | None]:
+    held = await roster(consents, limit=limit, offset=offset)
+    assert held is not None
+    return [holder.display_name for holder in held]
+
+
+async def test_the_roster_is_ordered_by_name_rather_than_by_id(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The order moved out of the browser and into the statement.
+
+    A paged listing has to be ordered by the thing serving it, or page two
+    is a window onto whatever the planner felt like returning. The key is
+    the display name, because somebody arrives here having been asked
+    about a *person* and scans for a name.
+    """
+    await set_policy(factory)
+    for person in (ANNA, BEN, CARL):
+        await grant(factory, person)
+    await a_recorded_session(factory, people={ANNA: "zoe", BEN: "adam", CARL: "Mia"})
+
+    assert await names(directory(factory)) == ["adam", "Mia", "zoe"]
+
+
+async def test_names_are_ordered_without_regard_to_case(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # Otherwise every capitalised nickname sorts into its own block above
+    # the lowercase ones, and the reader scanning for "mia" finds it in
+    # neither place they look.
+    await set_policy(factory)
+    for person in (ANNA, BEN):
+        await grant(factory, person)
+    await a_recorded_session(factory, people={ANNA: "Bob", BEN: "alice"})
+
+    assert await names(directory(factory)) == ["alice", "Bob"]
+
+
+async def test_people_with_no_name_yet_come_last(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Consent is given in a slash command; a display name is only learned
+    when somebody turns up in a recorded session. A bare snowflake is not
+    something anybody scans a page for, so the nameless rows lose nothing
+    by sitting at the bottom and every named row above them gains."""
+    await set_policy(factory)
+    for person in (ANNA, BEN):
+        await grant(factory, person)
+    await a_recorded_session(factory, people={BEN: "ben"})
+
+    assert await names(directory(factory)) == ["ben", None]
+
+
+async def test_two_people_sharing_a_name_are_separated_by_their_id(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The tiebreak, and the reason paging is safe at all.
+
+    An order that is not total is an order the planner may return
+    differently on two statements, and a caller paging through one of
+    those silently skips somebody. Every comparison ends at
+    `discord_user_id`, which is unique per person per guild.
+    """
+    await set_policy(factory)
+    for person in (CARL, ANNA, BEN):
+        await grant(factory, person)
+    await a_recorded_session(factory, people={ANNA: "sam", BEN: "sam", CARL: "sam"})
+
+    held = await roster(directory(factory))
+    assert held is not None
+    assert [holder.discord_user_id for holder in held] == [ANNA, BEN, CARL]
+
+
+async def test_the_nameless_run_is_ordered_by_id_too(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    for person in (CARL, ANNA, BEN):
+        await grant(factory, person)
+
+    held = await roster(directory(factory))
+    assert held is not None
+    assert [holder.discord_user_id for holder in held] == [ANNA, BEN, CARL]
+
+
+async def test_the_name_shown_is_the_one_from_the_most_recent_session(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # The same rule the unpaged listing applied, now expressed in the
+    # statement that also orders by it -- so the roster is never sorted by
+    # one name and labelled with another.
+    await set_policy(factory)
+    await grant(factory, BEN)
+    await a_recorded_session(factory, started_at=T0 - timedelta(days=2), people={BEN: "old"})
+    await a_recorded_session(factory, started_at=T0 - timedelta(days=1), people={BEN: "new"})
+
+    assert await names(directory(factory)) == ["new"]
+
+
+# ---------------------------------------------------------------------------
+# One page at a time
+# ---------------------------------------------------------------------------
+
+
+async def test_a_page_holds_only_what_was_asked_for_and_says_how_many_there_are(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    for person in (ANNA, BEN, CARL):
+        await grant(factory, person)
+    await a_recorded_session(factory, people={ANNA: "a", BEN: "b", CARL: "c"})
+
+    page = await directory(factory).holders(GUILD, requested_by=ANNA, limit=2, offset=0)
+
+    assert page is not None
+    assert [holder.display_name for holder in page.holders] == ["a", "b"]
+    assert page.total == 3
+    assert page.limit == 2
+    assert page.offset == 0
+
+
+async def test_the_pages_of_a_roster_partition_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """No name appears twice and none is skipped, which is the whole
+    argument for a total order in SQL rather than a sort in the browser."""
+    await set_policy(factory)
+    for person in (ANNA, BEN, CARL):
+        await grant(factory, person)
+    await a_recorded_session(factory, people={ANNA: "a", BEN: "b", CARL: "c"})
+
+    first = await names(directory(factory), limit=2, offset=0)
+    second = await names(directory(factory), limit=2, offset=2)
+
+    assert first + second == ["a", "b", "c"]
+
+
+async def test_a_window_past_the_end_is_an_empty_page_with_the_total_still_on_it(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    await grant(factory, BEN)
+
+    page = await directory(factory).holders(GUILD, requested_by=ANNA, limit=20, offset=100)
+
+    assert page is not None
+    assert page.holders == ()
+    assert page.total == 1
+
+
+async def test_the_total_counts_people_rather_than_consent_rows(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`consent` is append-only, so one person who granted, withdrew and
+    granted again is three rows and one row on the roster. A total counted
+    over rows would tell an administrator their guild has three times the
+    people it has."""
+    await set_policy(factory)
+    await grant(factory, BEN, granted_at=T0 - timedelta(days=3), revoked_at=T0 - timedelta(days=2))
+    await grant(factory, BEN, granted_at=T0 - timedelta(days=1))
+
+    page = await directory(factory).holders(GUILD, requested_by=ANNA, limit=20, offset=0)
+
+    assert page is not None
+    assert page.total == 1
+
+
+async def test_the_total_counts_only_this_guild_s_people(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    await grant(factory, BEN)
+    await grant(factory, CARL, guild_id=OTHER_GUILD)
+
+    page = await directory(factory).holders(GUILD, requested_by=ANNA, limit=20, offset=0)
+
+    assert page is not None
+    assert page.total == 1
+
+
+async def test_a_page_of_a_guild_nobody_administers_is_still_no_page_at_all(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # Paging changes nothing about who may look. `None` covers "no such
+    # guild" and "not yours" alike.
+    await grant(factory, BEN)
+
+    assert (
+        await directory(factory, admins=Admins({})).holders(
+            GUILD, requested_by=ANNA, limit=20, offset=0
+        )
+        is None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Withdrawing several at once
+# ---------------------------------------------------------------------------
+
+
+async def test_a_batch_withdraws_every_consent_it_can(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    for person in (BEN, CARL):
+        await grant(factory, person)
+
+    done = await directory(factory).revoke_many(GUILD, [BEN, CARL], requested_by=ANNA)
+
+    assert done is not None
+    assert [person.discord_user_id for person in done] == [BEN, CARL]
+    assert all(person.outcome.revoked for person in done)
+    held = await roster(directory(factory))
+    assert held is not None
+    assert [holder.revoked_at for holder in held] == [T0, T0]
+
+
+async def test_one_person_with_nothing_to_withdraw_does_not_block_the_others(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The transaction decision, as a test.
+
+    Per person rather than one statement for the batch. All-or-nothing
+    would mean a single stale row -- somebody whose consent a colleague
+    withdrew while this page was open -- refusing a withdrawal the other
+    people in the batch need *now*, and consent is not a thing to leave in
+    force because a second name was wrong.
+    """
+    await set_policy(factory)
+    await grant(factory, BEN)
+
+    done = await directory(factory).revoke_many(GUILD, [CARL, BEN], requested_by=ANNA)
+
+    assert done is not None
+    assert [(person.discord_user_id, person.outcome.refusal) for person in done] == [
+        (CARL, NO_CONSENT_ON_RECORD),
+        (BEN, None),
+    ]
+    held = await roster(directory(factory))
+    assert held is not None
+    assert [holder.revoked_at for holder in held] == [T0]
+
+
+async def test_a_batch_reports_each_refusal_by_the_name_the_single_endpoint_uses(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # The same bounded literals, not a second vocabulary: the console
+    # already writes a sentence for each of them.
+    await set_policy(factory)
+    await grant(factory, BEN, revoked_at=T0 - timedelta(days=1))
+
+    done = await directory(factory).revoke_many(GUILD, [BEN, CARL], requested_by=ANNA)
+
+    assert done is not None
+    assert [person.outcome.refusal for person in done] == [
+        ALREADY_REVOKED,
+        NO_CONSENT_ON_RECORD,
+    ]
+
+
+async def test_a_batch_answers_in_the_order_it_was_asked(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """One outcome per name, index for index, so the caller never has to
+    match answers back to requests by id."""
+    await set_policy(factory)
+    for person in (ANNA, BEN, CARL):
+        await grant(factory, person)
+
+    done = await directory(factory).revoke_many(GUILD, [CARL, ANNA, BEN], requested_by=ANNA)
+
+    assert done is not None
+    assert [person.discord_user_id for person in done] == [CARL, ANNA, BEN]
+
+
+async def test_a_batch_takes_the_instant_the_caller_named(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    for person in (BEN, CARL):
+        await grant(factory, person)
+    end_of_month = T0 + timedelta(days=9)
+
+    done = await directory(factory).revoke_many(
+        GUILD, [BEN, CARL], requested_by=ANNA, effective_at=end_of_month
+    )
+
+    assert done is not None
+    assert [person.outcome.effective_at for person in done] == [end_of_month, end_of_month]
+
+
+async def test_an_instant_before_one_person_s_grant_refuses_only_that_person(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A back-dated batch meets people who consented at different times.
+    Refusing the whole request would leave every withdrawal undone over
+    one person who joined last week."""
+    await set_policy(factory)
+    await grant(factory, BEN, granted_at=T0 - timedelta(days=10))
+    await grant(factory, CARL, granted_at=T0 - timedelta(days=1))
+
+    done = await directory(factory).revoke_many(
+        GUILD, [BEN, CARL], requested_by=ANNA, effective_at=T0 - timedelta(days=5)
+    )
+
+    assert done is not None
+    assert [person.outcome.refusal for person in done] == [None, EFFECTIVE_BEFORE_GRANT]
+
+
+async def test_a_batch_in_a_guild_this_person_does_not_administer_writes_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # The authorisation is asked once for the batch and it is the same
+    # question the single endpoint asks. `None` for "no such guild" and
+    # "not yours" alike.
+    await set_policy(factory)
+    await grant(factory, BEN)
+
+    assert (
+        await directory(factory, admins=Admins({OTHER_GUILD: {CARL}})).revoke_many(
+            GUILD, [BEN], requested_by=CARL
+        )
+        is None
+    )
+    held = await roster(directory(factory))
+    assert held is not None
+    assert held[0].revoked_at is None
+
+
+async def test_a_batch_naming_nobody_writes_nothing_and_refuses_nothing(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    # The handler refuses an empty batch before it gets here; the adapter
+    # still has to be defined for one, because a protocol that is only
+    # correct for the inputs one caller happens to send is a protocol with
+    # an undocumented precondition.
+    await set_policy(factory)
+    await grant(factory, BEN)
+
+    assert await directory(factory).revoke_many(GUILD, [], requested_by=ANNA) == ()
+
+
+async def test_a_batch_cannot_reach_a_consent_in_another_guild(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    await set_policy(factory)
+    await grant(factory, BEN, guild_id=OTHER_GUILD)
+
+    done = await directory(factory).revoke_many(GUILD, [BEN], requested_by=ANNA)
+
+    assert done is not None
+    assert [person.outcome.refusal for person in done] == [NO_CONSENT_ON_RECORD]

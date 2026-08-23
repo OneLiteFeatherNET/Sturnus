@@ -26,7 +26,9 @@ from aiohttp.test_utils import TestClient
 
 from sturnus.console.adapters import ALREADY_REVOKED, NO_CONSENT_ON_RECORD
 from sturnus.console.app import SESSION_COOKIE
-from sturnus.console.ports import ConsentHolder, RevocationOutcome
+from sturnus.console.paging import DEFAULT_PAGE_SIZE, InvalidPage, page_request
+from sturnus.console.ports import ConsentHolder, ConsentPage, PersonRevocation, RevocationOutcome
+from sturnus.console.routes_consent import MAX_REVOCATIONS_PER_REQUEST
 from sturnus.console.session import SessionCookie, SignedSession
 from sturnus.observability.events import Event
 from tests.console.conftest import (
@@ -42,6 +44,10 @@ from tests.console.conftest import (
 
 GRANTED = datetime(2026, 8, 1, 9, 0, 0, tzinfo=UTC)
 REVOKED_AT = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
+#: Two more people than `conftest` names, because a batch of one proves
+#: nothing about a batch: the ordering of the outcomes and the per-person
+#: audit lines are only visible with several.
+CARL, DORA = 300, 400
 
 
 def token(discord_user_id: int = ANNA) -> str:
@@ -535,3 +541,520 @@ async def test_the_audit_line_says_whether_the_instant_was_chosen(
 
     lines = _events(caplog, Event.CONSOLE_CONSENT_REVOKED)
     assert [_fields(line)["effective_at_given"] for line in lines] == [False, True]
+
+
+# ---------------------------------------------------------------------------
+# One page at a time
+# ---------------------------------------------------------------------------
+
+
+async def test_the_roster_arrives_a_page_at_a_time_with_the_count_beside_it(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The shape `GET /api/sessions` already established, reused unchanged.
+
+    A guild with four hundred participants used to send four hundred
+    records to draw the first ten, and the console then sorted them in the
+    browser. The window and the total travel together for the reason
+    `SessionPage` gives: a count fetched separately can be one grant older
+    than the rows.
+    """
+    consents = FakeConsents(page=ConsentPage(holders=(holder(),), total=412, limit=20, offset=0))
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    body = await (await client.get(list_url())).json()
+
+    assert body["total"] == 412
+    assert body["limit"] == 20
+    assert body["offset"] == 0
+    assert [entry["display_name"] for entry in body["consents"]] == ["ben"]
+
+
+async def test_a_roster_asked_for_without_a_window_gets_the_first_page(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """A link to the endpoint means "the first page", exactly as it does
+    for the recordings list. The default is `sturnus.console.paging`'s
+    rather than a second one invented here."""
+    page = ConsentPage(holders=(), total=0, limit=DEFAULT_PAGE_SIZE, offset=0)
+    consents = FakeConsents(page=page)
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    await client.get(list_url())
+
+    assert consents.windows == [(DEFAULT_PAGE_SIZE, 0)]
+
+
+async def test_the_window_the_caller_named_reaches_the_directory(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    consents = FakeConsents(page=ConsentPage(holders=(), total=0, limit=5, offset=40))
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    await client.get(list_url() + "?limit=5&offset=40")
+
+    assert consents.windows == [(5, 40)]
+
+
+@pytest.mark.parametrize(
+    "query,parameter,value",
+    [
+        ("?limit=0", "limit", "0"),
+        ("?limit=5000", "limit", "5000"),
+        ("?limit=ten", "limit", "ten"),
+        ("?offset=-1", "offset", "-1"),
+    ],
+)
+async def test_a_window_that_cannot_be_served_is_refused_rather_than_clamped(
+    aiohttp_client: AiohttpClientFactory, query: str, parameter: str, value: str
+) -> None:
+    """`?limit=5000` is a client bug or somebody pulling a whole roster in
+    one response, and silently answering with a hundred tells neither of
+    them anything.
+
+    The sentence is `sturnus.console.paging`'s own, passed through rather
+    than reworded here: one API that refuses a window two different ways
+    is two sentences for a console to translate. It names the rule and
+    never the value that broke it, because no user input is reflected
+    into a response body.
+    """
+    consents = FakeConsents(page=ConsentPage(holders=(), total=0, limit=20, offset=0))
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.get(list_url() + query)
+
+    assert response.status == 400
+    assert consents.windows == []
+    with pytest.raises(InvalidPage) as refusal:
+        page_request(*(value, None) if parameter == "limit" else (None, value))
+    assert (await response.json())["error"] == str(refusal.value)
+
+
+async def test_a_window_past_the_end_of_the_roster_is_an_empty_page_and_not_a_refusal(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    # What a bookmark to page five looks like once people have left. The
+    # total travelling with it is what lets the console say so rather than
+    # claim the guild has nobody.
+    consents = FakeConsents(page=ConsentPage(holders=(), total=3, limit=20, offset=100))
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.get(list_url() + "?offset=100")
+
+    assert response.status == 200
+    body = await response.json()
+    assert body["consents"] == []
+    assert body["total"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Withdrawing several at once
+# ---------------------------------------------------------------------------
+
+
+def bulk_url(guild_id: int | str = GUILD) -> str:
+    return f"/api/guilds/{guild_id}/consents/revoke"
+
+
+def revocation(discord_user_id: int = BEN, **over: object) -> PersonRevocation:
+    outcome: dict[str, object] = {"revoked": True, "refusal": None, "effective_at": REVOKED_AT}
+    outcome.update(over)
+    return PersonRevocation(
+        discord_user_id=discord_user_id,
+        outcome=RevocationOutcome(**outcome),  # type: ignore[arg-type]
+    )
+
+
+async def test_an_administrator_may_withdraw_several_consents_in_one_request(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    consents = FakeConsents(revocations=[revocation(BEN), revocation(CARL)])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(bulk_url(), json={"discord_user_ids": [str(BEN), str(CARL)]})
+
+    assert response.status == 200
+    assert consents.batches == [(GUILD, (BEN, CARL), ANNA)]
+
+
+async def test_a_mixed_batch_is_answered_person_by_person(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """The whole reason this endpoint has a body worth reading.
+
+    Some of the named people have no consent on record, some were
+    withdrawn while the page was open, some are fine. One status code for
+    all three would be lying to somebody, so the status describes the
+    request and the body describes each person.
+    """
+    consents = FakeConsents(
+        revocations=[
+            revocation(BEN, recordings_from_effective_at=4),
+            revocation(CARL, revoked=False, refusal=ALREADY_REVOKED, effective_at=None),
+            revocation(DORA, revoked=False, refusal=NO_CONSENT_ON_RECORD, effective_at=None),
+        ]
+    )
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(
+        bulk_url(), json={"discord_user_ids": [str(BEN), str(CARL), str(DORA)]}
+    )
+
+    assert response.status == 200
+    assert (await response.json()) == {
+        "guild_id": str(GUILD),
+        "requested": 3,
+        "revoked": 1,
+        "refused": 2,
+        "outcomes": [
+            {
+                "discord_user_id": str(BEN),
+                "revoked": True,
+                "refusal": None,
+                "effective_at": REVOKED_AT.isoformat(),
+                "recordings_from_effective_at": 4,
+            },
+            {
+                "discord_user_id": str(CARL),
+                "revoked": False,
+                "refusal": ALREADY_REVOKED,
+                "effective_at": None,
+                "recordings_from_effective_at": 0,
+            },
+            {
+                "discord_user_id": str(DORA),
+                "revoked": False,
+                "refusal": NO_CONSENT_ON_RECORD,
+                "effective_at": None,
+                "recordings_from_effective_at": 0,
+            },
+        ],
+    }
+
+
+async def test_a_batch_where_nothing_could_be_withdrawn_is_still_a_complete_answer(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """200, even when every person in it was refused.
+
+    Not 409. The console's `useApi` strips the body off every failed
+    request by design -- `ApiError` keeps the status and the path and
+    nothing else -- so any status outside 2xx would destroy the per-person
+    outcomes this endpoint exists to deliver, and an administrator would
+    be told "something was refused" with no way to learn which name.
+    """
+    consents = FakeConsents(
+        revocations=[revocation(BEN, revoked=False, refusal=ALREADY_REVOKED, effective_at=None)]
+    )
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(bulk_url(), json={"discord_user_ids": [str(BEN)]})
+
+    assert response.status == 200
+    body = await response.json()
+    assert body["revoked"] == 0
+    assert body["refused"] == 1
+
+
+async def test_a_bulk_withdrawal_names_the_signed_in_administrator_as_the_actor(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    # The subjects come from the body and the actor comes from the cookie.
+    consents = FakeConsents(revocations=[revocation(CARL)])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents), as_user=BEN)
+
+    await client.post(bulk_url(), json={"discord_user_ids": [str(CARL)]})
+
+    assert consents.batches == [(GUILD, (CARL,), BEN)]
+
+
+async def test_a_bulk_withdrawal_in_a_guild_this_person_does_not_administer_is_a_404(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    # The same refusal as "no such guild", for the same reason: a 403
+    # would confirm the roster exists to somebody with no business with it.
+    client = await signed_in(aiohttp_client, build_test_api(consents=FakeConsents()))
+
+    response = await client.post(bulk_url(), json={"discord_user_ids": [str(BEN)]})
+
+    assert response.status == 404
+    assert (await response.json())["error"] == "no such guild"
+
+
+async def test_a_bulk_withdrawal_takes_the_same_instant_the_single_one_takes(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    consents = FakeConsents(revocations=[revocation(BEN)])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    await client.post(
+        bulk_url(),
+        json={"discord_user_ids": [str(BEN)], "effective_at": "2026-09-30T12:00:00+02:00"},
+    )
+
+    assert consents.batch_instants == [datetime(2026, 9, 30, 10, 0, tzinfo=UTC)]
+
+
+async def test_a_batch_that_names_no_instant_means_now(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    consents = FakeConsents(revocations=[revocation(BEN)])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    await client.post(bulk_url(), json={"discord_user_ids": [str(BEN)]})
+
+    assert consents.batch_instants == [None]
+
+
+async def test_an_instant_that_names_no_moment_refuses_the_whole_batch(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    consents = FakeConsents(revocations=[revocation(BEN)])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(
+        bulk_url(), json={"discord_user_ids": [str(BEN)], "effective_at": "next tuesday"}
+    )
+
+    assert response.status == 400
+    assert consents.batches == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"discord_user_ids": []},
+        {"discord_user_ids": "100"},
+        {"discord_user_ids": {"0": "100"}},
+    ],
+)
+async def test_a_batch_that_names_nobody_is_a_bad_request(
+    aiohttp_client: AiohttpClientFactory, body: object
+) -> None:
+    """400 rather than an empty success. A request naming nobody is a
+    client that built its body wrongly, and answering "nothing happened,
+    as you asked" would hide the bug until somebody noticed a roster that
+    never changes."""
+    consents = FakeConsents(revocations=[])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(bulk_url(), json=body)
+
+    assert response.status == 400
+    assert consents.batches == []
+
+
+@pytest.mark.parametrize("entry", [100, None, "not-a-snowflake", ""])
+async def test_an_entry_that_names_no_person_is_a_bad_request(
+    aiohttp_client: AiohttpClientFactory, entry: object
+) -> None:
+    """Every snowflake is a string in JSON, here as everywhere else. A
+    number is refused rather than coerced: an id that survived a
+    JavaScript `JSON.parse` as a number has already lost its last digits,
+    and withdrawing the consent of whoever the rounded id names is worse
+    than refusing the request."""
+    consents = FakeConsents(revocations=[])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(bulk_url(), json={"discord_user_ids": [entry]})
+
+    assert response.status == 400
+    assert consents.batches == []
+
+
+async def test_a_batch_bigger_than_the_maximum_is_refused_before_anything_is_written(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """A request naming ten thousand people is a denial of service with a
+    valid session. The bound is `paging.MAX_PAGE_SIZE`, so the largest
+    batch is exactly one page of the roster it is withdrawn from."""
+    consents = FakeConsents(revocations=[])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    too_many = [str(1000 + n) for n in range(MAX_REVOCATIONS_PER_REQUEST + 1)]
+    response = await client.post(bulk_url(), json={"discord_user_ids": too_many})
+
+    assert response.status == 400
+    assert str(MAX_REVOCATIONS_PER_REQUEST) in (await response.json())["error"]
+    assert consents.batches == []
+
+
+async def test_a_batch_of_exactly_the_maximum_is_served(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    people = [1000 + n for n in range(MAX_REVOCATIONS_PER_REQUEST)]
+    consents = FakeConsents(revocations=[revocation(person) for person in people])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(
+        bulk_url(), json={"discord_user_ids": [str(person) for person in people]}
+    )
+
+    assert response.status == 200
+    assert len((await response.json())["outcomes"]) == MAX_REVOCATIONS_PER_REQUEST
+
+
+async def test_naming_the_same_person_twice_is_a_bad_request(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Refused rather than de-duplicated. The outcomes are one per name in
+    the order they were named, and silently collapsing two entries into
+    one would hand the console a shorter list than it sent -- which it
+    could only reconcile by matching on id, which is exactly the work this
+    shape exists to spare it."""
+    consents = FakeConsents(revocations=[])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(
+        bulk_url(), json={"discord_user_ids": [str(BEN), str(CARL), str(BEN)]}
+    )
+
+    assert response.status == 400
+    assert consents.batches == []
+
+
+async def test_signing_out_ends_the_bulk_endpoint_too(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    client = await aiohttp_client(build_test_api(consents=FakeConsents(revocations=[revocation()])))
+
+    assert (await client.post(bulk_url(), json={"discord_user_ids": [str(BEN)]})).status == 401
+
+
+async def test_a_batch_for_a_guild_id_that_is_not_a_number_never_reaches_the_directory(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    consents = FakeConsents(revocations=[revocation()])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    response = await client.post(bulk_url("not-a-guild"), json={"discord_user_ids": [str(BEN)]})
+
+    assert response.status == 404
+    assert consents.batches == []
+
+
+# ---------------------------------------------------------------------------
+# The audit line, one per person
+# ---------------------------------------------------------------------------
+
+
+async def test_every_person_in_a_batch_gets_their_own_audit_line(
+    aiohttp_client: AiohttpClientFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One line per person, never one line saying "9 people".
+
+    `consent.revoked_at` records no actor, so these lines are the entire
+    answer to "was this person's consent withdrawn, and by whom". A
+    summary line alone could not answer it without somebody first knowing
+    which batch that person was in.
+    """
+    consents = FakeConsents(revocations=[revocation(BEN), revocation(CARL)])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents), as_user=ANNA)
+
+    with caplog.at_level(logging.INFO):
+        await client.post(bulk_url(), json={"discord_user_ids": [str(BEN), str(CARL)]})
+
+    lines = _events(caplog, Event.CONSOLE_CONSENT_REVOKED)
+    assert [line.levelno for line in lines] == [logging.WARNING, logging.WARNING]
+    assert [_fields(line)["discord_user_id"] for line in lines] == [BEN, CARL]
+    assert {_fields(line)["requested_by"] for line in lines} == {ANNA}
+    assert {_fields(line)["guild_id"] for line in lines} == {GUILD}
+
+
+async def test_a_person_in_a_batch_who_could_not_be_withdrawn_is_logged_as_refused(
+    aiohttp_client: AiohttpClientFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The same two events a single revocation emits, per person, so a
+    # query over `console.consent_revoked` answers the same question
+    # whether a withdrawal was one of one or one of nine.
+    consents = FakeConsents(
+        revocations=[
+            revocation(BEN),
+            revocation(CARL, revoked=False, refusal=NO_CONSENT_ON_RECORD, effective_at=None),
+        ]
+    )
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    with caplog.at_level(logging.INFO):
+        await client.post(bulk_url(), json={"discord_user_ids": [str(BEN), str(CARL)]})
+
+    refused = _events(caplog, Event.CONSOLE_CONSENT_REVOKE_REFUSED)
+    assert len(refused) == 1
+    assert refused[0].levelno == logging.INFO
+    assert _fields(refused[0])["discord_user_id"] == CARL
+    assert _fields(refused[0])["reason"] == NO_CONSENT_ON_RECORD
+
+
+async def test_the_batch_itself_is_logged_beside_the_per_person_lines(
+    aiohttp_client: AiohttpClientFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Beside, never instead of.
+
+    The per-person lines cannot say whether this was one decision or nine
+    separate ones, because nine lines from a batch and nine lines from
+    nine clicks are identical. That is the one fact this line adds, and it
+    carries no name -- the names are on the lines above it.
+    """
+    consents = FakeConsents(
+        revocations=[
+            revocation(BEN),
+            revocation(CARL, revoked=False, refusal=ALREADY_REVOKED, effective_at=None),
+        ]
+    )
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents), as_user=ANNA)
+
+    with caplog.at_level(logging.INFO):
+        await client.post(bulk_url(), json={"discord_user_ids": [str(BEN), str(CARL)]})
+
+    lines = _events(caplog, Event.CONSOLE_CONSENT_BULK_REVOKED)
+    assert len(lines) == 1
+    assert lines[0].levelno == logging.WARNING
+    assert _fields(lines[0]) == {
+        "guild_id": GUILD,
+        "requested_by": ANNA,
+        "count": 2,
+        "revoked": 1,
+        "refused": 1,
+    }
+
+
+async def test_the_batch_audit_lines_say_whether_the_instant_was_chosen(
+    aiohttp_client: AiohttpClientFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The same field the single endpoint records, for the same reason: a
+    # back-dated batch is a claim about recordings that already exist, and
+    # `revoked_at` looks like an ordinary date either way.
+    consents = FakeConsents(revocations=[revocation(BEN)])
+    client = await signed_in(aiohttp_client, build_test_api(consents=consents))
+
+    with caplog.at_level(logging.INFO):
+        await client.post(bulk_url(), json={"discord_user_ids": [str(BEN)]})
+        await client.post(
+            bulk_url(),
+            json={"discord_user_ids": [str(BEN)], "effective_at": "2026-03-01T00:00:00+00:00"},
+        )
+
+    lines = _events(caplog, Event.CONSOLE_CONSENT_REVOKED)
+    assert [_fields(line)["effective_at_given"] for line in lines] == [False, True]
+
+
+async def test_a_batch_nobody_was_entitled_to_ask_for_is_not_an_audit_line(
+    aiohttp_client: AiohttpClientFactory,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Nothing happened and nothing was authorised. A line here would let
+    # anybody with a session fill the audit log with a hundred names of
+    # their choosing per request.
+    client = await signed_in(aiohttp_client, build_test_api(consents=FakeConsents()))
+
+    with caplog.at_level(logging.INFO):
+        await client.post(bulk_url(), json={"discord_user_ids": [str(BEN)]})
+
+    assert not _events(caplog, Event.CONSOLE_CONSENT_REVOKED)
+    assert not _events(caplog, Event.CONSOLE_CONSENT_REVOKE_REFUSED)
+    assert not _events(caplog, Event.CONSOLE_CONSENT_BULK_REVOKED)

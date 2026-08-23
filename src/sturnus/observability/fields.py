@@ -213,6 +213,15 @@ _MEASUREMENTS = frozenset(
         "seconds_since_last_packet",
         "consented_present",
         "jobs_enqueued",
+        #: How many people a bulk consent withdrawal actually withdrew,
+        #: and how many it changed nothing for. On
+        #: `console.consent_bulk_revoked` only, where they are the shape
+        #: of the outcome: "nine named, one withdrawn, eight already
+        #: gone" is a different act from "nine named, nine withdrawn",
+        #: and the per-person lines beside it can only be counted by
+        #: somebody who already knows which batch to count.
+        "revoked",
+        "refused",
         #: How many gateway connections this one process holds. On the
         #: shard lifecycle lines only -- `bot.connected`,
         #: `bot.shard_ready`, `bot.shard_disconnected` -- where it is the

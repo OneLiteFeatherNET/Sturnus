@@ -1525,6 +1525,30 @@ therefore the retention of the audit trail; if a longer one is needed, it
 has to become a column, which is a migration and a change to the shared
 `ConsentRepository.record_revocation`.
 
+**A bulk withdrawal writes one of those lines per person**, and the query
+above therefore answers the same question whether a consent was withdrawn
+on its own or as one of ninety. `POST /api/guilds/{id}/consents/revoke`
+takes up to a hundred people and the same optional `effective_at`, and it
+is deliberately **not** one transaction: each person is decided and
+written on their own, so one stale name — somebody a colleague withdrew
+while the roster was open — cannot refuse the withdrawals beside it. The
+response carries one outcome per person, in the order they were named,
+with the same refusal codes the single endpoint uses
+(`no_consent_on_record`, `already_revoked`, `effective_before_grant`); the
+status is 200 for any mixture of them, because one status code cannot
+describe an outcome that differs per person.
+
+A second line, `console.consent_bulk_revoked`, is emitted **beside** the
+per-person lines and never instead of them, at WARNING with `guild_id`,
+`requested_by`, `count`, `revoked` and `refused`. It carries no name. It
+exists for the one fact the per-person lines cannot carry — that they were
+one decision rather than ninety — which matters when reading a burst of
+withdrawals after the event:
+
+```logql
+{namespace="sturnus"} | json | sturnus_event="console.consent_bulk_revoked"
+```
+
 **A consent that is inactive is not the same as one that was withdrawn.**
 The page distinguishes them, and so should anybody reading it. A grant
 naming a superseded `policy_version` has no force and a NULL `revoked_at`:
@@ -1536,6 +1560,19 @@ The roster also shows each grant's **scope** (§3.2.1). Every row reads
 `audio` until a guild turns `video_consent_offered` on; a setting an
 administrator can switch on with no readout of who then used it is a
 setting nobody can audit.
+
+**The roster is paged**, with the same `limit` / `offset` / `total` shape
+`GET /api/sessions` uses and the same bounds (twenty by default, a hundred
+at most, a window outside them refused rather than clamped). The order is
+the statement's, not the browser's: display name, case-insensitively,
+nameless people last, `discord_user_id` as the tiebreak that makes it
+total — an order two statements could disagree about is one that silently
+skips somebody between page one and page two. Whether a consent is
+**active** is deliberately not part of that order. It is
+`is_consent_active(row, policy_version, now)`, a function of a setting and
+of the clock rather than of the row, so ordering by it would mean a second
+implementation of a domain rule *and* an order a scheduled withdrawal
+could reshuffle between two page loads.
 
 #### What a person may do to their own consent
 

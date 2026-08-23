@@ -213,6 +213,20 @@ class Event(StrEnum):
     #: reaching for the same name is this feature working. `reason` says
     #: which of the two it was.
     CONSOLE_CONSENT_REVOKE_REFUSED = "console.consent_revoke_refused"
+    #: An administrator withdrew several people's consent in one request.
+    #: **Beside the per-person lines, never instead of them.** Every
+    #: person in the batch still gets their own `console.consent_revoked`
+    #: or `console.consent_revoke_refused`, because those are the entire
+    #: answer to "was this person's consent withdrawn, and by whom" and a
+    #: line saying "9 people" could not answer it without somebody first
+    #: knowing which batch they were in. What this line adds is the one
+    #: fact the others cannot carry: nine lines from a batch and nine
+    #: lines from nine clicks are otherwise identical. `count` is how many
+    #: were named, `revoked` and `refused` how they came out. No name is
+    #: on it -- the names are on the lines beside it. WARNING for the
+    #: reason `console.consent_revoked` is: a third party acting on other
+    #: people's consent is not lighter for being done to several at once.
+    CONSOLE_CONSENT_BULK_REVOKED = "console.consent_bulk_revoked"
     #: A person withdrew their **own** consent from the console. INFO
     #: rather than WARNING, and the asymmetry with the line above it is
     #: deliberate: nobody is acting on anybody else here, which is the
