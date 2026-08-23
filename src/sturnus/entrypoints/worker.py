@@ -75,6 +75,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from sturnus.application.collection_mirror import CollectionSource, sweep_outline_collections
 from sturnus.application.documents import DocumentSink
 from sturnus.application.retention import sweep_expired_audio
 from sturnus.application.worker import process_one, retry_pending_documents
@@ -82,6 +83,7 @@ from sturnus.config import StrictSettings
 from sturnus.infrastructure.crypto import KeyWrapper, decrypt_file
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.models import Session, SessionParticipant, TranscriptionJob
+from sturnus.infrastructure.db.outline_collections import OutlineCollectionStore
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, JobQueue
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -133,6 +135,16 @@ _RETENTION_SWEEP_INTERVAL_SECONDS = 3600.0
 #: sessions that never got documented. Short enough that a transient
 #: Outline error self-heals within minutes, not hours.
 _DOCUMENT_RETRY_INTERVAL_SECONDS = 300.0
+
+#: How often Outline's collection list is mirrored so the console can name
+#: what `document_target` points at. Hourly, and deliberately far slower
+#: than the document-retry sweep beside it: a collection list changes when
+#: somebody creates or deletes a collection, which happens a handful of
+#: times a year, and nothing is waiting on the answer -- a picker showing a
+#: name an hour out of date is a picker showing a name. Every call is a
+#: full re-read of the list, so the cheap thing to do is to make few of
+#: them.
+_COLLECTION_SWEEP_INTERVAL_SECONDS = 3600.0
 
 #: faster-whisper on CPU (Spec 7 sizes the deployment for CPU, not GPU --
 #: see `charts/sturnus/values.yaml`'s `worker.resources`). The weights are
@@ -449,6 +461,41 @@ async def _document_retry_loop(
             await asyncio.wait_for(stop.wait(), timeout=_DOCUMENT_RETRY_INTERVAL_SECONDS)
 
 
+async def _collection_mirror_loop(
+    # A port of its own rather than `DocumentSink`: listing collections is
+    # not something a document sink does. `_run` passes the raw
+    # `OutlineSink` here and the traced wrapper to `_document_retry_loop`,
+    # because `TracedDocumentSink` wraps `create` and nothing else.
+    source: CollectionSource,
+    mirror: OutlineCollectionStore,
+    stop: asyncio.Event,
+) -> None:
+    """Periodically mirrors Outline's collection list for the console
+    (`sturnus.application.collection_mirror`) on
+    `_COLLECTION_SWEEP_INTERVAL_SECONDS`.
+
+    `sweep_outline_collections` already swallows a failure to *reach*
+    Outline and leaves the previous mirror standing; this `try`/`except`
+    is one layer up, for a failure to *write* it -- a database hiccup --
+    which would otherwise kill this loop outright and leave the console
+    naming collections from whenever the worker last restarted.
+    """
+    while not stop.is_set():
+        try:
+            await sweep_outline_collections(source, mirror, datetime.now(UTC))
+        except Exception as exc:
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.SWEEP_FAILED,
+                "Outline collection mirror sweep failed; will retry next interval",
+                exc,
+                reason="outline_collections",
+            )
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=_COLLECTION_SWEEP_INTERVAL_SECONDS)
+
+
 async def _run() -> None:
     settings = WorkerSettings()
 
@@ -549,11 +596,17 @@ async def _run() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, stop.set)
 
-    # Two background sweeps, independent of the main claim/transcribe loop
-    # below and of each other -- each survives its own errors (see their
-    # own docstrings) so a failure in one never stops the other or the
-    # main loop.
+    # Three background sweeps, independent of the main claim/transcribe
+    # loop below and of each other -- each survives its own errors (see
+    # their own docstrings) so a failure in one never stops the others or
+    # the main loop.
     retention_task = asyncio.create_task(_retention_sweep_loop(jobs, store, stop))
+    # The third, and the only one of the three that exists for the console
+    # rather than for the pipeline: it is what lets `document_target` be
+    # shown as a collection name instead of the UUID somebody pasted.
+    collection_task = asyncio.create_task(
+        _collection_mirror_loop(documents, OutlineCollectionStore(session_factory), stop)
+    )
     document_retry_task = asyncio.create_task(
         # The traced sink here too, not the raw one: the retry sweep is a
         # second path to the same `DocumentSink.create`, and a histogram
@@ -647,9 +700,9 @@ async def _run() -> None:
             Event.SHUTDOWN_BEGIN,
             "Shutdown requested: worker stopping after its current job",
         )
-        for task in (retention_task, document_retry_task):
+        for task in (retention_task, document_retry_task, collection_task):
             task.cancel()
-        for task in (retention_task, document_retry_task):
+        for task in (retention_task, document_retry_task, collection_task):
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         await health_runner.cleanup()

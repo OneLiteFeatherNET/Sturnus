@@ -42,6 +42,7 @@ from sturnus.application.recording import RecordingService
 from sturnus.domain import settings
 from sturnus.domain.session import EndReason, SessionTimeouts
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.directory import DirectoryStore
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -228,6 +229,10 @@ class FakeConfigStore:
     async def snapshot(self, guild_id: int) -> dict[str, str]:
         return {**settings.DEFAULTS, **self.values.get(guild_id, {})}
 
+    async def get(self, guild_id: int, key: str) -> str | None:
+        """One key at a time, which is what the mirroring sweeps read."""
+        return (await self.snapshot(guild_id)).get(key)
+
 
 class FakeAnnouncer:
     """Satisfies the `Announcer` port for the pipelines these tests build by hand.
@@ -343,6 +348,7 @@ def _client(
     jobs: FakeJobs | None = None,
     recording_dir: Path | None = None,
     audio_store: AudioStore | None = None,
+    directory_mirror: object | None = None,
 ) -> _TestClient:
     """A `SturnusClient` with every dependency these tests do not touch stubbed out.
 
@@ -350,10 +356,14 @@ def _client(
     reconcile tests drive the whole build path through the client rather
     than constructing a `RecordingService` themselves, and then need to
     assert on what that pipeline actually persisted. `audio_store` joins
-    them for the tests that need the upload inside `close()` to fail.
+    them for the tests that need the upload inside `close()` to fail, and
+    `directory_mirror` for the tests that assert the tick writes the names
+    the console needs -- left `None` everywhere else, which is a client
+    that does not mirror at all.
     """
     client = _TestClient(
         clock=clock,
+        directory_mirror=cast(DirectoryStore, directory_mirror),
         config_store=cast(ConfigStore, config_store)
         if config_store is not None
         else MagicMock(spec=ConfigStore),
@@ -1894,3 +1904,87 @@ async def test_a_join_that_failed_for_another_reason_reports_no_close_code(
         await client.on_voice_state_update(anna, _voice_state(None), _voice_state(occupied))
 
     assert getattr(_only_error(caplog), "sturnus_fields", {})["close_code"] is None
+
+
+class _RecordingDirectoryMirror:
+    """Stands in for `DirectoryStore` on the tick's mirroring path."""
+
+    def __init__(self, fails: bool = False) -> None:
+        self.channels: list[tuple[int, int]] = []
+        self.roles: list[tuple[int, int]] = []
+        self.members: list[tuple[int, int]] = []
+        self._fails = fails
+
+    async def replace_channels(self, guild_id: int, channels: object, _now: object) -> None:
+        if self._fails:
+            raise RuntimeError("the database said no")
+        self.channels.append((guild_id, len(cast(list[object], channels))))
+
+    async def replace_roles(self, guild_id: int, roles: object, _now: object) -> None:
+        self.roles.append((guild_id, len(cast(list[object], roles))))
+
+    async def replace_members(self, guild_id: int, members: object, _now: object) -> None:
+        self.members.append((guild_id, len(cast(list[object], members))))
+
+
+def _named_guild() -> MagicMock:
+    """A guild whose gateway cache holds one channel and one role."""
+    guild = MagicMock(spec=discord.Guild)
+    guild.id = GUILD_ID
+    channel = MagicMock()
+    channel.id, channel.name, channel.position = CHANNEL_ID, "meeting", 1
+    role = MagicMock(spec=discord.Role)
+    role.id, role.name, role.position, role.members = ROLE_ID, "recorded", 1, []
+    guild.voice_channels = [channel]
+    guild.text_channels = []
+    guild.roles = [role]
+    guild.get_role = MagicMock(side_effect={role.id: role}.get)
+    return guild
+
+
+async def test_the_tick_writes_the_names_the_console_cannot_ask_discord_for() -> None:
+    """`api` has no gateway, so a channel's name only reaches the console
+    if the bot writes it down on a sweep it is already making.
+    """
+    mirror = _RecordingDirectoryMirror()
+    client = _client(FakeClock(T0), config_store=FakeConfigStore(), directory_mirror=mirror)
+    _in_guild(client, _named_guild())
+
+    await client._mirror_directory(GUILD_ID, T0)
+
+    assert mirror.channels == [(GUILD_ID, 1)]
+    assert mirror.roles == [(GUILD_ID, 1)]
+
+
+async def test_a_guild_the_bot_cannot_see_is_left_alone_rather_than_emptied() -> None:
+    """A gateway that could not be asked is not an empty guild.
+
+    "We could not look" must never be written down as "there is nothing
+    there": a mirror emptied on a gateway hiccup would leave the console
+    naming nothing until the next sweep landed.
+    """
+    mirror = _RecordingDirectoryMirror()
+    client = _client(FakeClock(T0), config_store=FakeConfigStore(), directory_mirror=mirror)
+
+    await client._mirror_directory(GUILD_ID, T0)
+
+    assert mirror.channels == []
+    assert mirror.roles == []
+    assert mirror.members == []
+
+
+async def test_a_failed_name_sweep_does_not_take_the_tick_down(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The tick also enforces session timeouts. Losing those because a
+    cosmetic mirror could not be written would trade a picker showing a
+    snowflake for a meeting that never stops recording.
+    """
+    mirror = _RecordingDirectoryMirror(fails=True)
+    client = _client(FakeClock(T0), config_store=FakeConfigStore(), directory_mirror=mirror)
+    _in_guild(client, _named_guild())
+
+    with caplog.at_level(logging.WARNING, logger=CLIENT_LOGGER):
+        await client._mirror_directory(GUILD_ID, T0)
+
+    assert getattr(caplog.records[-1], "sturnus_event", None) == str(Event.GUILD_TICK_FAILED)

@@ -28,6 +28,7 @@ from urllib.parse import urlsplit
 import httpx
 from opentelemetry.trace import SpanKind
 
+from sturnus.application.collection_mirror import MirroredCollection
 from sturnus.application.documents import CreatedDocument, DocumentSink
 from sturnus.infrastructure.telemetry import set_span_fields, span
 from sturnus.observability.events import Event, log_event
@@ -38,6 +39,26 @@ log = logging.getLogger(__name__)
 #: `documents.create` RPC-style API). UNVERIFIED -- see
 #: docs/verification/outline-api.md.
 _CREATE_DOCUMENT_PATH = "/api/documents.create"
+
+#: Assumed endpoint for the collection list. UNVERIFIED in exactly the
+#: same way, and kept to one line for exactly the same reason.
+_LIST_COLLECTIONS_PATH = "/api/collections.list"
+
+#: How many collections one page asks for. Outline's list endpoints are
+#: `offset`/`limit` paginated, and this number is a trade between round
+#: trips and response size on a sweep that runs about once an hour --
+#: neither side of which is under pressure. It is deliberately not a
+#: setting: nothing an operator knows would tell them what to set it to.
+_COLLECTION_PAGE_LIMIT = 100
+
+#: A stop the protocol does not provide. Pagination ends when a page comes
+#: back shorter than it was asked for, which is correct against a server
+#: that behaves; against one that does not -- a proxy that keeps returning
+#: a full page, a misread response shape -- the loop below would never
+#: finish, inside a worker whose transcription queue is waiting on the same
+#: process. This bounds it at a hundred thousand collections, which is far
+#: past any real instance and far short of forever.
+_MAX_COLLECTION_PAGES = 1000
 
 #: Status codes that mean "this will never succeed as-is": an invalid
 #: token, a token without access, or a target collection that does not
@@ -72,6 +93,24 @@ def _build_payload(*, title: str, body: str, collection_id: str) -> dict[str, An
         "collectionId": collection_id,
         "publish": True,
     }
+
+
+def _extract_collections(payload: dict[str, Any]) -> list[MirroredCollection]:
+    """Reads one page of `collections.list` into `(id, name)` pairs.
+
+    UNVERIFIED shape, assumed from Outline's public API docs, and the only
+    place in this file the list response is read -- the same containment
+    `_extract_created_document` gets, for the same reason.
+
+    Nothing but `id` and `name` is taken. A collection also carries a
+    description, an icon, a colour and a permission, and none of them is
+    anything the console needs to turn a pasted UUID back into the words
+    the administrator saw when they copied it.
+    """
+    return [
+        MirroredCollection(collection_id=entry["id"], name=entry["name"])
+        for entry in payload["data"]
+    ]
 
 
 def _extract_created_document(payload: dict[str, Any], base_url: str) -> CreatedDocument:
@@ -116,6 +155,65 @@ class OutlineSink(DocumentSink):
         self._base_url = base_url.rstrip("/")
         self._api_token = api_token
         self._transport = transport
+
+    async def list_collections(self) -> list[MirroredCollection]:
+        """Every collection this token can see, as `(id, name)` pairs.
+
+        Exists so the console can show a name where `document_target`
+        currently shows a UUID. `api` cannot make this call -- it holds no
+        Outline token, by the console design's Section 2.1 -- so `worker`
+        makes it on a slow sweep and writes the answer where `api` reads.
+
+        Paginated because Outline's list endpoints are, and read to the
+        end because a half-read list is worse than no list: an
+        administrator offered the first hundred collections has no way to
+        tell that the one they want was on page two. The loop stops on a
+        page shorter than it asked for, with `_MAX_COLLECTION_PAGES` as a
+        floor under a server that never gives one.
+
+        Failures are classified exactly as `create` classifies them, and
+        for the same reason: 401, 403 and 404 mean this token will never
+        list anything, and a sweep retrying them every hour forever would
+        produce an hourly log line and never a collection. Nothing is
+        logged here -- the caller
+        (`sturnus.application.collection_mirror.sweep_outline_collections`)
+        is what decides that a failed sweep leaves the previous mirror
+        standing, and it says so once rather than twice.
+        """
+        collections: list[MirroredCollection] = []
+        with span(
+            "document.list_collections",
+            SpanKind.CLIENT,
+            http_method="POST",
+            url_path=_LIST_COLLECTIONS_PATH,
+            server_address=urlsplit(self._base_url).hostname or "",
+        ) as active:
+            async with httpx.AsyncClient(
+                base_url=self._base_url,
+                transport=self._transport,
+                headers={"Authorization": f"Bearer {self._api_token}"},
+            ) as client:
+                for page in range(_MAX_COLLECTION_PAGES):
+                    response = await client.post(
+                        _LIST_COLLECTIONS_PATH,
+                        json={
+                            "offset": page * _COLLECTION_PAGE_LIMIT,
+                            "limit": _COLLECTION_PAGE_LIMIT,
+                        },
+                    )
+                    set_span_fields(active, http_status=response.status_code)
+                    if response.status_code in _PERMANENT_STATUS_CODES:
+                        set_span_fields(active, permanent=True)
+                        raise PermanentDocumentError(response.status_code)
+                    response.raise_for_status()
+
+                    found = _extract_collections(response.json())
+                    collections.extend(found)
+                    if len(found) < _COLLECTION_PAGE_LIMIT:
+                        break
+
+            set_span_fields(active, count=len(collections))
+        return collections
 
     async def create(self, title: str, body: str, target: str) -> CreatedDocument:
         payload = _build_payload(title=title, body=body, collection_id=target)

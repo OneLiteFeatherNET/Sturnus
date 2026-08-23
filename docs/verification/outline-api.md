@@ -52,6 +52,8 @@ scattered through call sites:
 | Assumption | Where it is spelled | If verification finds it wrong |
 |---|---|---|
 | Endpoint path | `_CREATE_DOCUMENT_PATH` constant | Change the one constant |
+| Collection-list endpoint path | `_LIST_COLLECTIONS_PATH` constant | Change the one constant |
+| Collection-list response shape | `_extract_collections()` | Change the one function body |
 | Request field names | `_build_payload()` | Change the one function body |
 | Response shape / where the URL lives | `_extract_created_document()` | Change the one function body |
 | Auth header format | `OutlineSink.create()`, the `Authorization` header on the client | Change the one header line |
@@ -172,6 +174,46 @@ specific to Outline, and is considered lower-risk than Assumptions 1-3.
 - Whether Outline returns `429` for rate limiting, which the adapter
   currently treats as retryable by falling through to `raise_for_status()`
   — consistent with general HTTP practice, but not confirmed for this API.
+
+## Assumption 6: listing collections
+
+Added when the console needed to show `document_target` as a name rather
+than as the UUID an administrator pasted (see the console design's
+Section 6.1). `worker` holds the Outline token, so `worker` reads the list
+hourly and mirrors it into `outline_collection`.
+
+Assumed: `POST {base_url}/api/collections.list`, with an `offset`/`limit`
+body, answering with the same `data`-wrapped shape the rest of the API
+uses:
+
+```json
+{ "offset": 0, "limit": 100 }
+```
+
+```json
+{ "data": [{ "id": "col-1", "name": "Meetings" }] }
+```
+
+- The RPC-style path follows the same pattern as Assumption 1 and is
+  **not checked** against a live instance.
+- `offset`/`limit` pagination is assumed from Outline's documented list
+  endpoints; the adapter stops at the first page shorter than `limit`.
+  **Not checked**: whether the parameters are named this, and whether a
+  server that ignores them would return a full page forever —
+  `_MAX_COLLECTION_PAGES` bounds that case rather than trusting it not to
+  happen.
+- Only `id` and `name` are read. **Not checked**: whether `name` is the
+  field a person actually sees in Outline's sidebar, as opposed to a
+  title, a slug or a localised label.
+- Failure classification is shared with Assumption 5, deliberately: the
+  same `_PERMANENT_STATUS_CODES` decides both.
+
+**Lower stakes than Assumptions 1-3, and the code is built to keep them
+that way.** A wrong guess here costs the console a collection name, not a
+protocol: `sturnus.application.collection_mirror.sweep_outline_collections`
+writes nothing when the call fails, so the previous mirror stands and
+transcription is untouched. `scripts/verify_outline_api.py` does not cover
+this call yet.
 
 ## What must happen before this ships
 

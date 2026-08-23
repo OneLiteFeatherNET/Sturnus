@@ -16,7 +16,12 @@ import json
 import httpx
 import pytest
 
-from sturnus.infrastructure.documents.outline import OutlineSink, PermanentDocumentError
+from sturnus.application.collection_mirror import MirroredCollection
+from sturnus.infrastructure.documents.outline import (
+    _COLLECTION_PAGE_LIMIT,
+    OutlineSink,
+    PermanentDocumentError,
+)
 
 BASE = "https://outline.example"
 COLLECTION = "col-1"
@@ -154,4 +159,113 @@ async def test_a_permanent_failure_does_not_leak_the_body(
         await sink(httpx.MockTransport(handle)).create("T", "CONFIDENTIAL-SPEECH", COLLECTION)
 
     assert "CONFIDENTIAL-SPEECH" not in caplog.text
+    assert "secret-token" not in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# `collections.list` -- the names behind the `document_target` UUID
+# ---------------------------------------------------------------------------
+
+
+def _page(*collections: tuple[str, str]) -> dict[str, object]:
+    return {"data": [{"id": id_, "name": name} for id_, name in collections]}
+
+
+def _full_page() -> dict[str, object]:
+    return _page(*[(f"col-{index}", f"C{index}") for index in range(_COLLECTION_PAGE_LIMIT)])
+
+
+async def test_the_collections_are_returned_as_ids_and_names() -> None:
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_page(("col-1", "Meetings")))
+
+    listed = await sink(httpx.MockTransport(handle)).list_collections()
+    assert listed == [MirroredCollection(collection_id="col-1", name="Meetings")]
+
+
+async def test_the_list_is_read_from_the_collections_endpoint() -> None:
+    """The path is spelled in exactly one place in the adapter, and this is
+    what pins it -- the module's own docstring says every such guess is
+    unverified against a live Outline.
+    """
+    seen: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url.path)
+        return httpx.Response(200, json=_page())
+
+    await sink(httpx.MockTransport(handle)).list_collections()
+    assert seen == ["/api/collections.list"]
+
+
+async def test_every_page_is_read() -> None:
+    """A deployment with more collections than one page holds would
+    otherwise be offered only the first page of them, with nothing saying
+    the rest exist.
+    """
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        offset = json.loads(request.content)["offset"]
+        return httpx.Response(200, json=_full_page() if offset == 0 else _page(("col-x", "Last")))
+
+    listed = await sink(httpx.MockTransport(handle)).list_collections()
+    assert listed[-1] == MirroredCollection(collection_id="col-x", name="Last")
+    assert len(listed) == _COLLECTION_PAGE_LIMIT + 1
+
+
+async def test_a_short_page_ends_the_pagination() -> None:
+    """The stop condition. Without it the adapter asks forever, and the
+    hourly sweep would sit in that loop instead of returning.
+    """
+    calls = 0
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json=_page(("col-1", "Meetings")))
+
+    await sink(httpx.MockTransport(handle)).list_collections()
+    assert calls == 1
+
+
+async def test_each_page_asks_for_the_next_offset() -> None:
+    offsets: list[int] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        offset = json.loads(request.content)["offset"]
+        offsets.append(offset)
+        return httpx.Response(200, json=_full_page() if offset == 0 else _page())
+
+    await sink(httpx.MockTransport(handle)).list_collections()
+    assert offsets == [0, _COLLECTION_PAGE_LIMIT]
+
+
+async def test_a_rejected_token_is_permanent_when_listing_too() -> None:
+    """The same classification document creation makes: 401/403/404 will
+    not heal, and a sweep retrying them hourly forever would log forever.
+    """
+
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, json={"error": "forbidden"})
+
+    with pytest.raises(PermanentDocumentError):
+        await sink(httpx.MockTransport(handle)).list_collections()
+
+
+async def test_a_server_error_while_listing_is_retryable() -> None:
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "boom"})
+
+    with pytest.raises(httpx.HTTPStatusError) as excinfo:
+        await sink(httpx.MockTransport(handle)).list_collections()
+    assert not isinstance(excinfo.value, PermanentDocumentError)
+
+
+async def test_listing_never_logs_the_token(caplog: pytest.LogCaptureFixture) -> None:
+    def handle(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=_page(("col-1", "Meetings")))
+
+    with caplog.at_level("DEBUG"):
+        await sink(httpx.MockTransport(handle)).list_collections()
+
     assert "secret-token" not in caplog.text
