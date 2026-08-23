@@ -29,6 +29,7 @@ from sturnus.config import get_settings
 from sturnus.domain import settings as domain_settings
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.directory import DirectoryStore
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.models import Base
 from sturnus.infrastructure.db.repositories import (
@@ -188,6 +189,12 @@ async def _run() -> None:
     # gateway to ask Discord who holds `admin_role_id`, and must not be
     # given one (Spec 13.2): it already holds S3 and the master key.
     admin_mirror = AdminMemberStore(session_factory)
+    # The same arrangement, one step wider: the console makes an
+    # administrator paste snowflakes into `voice_channel_id`,
+    # `consent_role_id` and `admin_role_id` and then shows those
+    # snowflakes back, because `api` cannot ask what they are called
+    # either. This is where the names come from.
+    directory_mirror = DirectoryStore(session_factory)
     # `provider` fixed at construction: the bot only ever reads its own
     # Outline mapping back (`/link status`), never another provider's --
     # see `AccountLinkRepository`'s class docstring for why the read and
@@ -270,6 +277,7 @@ async def _run() -> None:
         clock=clock,
         config_store=config_store,
         admin_mirror=admin_mirror,
+        directory_mirror=directory_mirror,
         consent_repo=consent_repo,
         session_repo=session_repo,
         job_repo=traced_job_repo,

@@ -26,6 +26,11 @@ EXPECTED_TABLES = {
     "transcription_job",
     "admin_member",
     "console_state",
+    "user_preference",
+    "guild_channel",
+    "guild_role",
+    "guild_member",
+    "outline_collection",
 }
 
 

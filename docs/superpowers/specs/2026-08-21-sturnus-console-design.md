@@ -351,7 +351,7 @@ alternative is a decode pipeline in the request path.
 
 ## 6. New persisted data
 
-Three columns and one table. Everything else the console needs already
+Three columns and six tables. Everything else the console needs already
 exists.
 
 | Where | What | Why |
@@ -360,12 +360,47 @@ exists.
 | `transcription_job.speech_seconds` | What the gate handed the decoder | The dashboard's central number |
 | `transcription_job.segment_count` | Segments the decoder produced | Distinguishes "said little" from "was not transcribed" |
 | `admin_member` | Discord admins, mirrored | Section 3.4 |
+| `guild_channel` | A guild's voice and text channels: id, name, kind, position | `voice_channel_id` is a snowflake an administrator pasted, and `api` has no Discord token to ask what it is called (Section 2.1) |
+| `guild_role` | A guild's roles: id, name, position | The same, for `consent_role_id` and `admin_role_id` |
+| `guild_member` | Display names of the holders of the consent role and the admin role — **and nobody else** | The bounded set the console ever names: consent rosters, queue speakers, admin lists. Mirroring the whole guild would copy a Discord user directory into a database that exists to hold recordings |
+| `outline_collection` | Outline's collections: id, name | `document_target` is a collection UUID, and the Outline token belongs to `worker`, not to `api` |
+| `user_preference` | What one person set about their own console: `theme`, `locale` | `guild_config` keyed by person instead of guild; the registry of legal keys and values is `sturnus.domain.preferences` |
 
 The worker already computes the first three — they are the metrics
 `sturnus_transcription_audio_duration_seconds`,
 `sturnus_transcription_total_seconds` and the segment loop's own count.
 Persisting them is a write it does not currently make, not a measurement
 it does not currently take.
+
+### 6.1 Why four of those are mirrors
+
+`api` cannot ask Discord or Outline anything: Section 2.1 gives it S3, the
+master key and the OAuth secret, which already means it can decrypt every
+recording in the system, and a process in that position does not also get
+the ability to act as the bot (Spec 13.2). So the same arrangement
+Section 3.4 makes for `admin_member` is made four more times — **the
+process that already holds the credential writes the names down, and `api`
+reads them.**
+
+- `bot` writes `guild_channel`, `guild_role` and `guild_member`, on the
+  ten-second tick it already runs the `admin_member` sweep on. Every read
+  behind it (`Guild.voice_channels`, `Guild.roles`, `Role.members`) is a
+  gateway-cache lookup rather than an API call, so it needs no rate-limit
+  budget of its own.
+- `worker` writes `outline_collection`, on an hourly sweep. A collection
+  list changes a handful of times a year and nothing is waiting on it.
+
+Every mirrored row carries `synced_at`, and every write is a full
+replacement scoped to its guild: something deleted upstream must stop
+being offered, and a mirror that only ever grows would go on offering a
+channel nobody can join. Two failure modes are kept apart deliberately —
+a guild the bot cannot currently see, and an Outline that cannot be
+reached, both leave the previous mirror standing rather than emptying it.
+"We could not look" is not "there is nothing there".
+
+A name the mirror does not hold is shown as an id. That is the intended
+fallback, not a gap: it is exactly what the console does today for
+everything.
 
 ## 7. Delivery
 

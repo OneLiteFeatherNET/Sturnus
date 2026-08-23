@@ -55,6 +55,7 @@ from sturnus.domain import settings
 from sturnus.domain.session import EndReason, SessionTimeouts
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
+from sturnus.infrastructure.db.directory import DirectoryStore
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -67,6 +68,7 @@ from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
 from sturnus.infrastructure.discord.audio_cog import AudioCog
 from sturnus.infrastructure.discord.config_cog import ConfigCog
 from sturnus.infrastructure.discord.consent_cog import ConsentCog
+from sturnus.infrastructure.discord.directory_sync import sync_directory
 from sturnus.infrastructure.discord.link_cog import LinkCog
 from sturnus.infrastructure.discord.queue_cog import QueueCog
 from sturnus.infrastructure.discord.setup_cog import SetupCog
@@ -168,6 +170,7 @@ class SturnusClient(commands.Bot):
         clock: Clock,
         config_store: ConfigStore,
         admin_mirror: AdminMemberStore | None = None,
+        directory_mirror: DirectoryStore | None = None,
         consent_repo: ConsentRepository,
         session_repo: SessionRepository,
         # Typed against the narrow `JobQueue` port rather than the concrete
@@ -210,6 +213,11 @@ class SturnusClient(commands.Bot):
         #: what every test that has no interest in administrators gets.
         #: In production `sturnus.entrypoints.bot` always supplies it.
         self._admin_mirror = admin_mirror
+        #: Optional for the same reason `admin_mirror` is: a client built
+        #: without one does not mirror names, which is what every test
+        #: with no interest in the console gets. In production
+        #: `sturnus.entrypoints.bot` always supplies it.
+        self._directory_mirror = directory_mirror
         self._consent_repo = consent_repo
         self._session_repo = session_repo
         self._job_repo = job_repo
@@ -1136,6 +1144,7 @@ class SturnusClient(commands.Bot):
                 await self._sweep_due_session(guild_id, recording, now)
             await self._reconcile(guild_id)
             await self._mirror_administrators(guild_id, now)
+            await self._mirror_directory(guild_id, now)
             recording = self._guilds.get(guild_id)
             if (
                 recording is not None
@@ -1172,6 +1181,44 @@ class SturnusClient(commands.Bot):
                 Event.GUILD_TICK_FAILED,
                 "Could not mirror this guild's administrators; the console keeps "
                 "the membership it already had",
+                exc,
+                guild_id=guild_id,
+            )
+
+    async def _mirror_directory(self, guild_id: int, now: datetime) -> None:
+        """Writes this guild's channel, role and member names for `api` to read.
+
+        On the same tick as `_mirror_administrators`, and for the same
+        reasons: every gateway read behind it is a cache lookup rather
+        than an API call, so it costs nothing to run every ten seconds and
+        needs no rate-limit budget.
+
+        A separate method rather than a second write inside that one,
+        because the two mirrors carry different weight. `admin_member`
+        decides who may change a guild's settings; this decides whether a
+        picker shows a word or a snowflake. Keeping them apart means a
+        failure to refresh the cosmetic one never costs the privilege one
+        its own refresh in the same tick.
+
+        A guild the bot cannot currently see is skipped entirely --
+        `get_guild` returning `None` is "we could not look", which must
+        not be written down as "there is nothing there". The mirror keeps
+        what it had, and the console goes on naming what it named before.
+        """
+        if self._directory_mirror is None:
+            return
+        guild = self.get_guild(guild_id)
+        if guild is None:
+            return
+        try:
+            await sync_directory(guild, self._config_store, self._directory_mirror, now)
+        except Exception as exc:
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.GUILD_TICK_FAILED,
+                "Could not mirror this guild's channel and role names; the console "
+                "keeps the names it already had",
                 exc,
                 guild_id=guild_id,
             )

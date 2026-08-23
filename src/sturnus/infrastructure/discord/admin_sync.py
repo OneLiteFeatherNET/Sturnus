@@ -25,6 +25,7 @@ from typing import Protocol
 import discord
 
 from sturnus.application.admin_mirror import AdminSyncDecision, decide_admin_sync
+from sturnus.application.directory_mirror import parse_role_id
 from sturnus.domain import settings
 
 log = logging.getLogger(__name__)
@@ -82,11 +83,11 @@ def _resolve_role(guild: discord.Guild, configured: str | None) -> discord.Role 
     and `admin_role_id` is not among `INTEGER_KEYS`, so a hand-edited row
     can hold anything. A value nobody can interpret must not grant
     anything, and must not stop the sweep either.
+
+    The lenient read itself is `parse_role_id`, shared with the directory
+    sweep rather than spelled twice -- two copies of "what counts as a
+    role id" is two things to keep in agreement, and the day they disagree
+    is the day one sweep grants what the other revokes.
     """
-    if configured is None or not configured.strip():
-        return None
-    try:
-        role_id = int(configured.strip())
-    except ValueError:
-        return None
-    return guild.get_role(role_id)
+    role_id = parse_role_id(configured)
+    return guild.get_role(role_id) if role_id is not None else None

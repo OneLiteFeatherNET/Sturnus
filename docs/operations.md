@@ -88,7 +88,7 @@ in the bot would read it.
 | `STURNUS_MASTER_KEY` | **yes** | **yes** | The same base64-encoded 32-byte key the bot wraps data keys with; the worker unwraps them with it to decrypt each downloaded recording. It must be byte-identical to the bot's value, or nothing the bot recorded can be transcribed. See section 2. |
 | `STURNUS_MASTER_KEY_ID` | **yes** | no | Label recorded as `encryption_key_id` when a data key is wrapped. Not key material. |
 | `STURNUS_OUTLINE_BASE_URL` | **yes** | no | Base URL of the Outline instance the finished protocol is posted to. |
-| `STURNUS_OUTLINE_SERVICE_KEY` | **yes** | **yes** | Outline API token `OutlineSink` authenticates with when creating documents. Note the name — it is `OUTLINE_SERVICE_KEY`, not an `API_TOKEN` variant. A token that is invalid, lacks access, or points at a collection that does not exist surfaces as `PermanentDocumentError`; see section 5. |
+| `STURNUS_OUTLINE_SERVICE_KEY` | **yes** | **yes** | Outline API token `OutlineSink` authenticates with when creating documents, and — hourly — reads the collection list with, so the console can show `document_target` as a name instead of the UUID somebody pasted. Note the name — it is `OUTLINE_SERVICE_KEY`, not an `API_TOKEN` variant. A token that is invalid, lacks access, or points at a collection that does not exist surfaces as `PermanentDocumentError`; see section 5. A token that cannot list collections costs only the picker's names: the sweep leaves the previous mirror standing rather than emptying it, and nothing about transcription depends on it. |
 | `STURNUS_WHISPER_MODEL` | `large-v3` | no | faster-whisper model to load. Larger models are more accurate and markedly slower, and this deployment transcribes on CPU (see the chart's `worker.resources`), so the difference is measured in minutes per recording rather than seconds. It is deliberately not `large-v3-turbo`: turbo is a distilled decoder with four layers instead of thirty-two, and what it gives up is concentrated outside English. Transcription happens offline, per speaker, after the meeting, so the time it costs is time nobody is waiting on — the memory it costs is real, and the chart's `worker.resources` comment works it out. |
 | `STURNUS_WHISPER_DEFAULT_LANGUAGE` | `de` | no | Language reported when faster-whisper's own detection comes up empty. This is the floor under the per-guild `transcription_language` (section 4.1), not the usual setting to reach for — it is consulted only for a guild that asked for detection (`transcription_language auto`) and got nothing back. It still matters more than a fallback usually does: the first transcription for a speaker in such a session pins that speaker's language, and every later job for them reuses it. |
 | `STURNUS_MODEL_CACHE_DIR` | unset | no | Where model weights are cached. When set, the worker exports it as `HF_HOME` before loading the model, so the download lands on a persistent volume; left unset, every cold start re-downloads several gigabytes of weights. |
@@ -356,6 +356,22 @@ appear at all):
 Guild administrators bypass all of the above at the Discord-permission
 level and can always run `/setup` and `/config` regardless of role
 assignment (see `require_admin`).
+
+**View Channel, guild-wide, if the console is in use.** Every ten seconds
+the bot mirrors the guild's channels, roles and the display names of the
+consent-role and admin-role holders into the database, because the
+console's API process has no Discord token and must never be given one
+(see `docs/superpowers/specs/2026-08-21-sturnus-console-design.md`
+Section 6.1). That mirror is what lets the console show "meeting" where it
+would otherwise show a raw snowflake. Discord only pushes channels the bot
+can see, so a channel the bot lacks **View Channel** on is simply absent
+from the mirror and the console shows its id — which is what it does today
+for every channel, so this costs nothing beyond a less helpful picker.
+
+**No new intent for that sweep.** It reads `Guild.voice_channels`,
+`Guild.roles` and `Role.members`, all of them gateway-cache lookups rather
+than API calls. The last one needs the **Server Members Intent**, which is
+already required above for the consent gate.
 
 ### 3.2 Why the recording channel's permissions matter
 
