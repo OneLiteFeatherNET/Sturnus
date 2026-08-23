@@ -15,6 +15,7 @@ mention-less fallback.
 import ctranslate2  # type: ignore[import-untyped]
 
 from sturnus.application.worker import _FALLBACK_TEMPLATE
+from sturnus.domain import transcription_models
 from sturnus.entrypoints.worker import (
     _WHISPER_COMPUTE_TYPE,
     WorkerSettings,
@@ -60,6 +61,26 @@ def test_the_default_model_is_the_undistilled_large_one() -> None:
     buys time nobody is waiting for.
     """
     assert _settings().whisper_model == "large-v3"
+
+
+def test_the_default_model_is_the_one_a_requeue_falls_back_to() -> None:
+    """Two declarations of "the model nobody chose", pinned to one value.
+
+    `WorkerSettings.whisper_model` is what a first pass runs;
+    `sturnus.domain.transcription_models.FALLBACK` is what a re-queue
+    writes into `transcription_job.requested_model` when the caller named
+    nothing. Nothing in the running system forces them to agree -- the
+    worker never reads the registry for its own default, and the registry
+    cannot import the settings -- so a change to one and not the other
+    would make "re-queue it unchanged" silently change the model.
+
+    The pin is on the *declared* default, not on a deployed
+    `WHISPER_MODEL`. A cluster that overrides it is telling its workers
+    what to run on a first pass and is not telling this repository what
+    "unchanged" means; if such a deployment wants its re-queues to agree,
+    the registry is where that is said.
+    """
+    assert _settings().whisper_model == transcription_models.FALLBACK
 
 
 def test_the_default_language_is_the_one_these_meetings_are_held_in() -> None:

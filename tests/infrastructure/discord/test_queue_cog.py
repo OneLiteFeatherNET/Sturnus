@@ -45,6 +45,8 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from sturnus.application.requeue import RequeuePlan
+from sturnus.domain import transcription_models
+from sturnus.domain.transcription_models import FALLBACK
 from sturnus.infrastructure.db.models import Base, Session, TranscriptionJob
 from sturnus.infrastructure.db.repositories import JobRepository, SessionRepository
 from sturnus.infrastructure.db.requeue import JobLine, SessionSummary, apply_requeue
@@ -869,6 +871,36 @@ async def test_confirming_resets_every_column_the_redo_depends_on(
     assert job.transcript is None
 
 
+async def test_confirming_records_the_fallback_model_rather_than_leaving_it_null(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """`/queue requeue` offers no choice, so it names the fallback outright.
+
+    `NULL` used to mean "whichever model the worker that happens to claim
+    this job was configured with", which is not a record of anything and
+    can differ between two workers of one fleet. Writing the name makes
+    `transcription_job.requested_model` a fact: an operator comparing a
+    redo against the run before it can read what was asked for instead of
+    reconstructing it from a deployment's environment.
+
+    The command itself stays choiceless. Picking a model is an
+    administrator's decision made against a list and a description of what
+    each one costs, and a Discord slash command has nowhere to show that;
+    the console does.
+    """
+    session_id = await seed(factory, [Speaker(ANNA)])
+    interaction = _Interaction()
+    await _invoke(cog(factory), "requeue", interaction, session_id)
+    view = interaction.view
+    assert isinstance(view, RequeueConfirmView)
+
+    await _press(view, "Confirm", _Interaction())
+
+    assert (await read_jobs(factory, session_id))[ANNA].requested_model == (
+        transcription_models.FALLBACK
+    )
+
+
 async def test_confirming_clears_the_transcript_so_a_half_done_redo_cannot_lie(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
@@ -1101,8 +1133,29 @@ async def test_the_write_refuses_another_guilds_session_on_its_own(
     """
     session_id = await seed(factory, [Speaker(ANNA)], guild=OTHER_GUILD)
 
-    assert await apply_requeue(factory, GUILD, session_id) is None
+    assert await apply_requeue(factory, GUILD, session_id, model=FALLBACK) is None
     assert (await read_jobs(factory, session_id))[ANNA].status == "done"
+
+
+async def test_the_write_stores_the_model_it_was_handed(
+    factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """The question has to survive in the row until somebody picks the job up.
+
+    The worker that eventually claims this job is not the process that
+    handled the request -- there may be none running at all right now --
+    so a named model is stored rather than passed. No path through the cog
+    reaches this with anything but the fallback, which is exactly why the
+    write is exercised directly: the console names other models, and a
+    write that ignored the argument would look correct from Discord
+    forever.
+    """
+    session_id = await seed(factory, [Speaker(ANNA)])
+
+    view = await apply_requeue(factory, GUILD, session_id, model="small")
+
+    assert view is not None and not view.is_refused
+    assert (await read_jobs(factory, session_id))[ANNA].requested_model == "small"
 
 
 async def test_the_write_refuses_a_session_that_is_not_documented_on_its_own(
@@ -1121,7 +1174,7 @@ async def test_the_write_refuses_a_session_that_is_not_documented_on_its_own(
     """
     session_id = await seed(factory, [Speaker(ANNA)], session_status="open")
 
-    view = await apply_requeue(factory, GUILD, session_id)
+    view = await apply_requeue(factory, GUILD, session_id, model=FALLBACK)
 
     assert view is not None
     assert view.is_refused is True
@@ -1167,7 +1220,7 @@ async def test_the_write_waits_for_a_worker_holding_the_sessions_jobs(
             )
             .values(status="running")
         )
-        task = asyncio.create_task(apply_requeue(factory, GUILD, session_id))
+        task = asyncio.create_task(apply_requeue(factory, GUILD, session_id, model=FALLBACK))
         # Long enough for the task to reach the database and stop there.
         await asyncio.sleep(0.3)
         assert not task.done(), "the re-queue must wait on the lock, not race it"

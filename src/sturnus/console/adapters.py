@@ -380,23 +380,39 @@ class ConsoleQueueControl:
             refusal=None if not view.is_refused else refusal_reason(view),
         )
 
-    async def requeue(self, session_id: int, *, requested_by: int) -> RequeueOutcome | None:
+    async def requeue(
+        self, session_id: int, *, requested_by: int, model: str
+    ) -> RequeueOutcome | None:
+        """Re-queues one session against a named model, or refuses.
+
+        The administrator check comes first and decides everything after
+        it, `model` included. That is the whole of the "who may choose a
+        model" rule: naming one is not a separate permission that could be
+        granted or forgotten, it is part of a re-queue, and a caller who
+        may not re-queue has their request refused whole rather than
+        obeyed with the model quietly dropped.
+        """
         guild_id = await self._administered_guild(session_id, requested_by)
         if guild_id is None:
             return None
         # The plan this returns is the one that was applied under the row
         # lock, or the one that caused the refusal -- never the lock-free
         # read above, which may be seconds stale by now.
-        view = await apply_requeue(self._session_factory, guild_id, session_id)
+        view = await apply_requeue(self._session_factory, guild_id, session_id, model=model)
         if view is None:
             return None
         if view.is_refused:
-            return RequeueOutcome(False, (), (), refusal_reason(view))
+            # No model on a refusal: the field reports what was written,
+            # and a refused re-queue wrote nothing. Echoing the request
+            # back here would read as "we asked for `small`" from an
+            # endpoint that asked for nothing at all.
+            return RequeueOutcome(False, (), (), refusal_reason(view), None)
         return RequeueOutcome(
             accepted=True,
             requeued_user_ids=view.plan.resettable_user_ids,
             erased_user_ids=view.plan.erased_user_ids,
             refusal=None,
+            model=model,
         )
 
     async def _administered_guild(self, session_id: int, discord_user_id: int) -> int | None:

@@ -435,17 +435,21 @@ class FakeQueue:
     ) -> None:
         self.snapshot = snapshot
         self.outcome = outcome
-        self.requeued: list[tuple[int, int]] = []
+        self.requeued: list[tuple[int, int, str]] = []
 
     async def status_for(self, session_id: int, *, requested_by: int) -> QueueSnapshot | None:
         del session_id, requested_by
         return self.snapshot
 
-    async def requeue(self, session_id: int, *, requested_by: int) -> RequeueOutcome | None:
+    async def requeue(
+        self, session_id: int, *, requested_by: int, model: str
+    ) -> RequeueOutcome | None:
         # Recorded rather than merely counted: "an administrator's own id
         # reached the write, not one from the URL" is the property the
-        # authorisation tests assert on.
-        self.requeued.append((session_id, requested_by))
+        # authorisation tests assert on, and `model` is here for the same
+        # reason -- a handler that dropped the chosen model would still
+        # return a perfectly plausible 200.
+        self.requeued.append((session_id, requested_by, model))
         return self.outcome
 
 

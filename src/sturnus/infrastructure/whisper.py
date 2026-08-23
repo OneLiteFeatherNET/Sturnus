@@ -95,7 +95,9 @@ from sturnus.application.transcription import (
     TranscribedSegment,
     TranscriptionResult,
 )
+from sturnus.domain import transcription_models
 from sturnus.domain.measurements import JobMeasurements
+from sturnus.domain.transcription_models import UnknownTranscriptionModel
 from sturnus.infrastructure.speech_gate import speech_clips
 from sturnus.infrastructure.telemetry import TRANSCRIPTION_PROGRESS, set_current_span_fields
 from sturnus.observability.events import Event, log_event
@@ -239,7 +241,28 @@ class WhisperEngine:
         comparison run that silently used the old model would still
         produce a transcript, still record measurements, and look exactly
         like a result -- and this project has already lost days to a
-        failure that reported success.
+        failure that reported success. That is why the registry check
+        below raises instead of quietly returning the default: a job that
+        ran a different model than `transcription_job.model` records would
+        make that column a lie, and the column exists precisely so that
+        "what ran" is knowable.
+
+        **The check is here as well as at the boundary, and it is not the
+        same check.** `sturnus.domain.transcription_models.resolve`
+        refuses a name where a re-queue is *planned*, which is where a
+        caller can still be told to fix their request. This one catches a
+        name that got past it -- a row written by hand, a caller nobody
+        has added the validation to yet -- and its job is to fail with a
+        message an operator can read out of the job's `error` column
+        rather than with whatever HuggingFace says about a repository that
+        does not exist.
+
+        **Only a cache miss is checked**, which is what keeps this from
+        second-guessing the deployment. `__init__` loads the worker's own
+        `WHISPER_MODEL` eagerly, so that name is always a hit; an operator
+        who configured a private conversion has said so deliberately, and
+        a worker refusing the model it was started with would be refusing
+        its own configuration.
 
         Cached because loading `large-v3` takes long enough to dominate a
         short job, and a comparison means running the same file twice.
@@ -251,6 +274,8 @@ class WhisperEngine:
         existing = self._models.get(wanted)
         if existing is not None:
             return wanted, existing
+        if not transcription_models.is_known(wanted):
+            raise UnknownTranscriptionModel(wanted)
         log.info("Loading transcription model %s, which this worker has not used before", wanted)
         loaded = WhisperModel(wanted, device=self._device, compute_type=self._compute_type)
         self._models[wanted] = loaded

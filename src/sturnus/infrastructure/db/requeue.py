@@ -448,7 +448,8 @@ async def apply_requeue(
     session_factory: async_sessionmaker[AsyncSession],
     guild_id: int,
     session_id: int,
-    model: str | None = None,
+    *,
+    model: str,
 ) -> SessionView | None:
     """Resets a session's recoverable jobs, in one transaction and one commit.
 
@@ -458,6 +459,19 @@ async def apply_requeue(
     which the caller renders as `NO_SUCH_SESSION`. Whether the write
     happened is derivable: it did exactly when the returned view is not
     `is_refused`.
+
+    **`model` is required, and it is a name, never `None`.** It began as
+    an optional argument that both callers omitted, so every re-queue this
+    system had ever performed stored `NULL` -- which meant "whichever model
+    the worker that happens to claim this job was configured with", a
+    value that is not a record of anything and can differ between two
+    workers of one fleet. It is a registered name from
+    `sturnus.domain.transcription_models`; turning a request (or the
+    absence of one) into such a name is `resolve`'s job, at the boundary
+    where a caller can still be told to fix it. This function does not
+    re-check, because a second copy of that rule is how the two drift --
+    `WhisperEngine._model_for` is the backstop for a name that got past
+    the boundary by some other route.
 
     Three properties matter and none is incidental.
 
@@ -525,9 +539,10 @@ async def apply_requeue(
                 attempts=0,
                 # The old error described the old run.
                 error=None,
-                # What to transcribe with this time. `None` leaves the
-                # worker's own default, which is every re-queue nobody
-                # asked a question about.
+                # What to transcribe with this time. Always a name, never
+                # `NULL`: a re-queue nobody asked a question about carries
+                # the registry's fallback, so the column says what was
+                # asked for rather than that nothing was.
                 #
                 # It is stored rather than passed, because the worker that
                 # eventually claims this job is not the process handling
