@@ -44,6 +44,7 @@ function view(overrides: Partial<SettingView> & { key: string }): SettingView {
     value: null,
     default: null,
     required: false,
+    may_clear: false,
     integer: false,
     invalidates_consent: false,
     takes_effect: 'immediately',
@@ -289,14 +290,44 @@ describe('whether a key may be cleared', () => {
   })
 
   it('offers a clear for a key that has a default to fall back to', () => {
-    expect(clearability(view({ key: 'timezone', value: 'UTC', default: 'Europe/Berlin' })).clearable).toBe(
-      true,
-    )
+    expect(
+      clearability(view({ key: 'timezone', may_clear: true, value: 'UTC', default: 'Europe/Berlin' }))
+        .clearable,
+    ).toBe(true)
   })
 
   it('refuses when there is nothing stored to clear', () => {
-    const verdict = clearability(view({ key: 'transcription_prompt', value: null }))
+    const verdict = clearability(view({ key: 'transcription_prompt', may_clear: true, value: null }))
     expect(verdict.clearable).toBe(false)
+  })
+
+  it('refuses a key the API will not clear even though it is not required', () => {
+    // `voice_channel_id` is the deprecated spelling of the recording
+    // channels. It is required of nobody -- so a console reading
+    // clearability off `required` puts a live Clear button beside it --
+    // and clearing it would take a guild that has not moved to
+    // `voice_channel_ids` yet out of service, so the API answers 409.
+    // Inferring the button from `required` renders the refusal
+    // "this key is required" on a field the same page called optional.
+    const verdict = clearability(
+      view({ key: 'voice_channel_id', required: false, may_clear: false, value: '42' }),
+    )
+    expect(verdict.clearable).toBe(false)
+    if (!verdict.clearable) expect(verdict.reason).not.toContain('required')
+  })
+
+  it('reads the rule off the payload rather than deriving it', () => {
+    // The flag is the endpoint's own answer, serialised. A payload that
+    // omits it is an API this console does not know, and the safe read of
+    // an unknown API is "do not offer the button": explaining a missing
+    // control costs a support question, offering one the server refuses
+    // costs a 409 in somebody's face.
+    const parsed = parseSettings([
+      { key: 'timezone', value: 'UTC', may_clear: true },
+      { key: 'voice_channel_id', value: '42', may_clear: false },
+      { key: 'policy_url', value: 'https://x' },
+    ])
+    expect(parsed.map((v) => v.may_clear)).toEqual([true, false, false])
   })
 })
 

@@ -15,9 +15,10 @@ treated differently:
   point, on the next tick or in `close()`, and captured nowhere. They are
   applied in place, immediately, mid-session included (see
   `RecordingService.apply_tunables`).
-* **Identity** -- `voice_channel_id`, `consent_role_id`. These decide
-  which channel a session's row names and which role the headcount and
-  the per-packet filter agree on. They cannot move under a running
+* **Identity** -- `voice_channel_ids`, `consent_role_id`. These decide
+  which channels a session may be opened in, which channel a session's row
+  names, and which role the headcount and the per-packet filter agree on.
+  They cannot move under a running
   session without either lying about where the audio came from or
   dropping a live voice connection with unflushed writers behind it, so
   when a session is in progress they are *deferred* to the moment it
@@ -42,7 +43,7 @@ from sturnus.domain.session import SessionTimeouts
 
 #: The keys that decide *which* channel and *whose* voice -- the ones that
 #: cannot move under a running session.
-IDENTITY_KEYS: tuple[str, ...] = (settings.VOICE_CHANNEL_ID, settings.CONSENT_ROLE_ID)
+IDENTITY_KEYS: tuple[str, ...] = (settings.VOICE_CHANNEL_IDS, settings.CONSENT_ROLE_ID)
 
 #: The keys that only ever influence the *next* decision, so they can be
 #: swapped in place at any moment.
@@ -81,20 +82,41 @@ class GuildRuntimeConfig:
     to begin with. Only what the bot caches needs reconciling.
     """
 
-    channel_id: int
+    #: Every channel this guild allows Sturnus to record in, sorted and
+    #: never empty (an empty list is spelled "no configuration at all", so
+    #: `_desired_config` returns `None` instead of a config holding one).
+    #:
+    #: A *list*, and still one connection: a Discord bot holds one voice
+    #: connection per guild, so this says where Sturnus may record, not
+    #: how many rooms it records at once. Which of them is being served is
+    #: decided per pass by `sturnus.application.channel_choice`, from who
+    #: is actually sitting in them -- it is a fact about the moment, not
+    #: about the configuration, so it is deliberately not stored here.
+    channel_ids: tuple[int, ...]
     role_id: int
     timeouts: SessionTimeouts
     retention_days: int
 
     @property
-    def identity(self) -> tuple[int, int]:
-        return (self.channel_id, self.role_id)
+    def identity(self) -> tuple[tuple[int, ...], int]:
+        return (self.channel_ids, self.role_id)
 
     def identity_changes_from(self, other: GuildRuntimeConfig) -> tuple[str, ...]:
-        """Names the identity keys whose value differs from `other`'s."""
+        """Names the identity keys whose value differs from `other`'s.
+
+        The whole tuple is compared, so adding a second allowed channel is
+        an identity change with exactly the same defer-while-recording
+        semantics a channel *move* has always had. It has to be: the list
+        decides which voice-state updates the client is interested in and
+        which channel a new session may open against, and both of those
+        are read on the edge a session opens on.
+
+        Order is not a change, because `settings.parse_channel_ids` sorts
+        -- re-typing the same list differently must not retarget a guild.
+        """
         changed: list[str] = []
-        if self.channel_id != other.channel_id:
-            changed.append(settings.VOICE_CHANNEL_ID)
+        if self.channel_ids != other.channel_ids:
+            changed.append(settings.VOICE_CHANNEL_IDS)
         if self.role_id != other.role_id:
             changed.append(settings.CONSENT_ROLE_ID)
         return tuple(changed)
@@ -153,8 +175,9 @@ def plan_reconfigure(
     """Compares what the process is doing against what the database says.
 
     `current` is `None` when the process holds no pipeline for the guild,
-    `desired` is `None` when the guild has no usable configuration (either
-    `voice_channel_id` or `consent_role_id` is unset). `is_recording` is
+    `desired` is `None` when the guild has no usable configuration (no
+    recording channel is named, or `consent_role_id` is unset).
+    `is_recording` is
     the one fact that turns an immediate change into a deferred one.
     """
     if desired is None:
@@ -194,8 +217,8 @@ class ReconfigureResult:
     """What a reconcile pass actually did, for the command that triggered it.
 
     Exists so `/config set` can say what took effect instead of confirming
-    a write and implying the rest. A reply that reads `voice_channel_id set
-    to 123` when the process is still recording the old channel is the same
+    a write and implying the rest. A reply that reads `voice_channel_ids
+    set to 123` when the process is still recording the old channel is the same
     defect this whole module fixes, one layer up.
     """
 
@@ -219,7 +242,18 @@ class RunningState:
 
     is_live: bool
     is_recording: bool
+    #: The one allowed channel currently being served -- the channel the
+    #: session in progress is in, or the one the next session would open
+    #: against. `None` when the guild has no pipeline at all.
     channel_id: int | None
+    #: Every channel the guild allows, this one included. `/config show`
+    #: names the others so a person waiting in one of them is not left to
+    #: guess why nothing is happening.
+    allowed_channel_ids: tuple[int, ...]
+    #: Allowed channels that hold consenting members and are not being
+    #: served, as of the last headcount. In-memory bookkeeping like the
+    #: rest of this record -- reading it costs no I/O.
+    waiting_channel_ids: tuple[int, ...]
     #: Identity keys stored but not yet in force, waiting for the session.
     pending_keys: tuple[str, ...]
     pending_teardown: bool

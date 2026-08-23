@@ -6,7 +6,8 @@ Status: Draft for review · Date: 2026-08-19
 
 ## 1. Goal
 
-A dedicated Discord voice channel is recorded automatically and stored as a
+Every Discord voice channel a guild has named as recordable
+(`voice_channel_ids`) is recorded automatically and stored as a
 chronological transcript in a document system — in this phase, Outline,
 through a swappable adapter (Section 8). Speakers appear in it as real users
 of the target system, provided they have linked their Discord account to it
@@ -75,7 +76,16 @@ These points are not optional — they are a condition for operation:
 - **Non-recorded voice channels** must exist as an alternative. If consent is
   the only way to take part in voice at all, its voluntariness is open to
   challenge under Art. 7(4) GDPR (the prohibition on tying).
-- **The channel name and channel topic name the recording.** Because the bot
+- **One voice connection per guild.** A Discord bot may hold exactly one
+  voice connection per guild; discord.py enforces it and so does this
+  design. A guild's list of allowed recording channels therefore means "the
+  bot may record in any of these, and follows the one that is meeting", not
+  "the bot records all of them at once". Where two allowed channels are both
+  busy, the one with the most consenting members is recorded and the lowest
+  channel id breaks a tie (`sturnus.application.channel_choice`); a session
+  in progress is never moved. Simultaneous recording of two channels in one
+  guild needs a second bot identity.
+- **The channel names and channel topics name the recording.** Because the bot
   joins automatically, without an explicit start command, there is no moment
   at which someone consciously triggers the recording — the labeling has to
   live on the channel itself.
@@ -666,7 +676,8 @@ The bot and worker share the store.
 
 | Key | Default | Consumer |
 |---|---|---|
-| `voice_channel_id` | — | Bot |
+| `voice_channel_ids` | — | Bot |
+| `voice_channel_id` | — | Bot (legacy alias, read-only fallback) |
 | `consent_role_id` | — | Bot |
 | `empty_grace_seconds` | 60 | Bot |
 | `idle_timeout_minutes` | 15 | Bot |

@@ -40,6 +40,12 @@ _BASIC_CONFIG_OWNER = "setup.py"
 _LOG_METHODS = frozenset({"debug", "info", "warning", "error", "exception", "critical", "log"})
 _EVENT_HELPERS = frozenset({"log_event", "log_exception"})
 
+#: The names an exception is bound to in this repository. A denylist of
+#: four spellings rather than a proof that a value is not an exception:
+#: `except ValueError as exc` is the only way one gets a name at all, and
+#: `exc` is what every `except` clause in `src/` calls it.
+_EXCEPTION_NAMES = frozenset({"exc", "error", "exception", "err"})
+
 
 def _python_files() -> list[Path]:
     return sorted(SRC.rglob("*.py"))
@@ -244,12 +250,199 @@ def test_r6_an_exception_is_never_interpolated_into_a_log_message() -> None:
                 continue
             for argument in node.args[1:]:
                 name = _direct_name(argument)
-                if name in {"exc", "error", "exception", "err"}:
+                if name in _EXCEPTION_NAMES:
                     violations.append(
                         f"{path.relative_to(SRC)}:{node.lineno}: interpolates {name!r} "
                         f"into a log message. Use log_exception(...) instead."
                     )
     assert not violations, "\n".join(violations)
+
+
+def _formatting_log_helpers(module: ast.Module) -> frozenset[str]:
+    """Functions in this module that render a message with `%` and then log it.
+
+    `SturnusClient._notice` is the shape: it does `rendered = message %
+    args` and then `log.warning("%s", rendered)`. Every character its
+    callers hand it reaches `LogRecord.msg`'s output just as surely as if
+    they had written the `log.warning` themselves -- but R1 sees a literal
+    and R6 sees no `log.*` call, because one frame sits in between.
+
+    Recognised by shape rather than by a list of blessed helper names: a
+    function that renders a `%` expression and hands the result to a
+    logger. A list of names is a list somebody has to remember to extend,
+    which is the same failure this rule exists to stop.
+
+    The `%` must actually *reach* the log call, whether inline or through
+    one local name. Merely containing a `%` is not enough --
+    `DaveDecryptor._note_failure` rate-limits itself with
+    `self._consecutive_failures % FAILURE_LOG_EVERY` and passes its
+    exception to `exc_info`, which is the correct handling and not a
+    helper this rule has anything to say about.
+    """
+    helpers: set[str] = set()
+    for node in ast.walk(module):
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and _renders_into_a_log_call(
+            node
+        ):
+            helpers.add(node.name)
+    return frozenset(helpers)
+
+
+def _is_percent_format(node: ast.expr) -> bool:
+    return isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod)
+
+
+def _renders_into_a_log_call(function: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    """Whether a `%` expression in this function ends up inside a log call."""
+    rendered: set[str] = set()
+    for node in ast.walk(function):
+        if isinstance(node, ast.Assign) and _is_percent_format(node.value):
+            rendered.update(
+                name for name in (_direct_name(target) for target in node.targets) if name
+            )
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and node.value is not None
+            and _is_percent_format(node.value)
+        ):
+            name = _direct_name(node.target)
+            if name:
+                rendered.add(name)
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call) or not _is_log_call(node):
+            continue
+        for argument in node.args:
+            if _is_percent_format(argument) or _direct_name(argument) in rendered:
+                return True
+    return False
+
+
+def _called_helper(node: ast.Call) -> str | None:
+    """`_notice(...)` and `self._notice(...)`, but not `other._notice(...)`.
+
+    Module-local on purpose. Following a helper across an import would
+    need a resolver, and this rule earns its keep on the case that
+    actually happens -- a private formatter beside the call sites that use
+    it. A helper worth exporting is worth being `log_event`.
+    """
+    func = node.func
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        return func.attr if func.value.id == "self" else None
+    return None
+
+
+def test_r7_an_exception_never_reaches_a_helper_that_formats_and_logs() -> None:
+    """Rule R7. One frame of indirection is not a way around R6.
+
+    `self._notice(guild_id, "... (%s) ...", guild_id, exc)` renders
+    `str(exc)` into the text that `log.warning` then emits, and
+    `InvalidChannelList`'s message embeds the value it refused -- the
+    stored `voice_channel_ids` text, put there by whoever ran the direct
+    `UPDATE` that this notice exists to report. `routes_settings._write`
+    already says in writing what to do instead, for the same exception
+    class: the type and the key travel, the value does not.
+
+    R6 catches only the direct spelling, so it caught none of this. A rule
+    that matches one spelling is a rule the next helper walks past.
+    """
+    violations: list[str] = []
+    for path in _python_files():
+        module = _parse(path)
+        helpers = _formatting_log_helpers(module)
+        if not helpers:
+            continue
+        for node in ast.walk(module):
+            if not isinstance(node, ast.Call):
+                continue
+            helper = _called_helper(node)
+            if helper is None or helper not in helpers:
+                continue
+            arguments = list(node.args) + [keyword.value for keyword in node.keywords]
+            for argument in arguments:
+                name = _direct_name(argument)
+                if name in _EXCEPTION_NAMES:
+                    violations.append(
+                        f"{path.relative_to(SRC)}:{node.lineno}: passes {name!r} to "
+                        f"{helper!r}, which renders its arguments into a log message. "
+                        f"Pass type({name}).__name__ and the key instead."
+                    )
+    assert not violations, "\n".join(violations)
+
+
+@pytest.mark.parametrize(
+    "module_source,flagged",
+    [
+        # The shape that got past R6: the literal is the helper's, the
+        # exception is the caller's, and they meet one frame apart.
+        (
+            "def _notice(self, message, *args):\n"
+            "    rendered = message % args\n"
+            "    log.warning('%s', rendered)\n"
+            "def caller(self):\n"
+            "    try:\n"
+            "        f()\n"
+            "    except ValueError as exc:\n"
+            "        self._notice('bad (%s)', exc)\n",
+            True,
+        ),
+        # The fix. A type name is program text; the value stayed behind.
+        (
+            "def _notice(self, message, *args):\n"
+            "    rendered = message % args\n"
+            "    log.warning('%s', rendered)\n"
+            "def caller(self):\n"
+            "    try:\n"
+            "        f()\n"
+            "    except ValueError as exc:\n"
+            "        self._notice('bad (%s)', type(exc).__name__)\n",
+            False,
+        ),
+        # A helper that logs but never formats is not a formatter, and a
+        # helper that formats but never logs is not a log call site.
+        (
+            "def _record(self, exc):\n"
+            "    log.warning('failed')\n"
+            "def caller(self):\n"
+            "    try:\n"
+            "        f()\n"
+            "    except ValueError as exc:\n"
+            "        self._record(exc)\n",
+            False,
+        ),
+        # `%` on two integers is arithmetic. `DaveDecryptor._note_failure`
+        # rate-limits itself with one and hands its exception to
+        # `exc_info`, where the logging machinery renders the traceback --
+        # the correct spelling, and one this rule must not shout at.
+        (
+            "def _note_failure(self, error):\n"
+            "    if self.failures % 50 == 0:\n"
+            "        log.warning('could not decrypt %d frames', self.failures, exc_info=error)\n"
+            "def caller(self):\n"
+            "    try:\n"
+            "        f()\n"
+            "    except ValueError as error:\n"
+            "        self._note_failure(error)\n",
+            False,
+        ),
+    ],
+)
+def test_r7_catches_what_it_claims_to(module_source: str, flagged: bool) -> None:
+    """Shown to work on whole modules, because that is the scope it needs.
+
+    R7 is the one rule here that cannot be demonstrated on a single
+    expression: the mistake is a relationship between two of them.
+    """
+    module = ast.parse(module_source)
+    helpers = _formatting_log_helpers(module)
+    found = any(
+        isinstance(node, ast.Call)
+        and _called_helper(node) in helpers
+        and any(_direct_name(argument) in _EXCEPTION_NAMES for argument in node.args)
+        for node in ast.walk(module)
+    )
+    assert found is flagged
 
 
 @pytest.mark.parametrize(

@@ -6,12 +6,25 @@ and the id copied out of a context menu. `/setup` takes a channel and a
 role as typed command parameters instead, so Discord renders native
 pickers for both.
 
-It also configures the voice channel's permissions itself: Speak denied
-for `@everyone`, allowed for the consent role. That is deliberate, not
+One channel at a time, and **added** rather than substituted. A guild
+allows a list of recording channels, so running `/setup` for the second
+meeting room used to un-configure the first one silently -- a failure
+nobody notices until the meeting that should have been recorded was not.
+There is deliberately no `/setup remove`: removing a channel is
+`/config set voice_channel_ids <the list, minus one>`, and the reply
+prints the current list so that edit is a copy and a deletion rather than
+a lookup. A second command for one rare edit would be a second place
+where the list is written.
+
+It also configures the voice channels' permissions itself: Speak denied
+for `@everyone`, allowed for the consent role, on **every** allowed
+channel rather than only the one just named. That is deliberate, not
 incidental -- those two permission overwrites are the primary layer of the
 consent protection (Spec 3.1), and leaving that step to prose in an
 operations guide would put the one step nobody may get wrong into the
-hands of whoever reads the guide least carefully.
+hands of whoever reads the guide least carefully. A channel Sturnus may
+record in whose `@everyone` can still Speak is a hole in that protection
+whichever call added it.
 
 All the decisions -- what to write, what permissions to change, whether a
 role needs creating, what is still missing -- are computed by
@@ -31,7 +44,13 @@ from discord.ext import commands
 
 from sturnus.application.ports import Clock
 from sturnus.application.reconfigure import Reconfigure, ReconfigureResult
-from sturnus.application.setup_plan import PermissionChange, RoleAction, SetupPlan, plan_setup
+from sturnus.application.setup_plan import (
+    ChannelPermissions,
+    PermissionChange,
+    RoleAction,
+    SetupPlan,
+    plan_setup,
+)
 from sturnus.domain import settings
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.discord.config_cog import render_write_result
@@ -58,10 +77,10 @@ class SetupCog(commands.Cog):
 
     @app_commands.command(
         name="setup",
-        description="Guided setup: configures the voice channel, consent role and policy.",
+        description="Guided setup: adds a voice channel and configures consent role and policy.",
     )
     @app_commands.describe(
-        channel="Voice channel Sturnus should record",
+        channel="Voice channel to add to the list Sturnus may record in",
         policy_url="URL of the recording/consent policy shown to participants",
         policy_version="Version identifier of the policy currently in force",
         consent_role=(
@@ -91,9 +110,28 @@ class SetupCog(commands.Cog):
         # over the 3 second window for the initial response.
         await interaction.response.defer(ephemeral=True, thinking=True)
 
+        # The deprecated singular key is read alongside the required ones:
+        # a guild that has not been touched since the rename still has its
+        # channel there, and `/setup` must add to that list rather than
+        # start a new one beside it.
         current = {
-            key: await self._store.get_stored(guild.id, key) for key in settings.REQUIRED_KEYS
+            key: await self._store.get_stored(guild.id, key)
+            for key in settings.REQUIRED_KEYS | {settings.VOICE_CHANNEL_ID}
         }
+
+        list_error: str | None = None
+        try:
+            stored_channel_ids = settings.recording_channel_ids(current)
+        except settings.InvalidChannelList as exc:
+            # Only reachable through a direct `UPDATE` -- `ConfigStore.set`
+            # refuses an unparseable list at the write. Reported rather
+            # than swallowed, because the list this call goes on to write
+            # will not contain whatever the unreadable one meant.
+            list_error = (
+                f"The stored `{settings.VOICE_CHANNEL_IDS}` could not be read ({exc}), so "
+                "it is being replaced by the channels named below rather than added to."
+            )
+            stored_channel_ids = ()
 
         # Omitting `consent_role` must never be the destructive path (Spec
         # 10.1): the most natural way to re-run `/setup` is to repeat it
@@ -116,19 +154,22 @@ class SetupCog(commands.Cog):
         # stored role, otherwise nothing yet.
         role = consent_role if consent_role is not None else stored_role
 
-        everyone_overwrite = channel.overwrites_for(guild.default_role)
-        everyone_may_speak = everyone_overwrite.speak is not False
-        role_may_speak = role is not None and channel.overwrites_for(role).speak is True
+        # Every channel the guild will allow after this call, the new one
+        # included -- so the plan can report which of them still need the
+        # consent protection applied, not merely this one.
+        channel_permissions = self._read_permissions(
+            guild, role, (*stored_channel_ids, channel.id), named=channel
+        )
 
         plan = plan_setup(
             current=current,
             channel_id=channel.id,
+            stored_channel_ids=stored_channel_ids,
+            channel_permissions=channel_permissions,
             role_id=consent_role.id if consent_role is not None else None,
             stored_role_valid=stored_role is not None,
             policy_url=policy_url,
             policy_version=policy_version,
-            everyone_may_speak=everyone_may_speak,
-            role_may_speak=role_may_speak,
         )
 
         role_error: str | None = None
@@ -168,7 +209,7 @@ class SetupCog(commands.Cog):
             result = None
 
         applied, permission_errors = await self._apply_permission_changes(
-            channel, guild.default_role, role, plan.permission_changes
+            guild, guild.default_role, role, plan.permission_changes, named=channel
         )
 
         missing = list(plan.missing)
@@ -181,32 +222,96 @@ class SetupCog(commands.Cog):
                 applied,
                 permission_errors,
                 role_error,
+                list_error,
                 missing,
                 plan.role_action,
                 role,
+                plan.channel_ids,
                 result,
             ),
             ephemeral=True,
         )
 
+    def _resolve(
+        self, guild: discord.Guild, channel_id: int, named: discord.VoiceChannel
+    ) -> discord.VoiceChannel | None:
+        """The voice channel with this id, or `None` if there is no such thing.
+
+        `named` is the channel Discord's own picker resolved for this call,
+        and it is returned for its own id without a cache lookup -- the
+        object in hand is at least as good as anything the cache would
+        yield, and it is the one the administrator actually chose.
+        """
+        if channel_id == named.id:
+            return named
+        channel = guild.get_channel(channel_id)
+        return channel if isinstance(channel, discord.VoiceChannel) else None
+
+    def _read_permissions(
+        self,
+        guild: discord.Guild,
+        role: discord.Role | None,
+        channel_ids: tuple[int, ...],
+        *,
+        named: discord.VoiceChannel,
+    ) -> list[ChannelPermissions]:
+        """Reads each allowed channel's Speak overwrites, skipping what it cannot see.
+
+        A stored list can name a channel that has since been deleted, or one
+        this bot has no view of. Such an entry is left out rather than
+        guessed at: planning an overwrite for a channel that is not there
+        would only produce an error the administrator can do nothing about,
+        and it must not stop the channels that *do* exist from being fixed.
+        """
+        permissions: list[ChannelPermissions] = []
+        for channel_id in sorted(set(channel_ids)):
+            channel = self._resolve(guild, channel_id, named)
+            if channel is None:
+                continue
+            permissions.append(
+                ChannelPermissions(
+                    channel_id=channel_id,
+                    everyone_may_speak=(
+                        channel.overwrites_for(guild.default_role).speak is not False
+                    ),
+                    role_may_speak=(
+                        role is not None and channel.overwrites_for(role).speak is True
+                    ),
+                )
+            )
+        return permissions
+
     async def _apply_permission_changes(
         self,
-        channel: discord.VoiceChannel,
+        guild: discord.Guild,
         everyone: discord.Role,
         consent_role: discord.Role | None,
         changes: list[PermissionChange],
+        *,
+        named: discord.VoiceChannel,
     ) -> tuple[list[str], list[str]]:
         """Applies each overwrite independently; one failure never blocks the other.
 
         Returns the human-readable description of every change that
         succeeded, and of every one that did not -- a permission failure is
         reported, never swallowed, because a half-applied setup that claims
-        success is worse than one that admits it stopped.
+        success is worse than one that admits it stopped. That now holds
+        per *channel* as well as per overwrite: a guild whose second
+        meeting room the bot has no Manage Permissions on must still have
+        its first one configured, and must be told which one failed.
         """
         applied: list[str] = []
         errors: list[str] = []
         for change in changes:
             verb = "allow" if change.allow_speak else "deny"
+            channel = self._resolve(guild, change.channel_id, named)
+            if channel is None:
+                errors.append(
+                    f"Could not {verb} Speak in <#{change.channel_id}>: it is not a voice "
+                    "channel I can see. Remove it with "
+                    f"`/config set {settings.VOICE_CHANNEL_IDS} <the remaining ids>`."
+                )
+                continue
             target: discord.Role | None
             label: str
             if change.target == "everyone":
@@ -215,9 +320,10 @@ class SetupCog(commands.Cog):
                 target, label = consent_role, "the consent role"
                 if target is None:
                     errors.append(
-                        f"Could not {verb} Speak for the consent role: no consent role "
-                        "exists yet. Create one and run /setup again, or set it manually "
-                        f"and run `/config set {settings.CONSENT_ROLE_ID} <role id>`."
+                        f"Could not {verb} Speak for the consent role in "
+                        f"{channel.mention}: no consent role exists yet. Create one and "
+                        "run /setup again, or set it manually and run "
+                        f"`/config set {settings.CONSENT_ROLE_ID} <role id>`."
                     )
                     continue
 
@@ -231,13 +337,14 @@ class SetupCog(commands.Cog):
                 await channel.set_permissions(target, overwrite=overwrite, reason=_AUDIT_REASON)
             except discord.Forbidden:
                 errors.append(
-                    f"Could not {verb} Speak for {label}: I am missing the Manage "
-                    "Permissions permission on this channel. Set it manually."
+                    f"Could not {verb} Speak for {label} in {channel.mention}: I am "
+                    "missing the Manage Permissions permission on that channel. Set it "
+                    "manually."
                 )
             except discord.HTTPException as exc:
-                errors.append(f"Could not {verb} Speak for {label}: {exc}")
+                errors.append(f"Could not {verb} Speak for {label} in {channel.mention}: {exc}")
             else:
-                applied.append(f"{verb.capitalize()}ed Speak for {label}.")
+                applied.append(f"{verb.capitalize()}ed Speak for {label} in {channel.mention}.")
         return applied, errors
 
 
@@ -246,17 +353,23 @@ def _render_summary(
     applied_permissions: list[str],
     permission_errors: list[str],
     role_error: str | None,
+    list_error: str | None,
     missing: list[str],
     role_action: RoleAction,
     role: discord.Role | None,
+    channel_ids: tuple[int, ...],
     result: ReconfigureResult | None,
 ) -> str:
     """Builds the ephemeral reply: what changed, what did not, what is still missing.
 
-    Names keys, never values: today's six required keys hold nothing
-    sensitive, but this summary is written so that stays true even if a
-    future key does -- it reports *that* `policy_url` was written, not what
-    it was written to.
+    Names keys, never values -- with one deliberate exception: the list of
+    allowed channels is printed in full. Today's required keys hold nothing
+    sensitive, but this summary is otherwise written so that stays true
+    even if a future key does; it reports *that* `policy_url` was written,
+    not what it was written to. The channel list is different because it is
+    the one value an administrator has to edit by hand to remove an entry,
+    and making them go and look it up is how a stale channel stays in the
+    list -- channel ids are also already visible to anyone in the server.
 
     `role_action` is named explicitly (Spec 10.1): a re-run that silently
     replaced an already-working consent role with a fresh, empty one is
@@ -270,12 +383,16 @@ def _render_summary(
     else:
         lines.append("Configuration: nothing needed writing, everything was already correct.")
 
+    lines.append(_channel_list_line(channel_ids))
+
     lines.append(_role_action_line(role_action, role))
 
     lines.extend(applied_permissions)
     lines.extend(f"⚠️ {error}" for error in permission_errors)
     if role_error is not None:
         lines.append(f"⚠️ {role_error}")
+    if list_error is not None:
+        lines.append(f"⚠️ {list_error}")
 
     if missing:
         lines.append("**Still missing:** " + ", ".join(f"`{key}`" for key in sorted(missing)))
@@ -285,6 +402,31 @@ def _render_summary(
     lines.extend(_effect_lines(writes, result))
 
     return "\n".join(lines)
+
+
+def _channel_list_line(channel_ids: tuple[int, ...]) -> str:
+    """States the whole allowed list, and how to take a channel out of it.
+
+    `/setup` only ever adds, which is what stops a second meeting room from
+    un-configuring the first. That makes removal the operation with no
+    command of its own, so the reply hands over both halves of it: the list
+    as it now stands, and the one command that rewrites it. Copy, delete an
+    id, send.
+
+    The one-connection limit is stated here rather than left to the docs
+    because this is the moment somebody forms an expectation about it: they
+    have just named a second channel and are entitled to know that Sturnus
+    will not be in both at once.
+    """
+    mentions = " ".join(f"<#{channel_id}>" for channel_id in channel_ids)
+    ids = settings.render_channel_ids(channel_ids)
+    return (
+        f"Sturnus may now record in: {mentions}. It joins **one at a time** — a "
+        "Discord bot holds a single voice connection per server — and follows "
+        "whichever of them has the most consenting members until that session "
+        f"ends. To remove one, run `/config set {settings.VOICE_CHANNEL_IDS} {ids}` "
+        "with the id you no longer want deleted from the list."
+    )
 
 
 def _effect_lines(writes: dict[str, str], result: ReconfigureResult | None) -> list[str]:

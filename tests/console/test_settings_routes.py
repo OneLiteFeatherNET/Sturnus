@@ -232,16 +232,14 @@ async def test_the_listing_carries_every_key_with_its_metadata(
     body = await (await client.get(f"/api/guilds/{GUILD}/settings")).json()
 
     assert body["guild_id"] == str(GUILD)
-    assert {entry["key"] for entry in body["settings"]} == set(settings.DEFAULTS) | set(
-        settings.REQUIRED_KEYS
-    )
+    assert {entry["key"] for entry in body["settings"]} == set(settings.KNOWN_KEYS)
 
     grace = setting(body, "empty_grace_seconds")
     assert grace["required"] is False
     assert grace["integer"] is True
     assert grace["value"] == grace["default"]
 
-    channel = setting(body, "voice_channel_id")
+    channel = setting(body, "voice_channel_ids")
     assert channel["required"] is True
     assert channel["value"] is None
     assert channel["default"] is None
@@ -420,12 +418,14 @@ async def test_clearing_a_key_that_was_never_set_is_not_an_error(
     assert (await client.delete(f"/api/guilds/{GUILD}/settings/timezone")).status == 200
 
 
-@pytest.mark.parametrize("key", ["policy_version", "voice_channel_id"])
-async def test_a_required_key_may_not_be_cleared(
+@pytest.mark.parametrize("key", ["policy_version", "voice_channel_ids", "voice_channel_id"])
+async def test_a_key_with_no_default_may_not_be_cleared(
     aiohttp_client: AiohttpClientFactory, stores: Stores, key: str
 ) -> None:
     """There is no default to fall back to, so clearing it would stop the
-    guild recording rather than restore anything.
+    guild recording rather than restore anything. That holds for the
+    deprecated `voice_channel_id` too: a guild that has not moved to the
+    list key yet is still being served by it.
     """
     await stores.admins.replace(GUILD, [ANNA], T0)
     await stores.config.set(GUILD, key, "42", T0)
@@ -433,6 +433,35 @@ async def test_a_required_key_may_not_be_cleared(
     response = await client.delete(f"/api/guilds/{GUILD}/settings/{key}")
     assert response.status == 409
     assert await stores.config.get_stored(GUILD, key) == "42"
+
+
+@pytest.mark.parametrize("key", ["policy_version", "voice_channel_ids", "voice_channel_id"])
+async def test_the_listing_says_a_key_may_not_be_cleared_before_anybody_tries(
+    aiohttp_client: AiohttpClientFactory, stores: Stores, key: str
+) -> None:
+    """The other half of `test_a_key_with_no_default_may_not_be_cleared`.
+
+    The 409 is the right answer, and a page that had to provoke it to find
+    out is the wrong interface. `voice_channel_id` is the key that makes
+    this worth pinning: it is *not* required, so a console reading
+    clearability off `required` renders a live Clear button beside it and
+    then explains the refusal as "this key is required" on a field the
+    same page called optional.
+    """
+    await stores.admins.replace(GUILD, [ANNA], T0)
+    await stores.config.set(GUILD, key, "42", T0)
+    client = await signed_in_client(aiohttp_client, stores)
+    body = await (await client.get(f"/api/guilds/{GUILD}/settings")).json()
+    assert setting(body, key)["may_clear"] is False
+
+
+async def test_the_listing_offers_a_clear_for_a_key_with_a_default(
+    aiohttp_client: AiohttpClientFactory, stores: Stores
+) -> None:
+    await stores.admins.replace(GUILD, [ANNA], T0)
+    client = await signed_in_client(aiohttp_client, stores)
+    body = await (await client.get(f"/api/guilds/{GUILD}/settings")).json()
+    assert setting(body, "timezone")["may_clear"] is True
 
 
 async def test_clearing_an_unknown_key_is_not_found(
@@ -504,6 +533,6 @@ async def test_a_write_to_the_voice_channel_says_it_may_wait_for_the_recording(
     await stores.admins.replace(GUILD, [ANNA], T0)
     client = await signed_in_client(aiohttp_client, stores)
     response = await client.put(
-        f"/api/guilds/{GUILD}/settings/voice_channel_id", json={"value": "12345"}
+        f"/api/guilds/{GUILD}/settings/voice_channel_ids", json={"value": "12345"}
     )
     assert (await response.json())["setting"]["deferred_while_recording"] is True

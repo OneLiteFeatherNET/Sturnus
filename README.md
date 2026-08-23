@@ -2,20 +2,24 @@
 
 Discord voice transcription with Outline document output.
 
-Sturnus joins one dedicated voice channel per guild, records each
-participant's audio into a separate stream for the duration of the
-session, and — once the session ends — transcribes each stream with
-faster-whisper and assembles the results into a single chronological
-protocol, posted as a document in Outline and linked back into the
-channel's text chat.
+A guild names the voice channels Sturnus is allowed to record in, and
+Sturnus joins whichever of them is meeting: it records each participant's
+audio into a separate stream for the duration of the session, and — once
+the session ends — transcribes each stream with faster-whisper and
+assembles the results into a single chronological protocol, posted as a
+document in Outline and linked back into the channel's text chat. A
+Discord bot holds one voice connection per guild, so a list of allowed
+channels means "any of these, one at a time" rather than "all of these at
+once"; when two of them are busy, the one with the most consenting members
+wins and the other waits.
 
-Nobody may be recorded without consent: the recording channel denies
+Nobody may be recorded without consent: every recording channel denies
 `Speak` to `@everyone` and allows it only for a role granted through
 `/consent`, and the bot additionally drops any audio packet from a user
 who does not hold that role, even if Discord permissions alone would have
 let it through (guild administrators bypass channel overwrites). See
 [docs/operations.md](docs/operations.md) for why a non-recorded channel
-must also exist alongside it.
+must also exist alongside them.
 
 Recordings are encrypted before they ever leave the pod and are kept only
 for a configured retention window to allow reprocessing a poor

@@ -64,15 +64,27 @@ class ConfigStore:
     async def set(self, guild_id: int, key: str, value: str | None, now: datetime) -> None:
         """Sets a value; `None` removes it and restores the default.
 
-        `key` must be a known key — a member of `DEFAULTS` or `REQUIRED_KEYS` —
+        `key` must be a known key — a member of `settings.KNOWN_KEYS` —
         otherwise a typo would silently store a setting nobody reads.
 
         For a known integer key, the value must parse as a positive integer.
         Rejecting a bad value here keeps the read path (`_int`) reachable
         only with data that is already known to be sane.
+
+        `voice_channel_ids` is validated for the same reason and at the
+        same moment, by the parser the bot itself reads it with. A list
+        that cannot be parsed must be refused at the write, where an
+        administrator is looking at the reply — discovering it at the join
+        means a guild that reports itself configured and records nothing.
         """
-        if key not in settings.DEFAULTS and key not in settings.REQUIRED_KEYS:
+        if key not in settings.KNOWN_KEYS:
             raise ValueError(f"unknown configuration key {key!r}")
+
+        if value is not None and key == settings.VOICE_CHANNEL_IDS:
+            # Raises `settings.InvalidChannelList`, which is a `ValueError`
+            # — so `/config set` and the console's 400 both catch it
+            # already, and it says which entry it could not read.
+            settings.parse_channel_ids(value)
 
         if value is not None and key in settings.INTEGER_KEYS:
             try:

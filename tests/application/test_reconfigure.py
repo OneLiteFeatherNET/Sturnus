@@ -21,7 +21,7 @@ CHANNEL, ROLE = 100, 200
 
 def config(
     *,
-    channel_id: int = CHANNEL,
+    channel_ids: tuple[int, ...] = (CHANNEL,),
     role_id: int = ROLE,
     empty_grace_seconds: int = 60,
     idle_timeout_minutes: int = 15,
@@ -29,7 +29,7 @@ def config(
     retention_days: int = 30,
 ) -> GuildRuntimeConfig:
     return GuildRuntimeConfig(
-        channel_id=channel_id,
+        channel_ids=channel_ids,
         role_id=role_id,
         timeouts=SessionTimeouts(
             empty_grace_seconds=empty_grace_seconds,
@@ -98,18 +98,20 @@ def test_retention_is_a_tunable_too() -> None:
 
 
 def test_identity_changed_while_idle() -> None:
-    plan = plan_reconfigure(current=config(), desired=config(channel_id=999), is_recording=False)
+    plan = plan_reconfigure(
+        current=config(), desired=config(channel_ids=(999,)), is_recording=False
+    )
     assert plan.action is ReconfigureAction.RETARGET
     assert plan.retune is True
-    assert plan.applied_keys == (settings.VOICE_CHANNEL_ID,)
+    assert plan.applied_keys == (settings.VOICE_CHANNEL_IDS,)
     assert plan.deferred_keys == ()
 
 
 def test_identity_changed_while_recording_is_deferred() -> None:
     """The load-bearing row: the channel waits, so the recording survives."""
-    plan = plan_reconfigure(current=config(), desired=config(channel_id=999), is_recording=True)
+    plan = plan_reconfigure(current=config(), desired=config(channel_ids=(999,)), is_recording=True)
     assert plan.action is ReconfigureAction.DEFER_RETARGET
-    assert plan.deferred_keys == (settings.VOICE_CHANNEL_ID,)
+    assert plan.deferred_keys == (settings.VOICE_CHANNEL_IDS,)
 
 
 def test_a_deferred_identity_change_does_not_hold_up_the_tunables() -> None:
@@ -120,13 +122,13 @@ def test_a_deferred_identity_change_does_not_hold_up_the_tunables() -> None:
     """
     plan = plan_reconfigure(
         current=config(),
-        desired=config(channel_id=999, idle_timeout_minutes=5),
+        desired=config(channel_ids=(999,), idle_timeout_minutes=5),
         is_recording=True,
     )
     assert plan.action is ReconfigureAction.DEFER_RETARGET
     assert plan.retune is True
     assert plan.applied_keys == (settings.IDLE_TIMEOUT_MINUTES,)
-    assert plan.deferred_keys == (settings.VOICE_CHANNEL_ID,)
+    assert plan.deferred_keys == (settings.VOICE_CHANNEL_IDS,)
 
 
 def test_the_consent_role_moves_with_the_channel_not_with_the_tunables() -> None:
@@ -143,7 +145,27 @@ def test_the_consent_role_moves_with_the_channel_not_with_the_tunables() -> None
 
 def test_both_identity_keys_change_at_once() -> None:
     plan = plan_reconfigure(
-        current=config(), desired=config(channel_id=9, role_id=8), is_recording=False
+        current=config(), desired=config(channel_ids=(9,), role_id=8), is_recording=False
     )
     assert plan.action is ReconfigureAction.RETARGET
     assert plan.applied_keys == IDENTITY_KEYS
+
+
+def test_adding_a_second_allowed_channel_is_an_identity_change() -> None:
+    """A list change decides which channels a session may open against, so
+    it is deferred behind a recording exactly as a channel move always was."""
+    plan = plan_reconfigure(
+        current=config(), desired=config(channel_ids=(CHANNEL, 999)), is_recording=True
+    )
+    assert plan.action is ReconfigureAction.DEFER_RETARGET
+    assert plan.deferred_keys == (settings.VOICE_CHANNEL_IDS,)
+
+
+def test_the_same_channels_in_a_different_order_are_not_a_change() -> None:
+    """`parse_channel_ids` sorts, so re-typing a list cannot retarget a guild."""
+    plan = plan_reconfigure(
+        current=config(channel_ids=(10, 20)),
+        desired=config(channel_ids=(10, 20)),
+        is_recording=False,
+    )
+    assert plan.action is ReconfigureAction.NOTHING

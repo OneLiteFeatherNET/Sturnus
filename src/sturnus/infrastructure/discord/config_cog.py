@@ -39,8 +39,11 @@ from sturnus.infrastructure.discord.permissions import require_admin
 
 log = logging.getLogger(__name__)
 
-#: Every key `ConfigStore.set` accepts — the same union it validates against.
-_KNOWN_KEYS: frozenset[str] = frozenset(settings.DEFAULTS) | settings.REQUIRED_KEYS
+#: Every key `ConfigStore.set` accepts — the registry itself, not a second
+#: union assembled here. A command offering a key the store refuses renders
+#: an option that can never be saved; one hiding a key the store accepts
+#: makes a setting reachable only from the console.
+_KNOWN_KEYS: frozenset[str] = settings.KNOWN_KEYS
 
 #: Re-exported from `sturnus.application.reconfigure`, which is where the
 #: fact now lives: "read once at process start" is a property of how the bot
@@ -70,11 +73,19 @@ _EXCEEDED_WARNING = (
 async def missing_required(store: ConfigStore, guild_id: int) -> list[str]:
     """Lists required keys that have neither a stored value nor a default.
 
-    Sorted so repeated calls and command output stay stable — `REQUIRED_KEYS`
-    is a frozenset and offers no ordering guarantee of its own.
+    The decision itself is `settings.missing_required`, in the domain,
+    because it is not a simple per-key test any more: the recording
+    channels are one requirement with two spellings (`voice_channel_ids`
+    and the `voice_channel_id` it replaced), satisfied by either and
+    reported under the current one. The console asks the same question of
+    the same function, and a second copy of that rule is how one of them
+    starts telling an administrator to configure a deprecated key.
+
+    Sorted so repeated calls and command output stay stable — the answer is
+    a frozenset and offers no ordering guarantee of its own.
     """
-    missing = [key for key in settings.REQUIRED_KEYS if await store.get(guild_id, key) is None]
-    return sorted(missing)
+    snapshot = await store.snapshot(guild_id)
+    return sorted(settings.missing_required(snapshot))
 
 
 async def _effective(store: ConfigStore, guild_id: int, key: str) -> tuple[str | None, str]:
@@ -134,7 +145,7 @@ class ConfigCog(
     @app_commands.command(
         name="get", description="Show the effective value of a configuration key."
     )
-    @app_commands.describe(key="Configuration key, e.g. voice_channel_id")
+    @app_commands.describe(key="Configuration key, e.g. voice_channel_ids")
     @require_admin()
     async def get(self, interaction: discord.Interaction, key: str) -> None:
         guild_id = interaction.guild_id
@@ -226,6 +237,12 @@ class ConfigCog(
             lines.append("**Missing required keys:** " + ", ".join(f"`{k}`" for k in missing))
         else:
             lines.append("All required keys are set.")
+        deprecation = _deprecation_line(
+            await self._store.get_stored(guild_id, settings.VOICE_CHANNEL_IDS),
+            await self._store.get_stored(guild_id, settings.VOICE_CHANNEL_ID),
+        )
+        if deprecation is not None:
+            lines.append(deprecation)
         # The line that stops this command from insisting a value is in use
         # when the running process is still on the previous one.
         lines.append(render_running_state(self._running_state(guild_id), bool(missing)))
@@ -301,7 +318,13 @@ def _effect_sentence(key: str, result: ReconfigureResult) -> str:
             "normally, and then Sturnus stops watching that channel. "
             "**The recording will not be lost.**"
         )
-    if key in result.deferred_keys:
+    # Through `canonical_key`, because `voice_channel_id` and
+    # `voice_channel_ids` are one setting wearing two names: a write to the
+    # old one produces a reconcile result naming the new one, and comparing
+    # the raw strings would tell an administrator their change is in force
+    # while the bot is still recording the old channel.
+    deferred = {settings.canonical_key(each) for each in result.deferred_keys}
+    if settings.canonical_key(key) in deferred:
         return (
             "Stored — but a recording is in progress in the old channel. It takes "
             f"effect when that session ends (at the latest after "
@@ -322,8 +345,39 @@ def _effect_sentence(key: str, result: ReconfigureResult) -> str:
     )
 
 
+def _deprecation_line(stored_list: str | None, stored_legacy: str | None) -> str | None:
+    """Tells a guild still on `voice_channel_id` that it has been superseded.
+
+    The old key stays readable indefinitely, so nothing forces this and
+    nothing ever will — which is exactly why it has to be *said*. A setting
+    that silently keeps working under a name nobody documents any more is a
+    setting whose next reader has to go and find out why the two exist.
+
+    Two different sentences, because they are two different situations: a
+    guild on the old key alone is still being served by it, while a guild
+    with both set has a row that is doing nothing at all and is entitled to
+    know which of the two values the bot is actually using.
+    """
+    if stored_legacy is None:
+        return None
+    if stored_list is None:
+        return (
+            f"⚠️ This server is still on `{settings.VOICE_CHANNEL_ID}`, which "
+            f"`{settings.VOICE_CHANNEL_IDS}` replaced. It keeps working and will keep "
+            "working, but only the new key can name more than one channel — move over "
+            f"with `/config set {settings.VOICE_CHANNEL_IDS} {stored_legacy}` or by "
+            "running `/setup` again."
+        )
+    return (
+        f"ℹ️ `{settings.VOICE_CHANNEL_ID}` is set as well and is being **ignored** — "
+        f"`{settings.VOICE_CHANNEL_IDS}` wins whenever both exist. Clear the old one "
+        f"with `/config clear {settings.VOICE_CHANNEL_ID}` to stop it confusing the "
+        "next person who reads this."
+    )
+
+
 def render_running_state(state: RunningState, has_missing_keys: bool) -> str:
-    """The `/config show` line about what the process is *doing*, not storing."""
+    """The `/config show` lines about what the process is *doing*, not storing."""
     if not state.is_live:
         if has_missing_keys:
             return (
@@ -334,18 +388,49 @@ def render_running_state(state: RunningState, has_missing_keys: bool) -> str:
             "Running configuration: not applied yet — Sturnus is not watching this "
             "server. `/config apply` re-reads immediately."
         )
+    lines = [_channel_service_line(state)]
     if state.pending_teardown:
-        return (
+        lines.append(
             "Running configuration: a recording is in progress; when it ends "
             "Sturnus stops watching this server."
         )
-    if state.pending_keys:
+    elif state.pending_keys:
         keys = ", ".join(f"`{key}`" for key in state.pending_keys)
-        return (
+        lines.append(
             f"Running configuration: {len(state.pending_keys)} key(s) waiting for the "
             f"current recording to end: {keys}."
         )
-    return "Running configuration: in effect."
+    else:
+        lines.append("Running configuration: in effect.")
+    return "\n".join(lines)
+
+
+def _channel_service_line(state: RunningState) -> str:
+    """Says which allowed channel is being served, and which are not.
+
+    The question this answers is asked by somebody sitting in the second
+    allowed room wondering why the bot is not there. Without it the honest
+    answer — "it is in the other room, because more consenting people are
+    in it, and it can only be in one" — is available nowhere an
+    administrator can reach it.
+    """
+    served = f"<#{state.channel_id}>" if state.channel_id is not None else "no channel"
+    others = tuple(
+        channel_id for channel_id in state.allowed_channel_ids if channel_id != state.channel_id
+    )
+    if not others:
+        return f"Recording channel: {served}."
+    waiting = set(state.waiting_channel_ids)
+    rendered = ", ".join(
+        f"<#{channel_id}>" + (" (people waiting)" if channel_id in waiting else "")
+        for channel_id in others
+    )
+    return (
+        f"Recording channel: {served} — also allowed, but not being recorded right "
+        f"now: {rendered}. Sturnus holds one voice connection per server, so it "
+        "records whichever allowed channel has the most consenting members and "
+        "follows that one until its session ends."
+    )
 
 
 def render_apply_result(result: ReconfigureResult | None, *, force: bool) -> str:
