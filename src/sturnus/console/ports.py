@@ -587,6 +587,34 @@ class ConsentHolder:
 
 
 @dataclass(frozen=True)
+class ConsentPage:
+    """One window of a guild's consent roster, and how many people it has.
+
+    The same four fields `sturnus.console.statistics.SessionPage` carries,
+    deliberately: this API has one shape for a paged list, and a second
+    one would be a second thing for every client to learn. The total
+    travels with the rows for the reason it does there -- a count fetched
+    by a separate request can be one grant older than the page beside it,
+    and a roster reading "1-20 of 47" while holding twenty-one people is
+    worse than one that says nothing.
+
+    **The order is the statement's, not the reader's.** Everything below
+    the first page depends on it: a listing whose order two statements
+    disagree about is a listing that silently skips somebody between page
+    one and page two. `ConsoleConsentDirectory.holders` names the key and
+    the tiebreak.
+    """
+
+    holders: tuple[ConsentHolder, ...]
+    #: How many people this guild holds a consent record for, not how many
+    #: are on this page. One person who granted, withdrew and granted
+    #: again is three `consent` rows and one here.
+    total: int
+    limit: int
+    offset: int
+
+
+@dataclass(frozen=True)
 class RevocationOutcome:
     """What a revocation did, or why it did nothing."""
 
@@ -608,6 +636,21 @@ class RevocationOutcome:
     #: (`/audio purge`). Zero for a revocation dated now or later, which
     #: is the ordinary case.
     recordings_from_effective_at: int = 0
+
+
+@dataclass(frozen=True)
+class PersonRevocation:
+    """What one person's withdrawal did, inside a batch of them.
+
+    A pair rather than a wider `RevocationOutcome` with an id on it: the
+    outcome of a withdrawal is the same thing whether one person or nine
+    were named, and giving it a second shape for the batch case would be
+    two definitions of what a revocation answers, agreeing right up until
+    one of them changed.
+    """
+
+    discord_user_id: int
+    outcome: RevocationOutcome
 
 
 class ConsentDirectory(Protocol):
@@ -635,9 +678,13 @@ class ConsentDirectory(Protocol):
     so, in the interface, next to the button.
     """
 
+    #: One window of the roster. `limit` and `offset` are required and
+    #: have no defaults, so there is no call here that reads a whole
+    #: guild -- the narrowest thing this protocol can express is already
+    #: bounded, and nothing wider exists for a handler to reach for.
     async def holders(
-        self, guild_id: int, *, requested_by: int
-    ) -> Sequence[ConsentHolder] | None: ...
+        self, guild_id: int, *, requested_by: int, limit: int, offset: int
+    ) -> ConsentPage | None: ...
 
     #: `effective_at` is the instant the consent stops, and `None` means
     #: now -- which is what every caller meant before it existed, so no
@@ -653,6 +700,23 @@ class ConsentDirectory(Protocol):
         requested_by: int,
         effective_at: datetime | None = None,
     ) -> RevocationOutcome | None: ...
+
+    #: Several people, one instant, one answer per person **in the order
+    #: they were named**. Partial success is the ordinary case rather
+    #: than the exception here: one name whose consent a colleague
+    #: withdrew five minutes ago must not refuse the eight withdrawals
+    #: beside it, so each is decided on its own and each is reported on
+    #: its own. Whether a person may be *asked about* is still one
+    #: decision for the whole call, and it is the same one `revoke`
+    #: makes: `None` for "no such guild" and "not yours" alike.
+    async def revoke_many(
+        self,
+        guild_id: int,
+        discord_user_ids: Sequence[int],
+        *,
+        requested_by: int,
+        effective_at: datetime | None = None,
+    ) -> Sequence[PersonRevocation] | None: ...
 
 
 @dataclass(frozen=True)

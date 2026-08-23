@@ -26,6 +26,7 @@ from sturnus.console.ports import (
     CollectionNames,
     ConsentDirectory,
     ConsentHolder,
+    ConsentPage,
     DownloadableTrack,
     GuildDirectory,
     GuildNames,
@@ -36,6 +37,7 @@ from sturnus.console.ports import (
     OAuthClient,
     OwnConsent,
     PersonalConsents,
+    PersonRevocation,
     PreferenceDirectory,
     ProfileDirectory,
     QueueControl,
@@ -554,9 +556,18 @@ class FakeConsents:
         self,
         holders: Sequence[ConsentHolder] | None = None,
         outcome: RevocationOutcome | None = None,
+        page: ConsentPage | None = None,
+        revocations: Sequence[PersonRevocation] | None = None,
     ) -> None:
+        #: Either a whole page a test built, or the people it wants on
+        #: one. `holders=` is kept beside `page=` because most tests care
+        #: about what a row says and not about the window it arrived in,
+        #: and spelling out a `ConsentPage` in each of them would bury the
+        #: assertion under the envelope.
         self.holders_by_guild = None if holders is None else tuple(holders)
+        self.page = page
         self.outcome = outcome
+        self.revocations = None if revocations is None else tuple(revocations)
         #: Every revocation this was asked for, as (guild, subject, actor).
         #: Recorded rather than merely counted: "the administrator's own id
         #: reached the write, not one taken from the URL" is the property
@@ -565,10 +576,29 @@ class FakeConsents:
         self.revoked: list[tuple[int, int, int]] = []
         self.effective_instants: list[datetime | None] = []
         self.listed: list[tuple[int, int]] = []
+        #: Every window asked for, as (limit, offset). The handler taking
+        #: its window from the query string rather than defaulting one of
+        #: its own is invisible in a response body the fake also decides.
+        self.windows: list[tuple[int, int]] = []
+        #: Every batch, as (guild, subjects, actor).
+        self.batches: list[tuple[int, tuple[int, ...], int]] = []
+        self.batch_instants: list[datetime | None] = []
 
-    async def holders(self, guild_id: int, *, requested_by: int) -> Sequence[ConsentHolder] | None:
+    async def holders(
+        self, guild_id: int, *, requested_by: int, limit: int, offset: int
+    ) -> ConsentPage | None:
         self.listed.append((guild_id, requested_by))
-        return self.holders_by_guild
+        self.windows.append((limit, offset))
+        if self.page is not None:
+            return self.page
+        if self.holders_by_guild is None:
+            return None
+        return ConsentPage(
+            holders=self.holders_by_guild,
+            total=len(self.holders_by_guild),
+            limit=limit,
+            offset=offset,
+        )
 
     async def revoke(
         self,
@@ -584,6 +614,18 @@ class FakeConsents:
         #: the authorisation tests already read.
         self.effective_instants.append(effective_at)
         return self.outcome
+
+    async def revoke_many(
+        self,
+        guild_id: int,
+        discord_user_ids: Sequence[int],
+        *,
+        requested_by: int,
+        effective_at: datetime | None = None,
+    ) -> Sequence[PersonRevocation] | None:
+        self.batches.append((guild_id, tuple(discord_user_ids), requested_by))
+        self.batch_instants.append(effective_at)
+        return self.revocations
 
 
 class FakePersonalConsents:

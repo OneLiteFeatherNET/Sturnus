@@ -24,9 +24,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import Row, delete, func, or_, select
+from sqlalchemy import Row, case, delete, distinct, func, or_, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.sql import Subquery
 
 from sturnus.application.collection_mirror import MirroredCollection
 from sturnus.application.directory_mirror import (
@@ -41,11 +42,13 @@ from sturnus.console.ports import (
     AdminDirectory,
     CollectionListing,
     ConsentHolder,
+    ConsentPage,
     DownloadableTrack,
     GuildDirectory,
     GuildQueue,
     GuildRecording,
     OwnConsent,
+    PersonRevocation,
     QueuedSession,
     QueueSnapshot,
     QueueSpeaker,
@@ -641,6 +644,92 @@ class _ConsentRow:
     scope: ConsentScope
 
 
+@dataclass(frozen=True)
+class _RosterRow:
+    """One line of a guild's roster, as the paged statement returns it.
+
+    The consent and the name arrive together because the order is over
+    both: sorting by a name fetched in a second statement would order the
+    page by one set of names and label it with another, and the two can
+    differ by a session that started between them.
+    """
+
+    discord_user_id: int
+    #: `None` for somebody who consented and has not been in a recorded
+    #: session since -- `consent` stores no name, and `session_participant`
+    #: is the only place one exists.
+    display_name: str | None
+    consent: _ConsentRow
+
+
+def _newest_consent_per_person(guild_id: int) -> Subquery:
+    """Every person in this guild with their current grant, and nothing else.
+
+    A window function rather than the read-everything-and-fold-in-Python
+    this replaced. The fold could not be paged: it had to load every
+    `consent` row the guild ever wrote in order to decide which of them
+    were current, which is the read this whole change exists to stop.
+
+    `granted_at` descending is the rule `ConsentRepository.current`
+    applies, and the console must show the row the recorder acts on
+    rather than a different one. `id` descending is a tiebreak the
+    repository does not have: two grants at the same instant are not a
+    thing that happens, and a partition whose winner the planner picks is
+    a roster that changes between two refreshes for no reason.
+    """
+    return (
+        select(
+            Consent.discord_user_id.label("discord_user_id"),
+            Consent.granted_at.label("granted_at"),
+            Consent.revoked_at.label("revoked_at"),
+            Consent.policy_version.label("policy_version"),
+            Consent.scope.label("scope"),
+            func.row_number()
+            .over(
+                partition_by=Consent.discord_user_id,
+                order_by=(Consent.granted_at.desc(), Consent.id.desc()),
+            )
+            .label("recency"),
+        )
+        .where(Consent.guild_id == guild_id)
+        .subquery()
+    )
+
+
+def _latest_display_name_per_person(guild_id: int) -> Subquery:
+    """The name each person last appeared under in this guild.
+
+    `consent` stores no name, and a page of eighteen-digit numbers is not
+    a page an administrator can act on. The most recent
+    `session_participant` row is the closest thing the system holds -- the
+    name at the time of somebody's last recorded meeting -- and it is
+    scoped to this guild, because a display name is per-guild and
+    borrowing one from another guild would put a nickname from somewhere
+    else next to a decision about this one.
+
+    `id` descending breaks a tie between two sessions that started at the
+    same instant. The fold this replaced had no tiebreak at all, so which
+    of two simultaneous names it showed was the planner's to decide --
+    tolerable when the name was only a label, and not tolerable now that
+    the roster is *ordered* by it.
+    """
+    return (
+        select(
+            SessionParticipant.discord_user_id.label("discord_user_id"),
+            SessionParticipant.discord_display_name.label("display_name"),
+            func.row_number()
+            .over(
+                partition_by=SessionParticipant.discord_user_id,
+                order_by=(SessionRow.started_at.desc(), SessionParticipant.id.desc()),
+            )
+            .label("recency"),
+        )
+        .join(SessionRow, SessionRow.id == SessionParticipant.session_id)
+        .where(SessionRow.guild_id == guild_id)
+        .subquery()
+    )
+
+
 class ConsoleConsentDirectory:
     """Who has consented in a guild, and an administrator's power to end it.
 
@@ -690,53 +779,80 @@ class ConsoleConsentDirectory:
         self._now = now
 
     async def holders(
-        self, guild_id: int, *, requested_by: int
-    ) -> tuple[ConsentHolder, ...] | None:
+        self, guild_id: int, *, requested_by: int, limit: int, offset: int
+    ) -> ConsentPage | None:
+        """One window of the guild's roster, and how many people are on it.
+
+        **The order is the statement's, and it is total.** It used to be
+        the browser's -- the whole roster went over the wire and
+        `~/utils/consents` sorted it -- which a paged endpoint cannot do:
+        page two is a window onto a result set, and a window onto rows the
+        planner ordered as it pleased skips people between one page and
+        the next. So the key moves into SQL, and it ends at
+        `discord_user_id`, which is unique per person per guild: no two
+        rows can ever compare equal, so no two statements can disagree.
+
+        The key itself is the display name, case-insensitively, with the
+        nameless people last. That is what the reader is doing here --
+        somebody arrives having been asked about a *person* and scans for
+        a name -- and a bare snowflake is not something anybody scans for,
+        so the nameless rows lose nothing at the bottom and every named
+        row above them gains.
+
+        **What is deliberately *not* in the key is `active`.** The console
+        listed the people still being recorded first, and that cannot
+        survive paging even in principle. `active` is
+        `is_consent_active(row, policy_version, now)`: a function of a
+        setting that is not on the row and of the clock. Ordering by it in
+        SQL would be a second implementation of a domain rule -- the one
+        thing `ConsentHolder.active` exists to prevent -- and it would not
+        even be stable, because a scheduled withdrawal firing between two
+        page loads moves somebody across the boundary and out of the
+        window. A filter is the honest way to ask that question, and this
+        change deliberately adds none.
+        """
         if not await self._admins.is_admin(guild_id, requested_by):
             return None
 
-        newest = await self._newest_consent_per_person(guild_id)
-        if not newest:
-            return ()
-
-        people = tuple(newest)
-        names = await self._latest_display_names(guild_id, people)
-        held = await self._recordings_with_audio(guild_id, people)
-        # Read once for the whole listing rather than per person: whether
-        # a grant is still active depends on the guild's current policy
+        total, rows = await self._roster_page(guild_id, limit, offset)
+        people = tuple(row.discord_user_id for row in rows)
+        held = await self._recordings_with_audio(guild_id, people) if people else {}
+        # Read once for the whole page rather than per person: whether a
+        # grant is still active depends on the guild's current policy
         # version, and that is one value, not one per row.
         policy = (await self._config.snapshot(guild_id)).get(settings.POLICY_VERSION, "")
 
-        return tuple(
-            ConsentHolder(
-                discord_user_id=discord_user_id,
-                display_name=names.get(discord_user_id),
-                policy_version=row.policy_version,
-                granted_at=row.granted_at,
-                revoked_at=row.revoked_at,
-                # The domain's rule, not a reimplementation of it. An
-                # administrator must be shown the same verdict the
-                # recorder acts on -- including the case nobody expects,
-                # where a policy bump has quietly ended a consent nobody
-                # withdrew.
-                active=is_consent_active(
-                    ConsentRecord(
-                        granted_at=row.granted_at,
-                        revoked_at=row.revoked_at,
-                        policy_version=row.policy_version,
-                        scope=row.scope,
+        return ConsentPage(
+            holders=tuple(
+                ConsentHolder(
+                    discord_user_id=row.discord_user_id,
+                    display_name=row.display_name,
+                    policy_version=row.consent.policy_version,
+                    granted_at=row.consent.granted_at,
+                    revoked_at=row.consent.revoked_at,
+                    # The domain's rule, not a reimplementation of it. An
+                    # administrator must be shown the same verdict the
+                    # recorder acts on -- including the case nobody
+                    # expects, where a policy bump has quietly ended a
+                    # consent nobody withdrew.
+                    active=is_consent_active(
+                        ConsentRecord(
+                            granted_at=row.consent.granted_at,
+                            revoked_at=row.consent.revoked_at,
+                            policy_version=row.consent.policy_version,
+                            scope=row.consent.scope,
+                        ),
+                        policy,
+                        self._now(),
                     ),
-                    policy,
-                    self._now(),
-                ),
-                recordings_with_audio=held.get(discord_user_id, 0),
-                scope=row.scope.value,
-            )
-            # By id, so two page loads agree. What order a *person*
-            # wants to read this in is the console's decision, made in
-            # `~/utils/consents` where it can be tested without a
-            # database.
-            for discord_user_id, row in sorted(newest.items())
+                    recordings_with_audio=held.get(row.discord_user_id, 0),
+                    scope=row.consent.scope.value,
+                )
+                for row in rows
+            ),
+            total=total,
+            limit=limit,
+            offset=offset,
         )
 
     async def revoke(
@@ -777,80 +893,152 @@ class ConsoleConsentDirectory:
             effective_at,
         )
 
-    async def _newest_consent_per_person(self, guild_id: int) -> dict[int, _ConsentRow]:
-        """The newest grant per person in this guild.
+    async def revoke_many(
+        self,
+        guild_id: int,
+        discord_user_ids: Sequence[int],
+        *,
+        requested_by: int,
+        effective_at: datetime | None = None,
+    ) -> tuple[PersonRevocation, ...] | None:
+        """Withdraws several people's consent, one decision at a time.
 
-        Ordered and folded rather than a window function, and ordered by
-        `granted_at` descending because that is the rule
-        `ConsentRepository.current` applies -- the console must show the
-        row the recorder acts on, not a different one. `id` descending is
-        added as a tiebreak the repository does not have: two grants at
-        the same instant are not a thing that happens, and a listing whose
-        order the planner decides is a listing that changes between two
-        refreshes for no reason.
+        **One transaction per person, deliberately, and not one for the
+        batch.** The argument for all-or-nothing is that a half-applied
+        request is hard to reason about; it does not hold here, for three
+        reasons that all point the same way.
+
+        The first is what a partial failure actually *is*. The refusals
+        this can produce -- `no_consent_on_record`, `already_revoked`,
+        `effective_before_grant` -- all mean "that person is not in the
+        state you thought". A roster is read, an administrator ticks nine
+        boxes, and by the time they press the button a colleague has
+        already withdrawn one of the nine. All-or-nothing answers that by
+        leaving eight people being recorded, which is the one outcome
+        nobody asked for: consent is not a thing to leave in force
+        because a tenth name was stale.
+
+        The second is that there is no invariant to protect. Atomicity
+        buys a caller the guarantee that some rule spanning the rows
+        still holds afterwards, and no rule spans two people's consents:
+        each `consent` row is one person's decision about themselves, and
+        a batch is a convenience for an administrator's hand rather than
+        a unit of meaning in the data.
+
+        The third is that a retry is safe. `record_revocation` stamps the
+        newest row or does nothing, so re-sending a whole batch after a
+        partial application writes nothing twice -- the people already
+        withdrawn answer `already_revoked`, which is exactly what they
+        are. A caller who wants all-or-nothing can build it out of this;
+        a caller given all-or-nothing could not have built this out of
+        that.
+
+        The authorisation, by contrast, *is* one decision for the whole
+        call. It is a fact about the asker rather than about any person
+        named, and asking it once per name would be one question answered
+        `n` times.
         """
-        async with self._session_factory() as db:
-            rows = (
-                await db.execute(
-                    select(
-                        Consent.discord_user_id,
-                        Consent.granted_at,
-                        Consent.revoked_at,
-                        Consent.policy_version,
-                        Consent.scope,
-                    )
-                    .where(Consent.guild_id == guild_id)
-                    .order_by(
-                        Consent.discord_user_id,
-                        Consent.granted_at.desc(),
-                        Consent.id.desc(),
-                    )
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+        done: list[PersonRevocation] = []
+        for discord_user_id in discord_user_ids:
+            done.append(
+                PersonRevocation(
+                    discord_user_id=discord_user_id,
+                    outcome=await _write_revocation(
+                        self._consents,
+                        self._session_factory,
+                        self._now,
+                        guild_id,
+                        discord_user_id,
+                        effective_at,
+                    ),
                 )
-            ).all()
-
-        newest: dict[int, _ConsentRow] = {}
-        for discord_user_id, granted_at, revoked_at, policy_version, scope in rows:
-            newest.setdefault(
-                discord_user_id,
-                _ConsentRow(granted_at, revoked_at, policy_version, scope_of(scope)),
             )
-        return newest
+        return tuple(done)
 
-    async def _latest_display_names(self, guild_id: int, people: Sequence[int]) -> dict[int, str]:
-        """The name each person last appeared under in this guild.
+    async def _roster_page(
+        self, guild_id: int, limit: int, offset: int
+    ) -> tuple[int, tuple[_RosterRow, ...]]:
+        """How many people this guild holds consent for, and one page of them.
 
-        `consent` stores no name, and a page of eighteen-digit numbers is
-        not a page an administrator can act on. The most recent
-        `session_participant` row is the closest thing the system holds --
-        the name at the time of somebody's last recorded meeting -- and it
-        is scoped to this guild, because a display name is per-guild and
-        borrowing one from another guild would put a nickname from
-        somewhere else next to a decision about this one.
+        Two statements in one session rather than a `count(*) OVER ()` on
+        the rows, for the reason `ConsoleQueries.sessions_page` gives: the
+        window function comes back attached to the rows, so a request for
+        a window past the end returns no rows and therefore no count, and
+        the roster could not say "you asked for page five of three"
+        because it would not know there were three. The count is issued
+        first, so a grant made between the two leaves the page one person
+        short of its own total rather than one longer than it.
+
+        **The count is over people, not over rows.** `consent` is
+        append-only -- one person who granted, withdrew and granted again
+        is three rows and one line on the roster -- so counting rows would
+        tell an administrator their guild has three times the people it
+        has, and would put the last page beyond the end of the listing.
         """
+        newest = _newest_consent_per_person(guild_id)
+        named = _latest_display_name_per_person(guild_id)
         async with self._session_factory() as db:
+            total = await db.scalar(
+                select(func.count(distinct(Consent.discord_user_id))).where(
+                    Consent.guild_id == guild_id
+                )
+            )
             rows = (
                 await db.execute(
                     select(
-                        SessionParticipant.discord_user_id,
-                        SessionParticipant.discord_display_name,
-                        SessionRow.started_at,
+                        newest.c.discord_user_id,
+                        newest.c.granted_at,
+                        newest.c.revoked_at,
+                        newest.c.policy_version,
+                        newest.c.scope,
+                        named.c.display_name,
                     )
-                    .join(SessionRow, SessionRow.id == SessionParticipant.session_id)
-                    .where(
-                        SessionRow.guild_id == guild_id,
-                        SessionParticipant.discord_user_id.in_(people),
+                    .select_from(newest)
+                    # The name is joined rather than looked up afterwards
+                    # because the order depends on it: a roster sorted by
+                    # one name and labelled with another would be neither.
+                    # `recency == 1` belongs in the join condition and not
+                    # in the `WHERE`, or the outer join stops being one
+                    # and everybody who has never been in a recorded
+                    # session falls off the roster.
+                    .outerjoin(
+                        named,
+                        (named.c.discord_user_id == newest.c.discord_user_id)
+                        & (named.c.recency == 1),
                     )
+                    .where(newest.c.recency == 1)
                     .order_by(
-                        SessionParticipant.discord_user_id,
-                        SessionRow.started_at.desc(),
+                        # Nameless last, said with a `CASE` rather than
+                        # left to `NULLS LAST`: which end NULLs sort to is
+                        # a dialect's decision, and an order this endpoint
+                        # pages through is not one to leave to a default.
+                        case((named.c.display_name.is_(None), 1), else_=0),
+                        func.lower(named.c.display_name),
+                        # The tiebreak, and what makes the order total.
+                        newest.c.discord_user_id,
                     )
+                    .limit(limit)
+                    .offset(offset)
                 )
             ).all()
 
-        names: dict[int, str] = {}
-        for discord_user_id, display_name, _started_at in rows:
-            names.setdefault(discord_user_id, display_name)
-        return names
+        return int(total or 0), tuple(
+            _RosterRow(
+                discord_user_id=discord_user_id,
+                display_name=display_name,
+                consent=_ConsentRow(granted_at, revoked_at, policy_version, scope_of(scope)),
+            )
+            for (
+                discord_user_id,
+                granted_at,
+                revoked_at,
+                policy_version,
+                scope,
+                display_name,
+            ) in rows
+        )
 
     async def _recordings_with_audio(self, guild_id: int, people: Sequence[int]) -> dict[int, int]:
         """How many recordings of each person this guild still holds.
@@ -1176,8 +1364,8 @@ class ConsolePersonalConsents:
     async def _newest_per_guild(self, discord_user_id: int) -> dict[int, _ConsentRow]:
         """The newest grant per guild for this person.
 
-        `ConsoleConsentDirectory._newest_consent_per_person` turned ninety
-        degrees, and ordered by the same rule for the same reason:
+        `adapters._newest_consent_per_person` turned ninety degrees, and
+        ordered by the same rule for the same reason:
         `ConsentRepository.current` reads the newest by `granted_at`, and
         showing somebody a row the recorder does not act on would show
         them a decision nothing enforces. `id` descending is the tiebreak
