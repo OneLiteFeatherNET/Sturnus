@@ -45,6 +45,7 @@ matches the file that renders it:
 | `calendar.*`       | `pages/calendar.vue`, the heatmap and the timeline   |
 | `settings.*`       | `pages/settings.vue` — a person's own settings        |
 | `admin.settings.*` | `pages/admin/bot-settings.vue`                        |
+| `admin.destinations.*` | `pages/admin/destinations.vue`, `utils/exportTargets.ts`, the two `ExportTarget*` components |
 | `admin.consents.*` | `pages/admin/consents.vue`                            |
 | `admin.queue.*`    | `pages/admin/queue.vue`                               |
 | `admin.reporting.*`| `pages/admin/reporting.vue`                           |
@@ -75,6 +76,14 @@ effective-instant work added — the withdrawal's effective moment, and the
 scope on a roster row — so that the sweep has less to do rather than more.
 New strings on that page go through `$t` from now on; the existing ones move
 when the sweep reaches them.
+
+`admin.destinations.*` is the one administrative namespace that is complete
+from the start, because the page under it is new: nothing on
+`/admin/destinations` was ever hard-coded English, so there is nothing there
+for the sweep to reach. Three of its strings are not in it — a format's
+name (`common.formatOutline` and its two neighbours) lives in `common.*`,
+because the recording page has to say the same three words beside a
+published document and two copies of a word are two words that drift.
 
 `ui.*` is the one namespace that does not name a page. It serves
 `app/components/ui/*` — the six shared controls every page is about to be

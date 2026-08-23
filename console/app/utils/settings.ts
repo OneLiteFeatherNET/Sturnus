@@ -421,9 +421,37 @@ export function summariseValue(value: string, limit = 120): string {
   return flat.length <= limit ? flat : `${flat.slice(0, limit)}…`
 }
 
+/**
+ * Keys whose meaning changed when something else in the console arrived,
+ * and the sentence that says so.
+ *
+ * One entry so far. `document_target` looked like *the* answer to "where
+ * do this server's protocols go" and is now the **fallback** for a guild
+ * that has configured no destination of its own: `destinations_for`
+ * replaces it with the configured ones rather than joining them. A reader
+ * of this field who has not seen `/admin/destinations` would otherwise set
+ * a collection here and watch nothing publish into it. The Destinations
+ * page says the same thing from its own side, and states which of the two
+ * is in force for the guild being looked at — which this cannot, because a
+ * hint under a settings key knows nothing about that guild's destinations.
+ *
+ * English, like the rest of this module's hints, and for the same stated
+ * reason: this page is awaiting the sweep that translates all four admin
+ * pages together. It goes through `$t` the day that lands.
+ */
+const KEY_NOTES: Record<string, string> = {
+  document_target:
+    'Used only while this server has no destination switched on under Destinations — '
+    + 'a destination there replaces this setting rather than adding to it.',
+}
+
 /** The notes under a field: what is enforced, and what it falls back to. */
 export function fieldHints(view: SettingView): string[] {
   const hints: string[] = []
+  const note = KEY_NOTES[view.key]
+  if (note !== undefined) {
+    hints.push(note)
+  }
   if (view.required) {
     hints.push('Required — there is no default, so it must always have a value.')
   }

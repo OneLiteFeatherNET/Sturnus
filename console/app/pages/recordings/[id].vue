@@ -50,6 +50,12 @@ import {
   type RecordedSession,
 } from '~/utils/recordings'
 import { recordingTabQuery, recordingTabs } from '~/utils/recordingTabs'
+import {
+  parseSessionDocuments,
+  publishedProtocols,
+  sessionDocumentsPath,
+  type SessionDocument,
+} from '~/utils/sessionDocuments'
 import { transcriptAudioErased, transcriptPath, type SessionTranscript } from '~/utils/transcript'
 import type { SessionName } from '~/utils/sessionNaming'
 import { ApiError } from '~/utils/apiError'
@@ -61,6 +67,17 @@ interface Recording {
    *  The session is authoritative for the page's existence; a transcript
    *  that failed is one tab's problem and not five. */
   transcript: SessionTranscript | null
+  /**
+   * Every destination this meeting reached, or `null` when the listing
+   * could not be read.
+   *
+   * `null` and `[]` are deliberately different answers. An empty list is
+   * a real state — a meeting still being transcribed, a guild that has
+   * configured nowhere to publish — and drawing a failed read as one
+   * would tell somebody their meeting was published nowhere when in fact
+   * nobody asked. See `~/utils/sessionDocuments`.
+   */
+  documents: SessionDocument[] | null
 }
 
 const { t } = useI18n()
@@ -77,7 +94,7 @@ const { data, status, error, refresh } = await useAsyncData<Recording>(
     // In parallel. They are two independent reads behind the same
     // authorisation, and doing them one after the other would double the
     // wait for no answer either of them needs from the other.
-    const [session, transcript] = await Promise.all([
+    const [session, transcript, documents] = await Promise.all([
       api<RecordedSession>(`/sessions/${encodeURIComponent(sessionId)}`),
       // Swallowed on purpose, and only here: a transcript that cannot be
       // read must not take down the audio, the tags or the metadata. What
@@ -86,8 +103,14 @@ const { data, status, error, refresh } = await useAsyncData<Recording>(
       // — "the words could not be read" covers both, and the session's own
       // 404 is what decides whether this recording is anybody's at all.
       api<SessionTranscript>(transcriptPath(sessionId)).catch(() => null),
+      // Swallowed for the same reason, and `null` rather than `[]`: the
+      // difference between "nothing was published" and "where this went
+      // could not be read" is the whole point of this list existing.
+      api(sessionDocumentsPath(sessionId))
+        .then(parseSessionDocuments)
+        .catch(() => null),
     ])
-    return { session, transcript }
+    return { session, transcript, documents }
   },
   { watch: [id] },
 )
@@ -111,6 +134,23 @@ const session = computed<RecordedSession | null>(() => {
   return renamed.value === null ? found : { ...found, ...renamed.value }
 })
 const transcript = computed<SessionTranscript | null>(() => data.value?.transcript ?? null)
+
+/** The listing could not be read, as opposed to being empty. Only ever
+ *  true once the page itself has loaded, so it does not flash during the
+ *  first render. */
+const documentsFailed = computed(() => data.value !== null && data.value?.documents === null)
+
+/**
+ * What this meeting was published as, and how that squares with the one
+ * link the Discord announcement carries.
+ *
+ * `~/utils/sessionDocuments` decides all of it, including the state this
+ * section exists for: documents with no announced link means the
+ * destination Sturnus announces produced nothing while the others did.
+ */
+const protocols = computed(() =>
+  publishedProtocols(session.value?.document_url, data.value?.documents ?? []),
+)
 const length = computed(() => (session.value ? sessionLength(session.value) : null))
 const naming = computed(() => (session.value ? recordingNaming(session.value) : null))
 
@@ -336,27 +376,112 @@ function onRenamed(name: SessionName) {
               <MultiTrackPlayer v-else :session="session" />
             </section>
 
+            <!-- Where the meeting went. A section of its own, because it
+                 is a list now: a guild may publish to several
+                 destinations, each is written independently, and one
+                 failing while the others succeed is a state this page has
+                 to be able to show. A single "Open the protocol" button
+                 could only ever show the first of them and would imply it
+                 was the whole story. -->
             <section
               class="rounded-2xl border p-5"
               :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
             >
-              <h2 class="text-base font-semibold">{{ $t('recordings.aboutHeading') }}</h2>
+              <h2 class="text-base font-semibold">{{ $t('recordings.protocolsHeading') }}</h2>
 
-              <div class="mt-3 flex flex-wrap items-center gap-3">
+              <!-- The listing failed. Say so, and fall back to the one
+                   link the session itself carries rather than drawing an
+                   unread list as an empty one. -->
+              <template v-if="documentsFailed">
+                <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+                  {{ $t('recordings.protocolsFailed') }}
+                </p>
                 <a
                   v-if="hasProtocol(session)"
                   :href="session.document_url ?? ''"
                   target="_blank"
                   rel="noreferrer"
-                  class="rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+                  class="mt-2 inline-block rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
                   :style="{ color: 'var(--action)' }"
                 >
                   {{ $t('recordings.openProtocol') }}
                 </a>
-                <span v-else class="text-sm" :style="{ color: 'var(--text-muted)' }">
-                  {{ $t('recordings.noProtocolWritten') }}
-                </span>
-              </div>
+              </template>
+
+              <template v-else>
+                <p class="mt-1 text-sm" :style="{ color: 'var(--text-muted)' }">
+                  {{ say(protocols.summary) }}
+                </p>
+                <!-- The two answers disagree, and this says which way.
+                     Never a diagnosis: the retry sweep is still running,
+                     and a destination not yet retried looks exactly like
+                     one that will never work. -->
+                <p
+                  v-if="protocols.note"
+                  class="mt-2 rounded-lg border border-dashed p-3 text-sm"
+                  :style="{ borderColor: 'var(--border)', color: 'var(--text-muted)' }"
+                >
+                  {{ say(protocols.note) }}
+                </p>
+
+                <!-- The single link of a meeting published before this
+                     server named destinations of its own. There is no row
+                     carrying it, so it is rendered on its own. -->
+                <a
+                  v-if="protocols.state === 'announcedOnly' && protocols.announced"
+                  :href="protocols.announced"
+                  target="_blank"
+                  rel="noreferrer"
+                  class="mt-2 inline-block rounded-lg px-3 py-1.5 text-sm font-medium transition-colors hover:bg-[var(--surface-raised)]"
+                  :style="{ color: 'var(--action)' }"
+                >
+                  {{ $t('recordings.openProtocol') }}
+                </a>
+
+                <ul v-else-if="protocols.rows.length > 0" class="mt-3 flex flex-col gap-2">
+                  <li
+                    v-for="row in protocols.rows"
+                    :key="row.id"
+                    class="rounded-lg border p-3"
+                    :style="{ borderColor: 'var(--border)' }"
+                  >
+                    <div class="flex flex-wrap items-baseline justify-between gap-2">
+                      <span class="text-sm font-medium">{{ say(row.label) }}</span>
+                      <span
+                        v-if="row.at"
+                        class="text-xs tabular-nums"
+                        :style="{ color: 'var(--text-muted)' }"
+                      >{{ say(row.at) }}</span>
+                    </div>
+                    <a
+                      :href="row.url"
+                      target="_blank"
+                      rel="noreferrer"
+                      class="mt-1 inline-block text-sm font-medium transition-colors hover:underline"
+                      :style="{ color: 'var(--action)' }"
+                    >
+                      {{ $t('recordings.openProtocol') }}
+                    </a>
+                    <!-- The destination is gone and the document is not.
+                         Removing a destination is "stop publishing here",
+                         never "forget what was published". -->
+                    <p
+                      v-if="row.orphaned"
+                      class="mt-1 text-xs"
+                      :style="{ color: 'var(--text-muted)' }"
+                    >
+                      {{ $t('recordings.protocolOrphaned') }}
+                    </p>
+                  </li>
+                </ul>
+              </template>
+            </section>
+
+            <section
+              class="rounded-2xl border p-5"
+              :style="{ borderColor: 'var(--border)', background: 'var(--surface)' }"
+            >
+              <h2 class="text-base font-semibold">{{ $t('recordings.aboutHeading') }}</h2>
 
               <!-- What somebody wrote about the meeting, shown where a
                    listener wants it and edited on `details`. The rest of

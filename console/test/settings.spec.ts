@@ -499,6 +499,22 @@ describe('the hints beside a field', () => {
       200,
     )
   })
+
+  it('says that `document_target` is now a fallback rather than the answer', () => {
+    // It looked like *the* answer to "where do this server's protocols
+    // go" and is now what a guild with no destination of its own falls
+    // back to — `destinations_for` replaces it rather than joining it. A
+    // reader who has not seen the Destinations page would otherwise set a
+    // collection here and watch nothing publish into it.
+    const hints = fieldHints(view({ key: 'document_target' })).join(' ')
+    expect(hints).toContain('Destinations')
+    expect(hints).toContain('replaces this setting')
+  })
+
+  it('says nothing extra beside a key that has not changed meaning', () => {
+    // The note is one key's, not a paragraph every field grew.
+    expect(fieldHints(view({ key: 'timezone' }))).toEqual([])
+  })
 })
 
 describe('shortening a value for display', () => {

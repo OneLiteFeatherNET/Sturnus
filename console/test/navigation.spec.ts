@@ -119,6 +119,19 @@ describe('who is offered the Admin View', () => {
     expect(entry.to).toBe('/admin/consents')
   })
 
+  it('offers the destinations to an administrator', () => {
+    expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.destinations')
+  })
+
+  it('hides the destinations from somebody who administers nothing', () => {
+    // Every route under `/api/guilds/{id}/export-targets` answers 404 to a
+    // non-administrator — the same answer it gives for a guild that does
+    // not exist — so an entry left visible would offer a page that can
+    // only ever refuse them.
+    expect(visibleEntries(PARTICIPANT).map((e) => e.labelKey)).not.toContain('nav.destinations')
+    expect(visibleEntries(null).map((e) => e.labelKey)).not.toContain('nav.destinations')
+  })
+
   it('offers the queue to an administrator', () => {
     expect(visibleEntries(ADMIN).map((e) => e.labelKey)).toContain('nav.queue')
   })
@@ -155,8 +168,15 @@ describe('who is offered the Admin View', () => {
     // Reporting is last because it is the only entry nothing is ever
     // wrong on: it is read on a schedule, or when somebody asks how much
     // this server actually uses Sturnus, and never in a hurry.
+    //
+    // Destinations sits second, next to the configuration it is part of:
+    // where a guild's protocols go was a text field on Bot Settings until
+    // it became a page, and `document_target` is still the fallback for a
+    // guild that configures nothing here. Two adjacent entries is what
+    // stops them reading as rival settings.
     expect(ADMIN_VIEW.entries.map((e) => e.labelKey)).toEqual([
       'nav.botSettings',
+      'nav.destinations',
       'nav.consents',
       'nav.queue',
       'nav.reporting',
