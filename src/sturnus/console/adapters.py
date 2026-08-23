@@ -37,6 +37,8 @@ from sturnus.application.directory_mirror import (
     MirroredRole,
 )
 from sturnus.application.linking import new_state
+from sturnus.application.priorities import Placement, order_by_rule, order_with, resolve_rule
+from sturnus.application.priorities import QueuedSession as PrioritisedSession
 from sturnus.application.publishing import DOCUMENTED_STATUS
 from sturnus.console.auth import PROVIDER
 from sturnus.console.ports import (
@@ -52,6 +54,8 @@ from sturnus.console.ports import (
     OwnConsent,
     PersonRevocation,
     QueuedSession,
+    QueueOrder,
+    QueuePosition,
     QueueSnapshot,
     QueueSpeaker,
     RequeueOutcome,
@@ -86,6 +90,7 @@ from sturnus.infrastructure.db.models import (
 )
 from sturnus.infrastructure.db.models import Session as SessionRow
 from sturnus.infrastructure.db.models import SessionDocument as SessionDocumentRow
+from sturnus.infrastructure.db.priority import Decision, load_queued_sessions, reorder
 from sturnus.infrastructure.db.queue import DEFAULT_LEASE_SECONDS, TERMINAL_STATUSES
 from sturnus.infrastructure.db.repositories import (
     AccountLinkRepository,
@@ -704,6 +709,30 @@ class ConsoleQueueControl:
             refusal=None,
             model=model,
         )
+
+    async def place(
+        self, session_id: int, *, requested_by: int, placement: Placement
+    ) -> QueueOrder | None:
+        """Moves one session to where an administrator dropped it.
+
+        The same authorisation as `requeue`, expressed by the same call
+        and for the same reason: reordering a queue is an operation on the
+        system, not a use of one's own recording, so it takes an
+        administrator of the session's guild -- and `None` covers "no such
+        session" and "not yours" alike.
+
+        The write is `sturnus.infrastructure.db.priority.reorder` and the
+        decision handed to it is `order_with`, unwrapped. Nothing here
+        decides where a session goes; this method knows who may ask.
+        """
+        guild_id = await self._administered_guild(session_id, requested_by)
+        if guild_id is None:
+            return None
+
+        def decide(sessions: Sequence[PrioritisedSession]) -> tuple[int, ...] | None:
+            return order_with(sessions, session_id, placement)
+
+        return await apply_order(self._session_factory, guild_id, decide)
 
     async def _administered_guild(self, session_id: int, discord_user_id: int) -> int | None:
         """The session's guild, if this person administers it. `None` otherwise.
@@ -1636,6 +1665,38 @@ class ConsoleQueueOverview:
             truncated=truncated,
         )
 
+    async def reprioritise(
+        self, guild_id: int, *, requested_by: int, rule: str
+    ) -> QueueOrder | None:
+        """Reorders this guild's whole queue by one named rule.
+
+        The same authorisation as `for_guild` and expressed the same way,
+        because this is the same subject: a quick action is a statement
+        about a guild's queue, so it takes an administrator of that guild
+        and answers `None` for "no such guild" and "not yours" alike.
+
+        `rule` is a name from `sturnus.application.priorities.KNOWN_RULES`
+        and is resolved at the HTTP boundary, where a caller who named one
+        nobody has can still be told so -- the same division `model` has
+        with `transcription_models.resolve`. Below that line an unknown
+        rule does not exist.
+
+        **The rule reorders the whole queue and not a selection of it.**
+        "The biggest meetings first" is a statement about an ordering, and
+        an ordering that applied to some rows and not others would leave
+        the rest wherever a previous rule had put them -- an order nobody
+        chose and nobody could reconstruct.
+        """
+        if not await self._admins.is_admin(guild_id, requested_by):
+            return None
+
+        ranking = resolve_rule(rule)
+
+        def decide(sessions: Sequence[PrioritisedSession]) -> tuple[int, ...] | None:
+            return order_by_rule(sessions, ranking)
+
+        return await apply_order(self._session_factory, guild_id, decide)
+
 
 def _queued(session: ActiveSession) -> QueuedSession:
     return QueuedSession(
@@ -1650,6 +1711,55 @@ def _queued(session: ActiveSession) -> QueuedSession:
         running=session.counts.get("running", 0),
         done=session.counts.get("done", 0),
         dead=session.counts.get("dead", 0),
+        # Passed through including its absence. See `ActiveSession.priority`
+        # on why a session with nothing queued has no place rather than the
+        # ordinary one.
+        priority=session.priority,
+    )
+
+
+#: Why a reorder was refused, in one sentence. One string for both of the
+#: ways it can happen -- the session finished, or the session it was
+#: dropped beside did -- because they are the same news to the page that
+#: asked: the list you were looking at has moved on. It is a fixed
+#: literal, so a console may key off it and nothing a caller sent is ever
+#: echoed back.
+STALE_DRAG = "that session is no longer in this guild's queue"
+
+
+async def apply_order(
+    session_factory: async_sessionmaker[AsyncSession], guild_id: int, decide: Decision
+) -> QueueOrder:
+    """Runs one decision against one guild's queue and shapes the answer.
+
+    Shared by the drag and by the quick actions, which differ only in the
+    decision they hand over -- and which therefore must not differ in what
+    they authorise, what they write, or what they say afterwards. Called
+    only after the administrator check has passed, so `None` from
+    `reorder` is always a refusal and never a permission problem.
+
+    A refusal re-reads the queue rather than answering with nothing. The
+    drag that was refused was aimed at a list the browser was showing and
+    the refusal means precisely that the list is out of date, so sending
+    the current one back is what lets the page redraw instead of asking
+    again from the same stale picture. The re-read is a second moment and
+    may differ again by the time it arrives, which is why it is not
+    presented as the result of anything -- nothing was written.
+    """
+    result = await reorder(session_factory, guild_id, decide)
+    if result is None:
+        current = await load_queued_sessions(session_factory, guild_id)
+        return QueueOrder(
+            accepted=False, refusal=STALE_DRAG, sessions=_positions(current), changed=()
+        )
+    return QueueOrder(
+        accepted=True, refusal=None, sessions=_positions(result.sessions), changed=result.changed
+    )
+
+
+def _positions(sessions: Sequence[PrioritisedSession]) -> tuple[QueuePosition, ...]:
+    return tuple(
+        QueuePosition(session_id=session.id, priority=session.priority) for session in sessions
     )
 
 

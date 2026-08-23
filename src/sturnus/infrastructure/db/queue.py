@@ -85,7 +85,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import Integer, and_, case, cast, func, literal, or_, select
+from sqlalchemy import Integer, Select, and_, case, cast, func, literal, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import aliased
 from sqlalchemy.sql.elements import ColumnElement
@@ -200,6 +200,81 @@ def _outstanding_before() -> ColumnElement[int]:
     )
 
 
+def claim_statement(lease_cutoff: datetime) -> Select[tuple[TranscriptionJob]]:
+    """The one statement a claim runs, built apart from running it.
+
+    Lifted out of `claim` for a single reason: the ordering below makes a
+    claim about a *plan*, and a claim about a plan can only be settled by
+    asking PostgreSQL for one. A test that hand-copied this query into an
+    `EXPLAIN` would settle it about the copy, so the query
+    `test_no_index_this_schema_has_can_order_a_claim_by_priority`
+    explains is this one.
+
+    **What the planner does with this, which is not what migration 0013
+    predicted.** That migration added
+    `ix_job_claim_order (status, priority, id)` and said the claim's
+    `ORDER BY priority, id` would be one forward scan of it. It is not,
+    and it cannot be. `status` leads that index and this statement matches
+    *two* values of it -- a `pending` job and a `running` one whose lease
+    expired -- so a scan of it yields the pending rows in `(priority, id)`
+    order and then the running ones in `(priority, id)` order: two ordered
+    runs, not one. PostgreSQL puts a `Sort` on top. Measured on PostgreSQL
+    17, with sequential and bitmap scans disabled so that the ordered
+    index scan was the only plan left: it still sorted. The claim is
+    therefore no worse off than it was before this ordering existed -- it
+    sorted by `id` for the same reason -- but the index is earning
+    nothing, and nobody should read 0013's paragraph and believe
+    otherwise.
+
+    Two ways to earn it were considered and both rejected. Saying why here
+    is the point of this paragraph, because both look obvious.
+
+    `ORDER BY status, priority, id` does produce one forward scan with no
+    sort -- measured, not assumed. It also silently means "no expired
+    lease is ever reclaimed while any pending job is claimable", because
+    `pending` sorts before `running`. That is the Defect 4 hazard put
+    back: a job whose worker was killed would wait for the whole queue to
+    drain before anybody picked it up, and its session would stay
+    undocumented for exactly that long. A plan node is not worth that.
+
+    A partial index -- `(priority, id) WHERE status IN ('pending',
+    'running')` -- gives the ordering *and* keeps the semantics, because
+    the status predicate moves into the index's `WHERE` and stops being a
+    key column. It is the right answer, and it is a migration, which this
+    branch deliberately is not. Whoever writes the next one should write
+    it, and may drop `ix_job_claim_order` in the same breath.
+    """
+    return (
+        select(TranscriptionJob)
+        .where(
+            or_(
+                TranscriptionJob.status == "pending",
+                and_(
+                    TranscriptionJob.status == "running",
+                    TranscriptionJob.claimed_at < lease_cutoff,
+                ),
+            ),
+            _outstanding_before() < _parallel_track_limit(),
+        )
+        # **Lower first, then oldest first.** `priority` is what an
+        # administrator said should happen sooner (see
+        # `TranscriptionJob.priority` and `sturnus.application.priorities`);
+        # `id` is the age it has always been ordered by, and it still
+        # breaks every tie, so a queue nobody has touched claims in exactly
+        # the first-in-first-out order it did before this clause grew a
+        # column.
+        #
+        # Both ascending. That is what the lower-first convention was
+        # chosen for and it stays right whatever the plan does with it:
+        # `priority DESC, id ASC` would need an index with a descending
+        # column before it could ever be scanned in order, so it forecloses
+        # the partial index the docstring above recommends.
+        .order_by(TranscriptionJob.priority, TranscriptionJob.id)
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+
+
 def _claim_is_current(job: TranscriptionJob, lease: datetime | None) -> bool:
     """Whether the caller may still act on this job.
 
@@ -308,36 +383,29 @@ class JobQueue:
         past a session that is at its limit and takes the next session's
         work.
 
-        **Oldest first.** `ORDER BY id` is the ordering guarantee this
-        method now makes and did not make before: previously there was no
-        `ORDER BY` at all and a claim took whatever the scan reached
-        first. Jobs are enqueued when a session closes, so ascending id is
-        the order the meetings ended in -- and a guild that keeps meeting
-        gets ids that sort *behind* everything already waiting, which is
-        what stops it from starving a quieter guild. The cap and the
-        ordering answer opposite halves of the same question: the cap
-        stops one session monopolising the pool, the ordering stops the
-        sessions it makes room for being served out of turn.
+        **Lower priority first, then oldest first.** `ORDER BY priority,
+        id` is the ordering guarantee this method makes; see
+        `claim_statement`, which holds the clause and the argument for its
+        directions. `id` is the age it has always sorted by: jobs are
+        enqueued when a session closes, so ascending id is the order the
+        meetings ended in, and a guild that keeps meeting gets ids that
+        sort *behind* everything already waiting, which is what stops it
+        from starving a quieter guild. `priority` in front of it is the
+        only thing that can override that, it is written by nobody except
+        `sturnus.infrastructure.db.priority` on an administrator's
+        instruction, and it defaults to the same value for everybody -- so
+        a deployment where nobody has ever asked for anything claims in
+        exactly the order it did before.
+
+        The cap and the ordering answer opposite halves of the same
+        question: the cap stops one session monopolising the pool, the
+        ordering stops the sessions it makes room for being served out of
+        turn.
         """
         now = now if now is not None else datetime.now(UTC)
         lease_cutoff = now - timedelta(seconds=self._lease_seconds)
         async with self._session_factory() as session:
-            job = await session.scalar(
-                select(TranscriptionJob)
-                .where(
-                    or_(
-                        TranscriptionJob.status == "pending",
-                        and_(
-                            TranscriptionJob.status == "running",
-                            TranscriptionJob.claimed_at < lease_cutoff,
-                        ),
-                    ),
-                    _outstanding_before() < _parallel_track_limit(),
-                )
-                .order_by(TranscriptionJob.id)
-                .with_for_update(skip_locked=True)
-                .limit(1)
-            )
+            job = await session.scalar(claim_statement(lease_cutoff))
             if job is None:
                 return None
             job.status = "running"

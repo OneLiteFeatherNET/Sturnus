@@ -1672,6 +1672,10 @@ There is no re-queue control on this page. Each row links to
 of whether a re-queue is safe stays in one place (`plan_requeue`) rather
 than being made twice.
 
+Each row also carries a **priority** — where that session sits in the
+queue, and what an administrator can drag it to. §6.2.11 is what that
+means and what it does not promise.
+
 ### 6.2.8 The report
 
 **Admin View → Reporting**, per guild: how often this guild meets, how
@@ -1909,6 +1913,176 @@ unvalidated `yes` would silently mean the opposite of what was typed
 
 It takes effect **immediately**: the API reads it per request, and nothing
 caches it.
+
+### 6.2.11 Priority: saying what the queue should do first
+
+`transcription_job.priority` is one integer per job. **Lower runs first.**
+Zero is ordinary and is what every job carries unless somebody has said
+otherwise, so a deployment where nobody has ever touched this claims work
+in exactly the order it always did: oldest meeting first.
+
+The claim reads `ORDER BY priority, id`. `id` still breaks every tie, so
+first-in-first-out survives inside a priority — two sessions held back
+equally still run in the order they ended.
+
+#### It is a hint, not a promise about the clock
+
+Priority says what a worker takes **next when it next asks**. It says
+nothing about when that will be, and it is not a queue-jump:
+
+- A job already `running` is not interrupted. Raising a session's priority
+  while forty tracks are being transcribed changes what happens after
+  those forty finish, not what happens to them.
+- `max_parallel_tracks` still applies (§4.2). A session at the front of
+  the queue still takes at most that many workers at once, and the ones it
+  leaves free go to whatever is behind it.
+- A worker that is not running claims nothing at any priority. If nothing
+  is moving, priority will not start it; §5 is where to look.
+
+So "I moved it to the top and it did not start" is usually one of those
+three and almost never this feature failing.
+
+#### A reorder holds sessions back; it never pushes one forward
+
+This is the part worth understanding before using it, because it is
+visible in the numbers.
+
+`priority` is one column shared by every guild in the deployment, and any
+guild administrator can reorder their own guild's queue from the console.
+If a reorder could write a *smaller* number, the first administrator to
+find the control could put their whole guild in front of everybody else's
+ordinary work, permanently, and nobody else would be told. So the console
+never writes one. Going first is expressed as everything that was ahead
+going second.
+
+Concretely: a guild whose queue is entirely ordinary (`0`) drags its
+retrospective to the top. The retrospective stays at `0`; the sessions it
+overtook move to `1`. The guild's own order is now what the administrator
+asked for — and the sessions at `1` now sort behind every untouched job in
+the deployment, not merely behind that guild's own. That cost is real and
+it is the price of one shared column. It is bounded: only the sessions
+actually overtaken move, and a session leaves the queue when its work
+finishes.
+
+Two consequences follow that look surprising and are not bugs:
+
+- **Numbers drift upwards** as a queue is reordered repeatedly. Nothing
+  resets them, and nothing needs to: sessions leave the queue when they
+  are done, and new ones arrive at `0`.
+- **A meeting recorded after a reorder starts ahead of the held-back
+  ones**, because it is enqueued at the ordinary `0`. That is correct —
+  new work is ordinary, and the held-back sessions were held back
+  deliberately — but it means an order is a statement about the queue at
+  the moment it was made, not a standing instruction.
+
+An operator who genuinely wants a session ahead of *another guild's* work
+can write a negative priority with SQL, exactly as §4.1 describes for
+`guild_config`. The API cannot, on purpose.
+
+#### The two quick actions
+
+Beside the drag-and-drop list there are two buttons, and each reorders the
+guild's **whole** outstanding queue:
+
+- **Most people first** — by the number of rows in `session_participant`.
+  A meeting of eight is eight speakers waiting on one document; a
+  one-person recording is one.
+- **Shortest recording first** — by `transcription_job.audio_seconds`,
+  summed across the session's tracks.
+
+The second has a limitation that is worth knowing rather than
+rediscovering: **`audio_seconds` is written when a job completes.** A
+session that has never been transcribed has none, and null is not zero —
+an unmeasured recording is *not* treated as a nought-second one and is
+never promoted to the front on the strength of nothing being known about
+it. Unmeasured sessions sort after every measured one and keep the order
+they already had. In practice that means "shortest recording first" is
+useful on a queue of **re-queued** sessions, which keep the measurements
+their first pass produced, and does very little on a queue of fresh ones.
+
+Applying either action twice writes nothing the second time.
+
+#### Two administrators at once
+
+Each request is decided inside the same database transaction that writes
+it, holding a lock on the guild's outstanding jobs, so two reorders of one
+guild serialise. The second is applied to what the first left, never to
+the list its browser was showing. Nothing is lost and the result is never
+a blend of two orders — but the second administrator may well end up with
+an order they did not picture, because the queue moved under them. Their
+page is told immediately: priority is part of the queue snapshot the
+`/stream` endpoint watches, so a reorder anywhere reaches every open queue
+page within one poll.
+
+A reorder that names a session which has left the queue meanwhile — it
+finished while the page was open — is refused, and the refusal carries the
+queue as it now is so the page can redraw.
+
+#### Reading and setting it over the API
+
+`GET /api/guilds/{guild_id}/queue` (and its `/stream` twin) reports each
+session's `priority`. It is **null**, not zero, for a session with nothing
+outstanding — one that is still recording, or one that is listed only
+because a job of it died. Zero is a real place in the queue; null is a row
+with nothing to reorder.
+
+Both writes take an administrator of the guild and answer 404 to everybody
+else, indistinguishably from a session that does not exist.
+
+```
+POST /api/sessions/{session_id}/queue/priority
+{"place": "before", "session": "512"}
+```
+
+`place` is `first`, `last`, `before` or `after`; `session` names the
+neighbour and is required by the last two and refused by the first two.
+**No number is ever sent.** A drag produces "this one goes here", and
+turning that into integers is the server's job — a client computing them
+would be computing them from a copy of the queue that is already out of
+date.
+
+```
+POST /api/guilds/{guild_id}/queue/priority
+{"rule": "many-participants-first"}
+```
+
+`rule` is `many-participants-first` or `short-recordings-first`. An
+unrecognised name is a 400 that lists the ones there are, rather than a
+different rule being run quietly.
+
+Both answer with the guild's whole queue in claim order:
+
+```json
+{
+  "accepted": true,
+  "refusal": null,
+  "changed": ["512"],
+  "order": [
+    {"session_id": "77", "priority": 0},
+    {"session_id": "512", "priority": 1}
+  ]
+}
+```
+
+`changed` is empty when the order asked for was already the order in
+force. A stale reorder answers **409** with `accepted: false`, a `refusal`
+and the same `order` field, which is what the page redraws from.
+
+#### One thing that is *not* true, despite what migration 0013 says
+
+That migration added `ix_job_claim_order (status, priority, id)` and said
+the claim's `ORDER BY priority, id` would be one forward scan of it. It is
+not. `status` leads that index and the claim matches two values of it — a
+`pending` job and a `running` one whose lease expired — so PostgreSQL
+sorts. The index still narrows the scan to outstanding work, which is what
+keeps a claim off the table's history, but the ordering is not free.
+
+Nothing is wrong operationally: the sort is over the queue's depth and the
+claim cost the same before priority existed. It is recorded here so that
+nobody sizes anything on the migration's paragraph.
+`sturnus.infrastructure.db.queue.claim_statement` carries the measurement,
+the partial index that would fix it, and why the obvious cheaper fix
+(ordering by `status` first) must not be used.
 
 ### 6.3 Listening to a recording by hand
 

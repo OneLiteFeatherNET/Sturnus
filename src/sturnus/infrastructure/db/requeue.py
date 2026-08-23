@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sturnus.application.publishing import DOCUMENTED_STATUS
 from sturnus.application.requeue import TERMINAL_STATUSES, RequeuePlan, plan_requeue
 from sturnus.infrastructure.db.models import Session, SessionParticipant, TranscriptionJob
+from sturnus.infrastructure.db.priority import OUTSTANDING_STATUSES
 
 #: Job statuses reported by a queue summary, in lifecycle order rather
 #: than alphabetically: a reader looks at this to see where work is piling
@@ -276,6 +277,15 @@ class ActiveSession:
     #: One entry per `REPORTED_STATUSES`, zero-filled, so a caller can
     #: render the lifecycle in order without checking for absent keys.
     counts: dict[str, int]
+    #: Where this session sits in its guild's queue -- the priority its
+    #: outstanding jobs carry, lower first. **`None` when it has none**,
+    #: which is a meeting that is still recording, or one whose every job
+    #: has finished and which is only still listed because one of them
+    #: died. Deliberately not `0`: zero is the ordinary priority and a
+    #: real place in the queue, and a session with nothing queued does not
+    #: have a place in it. A page that read the two as the same would
+    #: offer a drag handle on a row that nothing can be reordered about.
+    priority: int | None
 
 
 async def load_active_sessions(
@@ -330,18 +340,39 @@ async def load_active_sessions(
             return [], False
 
         counted = await db.execute(
-            select(TranscriptionJob.session_id, TranscriptionJob.status, func.count())
+            # The priority comes back from the same grouped read as the
+            # counts rather than from a statement of its own, because the
+            # two are read for one page and a second query would be a
+            # second moment: a row could show a job that the counts say is
+            # still pending sitting at a priority its reorder has already
+            # moved on from.
+            select(
+                TranscriptionJob.session_id,
+                TranscriptionJob.status,
+                func.count(),
+                func.min(TranscriptionJob.priority),
+            )
             .where(TranscriptionJob.session_id.in_([row.id for row in found]))
             .group_by(TranscriptionJob.session_id, TranscriptionJob.status)
         )
         per_session: dict[int, dict[str, int]] = {
             row.id: dict.fromkeys(REPORTED_STATUSES, 0) for row in found
         }
-        for session_id, status, count in counted:
+        priorities: dict[int, int] = {}
+        for session_id, status, count, priority in counted:
             # `setdefault` rather than assignment: a status this build does
             # not know about is still work somebody has to account for, and
             # dropping it would make the counts silently fail to add up.
             per_session[session_id][status] = per_session[session_id].get(status, 0) + int(count)
+            if status in OUTSTANDING_STATUSES:
+                # The lowest number over the jobs a worker may still take,
+                # which is where a claim would next reach this session. A
+                # reorder writes one number to all of them, so this is
+                # normally that number; it differs only while a session
+                # that was reordered has since enqueued more speakers, and
+                # then the lower one is the honest answer.
+                current = priorities.get(session_id)
+                priorities[session_id] = priority if current is None else min(current, priority)
 
     return [
         ActiveSession(
@@ -353,6 +384,7 @@ async def load_active_sessions(
             status=row.status,
             document_url=row.document_url,
             counts=per_session[row.id],
+            priority=priorities.get(row.id),
         )
         for row in found
     ], truncated

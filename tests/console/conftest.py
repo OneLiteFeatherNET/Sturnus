@@ -27,6 +27,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from sturnus.application.directory_mirror import MirroredGuild
+from sturnus.application.priorities import Placement
 from sturnus.console.app import build_api
 from sturnus.console.audio import AudioDelivery
 from sturnus.console.filters import SessionFilter
@@ -54,6 +55,7 @@ from sturnus.console.ports import (
     PreferenceDirectory,
     ProfileDirectory,
     QueueControl,
+    QueueOrder,
     QueueOverview,
     QueueSnapshot,
     RequeueOutcome,
@@ -502,10 +504,17 @@ class FakeQueue:
         self,
         snapshot: QueueSnapshot | None = None,
         outcome: RequeueOutcome | None = None,
+        order: QueueOrder | None = None,
     ) -> None:
         self.snapshot = snapshot
         self.outcome = outcome
+        self.order = order
         self.requeued: list[tuple[int, int, str]] = []
+        #: Every placement this was asked to write, with who asked. Same
+        #: reason `requeued` is recorded: a handler that dropped the
+        #: placement, or that passed an id out of the URL instead of the
+        #: signed-in one, would still return a perfectly plausible 200.
+        self.placed: list[tuple[int, int, Placement]] = []
 
     async def status_for(self, session_id: int, *, requested_by: int) -> QueueSnapshot | None:
         del session_id, requested_by
@@ -521,6 +530,12 @@ class FakeQueue:
         # return a perfectly plausible 200.
         self.requeued.append((session_id, requested_by, model))
         return self.outcome
+
+    async def place(
+        self, session_id: int, *, requested_by: int, placement: Placement
+    ) -> QueueOrder | None:
+        self.placed.append((session_id, requested_by, placement))
+        return self.order
 
 
 class FakeTags:
@@ -567,16 +582,25 @@ class FakeQueueOverview:
     gets 404s rather than a fake that quietly authorises everything.
     """
 
-    def __init__(self, queue: GuildQueue | None = None) -> None:
+    def __init__(self, queue: GuildQueue | None = None, order: QueueOrder | None = None) -> None:
         self.queue = queue
+        self.order = order
         #: Every guild this was asked about, with who asked. The route
         #: tests assert on it: "the handler passed the signed-in id, not
         #: one from the URL" cannot be seen in a response body.
         self.asked: list[tuple[int, int]] = []
+        #: Every quick action this was asked to apply, with who asked.
+        self.reprioritised: list[tuple[int, int, str]] = []
 
     async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildQueue | None:
         self.asked.append((guild_id, requested_by))
         return self.queue
+
+    async def reprioritise(
+        self, guild_id: int, *, requested_by: int, rule: str
+    ) -> QueueOrder | None:
+        self.reprioritised.append((guild_id, requested_by, rule))
+        return self.order
 
 
 class FakeConsents:

@@ -94,6 +94,7 @@ def queued(**over: object) -> QueuedSession:
         "running": 0,
         "done": 0,
         "dead": 0,
+        "priority": 0,
     }
     base.update(over)
     return QueuedSession(**base)  # type: ignore[arg-type]
@@ -279,6 +280,32 @@ async def test_a_change_in_the_queue_arrives_as_an_event(
     assert len(sent) == 3
     assert '"pending":2,"running":1' in sent[0]
     assert '"pending":1,"running":2' in sent[1]
+
+
+async def test_a_reorder_alone_is_a_change_the_stream_sends(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Nothing moved, nothing finished -- only the order changed.
+
+    The stream sends an event when the serialised snapshot differs, and
+    priority being part of that snapshot is what makes one administrator's
+    drag arrive on another administrator's open page. Without it the two
+    would disagree about the order until something else happened to change
+    the counts.
+    """
+    overview = ScriptedOverview(
+        guild_queue(sessions=(queued(id=1, priority=0), queued(id=2, priority=0))),
+        guild_queue(sessions=(queued(id=1, priority=1), queued(id=2, priority=0))),
+        at_rest(),
+    )
+    client = await signed_in(aiohttp_client, streaming_api(queues=overview))
+
+    body = await (await client.get(guild_stream_url())).text()
+    sent = [block.replace(" ", "") for block in data_blocks(body)]
+
+    assert len(sent) == 3
+    assert '"priority":0' in sent[0]
+    assert '"priority":1' in sent[1]
 
 
 async def test_a_stream_with_nothing_to_say_keeps_the_connection_alive_with_a_comment(

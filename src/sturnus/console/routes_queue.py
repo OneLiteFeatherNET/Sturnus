@@ -1,11 +1,39 @@
-"""A guild's transcription queue, and re-running one session's part of it.
+"""A guild's transcription queue, what runs first, and re-running one session.
 
 - `GET  /api/guilds/{guild_id}/queue`
 - `GET  /api/guilds/{guild_id}/queue/stream`
+- `POST /api/guilds/{guild_id}/queue/priority`
 - `GET  /api/sessions/{session_id}/queue`
 - `GET  /api/sessions/{session_id}/queue/stream`
+- `POST /api/sessions/{session_id}/queue/priority`
 - `POST /api/sessions/{session_id}/queue/requeue`
 - `GET  /api/models`
+
+**Why a reorder is expressed relative to another session and never as a
+number.** A drag-and-drop list produces "this one goes here", and here is
+a neighbour: `{"place": "before", "session": "512"}`. It does not produce
+an integer, and an API that asked for one would be asking a browser to
+invent the queue's arithmetic -- with a stale copy of the queue, and with
+no way to agree with the other browser doing the same thing a second
+later. So the console names a session it can see and the server works out
+the numbers (`sturnus.application.priorities`).
+
+That choice is what makes two administrators dragging at once produce
+something sensible. Each request is decided inside the same lock that
+writes it, against the queue as it stands at that instant, so the second
+is applied to what the first left rather than to the list its browser was
+showing. The result is always one of the two orders those two drags could
+serialise into -- never a blend of both, and never a lost write. The
+second administrator may well see an order they did not picture, because
+the list moved under them; the stream tells them so immediately, and an
+anchor still means something after somebody else's move landed in a way
+that "put it at index 3" would not.
+
+**A reorder names a session, and applies to that session's jobs.** The
+rows are one per speaker, so a request that took job ids could reorder
+four of a meeting's five speakers -- a queue that is half moved, that no
+page renders and that nobody would ever notice. Nothing in this module
+can express that.
 
 **Why the guild-wide view is here rather than in a module of its own.**
 It is the same subject asked at a different scale: the per-session
@@ -100,10 +128,17 @@ from dataclasses import dataclass
 
 from aiohttp import web
 
+from sturnus.application.priorities import (
+    PLACEMENTS,
+    Placement,
+    UnknownPriorityRule,
+    resolve_rule,
+)
 from sturnus.console.ports import (
     GuildQueue,
     QueueControl,
     QueuedSession,
+    QueueOrder,
     QueueOverview,
     QueueSnapshot,
     RequeueOutcome,
@@ -127,8 +162,10 @@ QUEUE_OVERVIEW: web.AppKey[QueueOverview] = web.AppKey("queue_overview")
 _STATUS_PATH = "/api/sessions/{session_id}/queue"
 _STATUS_STREAM_PATH = "/api/sessions/{session_id}/queue/stream"
 _REQUEUE_PATH = "/api/sessions/{session_id}/queue/requeue"
+_PLACE_PATH = "/api/sessions/{session_id}/queue/priority"
 _GUILD_PATH = "/api/guilds/{guild_id}/queue"
 _GUILD_STREAM_PATH = "/api/guilds/{guild_id}/queue/stream"
+_GUILD_PRIORITY_PATH = "/api/guilds/{guild_id}/queue/priority"
 #: Deliberately not under `/api/guilds/{guild_id}/`. The registry is a
 #: property of this deployment's build, not of a guild -- putting a guild
 #: in the path would promise a per-guild answer that does not exist and
@@ -141,6 +178,11 @@ _MODELS_PATH = "/api/models"
 #: which names both what was asked for and what there is.
 _MALFORMED_BODY = "malformed request body"
 _MODEL_MUST_BE_A_STRING = "model must be a string naming a transcription model"
+_PLACE_MUST_BE_KNOWN = "place must be one of " + ", ".join(PLACEMENTS)
+_ANCHOR_MUST_BE_A_SESSION_ID = "session must be a string naming the session to sit beside"
+_ANCHOR_ONLY_WITH_BEFORE_OR_AFTER = "session may only be given with place before or after"
+_ANCHOR_IS_THE_SESSION_ITSELF = "a session cannot be placed relative to itself"
+_RULE_MUST_BE_A_STRING = "rule must be a string naming a queue rule"
 
 
 @dataclass(frozen=True)
@@ -576,6 +618,142 @@ async def requeue_session(request: web.Request) -> web.Response:
     return web.json_response(_outcome_json(outcome))
 
 
+async def place_session(request: web.Request) -> web.Response:
+    """Moves one session to where an administrator dropped it in the queue.
+
+    **404 for everybody who is not an administrator of the session's
+    guild, and the same 404 for a session that does not exist.** Expressed
+    by calling `QueueControl.place`, which is the same object and the same
+    check the re-queue endpoint above uses -- a second copy of that rule
+    here would be a second rule, and the copy is the one that gets left
+    behind when the original changes. A 403 would confirm that the session
+    exists and roughly when it ran, to somebody just established as having
+    no business knowing.
+
+    **409 for a drag the queue has moved out from under.** The session, or
+    the session it was dropped beside, has finished since the page was
+    drawn. That is not a malformed request -- it was perfectly good a few
+    seconds ago -- and it is not a permission problem, so it is neither
+    400 nor 404: it is the state having changed, which is exactly what
+    409 says and exactly what the re-queue refusal above uses it for. The
+    body carries the queue as it now is, so the page can redraw rather
+    than replay the drag it has just been told is stale.
+    """
+    from sturnus.console.app import current_user
+
+    viewer = current_user(request).discord_user_id
+    session_id = _session_id(request)
+    if session_id is None:
+        return _no_such_session()
+
+    placement = await _requested_placement(request, session_id)
+    order = await request.app[QUEUE_CONTROL].place(
+        session_id, requested_by=viewer, placement=placement
+    )
+    if order is None:
+        return _no_such_session()
+    return _order_response(order, session_id=session_id, requested_by=viewer)
+
+
+async def prioritise_guild_queue(request: web.Request) -> web.Response:
+    """Reorders a whole guild's queue by one named rule.
+
+    The quick actions beside the queue: run the meetings with the most
+    people in them first, or the shortest recordings first. Each is a sort
+    key in `sturnus.application.priorities` and nothing more, so the third
+    one somebody asks for is one function there and one name in a
+    registry -- not another endpoint, and not another way to write a
+    priority.
+
+    **The name is validated here, at the boundary**, and an unknown one is
+    a 400 naming both what was asked for and what there is. The same trade
+    the `model` parameter makes on the re-queue endpoint, and for the same
+    reason: below this line an unknown rule does not exist, so nothing
+    deeper has to decide what to do about one -- and silently running a
+    different rule than the one asked for would reorder a guild's queue in
+    a way the administrator could not tell from the feature working.
+
+    404 for a guild this person does not administer and for one that does
+    not exist alike, as everywhere else in this module.
+    """
+    from sturnus.console.app import current_user
+
+    viewer = current_user(request).discord_user_id
+    try:
+        guild_id = int(request.match_info["guild_id"])
+    except ValueError:
+        return _no_such_guild()
+
+    rule = await _requested_rule(request)
+    try:
+        resolve_rule(rule)
+    except UnknownPriorityRule as exc:
+        # The message names the value a caller sent, which is unbounded
+        # text, so it goes into the response and never into a log line --
+        # the same trade the unknown-model refusal makes above.
+        return _bad_request(str(exc))
+
+    order = await request.app[QUEUE_OVERVIEW].reprioritise(guild_id, requested_by=viewer, rule=rule)
+    if order is None:
+        return _no_such_guild()
+    return _order_response(order, guild_id=guild_id, requested_by=viewer, rule=rule)
+
+
+def _order_response(
+    order: QueueOrder,
+    *,
+    requested_by: int,
+    session_id: int | None = None,
+    guild_id: int | None = None,
+    rule: str | None = None,
+) -> web.Response:
+    """One answer for both writes, refusal included.
+
+    The audit line is here rather than in each handler because it is the
+    same event: somebody changed the order work will be done in. It is
+    logged at WARNING when something was actually written, for the reason
+    the re-queue audit line is -- a queue that reordered itself under a
+    team needs a name attached to why -- and nothing is logged for a
+    reorder that changed nothing, which is what a page re-sending its
+    current order produces.
+    """
+    if not order.accepted:
+        # INFO: a stale drag is this endpoint working. Nothing was written
+        # and there is nothing for an operator to do.
+        log_event(
+            log,
+            logging.INFO,
+            Event.CONSOLE_QUEUE_REORDER_REFUSED,
+            "Refused a queue reorder asked for from the console",
+            session_id=session_id,
+            guild_id=guild_id,
+            requested_by=requested_by,
+        )
+        return web.json_response(_order_json(order), status=409)
+
+    if order.changed:
+        log_event(
+            log,
+            logging.WARNING,
+            Event.CONSOLE_QUEUE_REORDERED,
+            "Reordered a guild's transcription queue from the console",
+            session_id=session_id,
+            guild_id=guild_id,
+            requested_by=requested_by,
+            # One of a fixed set of literals from this repository's own
+            # source, which is the standard `observability.fields` holds
+            # `model` to. `None` for a drag, which names no rule.
+            rule=rule,
+            sessions=len(order.changed),
+        )
+    return web.json_response(
+        _order_json(order),
+        # It names which meetings a guild has outstanding, and it is stale
+        # the moment a worker claims a job.
+        headers={"Cache-Control": "private, no-store"},
+    )
+
+
 async def known_models(request: web.Request) -> web.Response:
     """Every transcription model a re-queue may name, and which is the default.
 
@@ -655,6 +833,86 @@ async def _requested_model(request: web.Request) -> str | None:
     if not isinstance(model, str):
         raise _bad_request_exception(_MODEL_MUST_BE_A_STRING)
     return model
+
+
+async def _requested_placement(request: web.Request, session_id: int) -> Placement:
+    """Where a drag says a session goes, checked before anything is read.
+
+    Strict about types rather than forgiving, exactly as
+    `_requested_model` is: `{"place": 1}` is not coerced and
+    `{"session": 512}` is refused rather than read as `"512"`. Session ids
+    travel as strings everywhere in this API -- see `_queued_session_json`
+    -- so a number here is a client that has started parsing ids as
+    numbers somewhere, which is a bug worth failing loudly rather than
+    accommodating until it reaches an id that does not survive the round
+    trip.
+
+    The anchor's presence is checked against the placement rather than
+    ignored when it does not apply. `{"place": "first", "session": "512"}`
+    is somebody who believes they said where; obeying half of that and
+    discarding the rest is how a caller learns to distrust an API.
+    """
+    body = await _body(request)
+    place = body.get("place")
+    if not isinstance(place, str) or place not in PLACEMENTS:
+        raise _bad_request_exception(_PLACE_MUST_BE_KNOWN)
+
+    anchor = _anchor_id(body)
+    placement = Placement(place, anchor)
+    if not placement.is_valid:
+        raise _bad_request_exception(
+            _ANCHOR_MUST_BE_A_SESSION_ID if anchor is None else _ANCHOR_ONLY_WITH_BEFORE_OR_AFTER
+        )
+    if anchor == session_id:
+        # "Before itself" names no position at all. Refused rather than
+        # treated as a no-op, because a client that sent it is computing
+        # the anchor wrongly and a silent success hides that for ever.
+        raise _bad_request_exception(_ANCHOR_IS_THE_SESSION_ITSELF)
+    return placement
+
+
+def _anchor_id(body: dict[str, object]) -> int | None:
+    if "session" not in body:
+        return None
+    anchor = body["session"]
+    if not isinstance(anchor, str):
+        raise _bad_request_exception(_ANCHOR_MUST_BE_A_SESSION_ID)
+    try:
+        return int(anchor)
+    except ValueError:
+        raise _bad_request_exception(_ANCHOR_MUST_BE_A_SESSION_ID) from None
+
+
+async def _requested_rule(request: web.Request) -> str:
+    """The quick action a request named. Required, and only ever a string.
+
+    No default. A body without a rule is not "the usual one" -- there is
+    no usual one, and guessing would reorder a guild's queue by a rule
+    nobody chose.
+    """
+    body = await _body(request)
+    rule = body.get("rule")
+    if not isinstance(rule, str):
+        raise _bad_request_exception(_RULE_MUST_BE_A_STRING)
+    return rule
+
+
+async def _body(request: web.Request) -> dict[str, object]:
+    """The request's JSON object, or a 400.
+
+    Unlike the re-queue's body, this one is required: a re-queue with no
+    body is the console's button and means "no choice", while a reorder
+    with no body has not said what to do.
+    """
+    if not request.body_exists:
+        raise _bad_request_exception(_MALFORMED_BODY)
+    try:
+        body = await request.json()
+    except ValueError:
+        raise _bad_request_exception(_MALFORMED_BODY) from None
+    if not isinstance(body, dict):
+        raise _bad_request_exception(_MALFORMED_BODY)
+    return body
 
 
 def _bad_request(reason: str) -> web.Response:
@@ -769,6 +1027,53 @@ def _queued_session_json(session: QueuedSession) -> dict[str, object]:
             "done": session.done,
             "dead": session.dead,
         },
+        # Lower first, `0` ordinary. **Present-and-null rather than absent**
+        # for a session with nothing outstanding -- still recording, or
+        # listed only because a job of it died -- so a client never has to
+        # tell "no place in the queue" from "this API predates the field".
+        # It would guess, and it would guess wrong on one of them. The same
+        # shape `/api/me` gives `display_name`.
+        #
+        # Null is not zero here and the difference is what a page acts on:
+        # zero is the ordinary priority and a real place in the queue, null
+        # is a row with nothing to reorder, which is a row that must not
+        # offer a drag handle.
+        "priority": session.priority,
+    }
+
+
+def _order_json(order: QueueOrder) -> dict[str, object]:
+    """A guild's queue order, in the shape both writes answer with.
+
+    The whole queue every time, refusal included, because this is what a
+    page redraws from. It is deliberately not the *difference*: a client
+    that applied a diff to a list it had would be applying it to the list
+    that may have caused the refusal.
+
+    `changed` is sent beside it and is the one thing the order itself does
+    not say -- whether this request did anything. An administrator who
+    dragged a session two pixels and put it back gets `[]` and can be told
+    "nothing to do" instead of "done".
+    """
+    return {
+        "accepted": order.accepted,
+        # Present-and-null on success rather than absent; see `_outcome_json`.
+        "refusal": order.refusal,
+        "changed": [str(session_id) for session_id in order.changed],
+        "order": [
+            {
+                # A string, like every other id in this API. Session ids do
+                # not need it and follow anyway: two id shapes in one
+                # payload is how the one that matters gets parsed with the
+                # wrong one.
+                "session_id": str(position.session_id),
+                # Never null here, unlike the queue listing's field of the
+                # same name: everything in this list has outstanding work
+                # by construction, which is what having a place means.
+                "priority": position.priority,
+            }
+            for position in order.sessions
+        ],
     }
 
 
@@ -803,8 +1108,10 @@ def register(app: web.Application) -> None:
         [
             web.get(_GUILD_PATH, require_session(guild_queue)),
             web.get(_GUILD_STREAM_PATH, require_session(guild_queue_stream)),
+            web.post(_GUILD_PRIORITY_PATH, require_session(prioritise_guild_queue)),
             web.get(_STATUS_PATH, require_session(queue_status)),
             web.get(_STATUS_STREAM_PATH, require_session(queue_status_stream)),
+            web.post(_PLACE_PATH, require_session(place_session)),
             web.post(_REQUEUE_PATH, require_session(requeue_session)),
             web.get(_MODELS_PATH, require_session(known_models)),
         ]
