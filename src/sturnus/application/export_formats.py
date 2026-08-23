@@ -38,6 +38,15 @@ a format nothing can render must be refused where an administrator can read
 the refusal, not accepted and then silently skipped after every meeting.
 When either is built it belongs behind this registry and needs no other
 change.
+
+Absent from `FORMATS`, but **named in `UNBUILT` and reported by
+`catalogue`**. "Which formats exist" and "which of them this build can run"
+are two questions, and until an interface could ask the second it had to
+answer both by hard-coding a list of its own -- which is how the console
+came to hold three separate restatements of this paragraph, each of which
+building `pdf` would have quietly falsified. Moving a name from `UNBUILT`
+into `FORMATS` is now the one edit, in this one file, that the paragraph
+above always claimed it would be.
 """
 
 from __future__ import annotations
@@ -314,3 +323,85 @@ def supported_formats() -> tuple[str, ...]:
     than being left to guess.
     """
     return tuple(FORMATS)
+
+
+# ---------------------------------------------------------------------------
+# The catalogue: what exists, and what this build can run
+# ---------------------------------------------------------------------------
+
+#: The formats the specification names (spec §3.4) and this build does not
+#: implement. Names rather than entries, because an entry is a renderer
+#: paired with a sink and there is neither: writing `pdf` here would be
+#: this module claiming a fact about bytes nothing can produce.
+#:
+#: **Kept beside `FORMATS` rather than in the console, in the API layer, or
+#: in a sentence in a locale file**, and that is the whole reason this
+#: constant exists. `pdf` and `confluence` were documented as unbuilt in
+#: this module's docstring, restated as an absence in the console's own
+#: format list, and restated a third time as English prose under the format
+#: picker. Three copies of one fact, and building `pdf` would have made
+#: liars of the second and third with nothing failing. Moving a name out of
+#: here and into `FORMATS` is now the single edit the module docstring
+#: always promised it would be, and every reader of `catalogue` follows.
+UNBUILT: Final[tuple[str, ...]] = (
+    #: A large native dependency in an image that today holds Python and a
+    #: Whisper model -- a decision about attack surface and image size.
+    "pdf",
+    #: A second wiki API, with its own auth, its own document model and its
+    #: own idea of what a page is.
+    "confluence",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class CatalogueEntry:
+    """One format as somebody outside this process may be told about it.
+
+    Deliberately not `ExportFormat`. That record holds a callable, a media
+    type and a compiled pattern -- everything the *publisher* needs and
+    nothing a reader asking "what may I configure?" can use. This is the
+    other question, and it has three answers in it and no more:
+
+    - `name`, which is what `guild_export_target.format` stores;
+    - `available`, whether this build can actually run it -- the fact no
+      caller outside this process has ever been able to obtain, and the
+      reason `catalogue` exists at all;
+    - `sink`, the family that carries the bytes, which is what decides
+      whether a `target` is an address in Outline or a key prefix in an
+      object store. It is `None` for an unbuilt format, and honestly so:
+      nothing here has decided what would carry a PDF, and naming a family
+      for one would be inventing the answer rather than reporting it.
+
+    No media type and no file extension. They are read by the object-store
+    sink and by the route that serves an artefact back, both of which are
+    inside this process and both of which read `ExportFormat` directly.
+    """
+
+    name: str
+    available: bool
+    sink: str | None
+
+
+def catalogue() -> tuple[CatalogueEntry, ...]:
+    """Every format this deployment knows of, buildable or not.
+
+    `supported_formats` answers "what may be configured"; this answers
+    "what exists, and which of it works here", which is a strictly larger
+    question and the one an interface has to render. A console that can
+    only see the first has to guess at the difference between *not offered*
+    and *not built*, and the only way to guess is to hard-code a second
+    list that this module has no way to correct.
+
+    Buildable entries first, in registry order, then the unbuilt ones.
+    Order is part of the answer: `FORMATS` is ordered so that `outline` --
+    what every guild published to before any of the others existed -- comes
+    first, and a reader offered a list of choices reads the first one as
+    the ordinary one.
+    """
+    return tuple(
+        [
+            CatalogueEntry(name=entry.name, available=True, sink=entry.sink)
+            for entry in FORMATS.values()
+        ]
+        + [CatalogueEntry(name=name, available=False, sink=None) for name in UNBUILT]
+    )
