@@ -41,15 +41,41 @@ NOTHING_CONFIGURED: dict[str, str] = dict(settings.DEFAULTS)
 
 
 def test_the_view_offers_exactly_the_keys_the_store_accepts() -> None:
-    """`ConfigStore.set` refuses anything outside `DEFAULTS | REQUIRED_KEYS`.
+    """`ConfigStore.set` refuses anything outside `settings.KNOWN_KEYS`.
 
     A console that offered a key the store refuses would render a field
     that can never be saved; one that hid a key the store accepts would
     make a setting reachable only from Discord. Both are the same bug --
-    two lists of keys -- so this one is derived from the store's union
-    rather than typed out again.
+    two lists of keys -- so this one is the store's own registry rather
+    than a union assembled again here.
     """
-    assert frozenset(settings.DEFAULTS) | settings.REQUIRED_KEYS == settings_view.KNOWN_KEYS
+    assert settings.KNOWN_KEYS == settings_view.KNOWN_KEYS
+
+
+def test_the_deprecated_channel_key_is_still_offered() -> None:
+    """A guild cannot be moved off a key the console will not show it."""
+    listed = {view.key for view in settings_view.describe_all(NOTHING_CONFIGURED)}
+    assert settings.VOICE_CHANNEL_ID in listed
+    assert settings.VOICE_CHANNEL_IDS in listed
+
+
+def test_the_deprecated_channel_key_waits_for_the_recording_like_its_successor() -> None:
+    """One setting, two names -- so one answer, not two.
+
+    The bot reads the old key on exactly the same reconcile pass and defers
+    it behind exactly the same recording. Describing it as immediate would
+    be the console's own version of the lie `/config set` exists to avoid.
+    """
+    view = settings_view.describe(settings.VOICE_CHANNEL_IDS, NOTHING_CONFIGURED)
+    assert view.deferred_while_recording is True
+    assert view.takes_effect == settings_view.NEXT_RECONCILE
+
+
+def test_the_deprecated_channel_key_may_not_be_cleared_from_a_web_form() -> None:
+    """It has no default either, so clearing it can take a guild that has
+    not moved to the list key yet out of service -- while looking like
+    tidying up. `/config clear` will still do it, deliberately."""
+    assert settings_view.may_clear(settings.VOICE_CHANNEL_ID) is False
 
 
 def test_a_required_key_never_also_has_a_default() -> None:
@@ -119,7 +145,7 @@ def test_a_required_key_with_nothing_stored_has_no_value_at_all() -> None:
     text box that saves an empty string would store a value the bot then
     fails to parse.
     """
-    view = settings_view.describe(settings.VOICE_CHANNEL_ID, NOTHING_CONFIGURED)
+    view = settings_view.describe(settings.VOICE_CHANNEL_IDS, NOTHING_CONFIGURED)
     assert view.value is None
     assert view.default is None
 
@@ -142,7 +168,7 @@ def test_a_key_stored_by_hand_that_nobody_reads_is_not_shown() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("key", ["voice_channel_id", "policy_url"])
+@pytest.mark.parametrize("key", ["voice_channel_ids", "policy_url"])
 def test_a_key_with_no_default_is_marked_required(key: str) -> None:
     assert settings_view.describe(key, NOTHING_CONFIGURED).required is True
 
@@ -240,7 +266,7 @@ def test_a_key_that_names_the_channel_may_wait_for_the_recording_in_progress() -
     console has no way to know whether a session is in progress, so it
     says the change *may* wait rather than pretending it will not.
     """
-    view = settings_view.describe(settings.VOICE_CHANNEL_ID, NOTHING_CONFIGURED)
+    view = settings_view.describe(settings.VOICE_CHANNEL_IDS, NOTHING_CONFIGURED)
     assert view.deferred_while_recording is True
 
 

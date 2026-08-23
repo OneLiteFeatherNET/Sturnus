@@ -104,6 +104,10 @@ class _Store:
     async def get_stored(self, _guild_id: int, key: str) -> str | None:
         return self.values.get(key)
 
+    async def snapshot(self, _guild_id: int) -> dict[str, str]:
+        stored = {key: value for key, value in self.values.items() if value is not None}
+        return {**settings.DEFAULTS, **stored}
+
 
 class _Reconcile:
     """Stands in for the client's reconcile, recording when it was called."""
@@ -225,3 +229,79 @@ async def test_a_writing_command_outside_a_guild_is_refused_without_deferring(
     assert interaction.response.deferred is False
     assert "only be used in a server" in interaction.reply
     assert store.writes == []
+
+
+# ---------------------------------------------------------------------------
+# `/config show` and the key that was renamed
+# ---------------------------------------------------------------------------
+
+
+def _live_state(guild_id: int) -> RunningState:  # noqa: ARG001
+    return RunningState(
+        is_live=True,
+        is_recording=False,
+        channel_id=1,
+        allowed_channel_ids=(1,),
+        waiting_channel_ids=(),
+        pending_keys=(),
+        pending_teardown=False,
+    )
+
+
+def _show_cog(store: _Store) -> ConfigCog:
+    """A cog whose reconcile must not be reached: `/config show` writes nothing."""
+
+    async def _never(guild_id: int, *, force: bool = False) -> ReconfigureResult:
+        raise AssertionError(f"show must not reconcile (guild {guild_id}, force={force})")
+
+    return ConfigCog(cast(ConfigStore, store), _never, _live_state)
+
+
+async def test_show_tells_a_guild_still_on_the_old_key_that_it_was_replaced() -> None:
+    """The deprecation has to be *said*, precisely because nothing forces it.
+
+    The old key keeps working indefinitely, so a guild left on it would
+    otherwise never learn that the setting has a new name -- or that only
+    the new one can name more than one channel.
+    """
+    interaction = _Interaction()
+    store = _Store()
+    store.values[settings.VOICE_CHANNEL_ID] = "12345"
+    await _invoke(_show_cog(store), "show", interaction)
+
+    assert f"`{settings.VOICE_CHANNEL_ID}`" in interaction.reply
+    assert f"/config set {settings.VOICE_CHANNEL_IDS} 12345" in interaction.reply
+
+
+async def test_show_says_which_of_the_two_channel_keys_is_actually_being_used() -> None:
+    """A row that is doing nothing is worse than no row: it reads as configuration."""
+    interaction = _Interaction()
+    store = _Store()
+    store.values[settings.VOICE_CHANNEL_IDS] = "12345,67890"
+    store.values[settings.VOICE_CHANNEL_ID] = "999"
+    await _invoke(_show_cog(store), "show", interaction)
+
+    assert "being **ignored**" in interaction.reply
+    assert f"/config clear {settings.VOICE_CHANNEL_ID}" in interaction.reply
+
+
+async def test_show_says_nothing_about_the_old_key_to_a_guild_that_never_used_it() -> None:
+    """The overwhelmingly common case, which must stay quiet."""
+    interaction = _Interaction()
+    store = _Store()
+    store.values[settings.VOICE_CHANNEL_IDS] = "12345"
+    await _invoke(_show_cog(store), "show", interaction)
+
+    assert "replaced" not in interaction.reply
+    assert "being **ignored**" not in interaction.reply
+
+
+async def test_show_does_not_report_a_guild_on_the_old_key_as_unconfigured() -> None:
+    interaction = _Interaction()
+    store = _Store()
+    for key in settings.REQUIRED_KEYS - {settings.VOICE_CHANNEL_IDS}:
+        store.values[key] = "1"
+    store.values[settings.VOICE_CHANNEL_ID] = "12345"
+    await _invoke(_show_cog(store), "show", interaction)
+
+    assert "All required keys are set." in interaction.reply

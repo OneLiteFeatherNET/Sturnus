@@ -35,6 +35,7 @@ import discord
 from discord.ext import commands
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from sturnus.application.channel_choice import choose_channel
 from sturnus.application.ports import (
     AudioStore,
     AudioWriterFactory,
@@ -43,6 +44,7 @@ from sturnus.application.ports import (
     VoiceReceiver,
 )
 from sturnus.application.reconfigure import (
+    IDENTITY_KEYS,
     GuildRuntimeConfig,
     ReconfigureAction,
     ReconfigurePlan,
@@ -105,6 +107,23 @@ CAPTURE_FAILURE_REASONS = frozenset({EndReason.CAPTURE_FAILURE, EndReason.DECODE
 #: failed. Long enough that a persistent fault is visibly a fault rather
 #: than a flutter, short enough that a genuinely transient one costs a
 #: meeting's opening minutes rather than the rest of the day.
+#:
+#: **Guild-wide, not per channel, and deliberately so.** A guild now allows
+#: a list of channels, so the question had to be asked again: is a capture
+#: failure in one room a reason to refuse another? It is, because of what
+#: these two end reasons actually mean. `CAPTURE_FAILURE` is a join that
+#: raised or a reader that died, and `DECODE_FAILURE` is every stream
+#: ceasing to decode -- both are properties of *this process's* one voice
+#: connection, its libopus and its gateway session, none of which is per
+#: channel. The bot has one voice connection per guild; walking it into the
+#: next room reuses every part that just failed.
+#:
+#: The loop the cooldown exists to stop would also be strictly worse per
+#: channel. Leaving a channel is itself a voice-state update, so a
+#: per-channel guard would send the bot straight into the next allowed
+#: channel, fail there, block that one, and work down the list --
+#: announcing to each room in turn that it is being recorded, and
+#: recording none of them.
 REJOIN_COOLDOWN = timedelta(minutes=15)
 
 
@@ -136,8 +155,15 @@ class _GuildRecording:
     #: Set when a session ended because capture failed; while it is in the
     #: future, no new session opens for this guild. Cleared by the tick
     #: loop once it has passed -- a guard that only an operator can clear
-    #: turns a transient fault into an outage.
+    #: turns a transient fault into an outage. Guild-wide rather than per
+    #: channel; the reasoning is on `REJOIN_COOLDOWN` above.
     blocked_until: datetime | None = None
+    #: Allowed channels that held consenting members and were not being
+    #: served, as of the last headcount. Kept so `/config show` can tell a
+    #: person waiting in the second room why nothing is happening, and so
+    #: the log line about it is emitted once per *decision* rather than
+    #: once per voice-state update.
+    waiting_channel_ids: tuple[int, ...] = ()
     #: Monotonic timestamp of the moment this guild's session started
     #: recording, or `None` when it is idle. Kept here rather than on
     #: `RecordingService` because it exists purely to feed
@@ -154,7 +180,21 @@ class _GuildRecording:
 
     @property
     def channel_id(self) -> int:
-        return self.config.channel_id
+        """The one allowed channel currently being served.
+
+        Read off the service rather than the configuration, because that is
+        where it is decided: the configuration names every channel that is
+        *allowed*, and which of them is being recorded is settled per pass
+        from who is sitting in them. During a session it is the channel the
+        session's row names, which is the only answer that is ever true of
+        audio already on disk.
+        """
+        return self.service.channel_id
+
+    @property
+    def channel_ids(self) -> tuple[int, ...]:
+        """Every channel this guild allows Sturnus to record in."""
+        return self.config.channel_ids
 
     @property
     def role_id(self) -> int:
@@ -256,6 +296,13 @@ class SturnusClient(commands.Bot):
         #: is simply unconfigured -- or whose value someone fat-fingered
         #: with a direct UPDATE -- is reported once, not every ten seconds.
         self._config_notices: dict[int, str] = {}
+        #: Allowed channels last reported as unseeable, per guild. A list
+        #: can now name a channel that was deleted, or one the bot cannot
+        #: see, and that must be skipped rather than allowed to stop the
+        #: other channels working -- but it must also be *said*, once,
+        #: rather than on every headcount for as long as the id stays in
+        #: the configuration.
+        self._unreadable_channels: dict[int, tuple[int, ...]] = {}
         #: Set before anything is torn down, so a `/config set` landing
         #: during SIGTERM cannot rebuild a pipeline (and reconnect a voice
         #: client) after `graceful_shutdown` has already left the channel.
@@ -328,9 +375,9 @@ class SturnusClient(commands.Bot):
     ) -> GuildRuntimeConfig | None:
         """Reads what the database says this guild's runtime state should be.
 
-        Returns `None` when the guild cannot record at all -- `voice_channel_id`
-        or `consent_role_id` unset -- which is a genuine answer and leads to
-        a teardown, not an error.
+        Returns `None` when the guild cannot record at all -- no recording
+        channel named, or `consent_role_id` unset -- which is a genuine
+        answer and leads to a teardown, not an error.
 
         A value that will not parse is a different matter and must not be
         treated as either. `ConfigStore.set` validates integers, but a
@@ -343,9 +390,25 @@ class SturnusClient(commands.Bot):
         somebody's typo in a shell.
         """
         snapshot = await self._config_store.snapshot(guild_id)
-        channel = snapshot.get(settings.VOICE_CHANNEL_ID)
+        # Reads the list key and falls back to the singular one it replaced
+        # -- the one place the deprecation is resolved for the bot, so a
+        # guild configured before the rename keeps recording without a
+        # migration. Raises `InvalidChannelList` for a value that will not
+        # parse, which is caught below with every other unusable value.
+        try:
+            channel_ids = settings.recording_channel_ids(snapshot)
+        except settings.InvalidChannelList as exc:
+            self._notice(
+                guild_id,
+                "Guild %d has an unusable list of recording channels (%s); keeping the "
+                "configuration already in force. Fix it with /config set %s.",
+                guild_id,
+                exc,
+                settings.VOICE_CHANNEL_IDS,
+            )
+            return current
         role = snapshot.get(settings.CONSENT_ROLE_ID)
-        if channel is None or role is None:
+        if not channel_ids or role is None:
             # `missing` is the addition that matters: the prose line says a
             # guild is unconfigured without saying which key is absent, so
             # the operator's next step was always "run /config show and read
@@ -355,7 +418,7 @@ class SturnusClient(commands.Bot):
             # reconciled every ten seconds forever.
             if self._notice(
                 guild_id,
-                "Guild %d is missing voice_channel_id and/or consent_role_id; "
+                "Guild %d is missing voice_channel_ids and/or consent_role_id; "
                 "an administrator must run /config show to see what's missing.",
                 guild_id,
             ):
@@ -366,19 +429,12 @@ class SturnusClient(commands.Bot):
                     "Guild cannot record: required configuration is missing. "
                     "An administrator must run /config show.",
                     guild_id=guild_id,
-                    missing=[
-                        key
-                        for key, value in (
-                            (settings.VOICE_CHANNEL_ID, channel),
-                            (settings.CONSENT_ROLE_ID, role),
-                        )
-                        if value is None
-                    ],
+                    missing=sorted(settings.missing_required(snapshot) & set(IDENTITY_KEYS)),
                 )
             return None
         try:
             desired = GuildRuntimeConfig(
-                channel_id=int(channel),
+                channel_ids=channel_ids,
                 role_id=int(role),
                 timeouts=SessionTimeouts(
                     empty_grace_seconds=int(snapshot[settings.EMPTY_GRACE_SECONDS]),
@@ -628,12 +684,20 @@ class SturnusClient(commands.Bot):
         the channel from the *next* voice-state update, so an
         administrator who fixed the configuration while three people sat
         waiting in the channel got a bot that reported itself configured
-        and recorded nothing until somebody left and rejoined.
+        and recorded nothing until somebody left and rejoined. It is also
+        what settles *which* of the allowed channels this pipeline serves:
+        the id below is only a starting point, and the headcount replaces
+        it with whichever allowed channel actually holds a meeting.
         """
+        # The lowest allowed id, purely so the service has a channel before
+        # anyone has been counted. `_sync_participants` below retargets it
+        # to the real answer within the same call; nothing reads it in
+        # between, because a session can only open from that headcount.
+        initial_channel_id = desired.channel_ids[0]
         service = RecordingService(
             guild_id=guild_id,
-            channel_id=desired.channel_id,
-            channel_name=self._channel_name(guild_id, desired.channel_id),
+            channel_id=initial_channel_id,
+            channel_name=self._channel_name(guild_id, initial_channel_id),
             timeouts=desired.timeouts,
             sessions=self._session_repo,
             jobs=self._job_repo,
@@ -656,7 +720,8 @@ class SturnusClient(commands.Bot):
             Event.GUILD_CONFIGURED,
             "Guild is armed to record; watching its voice channel",
             guild_id=guild_id,
-            channel_id=desired.channel_id,
+            channel_id=initial_channel_id,
+            count=len(desired.channel_ids),
         )
         await self._sync_participants(self.get_guild(guild_id), self._guilds[guild_id])
 
@@ -694,65 +759,119 @@ class SturnusClient(commands.Bot):
     async def _retarget(
         self, guild_id: int, recording: _GuildRecording, desired: GuildRuntimeConfig
     ) -> None:
-        """Points an idle guild at a new channel and/or consent role, in place.
+        """Points an idle guild at a new list of channels and/or consent role, in place.
 
         Nothing is replaced: the same `RecordingService` and the same
         adapter carry on, so the adapter's reference to the service can
         never go stale and no voice connection is left behind. `leave()`
-        only when the channel itself moved -- it is idempotent, but a role
-        change alone has no connection to drop, and the adapter re-reads
-        the consent role on its next `join()` anyway.
+        only when the channel being served has just stopped being allowed
+        -- it is idempotent, but a role change, or a channel merely being
+        *added* to the list, has no connection to drop, and the adapter
+        re-reads the consent role on its next `join()` anyway.
+
+        Which of the newly allowed channels is served is not decided here.
+        `_sync_participants` decides it, from the headcounts, on the same
+        call -- so a list change and an ordinary voice-state update reach
+        exactly the same rule, and there is no second place where a
+        channel gets chosen.
 
         Then the same headcount `_build` takes, for the same reason and
         with the same consequence if it is skipped: after a retarget the
-        people who matter are the ones sitting in the *new* channel (or
-        the ones in the old one who have just been given the new consent
-        role), and none of them will emit a voice-state update merely
-        because the configuration changed underneath them.
+        people who matter are the ones sitting in the *newly allowed*
+        channels (or the ones in the old one who have just been given the
+        new consent role), and none of them will emit a voice-state update
+        merely because the configuration changed underneath them.
         """
-        if desired.channel_id != recording.channel_id:
+        if recording.channel_id not in desired.channel_ids:
             await recording.voice.leave()
-        recording.service.retarget(
-            desired.channel_id, self._channel_name(guild_id, desired.channel_id)
-        )
+            # The service must not be left naming a channel the guild no
+            # longer allows: if nobody is in any of them, nothing else
+            # would move it before the next session opened against it.
+            fallback = desired.channel_ids[0]
+            recording.service.retarget(fallback, self._channel_name(guild_id, fallback))
         recording.config = desired
         recording.pending = None
         await self._sync_participants(self.get_guild(guild_id), recording)
 
-    def _consenting_count(self, guild: discord.Guild, recording: _GuildRecording) -> int | None:
-        """How many consenting members are sitting in the target channel right now.
+    def _consenting_counts(
+        self, guild: discord.Guild, recording: _GuildRecording
+    ) -> dict[int, int]:
+        """How many consenting members sit in each allowed channel right now.
 
         Counts members carrying the consent role, never everyone present:
-        an administrator can be in the channel without the role and must
-        not, by their presence alone, start a recording nobody consented
-        to (Spec 3.1).
+        an administrator can be in a channel without the role and must not,
+        by their presence alone, start a recording nobody consented to
+        (Spec 3.1).
 
-        `None` when the answer cannot be read at all -- the configured id
-        is not a voice channel this process can see -- which is emphatically
-        not the same as zero and must not be handed to the machine as such:
-        zero is what starts the empty-grace countdown on a live session.
+        A channel that cannot be read at all -- deleted, or not a voice
+        channel this process can see -- is **absent from the result**,
+        never present as a zero. The distinction is the same one the
+        single-channel version made with `None`: zero means everybody left,
+        which is what starts the empty-grace countdown on a live session,
+        while "I could not look" must never be spelled that way. Absence
+        also keeps one broken entry in the list from stopping the other
+        channels from working, which is the whole reason the list is worth
+        having.
         """
-        channel = guild.get_channel(recording.channel_id)
-        if not isinstance(channel, discord.VoiceChannel):
-            return None
-        return sum(
-            1
-            for participant in channel.members
-            if any(role.id == recording.role_id for role in participant.roles)
+        counts: dict[int, int] = {}
+        unreadable: list[int] = []
+        for channel_id in recording.channel_ids:
+            channel = guild.get_channel(channel_id)
+            if not isinstance(channel, discord.VoiceChannel):
+                unreadable.append(channel_id)
+                continue
+            counts[channel_id] = sum(
+                1
+                for participant in channel.members
+                if any(role.id == recording.role_id for role in participant.roles)
+            )
+        self._note_unreadable_channels(guild.id, tuple(unreadable))
+        return counts
+
+    def _note_unreadable_channels(self, guild_id: int, unreadable: tuple[int, ...]) -> None:
+        """Reports allowed channels this process cannot see, once per change.
+
+        Every headcount runs this, and a headcount runs on every voice-state
+        update, so the line has to belong to the *transition* -- a channel
+        deleted out from under a stored list would otherwise repeat the same
+        sentence for as long as the id stays in the configuration.
+        """
+        if self._unreadable_channels.get(guild_id, ()) == unreadable:
+            return
+        self._unreadable_channels[guild_id] = unreadable
+        if not unreadable:
+            return
+        log.warning(
+            "Guild %d allows %s, which %s cannot be seen as a voice channel; skipping "
+            "it. Every other allowed channel keeps working. Remove it with "
+            "/config set %s.",
+            guild_id,
+            ", ".join(str(channel_id) for channel_id in unreadable),
+            "they" if len(unreadable) > 1 else "it",
+            settings.VOICE_CHANNEL_IDS,
         )
 
     async def _sync_participants(
         self, guild: discord.Guild | None, recording: _GuildRecording
     ) -> None:
-        """Reports the channel's current consenting headcount and joins if it starts one.
+        """Counts every allowed channel, picks one, and joins it if it starts a session.
 
-        The single place that turns "who is in the channel" into a session,
-        used by the voice-state handler and by every path that builds or
-        retargets a pipeline alike. Reading the channel's membership rather
-        than accumulating deltas is what makes it safe to call from all of
-        them: the answer is the truth at the moment it runs, so a caller
-        that has just changed which channel counts gets the right number
-        without anyone having to replay the events it missed.
+        The single place that turns "who is in the channels" into a
+        session, used by the voice-state handler and by every path that
+        builds or retargets a pipeline alike. Reading each channel's
+        membership rather than accumulating deltas is what makes it safe to
+        call from all of them: the answer is the truth at the moment it
+        runs, so a caller that has just changed which channels count gets
+        the right numbers without anyone having to replay the events it
+        missed.
+
+        It is also the single place a channel is *chosen*. A guild allows a
+        list; a Discord bot holds one voice connection per guild; so when
+        two allowed channels are both busy something must pick one, and
+        `sturnus.application.channel_choice.choose_channel` is the rule --
+        most consenting members first, lowest channel id to break a tie.
+        The rule lives there rather than inline here so every clause of it
+        can be pinned down without a gateway.
 
         The single place a session can start is also the single place the
         capture-failure guard is enforced. The bot's own `leave()` emits a
@@ -765,18 +884,60 @@ class SturnusClient(commands.Bot):
             return
         if recording.blocked_until is not None:
             log.info(
-                "Not counting channel %d: capture failed there and no session will "
-                "start before %s.",
+                "Not counting guild %d: capture failed in channel %d and no session "
+                "will start anywhere in this server before %s.",
+                guild.id,
                 recording.channel_id,
                 recording.blocked_until.isoformat(),
             )
             return
-        consented_count = self._consenting_count(guild, recording)
-        if consented_count is None:
+
+        counts = self._consenting_counts(guild, recording)
+
+        # A session in progress is never moved. Its `sessions` row already
+        # names the channel it opened against, and the audio on disk came
+        # from there -- so while one is open (or still closing) the only
+        # headcount that matters is that channel's, whatever the others are
+        # doing. The bigger meeting in the next room waits for this one to
+        # end, which is also the only honest thing to do with one voice
+        # connection.
+        if recording.service.is_recording or recording.service.needs_reset:
+            consented_count = counts.get(recording.channel_id)
+            if consented_count is None:
+                return
+            self._note_waiting(
+                guild.id,
+                recording,
+                tuple(
+                    sorted(
+                        channel_id
+                        for channel_id, count in counts.items()
+                        if count > 0 and channel_id != recording.channel_id
+                    )
+                ),
+            )
+            await recording.service.participants_changed(consented_count, self._clock.now())
             return
-        was_recording = recording.service.is_recording
-        await recording.service.participants_changed(consented_count, self._clock.now())
-        if recording.service.is_recording and not was_recording:
+
+        if not counts:
+            # Not one allowed channel could be read. Same answer the single
+            # channel version gave: say nothing to the machine rather than
+            # tell it everybody left.
+            return
+
+        choice = choose_channel(counts)
+        self._note_waiting(guild.id, recording, choice.waiting)
+        if choice.channel_id is None:
+            await recording.service.participants_changed(0, self._clock.now())
+            return
+        if choice.channel_id != recording.channel_id:
+            # Idle, so this is safe: `retarget` only refuses mid-session,
+            # and the branch above has already taken every such case.
+            recording.service.retarget(
+                choice.channel_id, self._channel_name(guild.id, choice.channel_id)
+            )
+        await recording.service.participants_changed(choice.consenting, self._clock.now())
+        if recording.service.is_recording:
             # The session's bookkeeping opens here, not inside
             # `_start_capture`. The session row exists from this moment
             # whether or not `join()` then works, and `_start_capture`
@@ -791,6 +952,38 @@ class SturnusClient(commands.Bot):
             # callback on the reader's own thread, which has no event loop.
             record(SESSION_ACTIVE, 1, guild_id=recording.service.guild_id)
             await self._start_capture(recording)
+
+    def _note_waiting(
+        self, guild_id: int, recording: _GuildRecording, waiting: tuple[int, ...]
+    ) -> None:
+        """Records, and announces once, which allowed channels are not being served.
+
+        A person sitting in the second room deserves an explanation. They
+        will not read the pod's logs, so the stored tuple is the half that
+        reaches them -- `/config show` renders it -- and the log line is
+        for the operator they will ask.
+
+        Emitted on the *transition*, not on the state: a headcount runs on
+        every voice-state update and every tick, so a second meeting
+        running alongside the first for an hour would otherwise repeat the
+        same sentence hundreds of times.
+        """
+        if waiting == recording.waiting_channel_ids:
+            return
+        recording.waiting_channel_ids = waiting
+        if not waiting:
+            return
+        log.info(
+            "Guild %d: recording channel %d; %s also %s consenting members and "
+            "%s waiting. Sturnus holds one voice connection per server, so it "
+            "records whichever allowed channel has the most consenting members "
+            "and follows that one until its session ends.",
+            guild_id,
+            recording.channel_id,
+            ", ".join(str(channel_id) for channel_id in waiting),
+            "have" if len(waiting) > 1 else "has",
+            "are" if len(waiting) > 1 else "is",
+        )
 
     async def _start_capture(self, recording: _GuildRecording) -> None:
         """Joins the voice channel, or ends the session it could not capture.
@@ -924,6 +1117,9 @@ class SturnusClient(commands.Bot):
         blocked on it must not be handed a fresh one and run concurrently."""
         await recording.voice.leave()
         self._guilds.pop(guild_id, None)
+        # Forgotten with the pipeline, so a guild reconfigured later is
+        # told again about a channel it still cannot see.
+        self._unreadable_channels.pop(guild_id, None)
 
     async def _apply_pending(self, guild_id: int, recording: _GuildRecording) -> None:
         """Lands a deferred identity change, at the one safe moment there is.
@@ -947,10 +1143,11 @@ class SturnusClient(commands.Bot):
             return
         if recording.pending is not None:
             log.info(
-                "Guild %d: the deferred channel/role change is now in force (channel %d -> %d).",
+                "Guild %d: the deferred channel/role change is now in force "
+                "(allowed channels %s -> %s).",
                 guild_id,
-                recording.channel_id,
-                recording.pending.channel_id,
+                ",".join(str(channel_id) for channel_id in recording.channel_ids),
+                ",".join(str(channel_id) for channel_id in recording.pending.channel_ids),
             )
             # Only the *identity* comes from what was deferred. The
             # tunables on `config` are the live ones -- a retune that
@@ -962,7 +1159,7 @@ class SturnusClient(commands.Bot):
                 recording,
                 replace(
                     recording.config,
-                    channel_id=recording.pending.channel_id,
+                    channel_ids=recording.pending.channel_ids,
                     role_id=recording.pending.role_id,
                 ),
             )
@@ -981,6 +1178,8 @@ class SturnusClient(commands.Bot):
                 is_live=False,
                 is_recording=False,
                 channel_id=None,
+                allowed_channel_ids=(),
+                waiting_channel_ids=(),
                 pending_keys=(),
                 pending_teardown=False,
             )
@@ -991,6 +1190,8 @@ class SturnusClient(commands.Bot):
             is_live=True,
             is_recording=recording.service.is_recording,
             channel_id=recording.channel_id,
+            allowed_channel_ids=recording.channel_ids,
+            waiting_channel_ids=recording.waiting_channel_ids,
             pending_keys=pending_keys,
             pending_teardown=recording.pending_teardown,
         )
@@ -1039,10 +1240,14 @@ class SturnusClient(commands.Bot):
         if recording is None:
             return
 
+        # Every *allowed* channel is interesting, not only the one being
+        # served: a meeting starting in the second allowed room is exactly
+        # the update that has to wake this handler, and filtering on the
+        # served channel alone would mean the bot never noticed it.
         touched_channel_ids = {
             channel.id for channel in (before.channel, after.channel) if channel is not None
         }
-        if recording.channel_id not in touched_channel_ids:
+        if touched_channel_ids.isdisjoint(recording.channel_ids):
             return
 
         if guild_id in self._voice_updates_waiting:

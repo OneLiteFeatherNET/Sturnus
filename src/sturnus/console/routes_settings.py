@@ -72,7 +72,7 @@ _NO_SUCH_KEY = "no such setting"
 _MALFORMED_BODY = "malformed request body"
 _VALUE_MUST_BE_A_STRING = "value must be a string"
 _VALUE_REFUSED = "the value is not valid for this setting"
-_REQUIRED_KEY = "this setting is required and cannot be cleared"
+_REQUIRED_KEY = "this setting has no default and cannot be cleared"
 
 #: What a write did, for the audit line. Two bounded literals rather than
 #: the value itself: an operator needs to know that somebody changed
@@ -153,9 +153,10 @@ async def write_setting(request: web.Request) -> web.Response:
 async def clear_setting(request: web.Request) -> web.Response:
     """Clears one value so its default comes back.
 
-    Refused for a required key, which has no default to come back to:
-    clearing one does not restore anything, it takes the guild out of
-    service until somebody sets it again. `/config clear` on this branch
+    Refused for any key with no default to come back to — a required one,
+    or the deprecated `voice_channel_id` a guild may still be relying on.
+    Clearing either does not restore anything, it takes the guild out of
+    service until somebody sets something. `/config clear` on this branch
     will do it; a web form will not, and that difference is deliberate.
     A slash command is typed by an administrator reading the reply, a
     button sits next to every field on a page.

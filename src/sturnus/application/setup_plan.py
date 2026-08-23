@@ -9,6 +9,15 @@ primary layer of the consent protection (Spec 3.1), and leaving that step
 to prose in an operations guide would put the one step nobody may get
 wrong into the hands of whoever reads the guide least carefully.
 
+A guild names a *list* of channels Sturnus may record in, so `/setup`
+**adds** the channel it was given to that list rather than replacing it.
+Setting up a second meeting room used to silently un-configure the first,
+which is the kind of failure nobody notices until the meeting that was
+supposed to be recorded was not. The permissions are then planned for
+*every* allowed channel, not only the one just named: a channel that is
+allowed but whose `@everyone` may still Speak is a hole in the consent
+protection whether or not this call is the one that added it.
+
 This module holds only the comparison between the desired state and what
 is already configured -- no Discord object reaches it, only the ids and
 permission facts already read off them. That is what makes it testable
@@ -19,6 +28,7 @@ not a rewrite.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -27,8 +37,23 @@ from sturnus.domain import settings
 #: Required keys always supplied through `/setup`'s own parameters -- either
 #: written this call or already correct, so they are never reported missing.
 _ALWAYS_SUPPLIED: frozenset[str] = frozenset(
-    {settings.VOICE_CHANNEL_ID, settings.POLICY_URL, settings.POLICY_VERSION}
+    {settings.VOICE_CHANNEL_IDS, settings.POLICY_URL, settings.POLICY_VERSION}
 )
+
+
+@dataclass(frozen=True)
+class ChannelPermissions:
+    """What one allowed channel's Speak overwrites say today.
+
+    Read off a `discord.VoiceChannel` by the caller and handed in as two
+    booleans, so this module keeps knowing nothing about Discord. A channel
+    the caller cannot resolve is simply not in the list it passes -- and is
+    therefore not planned for, rather than being planned for wrongly.
+    """
+
+    channel_id: int
+    everyone_may_speak: bool
+    role_may_speak: bool
 
 
 @dataclass(frozen=True)
@@ -37,8 +62,13 @@ class PermissionChange:
 
     `target` is `"everyone"` or `"consent_role"` -- which Discord role the
     change applies to is resolved by the caller, not carried here.
+
+    `channel_id` says *where*. It has to: the plan now covers every allowed
+    channel, and the caller applies each change to the channel it names
+    rather than to the one that happened to be typed into this call.
     """
 
+    channel_id: int
     target: str
     allow_speak: bool | None
 
@@ -68,6 +98,10 @@ class SetupPlan:
     role_to_create: str | None
     role_action: RoleAction
     missing: list[str]
+    #: Every channel the guild allows once this call has been applied --
+    #: what was already stored plus the channel just named. Reported so the
+    #: reply can print the list an administrator would edit to remove one.
+    channel_ids: tuple[int, ...]
 
 
 #: Name given to the consent role setup offers to create when none exists.
@@ -77,12 +111,12 @@ _DEFAULT_ROLE_NAME = "Sturnus Consent"
 def plan_setup(
     current: dict[str, str | None],
     channel_id: int,
+    stored_channel_ids: tuple[int, ...],
+    channel_permissions: Sequence[ChannelPermissions],
     role_id: int | None,
     stored_role_valid: bool,
     policy_url: str,
     policy_version: str,
-    everyone_may_speak: bool,
-    role_may_speak: bool,
 ) -> SetupPlan:
     """Computes what `/setup` still needs to do.
 
@@ -98,6 +132,19 @@ def plan_setup(
     names an Outline collection -- so it is never guessed here. If the
     caller reports it unset, it is reported in `missing`, exactly like a
     guild that has never run `/setup` at all.
+
+    `stored_channel_ids` is what the guild already allows, read through
+    `settings.recording_channel_ids` so the key this replaced still counts.
+    `channel_id` is **added** to it, never substituted for it: running
+    `/setup` for a second meeting room must not stop the first one being
+    recorded. Removing one is `/config set voice_channel_ids`, which is why
+    the resulting list is reported back rather than merely written.
+
+    `channel_permissions` describes the Speak overwrites of every allowed
+    channel the caller could resolve, the newly added one included. Every
+    allowed channel is planned for, not only the one this call named: a
+    channel Sturnus may record in whose `@everyone` can still Speak is a
+    hole in the consent protection regardless of which call added it.
 
     `role_id` is the consent role explicitly supplied to `/setup`'s
     `consent_role` parameter this call, or `None` if that argument was
@@ -116,7 +163,13 @@ def plan_setup(
         if current.get(key) != desired:
             writes[key] = desired
 
-    _maybe_write(settings.VOICE_CHANNEL_ID, str(channel_id))
+    channel_ids = tuple(sorted({*stored_channel_ids, channel_id}))
+    # The plural key, always -- `/setup` is one of the two commands that
+    # moves a guild off the singular one. The old row is left alone rather
+    # than deleted: it is read only when the plural key is unset, so from
+    # this write on it is inert, and removing it would be a second write
+    # nobody asked for.
+    _maybe_write(settings.VOICE_CHANNEL_IDS, settings.render_channel_ids(channel_ids))
     _maybe_write(settings.POLICY_URL, policy_url)
     _maybe_write(settings.POLICY_VERSION, policy_version)
 
@@ -134,10 +187,15 @@ def plan_setup(
         role_to_create = _DEFAULT_ROLE_NAME
 
     permission_changes: list[PermissionChange] = []
-    if everyone_may_speak:
-        permission_changes.append(PermissionChange("everyone", allow_speak=False))
-    if not role_may_speak:
-        permission_changes.append(PermissionChange("consent_role", allow_speak=True))
+    for channel in sorted(channel_permissions, key=lambda each: each.channel_id):
+        if channel.everyone_may_speak:
+            permission_changes.append(
+                PermissionChange(channel.channel_id, "everyone", allow_speak=False)
+            )
+        if not channel.role_may_speak:
+            permission_changes.append(
+                PermissionChange(channel.channel_id, "consent_role", allow_speak=True)
+            )
 
     missing: list[str] = []
     for key in sorted(settings.REQUIRED_KEYS):
@@ -159,4 +217,5 @@ def plan_setup(
         role_to_create=role_to_create,
         role_action=role_action,
         missing=missing,
+        channel_ids=channel_ids,
     )

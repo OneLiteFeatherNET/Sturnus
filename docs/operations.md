@@ -339,13 +339,15 @@ Discord Developer Portal, or the bot will fail to connect.
 and `applications.commands` — the latter is what makes slash commands
 appear at all):
 
-- **View Channel** and **Connect**, on the recording voice channel — the
-  bot joins automatically once enough consenting members are present
-  (`SturnusClient.on_voice_state_update`); it never needs **Speak**, since
-  it only receives audio.
+- **View Channel** and **Connect**, on **every** recording voice channel
+  named by `voice_channel_ids` — the bot joins automatically once enough
+  consenting members are present (`SturnusClient.on_voice_state_update`);
+  it never needs **Speak**, since it only receives audio. A channel in the
+  list that the bot cannot see is skipped with a warning naming it, and
+  does not stop the other channels working.
 - **Manage Roles** — needed for three separate things `/setup` and
   `/consent` do: creating the consent role when none exists yet
-  (`SetupCog`), editing the recording channel's `Speak` permission
+  (`SetupCog`), editing each recording channel's `Speak` permission
   overwrites for `@everyone` and the consent role, and granting/revoking
   the consent role itself on `/consent grant` / `/consent revoke`. Discord
   additionally requires the bot's own highest role to sit above the
@@ -373,10 +375,10 @@ for every channel, so this costs nothing beyond a less helpful picker.
 than API calls. The last one needs the **Server Members Intent**, which is
 already required above for the consent gate.
 
-### 3.2 Why the recording channel's permissions matter
+### 3.2 Why the recording channels' permissions matter
 
-`/setup` denies `Speak` to `@everyone` on the recording channel and
-allows it for the consent role — this is not cosmetic, it is the primary
+`/setup` denies `Speak` to `@everyone` on every allowed recording channel
+and allows it for the consent role — this is not cosmetic, it is the primary
 layer of the consent protection (Spec 3.1): someone who has not consented
 cannot technically produce audio in that channel at all. The bot enforces
 a second, independent layer on top of it: `VoiceReceiveAdapter` drops any
@@ -389,32 +391,63 @@ what makes bumping `policy_version` take effect on its own (see section 6).
 
 ### 3.3 Why non-recorded channels must also exist
 
-If the recording channel is the *only* voice channel available, consenting
-to recording stops being a real choice — it becomes the price of admission
-for talking to anyone by voice at all, and consent extracted that way is
-not "freely given" under Art. 7(4) GDPR (the prohibition on tying an
+If the recording channels are the *only* voice channels available,
+consenting to recording stops being a real choice — it becomes the price of
+admission for talking to anyone by voice at all, and consent extracted that
+way is not "freely given" under Art. 7(4) GDPR (the prohibition on tying an
 unrelated condition to consent). At least one voice channel that Sturnus
-never joins must exist alongside the recording channel for consent on the
-recording channel to be legally meaningful, not merely technically
-present.
+never joins must exist alongside the recording channels for consent on
+them to be legally meaningful, not merely technically present. Adding a
+room to `voice_channel_ids` is therefore not a free action: each one taken
+into the list is one fewer room where a member can talk without being
+recorded.
 
 ### 3.4 `/setup` applies the permissions itself
 
-`/setup` is not just a configuration-writing command: it reads the voice
-channel's current `Speak` overwrites and, if they do not already match
-(`@everyone` denied, the consent role allowed), applies the change itself
-through the Discord API, with every partial failure reported back rather
+`/setup` is not just a configuration-writing command: it reads the current
+`Speak` overwrites of **every** allowed voice channel — not only the one
+it was just given — and, wherever they do not already match (`@everyone`
+denied, the consent role allowed), applies the change itself through the
+Discord API, with every partial failure reported back per channel rather
 than swallowed. This is deliberate (see `setup_cog.py`'s module docstring)
 — the one step that must never be gotten wrong is not left to prose in
 this document for whoever reads it least carefully.
 
+### 3.5 One voice connection per server
+
+A Discord bot holds exactly **one** voice connection per guild. That is a
+platform limit, not a Sturnus decision, and no configuration changes it.
+`voice_channel_ids` therefore means "Sturnus may record in any of these,
+and follows the one that is meeting" — never "Sturnus records all of them
+at once".
+
+When more than one allowed channel holds consenting members, Sturnus picks
+one deterministically: **the most consenting members wins, and the lowest
+channel id breaks a tie** (`sturnus.application.channel_choice`). A session
+already in progress is never moved — its `sessions` row names the channel
+its audio came from — so the second room waits for the first meeting to
+end. `/config show` names which channel is being recorded and which allowed
+channels are not, marking any that have people waiting in them.
+
+Recording two rooms of one server simultaneously would need a second bot
+identity (a second Discord application and a second deployment). That is a
+deployment decision nobody has taken.
+
 ## 4. First run
 
-1. Run `/setup`, supplying the voice channel to record, the URL of the
+1. Run `/setup`, supplying a voice channel to record, the URL of the
    privacy/consent policy, and a policy version identifier. Optionally
    supply an existing role as the consent role; if omitted, `/setup`
    reuses whatever role is already configured (if it still exists) or
-   creates a new one.
+   creates a new one. Run it again, with a different channel, for every
+   further room Sturnus should be allowed to record: `/setup` **adds** to
+   `voice_channel_ids` rather than replacing it, so setting up a second
+   meeting room does not un-configure the first. To remove one, edit the
+   list with `/config set voice_channel_ids <the remaining ids>` — the
+   reply to `/setup` prints the current list so that is a copy and a
+   deletion, not a lookup. Removing a channel does not undo its `Speak`
+   overwrites; restore those by hand if the room should go back to being
+   an ordinary one.
 2. Run `/config show`. It lists every known key, its effective value and
    source (`stored` vs. `default` vs. `unset`), and a **Missing required
    keys** line. `/setup` does not set every required key — in particular
@@ -473,11 +506,57 @@ Keep it a sentence rather than a word list, keep it in the transcription
 language, and keep it short — Whisper only sees the last ~224 tokens of it,
 and a long prompt bleeds its own wording into the transcript.
 
-Until every required key (`voice_channel_id`, `consent_role_id`,
+### 4.0 `voice_channel_ids`, and the key it replaced
+
+`voice_channel_ids` names every voice channel Sturnus is allowed to record
+in. Its value is a **comma-separated list of channel ids**; whitespace
+around the commas is ignored, and the order carries no meaning (it is
+normalised to ascending ids on read):
+
+```
+/config set voice_channel_ids 123456789012345678,987654321098765432
+```
+
+The value is validated at the write, not at the join: a non-integer entry,
+an empty entry (`12,,34`), a repeated id, or an empty list is refused by
+`/config set` and by the console with a message naming the entry it could
+not read. A guild that reports itself configured and then records nothing
+is the failure that check exists to prevent.
+
+It says **where Sturnus may record, not how many rooms it records at
+once** — see 3.5 above for the one-connection-per-server limit and the
+rule that picks between two busy rooms.
+
+**The legacy alias.** The setting used to be called `voice_channel_id`
+(singular, one id). That key is still read, indefinitely, and a guild that
+has never touched its configuration since the rename keeps recording
+exactly as before — there is no migration, and none is planned.
+`guild_config` is an EAV table keyed `(guild_id, key)`, so the old name is
+a row rather than a column and nothing is in the way.
+
+The precise rules:
+
+- `voice_channel_ids` wins outright whenever it is set. `voice_channel_id`
+  is read only when the plural key is unset, so a stale singular row cannot
+  overrule a deliberate write.
+- `/setup` and `/config set voice_channel_ids` write the plural key. Only
+  the plural key can name more than one channel.
+- Either key alone satisfies the "required" check, and the missing-key
+  report always names the plural one — telling an administrator to
+  configure a deprecated setting would be worse than saying nothing.
+- `/config show` says so when a guild is still on the old key, and says so
+  again (differently) when *both* are set, naming which of the two is
+  actually in use.
+- The old key stays writable and clearable from `/config` so a guild can
+  move off it. The console will not clear either channel key: neither has a
+  default to fall back to, so clearing one from a web form would take a
+  guild out of service while looking like tidying up.
+
+Until every required key (`voice_channel_ids`, `consent_role_id`,
 `document_target`, `policy_version`, `policy_url`, `admin_role_id`) is set,
 the bot logs a warning naming the guild and skips building that guild's
 recording pipeline entirely (`SturnusClient._desired_config`) — it will
-not join the voice channel or record anything for that guild. It re-checks
+not join any voice channel or record anything for that guild. It re-checks
 every ten seconds, so the pipeline appears as soon as the keys are there;
 no restart is involved (see 4.1).
 
@@ -510,9 +589,11 @@ value — and a job that has already run is not redone. Changing them
 because a protocol came out wrong therefore affects the next meeting, not
 the one you are looking at.
 
-**Deferred until the recording in progress ends.** `voice_channel_id` and
-`consent_role_id`. These decide which channel a session's row names and
-which role both the headcount and the per-packet filter agree on;
+**Deferred until the recording in progress ends.** `voice_channel_ids`
+(and the `voice_channel_id` it replaced) and `consent_role_id`. These
+decide which channels a session may open against, which channel a
+session's row names, and which role both the headcount and the per-packet
+filter agree on;
 swapping them mid-session would mean a protocol whose header names one
 channel while its audio came from another, an orphaned plaintext file on
 the PVC, and a voice connection nobody would ever disconnect. The change
@@ -1029,7 +1110,7 @@ carries `takes_effect`:
 | `next_reconcile` | Cached by the bot; picked up within about ten seconds |
 | `process_restart` | Read once at startup — `publish_poll_seconds`. **No amount of waiting lands it**; the deployment has to be restarted |
 
-Plus `deferred_while_recording` for `voice_channel_id` and
+Plus `deferred_while_recording` for `voice_channel_ids` and
 `consent_role_id`, which a reconcile holds back for the length of a
 running session.
 

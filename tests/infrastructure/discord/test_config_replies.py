@@ -57,11 +57,11 @@ def test_a_key_that_took_effect_says_so() -> None:
 
 def test_a_deferred_key_says_it_is_waiting_and_that_nothing_is_lost() -> None:
     reply = render_write_result(
-        settings.VOICE_CHANNEL_ID,
+        settings.VOICE_CHANNEL_IDS,
         "123",
         result(
             action=ReconfigureAction.DEFER_RETARGET,
-            deferred_keys=(settings.VOICE_CHANNEL_ID,),
+            deferred_keys=(settings.VOICE_CHANNEL_IDS,),
             is_recording=True,
         ),
     )
@@ -74,7 +74,7 @@ def test_a_deferred_key_says_it_is_waiting_and_that_nothing_is_lost() -> None:
 
 def test_a_deferred_teardown_promises_the_recording_finishes_first() -> None:
     reply = render_write_result(
-        settings.VOICE_CHANNEL_ID,
+        settings.VOICE_CHANNEL_IDS,
         None,
         result(
             action=ReconfigureAction.DEFER_TEARDOWN,
@@ -82,7 +82,7 @@ def test_a_deferred_teardown_promises_the_recording_finishes_first() -> None:
             is_recording=True,
         ),
     )
-    assert "`voice_channel_id` cleared." in reply
+    assert "`voice_channel_ids` cleared." in reply
     assert "finish and upload" in reply
     assert "will not be lost" in reply
 
@@ -108,7 +108,7 @@ def test_the_key_that_makes_a_guild_live_says_no_restart_is_needed() -> None:
 
 
 def test_a_key_stored_for_a_guild_that_still_cannot_record_says_so() -> None:
-    reply = render_write_result(settings.VOICE_CHANNEL_ID, "123", result(is_live=False))
+    reply = render_write_result(settings.VOICE_CHANNEL_IDS, "123", result(is_live=False))
     assert "not watching this server yet" in reply
     assert "`/config show`" in reply
 
@@ -140,41 +140,73 @@ def test_the_exceeded_warning_is_not_attached_to_unrelated_keys() -> None:
     assert "already exceeds this" not in reply
 
 
-def test_show_reports_the_running_configuration_as_in_effect() -> None:
-    state = RunningState(
-        is_live=True,
-        is_recording=True,
-        channel_id=1,
-        pending_keys=(),
-        pending_teardown=False,
+def _state(
+    *,
+    is_live: bool = True,
+    is_recording: bool = True,
+    channel_id: int | None = 1,
+    allowed_channel_ids: tuple[int, ...] = (1,),
+    waiting_channel_ids: tuple[int, ...] = (),
+    pending_keys: tuple[str, ...] = (),
+    pending_teardown: bool = False,
+) -> RunningState:
+    return RunningState(
+        is_live=is_live,
+        is_recording=is_recording,
+        channel_id=channel_id,
+        allowed_channel_ids=allowed_channel_ids,
+        waiting_channel_ids=waiting_channel_ids,
+        pending_keys=pending_keys,
+        pending_teardown=pending_teardown,
     )
-    assert render_running_state(state, has_missing_keys=False) == (
+
+
+def test_show_reports_the_running_configuration_as_in_effect() -> None:
+    assert render_running_state(_state(), has_missing_keys=False).endswith(
         "Running configuration: in effect."
     )
 
 
+def test_show_names_the_one_channel_being_recorded() -> None:
+    line = render_running_state(_state(), has_missing_keys=False)
+    assert "Recording channel: <#1>." in line
+
+
+def test_show_names_the_allowed_channels_that_are_not_being_recorded() -> None:
+    """A person sitting in the second allowed room is owed the reason.
+
+    Without this the honest answer -- "the bot is in the other room,
+    because more consenting people are in it, and it can only be in one" --
+    is available nowhere an administrator can reach it.
+    """
+    line = render_running_state(
+        _state(channel_id=1, allowed_channel_ids=(1, 2, 3)), has_missing_keys=False
+    )
+    assert "Recording channel: <#1>" in line
+    assert "<#2>" in line
+    assert "<#3>" in line
+    assert "one voice connection per server" in line
+
+
+def test_show_marks_an_allowed_channel_that_has_people_waiting_in_it() -> None:
+    line = render_running_state(
+        _state(channel_id=1, allowed_channel_ids=(1, 2), waiting_channel_ids=(2,)),
+        has_missing_keys=False,
+    )
+    assert "<#2> (people waiting)" in line
+
+
 def test_show_names_the_keys_that_are_still_waiting() -> None:
     """The line that stops `/config show` from insisting a value is in use."""
-    state = RunningState(
-        is_live=True,
-        is_recording=True,
-        channel_id=1,
-        pending_keys=(settings.VOICE_CHANNEL_ID,),
-        pending_teardown=False,
+    line = render_running_state(
+        _state(pending_keys=(settings.VOICE_CHANNEL_IDS,)), has_missing_keys=False
     )
-    line = render_running_state(state, has_missing_keys=False)
     assert "waiting for the current recording to end" in line
-    assert "`voice_channel_id`" in line
+    assert "`voice_channel_ids`" in line
 
 
 def test_show_reports_a_guild_that_is_not_being_watched() -> None:
-    state = RunningState(
-        is_live=False,
-        is_recording=False,
-        channel_id=None,
-        pending_keys=(),
-        pending_teardown=False,
-    )
+    state = _state(is_live=False, is_recording=False, channel_id=None, allowed_channel_ids=())
     assert "not applied" in render_running_state(state, has_missing_keys=True)
 
 
@@ -186,7 +218,9 @@ def test_apply_with_force_says_up_front_what_it_did_to_the_recording() -> None:
 
 def test_apply_without_force_offers_force_when_something_is_deferred() -> None:
     reply = render_apply_result(
-        result(action=ReconfigureAction.DEFER_RETARGET, deferred_keys=(settings.VOICE_CHANNEL_ID,)),
+        result(
+            action=ReconfigureAction.DEFER_RETARGET, deferred_keys=(settings.VOICE_CHANNEL_IDS,)
+        ),
         force=False,
     )
     assert "`/config apply force:true`" in reply
@@ -196,3 +230,25 @@ def test_apply_without_force_offers_force_when_something_is_deferred() -> None:
 def test_apply_on_an_already_correct_guild_says_nothing_changed() -> None:
     reply = render_apply_result(result(), force=False)
     assert "already correct" in reply
+
+
+def test_writing_the_deprecated_key_mid_session_still_says_it_is_waiting() -> None:
+    """The two spellings are one setting, so the reply must recognise itself.
+
+    A write to `voice_channel_id` produces a reconcile result naming
+    `voice_channel_ids`. Comparing the raw strings would tell the
+    administrator their change is in force while the bot is in fact still
+    recording the old channel -- the exact lie this rendering exists to
+    prevent, wearing the other name.
+    """
+    reply = render_write_result(
+        settings.VOICE_CHANNEL_ID,
+        "123",
+        result(
+            action=ReconfigureAction.DEFER_RETARGET,
+            deferred_keys=(settings.VOICE_CHANNEL_IDS,),
+            is_recording=True,
+        ),
+    )
+    assert "recording is in progress" in reply
+    assert "In effect now." not in reply

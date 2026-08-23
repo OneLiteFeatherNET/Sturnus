@@ -39,6 +39,15 @@ holds back for as long as a session lasts rather than dropping a live
 voice connection. A recording is never discarded to make a setting apply
 sooner; the console cannot see whether one is in progress, so it says the
 wait is possible rather than pretending it is not.
+
+**Not a second opinion about the deprecated key, either.** `voice_channel_id`
+and the `voice_channel_ids` that replaced it are one setting with two
+names. Both are rendered — the old one has to stay visible and clearable
+for a guild to be able to move off it — and both are described through
+`settings.canonical_key`, so the console cannot end up calling one of them
+immediate and the other deferred. Which of the two the bot actually reads
+is `settings.recording_channel_ids`' answer, and this module does not
+duplicate it.
 """
 
 from __future__ import annotations
@@ -53,12 +62,13 @@ from sturnus.application.reconfigure import (
 )
 from sturnus.domain import settings
 
-#: Every key `ConfigStore.set` accepts — the same union it validates
-#: against, computed rather than restated. `REQUIRED_KEYS` and `DEFAULTS`
-#: are disjoint by construction (a required key is required precisely
-#: because it has no default), which is what makes "may this be cleared?"
-#: a question with a total answer.
-KNOWN_KEYS: frozenset[str] = frozenset(settings.DEFAULTS) | settings.REQUIRED_KEYS
+#: Every key `ConfigStore.set` accepts — the registry itself, not a second
+#: union assembled here. `REQUIRED_KEYS` and `DEFAULTS` are disjoint by
+#: construction (a required key is required precisely because it has no
+#: default), which is what makes "may this be cleared?" a question with a
+#: total answer; `LEGACY_KEYS` joins them as a third disjoint class, keys
+#: that are read and writable but required of nobody.
+KNOWN_KEYS: frozenset[str] = settings.KNOWN_KEYS
 
 #: The three answers to "when does this write reach the running system?".
 #: Strings rather than an enum because they cross a JSON boundary and the
@@ -78,6 +88,13 @@ PROCESS_RESTART = "process_restart"
 _CONSENT_INVALIDATING_KEYS: frozenset[str] = frozenset({settings.POLICY_VERSION})
 
 #: Keys the bot holds in memory and refreshes on its reconcile pass.
+#:
+#: Membership is asked through `settings.canonical_key`, because
+#: `voice_channel_id` and `voice_channel_ids` are one setting with two
+#: names: the deprecated spelling is read on exactly the same pass and
+#: deferred behind exactly the same recording, and rendering it as
+#: "immediate" would be the console's own version of the lie `/config set`
+#: exists to avoid.
 _RECONCILED_KEYS: frozenset[str] = frozenset(IDENTITY_KEYS) | frozenset(TUNABLE_KEYS)
 
 
@@ -135,21 +152,28 @@ def is_known(key: str) -> bool:
 def may_clear(key: str) -> bool:
     """Whether clearing this key restores something rather than removing it.
 
-    A required key has no default, so clearing it does not fall back — it
-    takes the guild out of service until somebody sets it again. `/config
-    clear` on this branch will happily do that; the console will not, and
-    that difference is deliberate rather than an oversight. A slash
-    command is typed by an administrator who is looking at the reply; a
-    web form is a button next to every field.
+    Asked of `DEFAULTS` rather than "not required", because there are now
+    three classes of key rather than two. A required key has no default, so
+    clearing it does not fall back — it takes the guild out of service
+    until somebody sets it again. A legacy key (`voice_channel_id`) has no
+    default either, and clearing it from a page would take a guild that has
+    not moved to `voice_channel_ids` yet out of service in exactly the same
+    way, while looking like tidying up. Both are refused here.
+
+    `/config clear` on this branch will happily do either, and that
+    difference is deliberate rather than an oversight. A slash command is
+    typed by an administrator who is looking at the reply; a web form is a
+    button next to every field.
     """
-    return key not in settings.REQUIRED_KEYS
+    return key in settings.DEFAULTS
 
 
 def takes_effect(key: str) -> str:
     """How long before the running system uses a new value for this key."""
-    if key in RESTART_REQUIRED_KEYS:
+    canonical = settings.canonical_key(key)
+    if canonical in RESTART_REQUIRED_KEYS:
         return PROCESS_RESTART
-    if key in _RECONCILED_KEYS:
+    if canonical in _RECONCILED_KEYS:
         return NEXT_RECONCILE
     return IMMEDIATELY
 
@@ -171,7 +195,7 @@ def describe(key: str, stored: Mapping[str, str]) -> KeyView:
         integer=key in settings.INTEGER_KEYS,
         invalidates_consent=key in _CONSENT_INVALIDATING_KEYS,
         takes_effect=takes_effect(key),
-        deferred_while_recording=key in IDENTITY_KEYS,
+        deferred_while_recording=settings.canonical_key(key) in IDENTITY_KEYS,
     )
 
 

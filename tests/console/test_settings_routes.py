@@ -232,16 +232,14 @@ async def test_the_listing_carries_every_key_with_its_metadata(
     body = await (await client.get(f"/api/guilds/{GUILD}/settings")).json()
 
     assert body["guild_id"] == str(GUILD)
-    assert {entry["key"] for entry in body["settings"]} == set(settings.DEFAULTS) | set(
-        settings.REQUIRED_KEYS
-    )
+    assert {entry["key"] for entry in body["settings"]} == set(settings.KNOWN_KEYS)
 
     grace = setting(body, "empty_grace_seconds")
     assert grace["required"] is False
     assert grace["integer"] is True
     assert grace["value"] == grace["default"]
 
-    channel = setting(body, "voice_channel_id")
+    channel = setting(body, "voice_channel_ids")
     assert channel["required"] is True
     assert channel["value"] is None
     assert channel["default"] is None
@@ -420,12 +418,14 @@ async def test_clearing_a_key_that_was_never_set_is_not_an_error(
     assert (await client.delete(f"/api/guilds/{GUILD}/settings/timezone")).status == 200
 
 
-@pytest.mark.parametrize("key", ["policy_version", "voice_channel_id"])
-async def test_a_required_key_may_not_be_cleared(
+@pytest.mark.parametrize("key", ["policy_version", "voice_channel_ids", "voice_channel_id"])
+async def test_a_key_with_no_default_may_not_be_cleared(
     aiohttp_client: AiohttpClientFactory, stores: Stores, key: str
 ) -> None:
     """There is no default to fall back to, so clearing it would stop the
-    guild recording rather than restore anything.
+    guild recording rather than restore anything. That holds for the
+    deprecated `voice_channel_id` too: a guild that has not moved to the
+    list key yet is still being served by it.
     """
     await stores.admins.replace(GUILD, [ANNA], T0)
     await stores.config.set(GUILD, key, "42", T0)
@@ -504,6 +504,6 @@ async def test_a_write_to_the_voice_channel_says_it_may_wait_for_the_recording(
     await stores.admins.replace(GUILD, [ANNA], T0)
     client = await signed_in_client(aiohttp_client, stores)
     response = await client.put(
-        f"/api/guilds/{GUILD}/settings/voice_channel_id", json={"value": "12345"}
+        f"/api/guilds/{GUILD}/settings/voice_channel_ids", json={"value": "12345"}
     )
     assert (await response.json())["setting"]["deferred_while_recording"] is True
