@@ -29,6 +29,7 @@ from sturnus.domain.transcript import SpeakerIdentity, Transcript, TranscriptBlo
 T0 = datetime(2026, 8, 19, 20, 0, 0, tzinfo=UTC)
 NOW = T0 + timedelta(hours=2)
 SESSION = 77
+GUILD = 1
 
 TEMPLATE = (
     Path(__file__).parent.parent.parent
@@ -62,7 +63,7 @@ def target(
 ) -> ExportTarget:
     return ExportTarget(
         id=target_id,
-        guild_id=1,
+        guild_id=GUILD,
         format=format,
         name=name,
         target=where,
@@ -80,7 +81,12 @@ def destination(
     entry = format_named(format)
     assert entry is not None
     return exporting.Destination(
-        session_id=SESSION, target_id=target_id, format=entry, target=where, provider=format
+        session_id=SESSION,
+        target_id=target_id,
+        format=entry,
+        target=where,
+        provider=format,
+        guild_id=GUILD,
     )
 
 
@@ -441,6 +447,7 @@ async def test_a_failure_beside_a_destination_already_published_does_not_raise()
 def recorded(target_id: int, url: str = "https://outline/1") -> SessionDocument:
     return SessionDocument(
         session_id=SESSION,
+        guild_id=GUILD,
         target_id=target_id,
         provider=OUTLINE,
         document_id="doc-1",

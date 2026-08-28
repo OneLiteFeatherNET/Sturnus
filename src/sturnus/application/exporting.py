@@ -103,6 +103,17 @@ class Destination:
     configured target and the guild's `document_provider` setting for the
     legacy one, so nothing about what an existing guild writes to that
     column changes.
+
+    `guild_id` is carried rather than looked up because a sink may need to
+    say *whose* artefact this is at the moment it writes one: an
+    object-store destination seals its bytes under a key bound to the
+    guild and the purpose (`sturnus.infrastructure.crypto.secret_context`),
+    and a sink that had to ask a database which guild it was serving would
+    be a sink with a database. It is the same guild for every destination
+    of one publish -- they are that guild's destinations -- which is
+    precisely why it belongs on the destination rather than being threaded
+    through `publish_session` as a second parameter that could disagree
+    with it.
     """
 
     session_id: int
@@ -110,6 +121,7 @@ class Destination:
     format: ExportFormat
     target: str
     provider: str
+    guild_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,6 +302,11 @@ def destinations_for(
                 format=entry,
                 target=target.target,
                 provider=entry.name,
+                # The row's own guild, not one passed in beside it: this
+                # value ends up in the associated data that seals an
+                # object-store artefact, and a mismatch between it and
+                # the row would be an artefact nobody can open again.
+                guild_id=target.guild_id,
             )
         )
     if chosen:

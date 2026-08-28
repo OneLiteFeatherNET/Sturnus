@@ -2504,10 +2504,16 @@ class ConsoleSessionDocuments:
         if target_id is not None:
             statement = statement.where(SessionDocumentRow.target_id == target_id)
         async with self._session_factory() as db:
-            exists = await db.scalar(
-                select(select(SessionRow.id).where(SessionRow.id == session_id).exists())
+            # The guild, from the statement that was already establishing
+            # that the session exists. A read model carries it because an
+            # object-store artefact is sealed under a key bound to it
+            # (`sturnus.domain.exports.SessionDocument`), and asking a
+            # second time would be a second query for a column this one
+            # is already looking at.
+            guild_id = await db.scalar(
+                select(SessionRow.guild_id).where(SessionRow.id == session_id)
             )
-            if not exists:
+            if guild_id is None:
                 return None
             rows = await db.scalars(
                 # Publication order, so the list reads as the history it
@@ -2518,6 +2524,7 @@ class ConsoleSessionDocuments:
             return tuple(
                 SessionDocument(
                     session_id=row.session_id,
+                    guild_id=guild_id,
                     target_id=row.target_id,
                     provider=row.provider,
                     document_id=row.document_id,

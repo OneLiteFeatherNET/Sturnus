@@ -448,14 +448,28 @@ class SessionDocumentDirectory(Protocol):
 
 
 class DocumentArtefacts(Protocol):
-    """Where a stored protocol's bytes are read from. `S3DocumentStore`.
+    """Where a stored protocol's bytes are read from. `SealedArtefacts`.
 
     `KeyError` for an object that is not there, which is an ordinary
     outcome rather than a fault: a re-export can move nothing, but a
     destination removed from the bucket by hand leaves the row behind.
+    `sturnus.domain.errors.UnreadableArtefact` for one that is there and
+    does not open, which is not ordinary -- see that class for why the two
+    are different exceptions rather than one.
+
+    `guild_id` is what the artefact's own key is bound to, so it is the
+    caller's to supply and it comes off the `SessionDocument` row rather
+    than out of the object. An envelope carrying the guild it was filed
+    under would authenticate just as happily after being moved to another
+    guild's, which is the move this binding exists to fail.
+
+    The adapter behind this holds the master key and this port says
+    nothing about it: the console decides *who* may read a protocol, and
+    what it takes to turn an object into bytes is not a question a route
+    should be able to ask.
     """
 
-    async def get(self, key: str) -> bytes: ...
+    async def get(self, key: str, *, guild_id: int) -> bytes: ...
 
 
 class AdminDirectory(Protocol):

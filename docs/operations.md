@@ -316,6 +316,18 @@ there isn't one to run. Changing `STURNUS_MASTER_KEY` today makes every
 previously wrapped data key permanently unreadable (see below), it does
 not rotate anything.
 
+**It also wraps things that are not recordings, and one of them outlives
+every recording.** Three kinds of material are sealed under it beyond the
+audio: an export destination's credential and a guild's OAuth client
+secret, both in the database and both bound to their guild and purpose;
+and — since export targets could store a rendered protocol — the
+protocol artefacts themselves in the object bucket. Those artefacts do
+*not* use a session data key. Each carries a data key of its own, wrapped
+under the master key inside the object, because a protocol is deliberately
+not subject to `audio_retention_days` and a key that the retention sweep
+ends the life of would end the protocol's life with it. §6 states that
+rule from the retention side.
+
 **Losing a master key destroys every recording it wrapped.** This is the
 single most consequential operational fact about this system, so it is
 stated here plainly: audio is only ever stored encrypted, and only the
@@ -1297,6 +1309,46 @@ this sweep is the only thing in the system that ends a recording's life.
 `audio_deleted_at` is stamped only once both objects are gone, so a
 partial failure is retried on the next sweep rather than recorded as
 done.
+
+**The sweep does not touch a session's stored protocol, and it must not
+start.** A guild publishing to a `markdown` or `html` export target gets
+an artefact in the same bucket the recordings are in
+(`{prefix}/{session_id}/{target_id}.md`), and nothing in this system ever
+deletes it: not this sweep, not the console, not a re-export, which
+replaces the object at the same address rather than adding one. That is
+the intended rule and not an omission. `audio_retention_days` governs the
+*recording*; the record of the meeting deliberately outlives it, which is
+why a transcript endpoint answers `200` with `audio_available: false`
+rather than `404` once the audio is gone. A protocol swept because its
+recording expired would be a meeting's minutes deleted on the strength of
+a window that was never about them.
+
+Two consequences an operator has to plan for. **These objects accumulate**
+— one per session per object-store destination, tens of kilobytes each,
+and the bucket lifecycle rule that backstops the recordings must not be
+written broadly enough to catch them. And **their retention is a policy
+question this system does not answer**: if a deployment needs stored
+protocols to expire, that is a rule somebody has to state, and there is no
+setting for it today.
+
+They are encrypted, and **not under the recording's key**. Each artefact
+carries a data key of its own, generated when the artefact is written and
+wrapped under `STURNUS_MASTER_KEY` inside the object itself, bound to the
+guild it belongs to. So an artefact opens with the master key and the
+guild alone: it needs no row to have survived, and nothing the sweep
+destroys. Sealing one under the session data key instead would have made
+every stored export unreadable the day its recording's window closed —
+silently, and noticed only by whoever next opened an old document.
+
+**Protocols written before v0.17.0 are plaintext in that bucket.** The
+release that introduced export targets stored them unencrypted; nothing
+sweeps them, so they are still there. They are still served — refusing
+them would turn a link somebody already holds into a 404 over bytes that
+are already written — and each read logs `session.export_unsealed` at
+WARNING, which is how you watch that corpus drain. Re-publishing a session
+replaces its object with a sealed one at the same address; there is no
+bulk migration, deliberately, because it would need to re-render every
+protocol ever published.
 
 Because recordings outlive their transcription by weeks, not minutes, the
 retention period is not merely an implementation detail — **it belongs in

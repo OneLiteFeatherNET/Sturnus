@@ -160,6 +160,14 @@ class Event(StrEnum):
     #: `pdf` yet it is a configured intention, and it repeats on every
     #: publish for as long as the row exists.
     SESSION_EXPORT_SKIPPED = "session.export_skipped"
+    #: A stored protocol was served that had been written in plaintext,
+    #: before export artefacts were sealed. WARNING rather than INFO: it
+    #: is the only signal that unencrypted meetings are still in the
+    #: bucket, and the count of these lines going to zero is how an
+    #: operator knows that corpus has drained. Not an error -- refusing
+    #: the object would turn a link somebody already holds into a 404
+    #: over bytes that are already written.
+    SESSION_EXPORT_UNSEALED = "session.export_unsealed"
     RETENTION_SWEPT = "retention.swept"
     RETENTION_FAILED = "retention.failed"
     #: A guild that asked for `spectrograms_by_default` got one: the
