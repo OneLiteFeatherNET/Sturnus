@@ -34,7 +34,7 @@ jobs:
     permissions:
       contents: read
       id-token: write   # keyless signing
-    uses: OneLiteFeatherNET/workflows/.github/workflows/docker-publish.yml@v2.8.1
+    uses: OneLiteFeatherNET/workflows/.github/workflows/docker-publish.yml@v2.8.2
     with:
       image-name: "onelitefeather/sturnus"
       version: ${{ needs.release-please.outputs.version }}
@@ -59,7 +59,7 @@ jobs:
     permissions:
       contents: read
       id-token: write   # keyless signing
-    uses: OneLiteFeatherNET/workflows/.github/workflows/docker-publish.yml@v2.8.1
+    uses: OneLiteFeatherNET/workflows/.github/workflows/docker-publish.yml@v2.8.2
     with:
       image-name: "onelitefeather/sturnus-console"
       version: ${{ needs.release-please.outputs.version }}
