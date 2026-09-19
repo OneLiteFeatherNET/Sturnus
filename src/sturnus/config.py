@@ -175,6 +175,18 @@ class Settings(StrictSettings):
     outline_base_url: str
     outline_client_id: str
     outline_redirect_uri: str
+    #: Where the worker sends audio to be transcribed. **The bot needs it
+    #: although the bot never calls it**: `/about` and the `/consent`
+    #: prompt have to name the host before somebody agrees to be recorded,
+    #: and a person deciding whether to speak cannot be asked to read the
+    #: worker's Deployment. Required here for the same reason it is
+    #: required there -- a default would be a host chosen by nobody.
+    #:
+    #: One value for both processes (`commonEnv` in the chart, not
+    #: `worker.env`): a bot naming one endpoint while the worker uploads
+    #: to another would make the consent prompt a false statement, which
+    #: is worse than no statement at all.
+    transcription_base_url: str
     health_port: int = 8080
     # How many gateway connections this one process opens. **Unset means
     # "let Discord decide"** -- `discord.AutoShardedClient` asks

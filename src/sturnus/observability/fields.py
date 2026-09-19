@@ -212,6 +212,14 @@ _MEASUREMENTS = frozenset(
         "blocks",
         "packets",
         "segments",
+        #: How many requests a transcription job was divided into. On
+        #: `transcription.decoded` only, where it is what separates two
+        #: jobs the realtime factor alone cannot: "one window" and "nine
+        #: windows" are the same recording length against very different
+        #: request patterns, and the stall gauge's resolution is one
+        #: window, so this is the number that says how coarse the clock
+        #: was for this particular job.
+        "windows",
         "segment_count",
         "char_count",
         "title_chars",

@@ -20,12 +20,22 @@ from sturnus.infrastructure.db.repositories import ConsentRepository
 
 CONSENT_STRINGS: dict[str, str] = {
     "title": "Recording consent",
+    # `{transcription_host}` is named here, in front of the button,
+    # rather than only in the policy document: transcription happens at an
+    # endpoint the operator chose, so a chunk of this person's audio
+    # leaves the pod, and somebody deciding whether to be recorded should
+    # see that before they press "I consent" -- not in a document they
+    # will not open. The host only; the endpoint's credential appears in
+    # no user-facing text at all.
     "description": (
         "While this bot is recording the configured voice channel, your "
         "audio is captured and transcribed separately from everyone "
         "else's speech. Recordings are kept only for the configured "
         "retention period and then deleted; the resulting transcript is "
         "published to the configured document target.\n\n"
+        "Transcription happens at {transcription_host}, which means a "
+        "portion of your audio is sent there over an encrypted "
+        "connection.\n\n"
         "Full policy: {policy_url}"
     ),
     "granted": "Consent recorded. The {role} role has been assigned.",

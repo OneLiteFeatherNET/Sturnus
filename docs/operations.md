@@ -90,9 +90,13 @@ in the bot would read it.
 | `STURNUS_MASTER_KEY_ID` | **yes** | no | Label recorded as `encryption_key_id` when a data key is wrapped. Not key material. |
 | `STURNUS_OUTLINE_BASE_URL` | **yes** | no | Base URL of the Outline instance the finished protocol is posted to. |
 | `STURNUS_OUTLINE_SERVICE_KEY` | **yes** | **yes** | Outline API token `OutlineSink` authenticates with when creating documents, and — hourly — reads the collection list with, so the console can show `document_target` as a name instead of the UUID somebody pasted. Note the name — it is `OUTLINE_SERVICE_KEY`, not an `API_TOKEN` variant. A token that is invalid, lacks access, or points at a collection that does not exist surfaces as `PermanentDocumentError`; see section 5. A token that cannot list collections costs only the picker's names: the sweep leaves the previous mirror standing rather than emptying it, and nothing about transcription depends on it. |
-| `STURNUS_WHISPER_MODEL` | `large-v3` | no | faster-whisper model to load. Larger models are more accurate and markedly slower, and this deployment transcribes on CPU (see the chart's `worker.resources`), so the difference is measured in minutes per recording rather than seconds. It is deliberately not `large-v3-turbo`: turbo is a distilled decoder with four layers instead of thirty-two, and what it gives up is concentrated outside English. Transcription happens offline, per speaker, after the meeting, so the time it costs is time nobody is waiting on — the memory it costs is real, and the chart's `worker.resources` comment works it out. This is the default for a *first* pass only; which models a re-queue may name, and which one it falls back to, is the closed registry in section 6.2.9. |
-| `STURNUS_WHISPER_DEFAULT_LANGUAGE` | `de` | no | Language reported when faster-whisper's own detection comes up empty. This is the floor under the per-guild `transcription_language` (section 4.1), not the usual setting to reach for — it is consulted only for a guild that asked for detection (`transcription_language auto`) and got nothing back. It still matters more than a fallback usually does: the first transcription for a speaker in such a session pins that speaker's language, and every later job for them reuses it. |
-| `STURNUS_MODEL_CACHE_DIR` | unset | no | Where model weights are cached. When set, the worker exports it as `HF_HOME` before loading the model, so the download lands on a persistent volume; left unset, every cold start re-downloads several gigabytes of weights. |
+| `STURNUS_TRANSCRIPTION_BASE_URL` | **none** | no | Base URL of the OpenAI-compatible endpoint audio is sent to — OpenAI's own (`https://api.openai.com/v1`), a self-hosted vLLM or Speaches container, anything speaking `/audio/transcriptions`. **Required, with no default, and that is a consent control rather than an oversight:** a worker without it fails to construct its settings and does not start, so there is no configuration under which a recording leaves the pod because nobody chose otherwise. Its *host* is shown in `/about` and in the `/consent` prompt, so the bot needs the same value — it is in the chart's `commonEnv` for that reason, and a bot naming one endpoint while the worker uploads to another would make the consent prompt a false statement. |
+| `STURNUS_TRANSCRIPTION_API_KEY` | `""` | **yes** | Credential for that endpoint. **Empty is valid** — a vLLM or Speaches container on the cluster's own network needs none. It appears in no user-facing text, no log field, no span attribute and no metric label; only the host does. |
+| `STURNUS_TRANSCRIPTION_MODEL` | `whisper-1` | no | What a job that names no model runs. On OpenAI only `whisper-1` returns segment timestamps (`verbose_json` with `timestamp_granularities`); `gpt-4o-transcribe` and `gpt-4o-mini-transcribe` return neither, and the protocol interleaves several speakers chronologically, so a transcript without segment times is not a partial result — it is no result. **"Use the newer model" is the obvious wrong move and the API error it produces will not explain itself.** Which names a re-queue may ask for is the closed registry in section 6.2.9. |
+| `STURNUS_TRANSCRIPTION_DEFAULT_LANGUAGE` | `de` | no | Language reported when the endpoint's own detection comes up empty or names a language that cannot be mapped to an ISO-639-1 code. This is the floor under the per-guild `transcription_language` (section 4.1), not the usual setting to reach for — it is consulted only for a guild that asked for detection (`transcription_language auto`) and got nothing usable back. It still matters more than a fallback usually does: the first transcription for a speaker in such a session pins that speaker's language, and every later job for them reuses it. |
+| `STURNUS_TRANSCRIPTION_TIMEOUT` | `600.0` | no | Per request, in seconds. Generous because one request is a whole window: a large upload followed by however long the endpoint takes to decode it. A timeout that fires on a healthy window costs one of `STURNUS_MAX_JOB_ATTEMPTS`. |
+| `STURNUS_TRANSCRIPTION_MAX_RETRIES` | `2` | no | Retries the client makes itself, with backoff, honouring `Retry-After`. Deliberately below `STURNUS_MAX_JOB_ATTEMPTS`: without them a rate-limited request burns one of the job's attempts and re-uploads the whole window from the start. |
+| `STURNUS_TRANSCRIPTION_MAX_CHUNK_SECONDS` | `720.0` | no | The window cap. A track longer than this is divided, and every cut lands inside a silence the speech gate reported — see section 6.2.9 for why that matters more than it sounds. Twelve minutes of 16 kHz mono 16-bit PCM is about 23 MB, inside OpenAI's 25 MB request limit with room for the multipart envelope; it is configurable because that limit is OpenAI's and not the protocol's. **Raising it coarsens the stall alert**: progress is reported once per completed window, so the threshold in section 7.5 has to move with this value. |
 | `STURNUS_WORK_DIR` | `/tmp` | no | Scratch directory the encrypted recording is downloaded and decrypted into before transcription. It must be large enough for the biggest single recording — the chart sizes the corresponding volume with `worker.tmpSizeLimit`. |
 | `STURNUS_CONSOLE_ORIGIN` | `https://sturnus.onelitefeather.dev` | no | Where a protocol stored in the object store is served from. A guild that publishes to a `markdown` or `html` export target gets an artefact in the audio bucket, and the URL recorded for it — the one the bot posts into the channel — is this origin plus `/api/sessions/{id}/documents/{target_id}`, answered by `sturnus-api` under the same participant rule as the session's own page. Deliberately **not** a presigned S3 URL, which would keep working for anybody it was forwarded to and could not be revoked. It must be the same value `sturnus-api` runs with, or every such link points at a host that does not answer — and because the link is posted into Discord, it outlives any later correction. |
 | `STURNUS_MAX_JOB_ATTEMPTS` | `3` | no | How many failed attempts a job gets before `JobQueue.fail` marks it `dead`. See section 5 for what a `dead` job means for the rest of its session. |
@@ -107,27 +111,36 @@ in the bot would read it.
 | `STURNUS_LOG_THIRD_PARTY_LEVEL` | `WARNING` | no | Level for every other library. **Raised to `INFO` if you set it lower**, and the per-logger floors in section 7.2 clamp several libraries tighter still; no value here undercuts either. A clamped value is not ignored silently — the process logs one `log.level_clamped` line at startup saying it happened. |
 | `STURNUS_LOG_FORMAT` | `json` (auto) | no | `json` — one object per line on stdout, which is what `alloy-logs` scrapes into Loki — or `console` for a human at a terminal. Defaults to `console` when stdout is a TTY and `json` otherwise, so local development needs no setting. Both formats share the same redaction filter; the choice is presentation only. |
 
-Whisper's device and compute type are deliberately *not* environment-driven:
-the worker constructs `WhisperEngine` with `"cpu"` and `int8_float32`
-hardcoded, because Spec 7 sizes this deployment for CPU inference. There is
-no `STURNUS_WHISPER_DEVICE` to set — moving to GPU is a code change, not a
-configuration change.
+Where transcription happens is configuration; *how* it happens is not.
+The worker sends one window at a time and asks for `verbose_json` with
+segment timestamps, at `temperature=0`, and none of that is
+environment-driven — there is no `STURNUS_TRANSCRIPTION_TEMPERATURE` to
+set. What the endpoint then does with the audio is the endpoint's business,
+which is the trade this design makes: Sturnus stopped owning a decoder and
+started owning a client.
 
-`int8_float32` rather than plain `int8`: the weights are quantised to int8
-either way, and the suffix names the type everything else runs in.
-CTranslate2 treats bare `int8` as an alias and picks that float type for
-whichever machine it finds itself on, which would leave transcription
-quality depending on the node the pod was scheduled to. It also falls back
-silently rather than refusing a compute type it cannot provide, so a wrong
-value here costs accuracy with nothing in the logs to say so.
+Two consequences worth knowing before choosing an endpoint:
 
-Neither the decoding parameters (`beam_size`, `condition_on_previous_text`,
-the VAD filter and the two hallucination thresholds) is configurable
-either. They are quality decisions with one right answer for this workload,
-argued in `sturnus/infrastructure/whisper.py` and pinned by
-`tests/infrastructure/test_whisper.py`; what *is* per-guild is the language
-and the vocabulary, and those are runtime configuration rather than
-environment variables — see section 4.1.
+**An endpoint that reports `no_speech_prob` is the safer one to point at.**
+Sturnus drops a returned segment when its no-speech probability exceeds
+0.6, and independently when its compression ratio exceeds 2.4 — the two
+rules that catch a model inventing text on near-silence. vLLM's
+`verbose_json` omits `no_speech_prob`, and a missing figure means the rule
+that reads it does not apply (never that the job fails). A deployment
+against such an endpoint keeps the speech gate and `temperature=0` and
+nothing else, and the speech gate is the defence that caught the failure
+this project actually had — see section 6.2.9.
+
+**The decoding parameters that could not follow are gone, not hidden.**
+`beam_size`, `condition_on_previous_text` and the VAD filter are not
+expressible over this interface. The first is simply lost. The second
+survives structurally rather than as a parameter: each window is its own
+request carrying the guild's configured prompt and nothing else, so no
+returned text is ever fed back and the cascade it guarded against cannot
+form. The third is ours and always was — `sturnus.infrastructure.speech_gate`
+runs before anything is uploaded. What *is* per-guild is the language and
+the vocabulary, and those are runtime configuration rather than environment
+variables — see section 4.1.
 
 ### 1.3 `sturnus-link` (`sturnus.entrypoints.link.LinkSettings`)
 
@@ -856,12 +869,14 @@ It is a positive integer, per guild, and it takes effect on the next claim:
 the value is read inside the claim query itself, from `guild_config`, so
 there is nothing to restart and nothing cached anywhere.
 
-**What it does not cap: memory.** Each worker is its own process with its
-own loaded Whisper model, and the model cache is deliberately unbounded.
-Peak memory across the cluster is therefore set by
-`worker.replicaCount` and `worker.resources`, not by this key — raising
-`max_parallel_tracks` above the number of workers you run changes nothing
-at all, and raising the worker count is what costs memory.
+**What it does not cap: memory, or load on the endpoint.** Each worker is
+its own process holding one recording in memory at a time; peak memory
+across the cluster is set by `worker.replicaCount` and `worker.resources`,
+not by this key — raising `max_parallel_tracks` above the number of
+workers you run changes nothing at all. What it *does* affect now is how
+many requests reach the transcription endpoint at once, which is the
+ceiling worth respecting: a rate-limited endpoint answers 429, the client
+retries with backoff, and then the job fails.
 
 **A capped meeting never blocks the queue.** Claims are ordered
 oldest-job-first, and a session that is already at its limit is skipped
@@ -871,24 +886,17 @@ in the other direction — a guild that keeps meeting produces jobs with
 newer ids, which sort *behind* everything already waiting, so it cannot
 push a quieter guild's meeting back indefinitely.
 
-**Running more than one worker is a storage change, not a config change.**
-The chart ships `worker.replicaCount: 1` and that is not a limit of the
-queue. It is one volume: the model cache
-(`worker.persistence`) is a single `ReadWriteOnce` claim, so a second pod
-can only mount it if the scheduler happens to place it on the same node,
-and across nodes it stays `Pending` on a multi-attach error. (The
-worker's working directory is *not* shared — `/tmp` is a per-pod
-`emptyDir` sized by `worker.tmpSizeLimit`, so the decrypted audio needs no
-change at all.) To run two workers, do one of:
+**Running more than one worker is now an ordinary capacity decision.** The
+chart ships `worker.replicaCount: 1`, and what used to stand in the way was
+one volume: the model cache was a single `ReadWriteOnce` claim a second pod
+could mount only if the scheduler placed it on the same node. That volume
+is gone with the local decoder — the worker holds no state between jobs and
+mounts nothing but a per-pod `/tmp` — so raising the replica count is a
+matter of what you want to pay for rather than a storage migration.
 
-- set `worker.persistence.accessMode: ReadWriteMany` on a storage class
-  that provides it (CephFS, NFS, Longhorn RWX) — one shared, read-mostly
-  cache, written only by the first download;
-- give each pod its own claim, which means running the worker as a
-  StatefulSet with `volumeClaimTemplates`: every replica then downloads
-  the ~3.1GB checkpoint once, inside its `startupProbe` budget;
-- drop the cache entirely and mount an `emptyDir` in its place — simplest
-  to deploy, and every pod restart re-downloads the model.
+What to weigh instead: every worker uploads to the same endpoint, so N
+workers is N times the concurrent load on it and on this cluster's egress.
+The ceiling worth respecting is the endpoint's, not this cluster's.
 
 Then remember that `worker.resources` is per replica (two workers is 8
 CPUs and 12Gi of limit, not 4 and 6), and that `strategy: Recreate` in
@@ -1088,8 +1096,8 @@ These happen at different granularities and leave different traces:
 **A third kind, distinct from both of the above: a job that is `done`,
 raised no error, and is still wrong.** Every session transcribed by a
 worker running Silero VAD (`vad_filter=True`, before this fix landed —
-`sturnus.infrastructure.whisper.WhisperEngine._transcribe`, commit
-`12d4299`) produced an empty or hallucinated transcript while reporting
+the in-process decoder that `sturnus.infrastructure.openai_transcription`
+replaced, commit `12d4299`) produced an empty or hallucinated transcript while reporting
 complete success: `status` is `done`, `transcript` is non-`NULL`, nothing
 is logged, and `/queue status` shows nothing wrong, because nothing failed
 from the code's point of view. The mechanism (full reasoning in
@@ -1738,32 +1746,41 @@ buildable; building it is a separate, deliberate act.
 ### 6.2.9 Which transcription model a re-queue runs
 
 A re-queue may name the model the redo is transcribed with. Which names
-exist is not a matter of what faster-whisper can resolve — it will resolve
-any HuggingFace repository id — but of a closed registry in this
-repository, `sturnus/domain/transcription_models.py`. Changing it is a
-commit, a review and a deploy, which is the right amount of ceremony for
-"this cluster will now download and run a new model".
+exist is a closed registry in this repository,
+`sturnus/domain/transcription_models.py`. Changing it is a commit, a review
+and a deploy.
 
-| Name | Approximate size | What it trades |
-|---|---|---|
-| `tiny` | 75 MB | Fastest, least accurate. Good for confirming a recording contains speech at all. |
-| `base` | 145 MB | Very fast; visibly wrong on names and technical terms. |
-| `small` | 480 MB | The smallest that produces German a reader can follow without the audio. |
-| `medium` | 1.5 GB | Close to `large-v3` on clear speech, behind it on crosstalk and accents, for roughly half the time and memory. |
-| `large-v2` | 3.1 GB | The previous large model. Worth a second run when `large-v3` hallucinated on one particular recording. |
-| `large-v3-turbo` | 1.6 GB | A distillation of `large-v3` — four decoder layers instead of thirty-two. Much faster; what it gives up is concentrated outside English. |
-| `large-v3` | 3.1 GB | **The fallback.** Most accurate and slowest; this deployment's default. |
+**Today the registry holds one name: `whisper-1`.** On OpenAI it is the
+only model that returns `verbose_json` with `timestamp_granularities`, and
+a protocol that interleaves several speakers chronologically cannot be
+assembled without segment times. `gpt-4o-transcribe` and
+`gpt-4o-mini-transcribe` support neither, so Sturnus cannot use them at
+all — adding either to the registry deploys jobs that cannot succeed, and
+a test refuses it for that reason.
 
-Sizes are approximate on purpose. These are CTranslate2 conversions whose
-on-disk size depends on the compute type the worker was built with
-(`int8_float32` here), so a figure presented as exact would be exact about
-the wrong thing.
+**Why the list is still closed, now that the worker downloads nothing.**
+The original argument was that a free model name is an instruction to this
+worker to fetch and execute arbitrary weights from the internet. That
+argument is gone: a name is now a string handed to somebody else's server,
+which serves what it serves and refuses the rest, and the worst a wrong
+name achieves is a 400 and a failed job. Two weaker reasons remain and are
+still enough — the console's dropdown needs a finite set to render, and
+`transcription_job.model` records what ran, so an unknown name must be
+*refused* rather than quietly substituted.
 
-**The English-only builds are deliberately absent** — the `.en` variants
-and `distil-large-v3`. Every guild this serves meets in German
-(`STURNUS_WHISPER_DEFAULT_LANGUAGE`), so offering them would be offering a
-choice that is wrong for this deployment's own material in a way the
-person choosing could not see from the name.
+**The entries carry a name and nothing else.** They used to carry an
+approximate size and a one-sentence trade, and both were honest while the
+worker downloaded the weights and ran them. For a model served by somebody
+else's endpoint, no value this repository could write for either would be
+true, and a plausible-looking wrong answer in a dropdown is worse than a
+bare name.
+
+**A self-hoster whose endpoint serves a differently named model needs a
+fork today.** Making the list configuration
+(`STURNUS_TRANSCRIPTION_MODELS`) is a settled design that was deliberately
+deferred: it is the only part of the endpoint change that reaches outside
+the worker, touching the console and the bot as well. That is the cost,
+recorded rather than hidden.
 
 **Who may choose.** An administrator of the session's guild, and nobody
 else — because nobody else may re-queue at all. `POST
@@ -1771,11 +1788,11 @@ else — because nobody else may re-queue at all. `POST
 in its body; a request from somebody who does not administer that guild is
 refused whole (404, the same answer they get for a session that does not
 exist), never obeyed with the model quietly discarded. `GET /api/models`
-serves the table above for the console's dropdown, and answers 403 to
+serves the registry for the console's dropdown, and answers 403 to
 somebody who administers nothing.
 
-`/queue requeue` in Discord offers no choice. A slash command has nowhere
-to show what each model costs, so it names the fallback explicitly.
+`/queue requeue` in Discord offers no choice; it names the fallback
+explicitly.
 
 **What a re-queue records, and what it does not.** Two columns, and the
 difference matters when reading them:
@@ -1790,21 +1807,19 @@ difference matters when reading them:
   `JobQueue.complete` from the engine's own measurements, after the fact.
 
 A first-pass job (never re-queued) has `requested_model` `NULL` and runs
-whatever `STURNUS_WHISPER_MODEL` says. That is unchanged.
+whatever `STURNUS_TRANSCRIPTION_MODEL` says.
 
 **Note one behaviour change** if this cluster overrides
-`STURNUS_WHISPER_MODEL`: a re-queue that names nothing now runs the
-registry's fallback (`large-v3`) rather than that override. The two are
+`STURNUS_TRANSCRIPTION_MODEL`: a re-queue that names nothing runs the
+registry's fallback (`whisper-1`) rather than that override. The two are
 pinned equal in `tests/entrypoints/test_worker_entrypoint.py` for the
 declared default; a deployment that genuinely wants a different one has to
 say so in the registry, because "run whatever that worker was configured
 with" is not something a stored row can express.
 
-**What happens to a job whose model cannot be loaded.** It fails, and it
-is meant to. There is no fallback at the engine: `WhisperEngine._model_for`
-raises rather than quietly substituting, because a job that ran one model
-and recorded another would make `transcription_job.model` a lie, and that
-column exists precisely so "what ran" is knowable.
+**What happens to a job whose model the endpoint will not serve.** It
+fails, and it is meant to. There is no substitution: a job that ran one
+model and recorded another would make `transcription_job.model` a lie.
 
 Three places can produce that failure, and they look different:
 
@@ -1812,20 +1827,47 @@ Three places can produce that failure, and they look different:
   with `400` and a message naming both what was asked for and what this
   deployment runs.
 - **An unknown name that got past the boundary** — a row edited by hand, a
-  caller nobody has added the validation to — fails the job at claim time
-  with that same message in `transcription_job.error`. `attempts` climbs,
-  the job is retried, and at `STURNUS_MAX_JOB_ATTEMPTS` it is `dead` with
-  no transcript. Fix the row (or re-queue the session) rather than waiting.
-- **A registered name the worker cannot fetch** — no network, no
-  `STURNUS_MODEL_CACHE_DIR`, a full disk — fails with whatever
-  huggingface_hub says, in the same column. That is an infrastructure
-  fault, not a bad request, and section 5 is where to look.
+  caller nobody has added the validation to — fails the job before a
+  single sample is uploaded, with that same message in
+  `transcription_job.error`. `attempts` climbs, the job is retried, and at
+  `STURNUS_MAX_JOB_ATTEMPTS` it is `dead` with no transcript. Fix the row
+  (or re-queue the session) rather than waiting.
+- **A registered name the endpoint does not serve** — the registry and the
+  endpoint disagreeing — fails with whatever that endpoint answers,
+  usually a 400, in the same column. That is a configuration fault: either
+  the endpoint or the registry is wrong about what this deployment runs.
 
-The worker's own `STURNUS_WHISPER_MODEL` is never checked against the
-registry. It is loaded eagerly at startup and is therefore always a cache
-hit; an operator who configured a private conversion has said so
-deliberately, and a worker that refused the model it was started with
-would be refusing its own configuration.
+The worker's own `STURNUS_TRANSCRIPTION_MODEL` is never checked against the
+registry. An operator who pointed this deployment at an endpoint serving a
+privately named model has said so deliberately, and a worker that refused
+the model it was started with would be refusing its own configuration.
+
+### 6.2.9.1 How a long recording is divided, and why the cuts land in silence
+
+A track longer than `STURNUS_TRANSCRIPTION_MAX_CHUNK_SECONDS` is sent as
+several requests. Where those cuts fall is not a detail: **every cut lands
+inside a stretch the speech gate reported as silence, and silence inside a
+window is never removed.**
+
+The cheaper thing to do would be to drop the gaps and concatenate the
+speech, which is what the in-process decoder did. It cannot be done here.
+That decoder attributed each returned segment to a clip by the encoder
+window it came out of, because a decoded end time routinely overruns the
+window it belongs to — and resolving the clip from that end adds the
+*next* clip's offset, moving the text across an entire removed silence. On
+a measured 100-minute recording with 187 clips, 57 of 462 segments
+overran, five of them by more than half their own length, landing 20 to 31
+seconds from where they were spoken. An HTTP response carries no such
+marker, so the only safe arrangement is one where attribution is
+unnecessary: nothing inside a window is removed, so every segment in it
+maps back by one constant addition.
+
+One case cannot honour the rule: a window that reaches the cap with no
+silence in it at all is cut at the cap, through whatever is being said.
+That needs twelve minutes of continuous speech from one participant, it is
+logged when it happens, and it is the deliberate lesser evil — a cut word
+costs one word at one boundary, while an oversized request is a rejected
+request and a failed job.
 
 ### 6.2.10 `admin_audio_download_offered`: letting administrators download recordings
 
@@ -2899,17 +2941,41 @@ orders of magnitude out, not a few percent.
 **The stall alert, which is the one to page on.**
 
 ```promql
-# A job that has produced nothing for ten minutes. Absent when idle, so this
-# expression is simply empty on a worker with no work.
-sturnus_transcription_seconds_since_progress > 600
+# A job that has produced nothing for half an hour. Absent when idle, so
+# this expression is simply empty on a worker with no work.
+sturnus_transcription_seconds_since_progress > 1800
 ```
 
 This is the only signal that covers a job which wedges **before its first
-segment** — inside feature extraction or language detection, which is where
-the collapse happened. A position gauge cannot: a job stuck at zero looks
-exactly like a job that has only just started, and every real job passes
-through that state. The clock therefore starts when the model is called,
+result** — while a request is in flight, which is where a remote endpoint
+fails silently. A position gauge cannot: a job stuck at zero looks exactly
+like a job that has only just started, and every real job passes through
+that state. The clock therefore starts when the endpoint is first called,
 not when the first segment arrives.
+
+**This threshold is a function of `STURNUS_TRANSCRIPTION_MAX_CHUNK_SECONDS`
+and must be raised with it.** Progress advances once per *completed
+window*, because one window is one HTTP request with no intermediate
+signal. The smallest interval this gauge can report on a perfectly healthy
+job is therefore a whole window's round trip: the upload, the endpoint's
+own decoding, and up to `STURNUS_TRANSCRIPTION_MAX_RETRIES` retries with
+backoff underneath it, each bounded by `STURNUS_TRANSCRIPTION_TIMEOUT`.
+
+At the defaults — a 720-second window, two retries, a 600-second per-request
+timeout — 1800 leaves room for a window that takes twice its own length to
+come back. **600, the value this rule carried while transcription ran
+in-process, would now page on every multi-window job**: the window cap alone
+exceeds it. If you raise the cap, raise this with it; if you lower the cap
+to reduce request size, this can come down too.
+
+What this costs, stated rather than left to be discovered: a job that
+genuinely wedges is now invisible for up to a window's round trip, where it
+used to be visible within seconds. That is the price of one request per
+window instead of one callback per decoded segment, and it is not
+recoverable without reporting progress on the upload — which would report
+the transfer rather than the transcription, and an endpoint that accepts a
+whole upload and then wedges is exactly the failure this instrument exists
+for.
 
 `position_seconds / total_seconds` is the dashboard number ("this job is 12
 minutes into 43"). Both are on the concatenated-speech timeline, which is

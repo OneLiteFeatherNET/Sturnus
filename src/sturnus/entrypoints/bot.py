@@ -46,6 +46,7 @@ from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState, start_health_server
 from sturnus.infrastructure.objectstore import S3AudioStore
 from sturnus.infrastructure.observability import init_sentry
+from sturnus.infrastructure.openai_transcription import endpoint_host
 from sturnus.infrastructure.recording_adapters import CryptoEncryptor, FileAudioWriterFactory
 from sturnus.infrastructure.telemetry import init_telemetry, shutdown_telemetry
 from sturnus.infrastructure.traced import TracedAudioStore, TracedEncryptor, TracedJobQueue
@@ -290,6 +291,7 @@ async def _run() -> None:
 
     client = SturnusClient(
         clock=clock,
+        transcription_host=endpoint_host(settings.transcription_base_url),
         config_store=config_store,
         admin_mirror=admin_mirror,
         directory_mirror=directory_mirror,

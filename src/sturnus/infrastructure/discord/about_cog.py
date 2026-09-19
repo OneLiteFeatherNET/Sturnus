@@ -31,33 +31,55 @@ REPOSITORY_URL = "https://github.com/OneLiteFeatherNET/Sturnus"
 LICENSE_NAME = "AGPL-3.0-or-later"
 
 
-def about_text(*, version: str = __version__, repository_url: str = REPOSITORY_URL) -> str:
-    """Builds the `/about` notice: name, version, license, and source offer.
+def about_text(
+    *,
+    transcription_host: str,
+    version: str = __version__,
+    repository_url: str = REPOSITORY_URL,
+) -> str:
+    """Builds the `/about` notice: name, version, license, source, endpoint.
 
     Kept separate from the Discord response so a future edit cannot
     silently drop the license name or the repository link without a test
     noticing -- AGPL-3.0 section 13 requires this offer to reach users of
     a modified, network-deployed version, not just live in a repository
     nobody using the bot ever sees.
+
+    **`transcription_host` is here for the same reason the rest is.**
+    `/about` is the one command whose whole purpose is telling a user what
+    this deployment actually *is*, and since transcription happens at an
+    endpoint the operator chose, where a person's voice is sent is part of
+    that answer. It is a required argument rather than one with a default
+    so that no deployment can answer the question by omission.
+
+    The host only, never the key: `endpoint_host` takes the URL apart, and
+    a base URL's path or query is where a credential would be.
     """
     return (
         f"**Sturnus** v{version}\n"
         f"Licensed under the GNU Affero General Public License v3.0 or later "
         f"({LICENSE_NAME}).\n"
         f"Source code, including this deployment's corresponding source, is "
-        f"available at: {repository_url}"
+        f"available at: {repository_url}\n"
+        f"Speech is transcribed by: {transcription_host}"
     )
 
 
 class AboutCog(commands.Cog):
     """`/about` command; open to everyone, and always ephemeral."""
 
+    def __init__(self, transcription_host: str) -> None:
+        self._transcription_host = transcription_host
+        super().__init__()
+
     @app_commands.command(
         name="about",
         description="Show Sturnus's version, license and where to get the source code.",
     )
     async def about(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message(about_text(), ephemeral=True)
+        await interaction.response.send_message(
+            about_text(transcription_host=self._transcription_host), ephemeral=True
+        )
 
 
 __all__ = ["AboutCog", "LICENSE_NAME", "REPOSITORY_URL", "about_text"]

@@ -372,6 +372,11 @@ class SturnusClient(commands.AutoShardedBot):
         account_links: AccountLinkRepository,
         tick_interval_seconds: float = TICK_INTERVAL_SECONDS,
         capture_diagnostics: bool = False,
+        #: The host `/about` and the `/consent` prompt name as the place
+        #: audio is sent to be transcribed. Carried here rather than read
+        #: from settings inside the cogs, because this class is the
+        #: composition root for everything the gateway serves.
+        transcription_host: str = "",
         #: How many gateway connections this one process opens. `None`
         #: means "let Discord decide" -- `AutoShardedClient` asks
         #: `/gateway/bot` and takes the recommendation, which tracks the
@@ -431,6 +436,7 @@ class SturnusClient(commands.AutoShardedBot):
         self._account_links = account_links
         self._tick_interval_seconds = tick_interval_seconds
         self._capture_diagnostics = capture_diagnostics
+        self._transcription_host = transcription_host
 
         #: Every room this process is recording, or is watching so that it
         #: can, keyed by the room: `(guild_id, channel_id)`.
@@ -623,7 +629,14 @@ class SturnusClient(commands.AutoShardedBot):
         `tests/infrastructure/discord/test_client_cogs.py`, added
         specifically to catch that failure mode).
         """
-        await self.add_cog(ConsentCog(self._consent_repo, self._config_store, self._clock))
+        await self.add_cog(
+            ConsentCog(
+                self._consent_repo,
+                self._config_store,
+                self._clock,
+                self._transcription_host,
+            )
+        )
         await self.add_cog(ConfigCog(self._config_store, self.reconcile_guild, self.running_state))
         await self.add_cog(SetupCog(self._config_store, self._clock, self.reconcile_guild))
         await self.add_cog(AudioCog(self._session_factory, self._audio_store, self._clock))
@@ -640,7 +653,7 @@ class SturnusClient(commands.AutoShardedBot):
         # The AGPL's section 13 obliges us to offer the source to people who
         # interact with this over a network. They never receive a binary, so a
         # LICENSE file in the repository does not reach them — /about does.
-        await self.add_cog(AboutCog())
+        await self.add_cog(AboutCog(self._transcription_host))
         await self.tree.sync()
         self._ensure_tick_loop()
 

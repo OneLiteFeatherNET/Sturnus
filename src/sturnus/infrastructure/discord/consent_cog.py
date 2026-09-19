@@ -37,10 +37,15 @@ class ConsentCog(commands.GroupCog, name="consent", description="Manage recordin
         consent_repo: ConsentRepository,
         config_store: ConfigStore,
         clock: Clock,
+        transcription_host: str,
     ) -> None:
         self._consent_repo = consent_repo
         self._config_store = config_store
         self._clock = clock
+        #: Named in the prompt, in front of the button. See
+        #: `CONSENT_STRINGS["description"]` for why it is there rather
+        #: than only in the policy document.
+        self._transcription_host = transcription_host
         super().__init__()
 
     async def _policy(self, guild_id: int) -> tuple[str | None, str | None]:
@@ -88,7 +93,9 @@ class ConsentCog(commands.GroupCog, name="consent", description="Manage recordin
 
         embed = discord.Embed(
             title=CONSENT_STRINGS["title"],
-            description=CONSENT_STRINGS["description"].format(policy_url=policy_url),
+            description=CONSENT_STRINGS["description"].format(
+                policy_url=policy_url, transcription_host=self._transcription_host
+            ),
         )
         view = ConsentView(
             author_id=member.id,

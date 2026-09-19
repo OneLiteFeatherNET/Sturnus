@@ -4,8 +4,9 @@
 #             fixed, RWO PVC for the in-progress recording.
 #   link   -- the small HTTP service handling the OAuth account-link callback;
 #             the only component with any inbound route.
-#   worker -- pulls transcription jobs, runs faster-whisper; PVC for the
-#             model cache so a restart does not re-download the model.
+#   worker -- pulls transcription jobs and sends each speaker's audio to
+#             the configured OpenAI-compatible endpoint. Stateless: it
+#             holds no model and no volume but a per-pod /tmp.
 
 image:
   repository: harbor.onelitefeather.dev/sturnus/sturnus
@@ -45,6 +46,7 @@ podLabels: {}
 #   STURNUS_S3_SECRET_KEY         bot, worker
 #   STURNUS_MASTER_KEY            bot, worker
 #   STURNUS_OUTLINE_SERVICE_KEY   worker
+#   STURNUS_TRANSCRIPTION_API_KEY worker
 #   STURNUS_OUTLINE_CLIENT_SECRET link
 #
 # That distribution is not configurable from here on purpose; it is encoded
@@ -95,6 +97,21 @@ commonEnv:
   STURNUS_OUTLINE_BASE_URL: "https://wiki.example.invalid"
   STURNUS_OUTLINE_CLIENT_ID: ""
   STURNUS_OUTLINE_REDIRECT_URI: "https://sturnus.example.invalid/oauth/callback"
+  # **Required, blank here rather than defaulted, and shared on purpose.**
+  # Audio leaves the pod for this host, so a default would mean a
+  # deployment sending recordings somewhere because nobody chose
+  # otherwise. Blank makes the settings refuse to construct and the pod
+  # fail at startup, which is the loudest place to find out. Point it at
+  # OpenAI (`https://api.openai.com/v1`) or at a vLLM/Speaches container
+  # of your own -- anything speaking `/audio/transcriptions`.
+  #
+  # In `commonEnv` and not in `worker.env` because two components read it:
+  # the worker uploads to it, and the bot names its host in `/about` and
+  # in the `/consent` prompt. A bot naming one endpoint while the worker
+  # uploads to another would make the consent prompt a false statement,
+  # which is worse than no statement at all -- one value makes that
+  # unrepresentable. The key beside it appears in no user-facing text.
+  STURNUS_TRANSCRIPTION_BASE_URL: ""
   # STURNUS_SENTRY_DSN is deliberately absent here. It travels through the
   # Secret named by `existingSecret`, like every other key in
   # templates/_helpers.tpl's credential lists, and putting it back in this
@@ -510,52 +527,46 @@ httpRoute:
 
 worker:
   command: ["sturnus-worker"]
-  # **One replica, and raising it needs a storage decision first.** The
-  # queue itself is ready for a pool: it hands each job to exactly one
-  # worker (`FOR UPDATE SKIP LOCKED`), it caps how many of one meeting's
-  # speaker tracks may run at once so that a single eight-speaker session
-  # cannot occupy every worker (the per-guild `max_parallel_tracks`
-  # setting -- see docs/operations.md 4.2), and `complete`/`fail` now
-  # refuse a worker whose lease expired and whose job was taken over, so
-  # two workers on one track waste a transcription rather than writing the
-  # session's protocol twice.
+  # **One replica by default, and nothing structural stops more.** The
+  # queue hands each job to exactly one worker (`FOR UPDATE SKIP LOCKED`),
+  # it caps how many of one meeting's speaker tracks may run at once so a
+  # single eight-speaker session cannot occupy every worker (the per-guild
+  # `max_parallel_tracks` setting -- see docs/operations.md 4.2), and
+  # `complete`/`fail` refuse a worker whose lease expired and whose job was
+  # taken over, so two workers on one track waste a transcription rather
+  # than writing the session's protocol twice.
   #
-  # What is not ready is this deployment's storage, and it is exactly one
-  # volume. The working directory is already per pod -- `/tmp` is an
-  # `emptyDir` sized by `tmpSizeLimit` below, so nothing about the
-  # decrypted audio is shared between replicas and no change is needed
-  # there. The **model cache** (`persistence` below) is the whole problem:
-  # it is a single ReadWriteOnce claim, which a second pod can mount only
-  # if the scheduler puts it on the node already holding it. Across nodes
-  # the second pod stays Pending on a multi-attach error, which is also
-  # why `strategy: Recreate` is set in worker-deployment.yaml.
+  # The model cache used to be the one thing in the way: a single
+  # ReadWriteOnce claim a second pod could mount only if the scheduler put
+  # it on the same node. That volume is gone -- transcription happens at an
+  # endpoint and the worker keeps nothing but a per-pod `/tmp` -- so
+  # raising this is now a capacity decision rather than a storage one.
   #
-  # To actually run more than one worker, pick one of these:
-  #
-  #   * `persistence.accessMode: ReadWriteMany` on a storage class that
-  #     provides it (CephFS, NFS, Longhorn RWX). One shared, read-mostly
-  #     cache of ~3.1GB; the only write is the first download.
-  #   * A per-pod claim, which means turning this Deployment into a
-  #     StatefulSet with `volumeClaimTemplates`. Every replica then pays
-  #     the ~3.1GB download once, on first start, inside the startupProbe
-  #     budget below.
-  #   * No cache at all: mount an `emptyDir` where the claim is now. The
-  #     simplest of the three and the most expensive to run -- every pod
-  #     restart re-downloads the model.
-  #
-  # Then also: `strategy: RollingUpdate` becomes possible (and worth it)
-  # once the volume is no longer ReadWriteOnce, and `resources` below is
-  # per replica -- two workers is 8 CPUs and 12Gi of limit, not 4 and 6.
+  # What to weigh instead: every worker uploads audio to the same endpoint,
+  # so N workers is N times the concurrent load on it and on this
+  # cluster's egress. A rate-limited endpoint answers 429, which the client
+  # retries with backoff and then fails the job on -- so the ceiling worth
+  # respecting is the endpoint's, not this cluster's. `resources` below is
+  # per replica.
   replicaCount: 1
   env:
-    STURNUS_MODEL_CACHE_DIR: /data/model-cache
-    # Not `large-v3-turbo`: turbo is a distilled decoder, four layers where
-    # this has thirty-two, and the accuracy it trades away lands outside
-    # English -- which is the only place these meetings happen. It is a
-    # latency trade, and nothing here is waiting on latency: transcription
-    # is offline, per speaker, after the meeting. `worker.resources` below
-    # is where that decision is actually paid for.
-    STURNUS_WHISPER_MODEL: large-v3
+    # `whisper-1` is the only OpenAI model that returns segment timestamps
+    # (`verbose_json` + `timestamp_granularities`). `gpt-4o-transcribe` and
+    # `gpt-4o-mini-transcribe` return neither, and a protocol that
+    # interleaves several speakers chronologically cannot be assembled
+    # without them -- "use the newer model" is the obvious wrong move and
+    # the API error it produces will not explain itself. A self-hosted
+    # endpoint serving a differently named model needs
+    # `transcription_models.KNOWN_MODELS` changed, which is a code change
+    # today; see that module for why.
+    STURNUS_TRANSCRIPTION_MODEL: whisper-1
+    # The window cap. Twelve minutes of 16 kHz mono 16-bit PCM is ~23MB,
+    # inside OpenAI's 25MB request limit with room for the multipart
+    # envelope. **Raising this coarsens the stall alert**: progress is
+    # reported once per completed window, so the alert threshold in
+    # docs/operations.md section 7.5 has to stay above this plus the
+    # endpoint's own processing and retry time. The two move together.
+    STURNUS_TRANSCRIPTION_MAX_CHUNK_SECONDS: "720"
   # Larger than bot/link's: `process_one` downloads the encrypted object and
   # decrypts it to a WAV before transcribing, both under its work directory
   # (`sturnus.application.worker.process_one`, which creates a
@@ -566,114 +577,54 @@ worker:
   # Setting STURNUS_WORK_DIR to anything outside this mount points the worker
   # at the read-only root filesystem, so the two have to move together.
   tmpSizeLimit: 4Gi
-  # Sized for large-v3 at int8_float32 with beam_size 8, which is a
-  # different budget from the large-v3-turbo/beam 5 these numbers were set
-  # for. Four parts, added up rather than guessed at -- except the last,
-  # which peaks before the second one starts and so overlaps it:
+  # **Sized for a worker that holds no model.** The four terms that used
+  # to dominate this budget -- 1.55GB of int8 weights resident for the life
+  # of the process, ~2.2GB of decoding buffers, ~2.0GB of transient log-mel
+  # extraction, and the CPU to drive all three -- are gone with the local
+  # decoder. What is left is ordinary Python work plus one recording in
+  # memory:
   #
-  #   * The weights, resident for the life of the process. 1.55B
-  #     parameters quantised to one byte each is ~1.55GB, against ~0.81GB
-  #     for turbo's 809M. (The checkpoint on the cache volume below is
-  #     float16 and twice that; it is quantised while loading, not kept.)
-  #   * The decoding buffers, which exist only while a job runs and are
-  #     the part that actually scales: the cached attention keys and
-  #     values are held per beam, per decoder layer, and large-v3 has 32
-  #     decoder layers where turbo has 4. faster-whisper's own published
-  #     CPU benchmark for this architecture (large-v2 -- same 1.55B
-  #     parameters, same layer counts -- int8, beam 5) peaks at ~2.9GB
-  #     all in, i.e. ~1.35GB on top of the weights. beam_size 8 scales
-  #     that share by 8/5, so ~2.2GB.
-  #   * The process itself -- interpreter, numpy, soxr, boto3, SQLAlchemy,
-  #     one decrypted WAV read through it. A few hundred MB; call it 0.5GB.
-  #   * The log-mel extraction, which is transient and peaks *before* any
-  #     decoding starts, so it overlaps with the second item rather than
-  #     adding to it. Linear in the array handed to the model, at roughly
-  #     50MB per minute of it: 2.0GB for the 40.2 minutes of speech in a
-  #     100-minute session. This is the term nobody costed and the reason
-  #     this limit had to be overridden to 12Gi in the deployment repo --
-  #     `WhisperEngine` used to hand faster-whisper the *whole* padded
-  #     track and mark the speech with `clip_timestamps`, and the library
-  #     shrinks the array only in the `vad_filter` branch that setting clips
-  #     skips, so extraction scaled with session length and cost 4.94GB for
-  #     that same session. It now concatenates the gated speech before the
-  #     call (`sturnus.infrastructure.whisper`), which is what makes the
-  #     arithmetic here true again and lets the 12Gi override go back to the
-  #     6Gi below. For scale: on the old path a four-hour session
-  #     extrapolates to ~11.9GB of extraction alone, i.e. it would have
-  #     burst even the 12Gi stopgap.
+  #   * The track as float32, which is what the speech gate needs. 16 kHz
+  #     at 4 bytes a sample is ~3.7MB per minute, so a 100-minute session's
+  #     longest speaker track is ~384MB. This is the term that scales with
+  #     session length and the only one worth sizing against.
+  #   * One window re-encoded to int16 for the upload: ~23MB at the default
+  #     cap, released per request.
+  #   * The process -- interpreter, numpy, soxr, boto3, SQLAlchemy, the
+  #     HTTP client, one decrypted WAV read through it. A few hundred MB.
   #
-  # ~4.25GB at peak, and measured at **4.11GB** on an x86 CPU pinned to
-  # four threads, transcribing 4.7 minutes of German speech -- close enough
-  # to the arithmetic above to trust it for longer jobs, since only the
-  # second and fourth items grow with the audio and the fourth peaks first.
-  # For comparison the previous
-  # configuration (large-v3-turbo, int8, beam 5) peaked at 1.96GB, which is
-  # why the old 2560Mi limit held.
+  # ~0.8GB at peak for a 100-minute session, so 1Gi requested and 2Gi
+  # limited leaves room for a four-hour one (~920MB of track) without
+  # making the limit the thing that fails first. The limit is still the
+  # number worth being generous with: exceeding it is an OOMKill in the
+  # middle of a job.
   #
-  # The request is 4Gi (steady state between jobs is
-  # closer to 2GB -- the second item is transient), and the limit 6Gi. The
-  # limit is the number worth being generous with: exceeding it is an
-  # OOMKill in the middle of a transcription, which fails the job, and
-  # headroom on a node that has the memory costs nothing until it is
-  # needed. cpu stays at 4: large-v3 needs more *time* than turbo, not
-  # more parallelism, and the ceiling that time has to stay under is
-  # STURNUS_JOB_LEASE_SECONDS (1800s), not this.
-  #
-  # Measured, that ceiling is further away than it looks. The same run
-  # transcribed 282s of speech in 145s -- 1.94x faster than real time,
-  # against 4.6x for the old configuration. The gate finds the speech and
-  # `WhisperEngine` concatenates it before the model sees it, so both
-  # extraction and decoding scale with what was said and not with the padded
-  # length of a track: 1800s of lease covers roughly 58 minutes of one
-  # person actually talking. That is also what keeps the memory limit off
-  # the critical path -- 6Gi covers roughly 60 minutes of one speaker's
-  # actual speech (60 x 50MB of extraction + 1.55 + 0.5 ~= 5.1GB) and the
-  # lease expires just before that, so for a four-hour session the lease,
-  # not this limit, is the number to revisit. Beyond
-  # that the lease expires mid-job; with `replicaCount: 1` above and the
-  # worker processing one job at a time, nothing else can claim it, so the
-  # only consequence today is that a restart may reclaim a job that was
-  # still running.
-  #
-  # With more than one replica that changes: a second worker claims the
-  # job while the first is still decoding it. The outcome is now bounded
-  # rather than corrupting -- the first worker's `complete` is refused,
-  # because the claim it presents is no longer the one on the row, and the
-  # job is counted `stale` instead of `done` (see
-  # `sturnus.infrastructure.db.queue`), so the session's protocol is still
-  # written exactly once. What it costs is a whole transcription, thrown
-  # away. `job.claim_lost` in the logs and
-  # `sturnus_job_outcome_total{outcome="stale"}` are the signal that
-  # STURNUS_JOB_LEASE_SECONDS is too short for the material being
-  # recorded: raise the lease, rather than reading it as a reason not to
-  # scale out.
+  # cpu drops to 1: nothing here decodes. The worker gates an array, slices
+  # it, and waits on HTTP -- and waiting is not CPU. The ceiling that
+  # matters for a long job is STURNUS_JOB_LEASE_SECONDS against the
+  # *endpoint's* speed, which is no longer this cluster's to improve by
+  # giving the pod more cores.
   resources:
     requests:
-      cpu: "4"
-      memory: 4Gi
+      cpu: "1"
+      memory: 1Gi
     limits:
-      cpu: "4"
-      memory: 6Gi
-  # The model (faster-whisper large-v3) downloads on first start on a cold
-  # cache volume, which takes minutes -- not seconds. A startupProbe gives
-  # that its own, generous budget: liveness and readiness are not
-  # evaluated at all until it succeeds, so a slow download cannot be mistaken
-  # for a hung process and cannot trigger a restart loop. Once the startup
-  # probe succeeds, liveness/readiness take over on their normal cadence.
-  # The budget is what it is because `sturnus.entrypoints.worker` builds
-  # the engine -- download, then quantise 1.55B parameters down to int8 --
-  # *before* it starts the health server, so nothing answers /healthz until
-  # that has finished.
+      cpu: "1"
+      memory: 2Gi
+  # Nothing is downloaded or quantised at startup any more: the worker
+  # runs its database migrations and starts its health server. The probe
+  # stays because migrations are still work that happens before /healthz
+  # answers, and a slow one must not be mistaken for a hung process.
+  #
+  # Two minutes rather than twenty. The old budget was a model download
+  # and an int8 quantisation of 1.55B parameters; what it now covers is
+  # Alembic against a database that may itself be starting.
   startupProbe:
     httpGet:
       path: /healthz
       port: health
     periodSeconds: 10
-    # 20 minutes. Twice what it was, because large-v3's float16 checkpoint
-    # is ~3.1GB against large-v3-turbo's ~1.6GB and the quantisation at the
-    # end of it is longer too. This only ever costs anything on a cold
-    # cache volume: it is a ceiling, not a wait.
-    failureThreshold: 120
+    failureThreshold: 12
   livenessProbe:
     httpGet:
       path: /healthz
@@ -684,21 +635,9 @@ worker:
       path: /readyz
       port: health
     periodSeconds: 10
-  persistence:
-    # Holds the downloaded model weights so a restart doesn't repeat the
-    # download. What lands here is the float16 checkpoint as published,
-    # ~3.1GB for large-v3 (Spec 7) -- the int8 quantisation happens in
-    # memory at load time and is never written back. Plenty of headroom at
-    # 10Gi, and worth keeping: a resize is far more disruptive than the
-    # unused gigabytes are expensive.
-    size: 10Gi
-    storageClassName: ""
-    # ReadWriteOnce is what pins the worker to a single replica, and it is
-    # the only thing that does -- the working directory is a per-pod
-    # `emptyDir` already. This is the value to change (to ReadWriteMany, on
-    # a storage class that offers it) before raising `replicaCount` above;
-    # see the alternatives spelled out there.
-    accessMode: ReadWriteOnce
+  # No `persistence` block: the worker holds no state between jobs. `/tmp`
+  # is a per-pod `emptyDir` (`tmpSizeLimit` above) and the model cache it
+  # used to mount is gone with the local decoder.
   service:
     enabled: true
     type: ClusterIP

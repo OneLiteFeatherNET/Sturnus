@@ -763,17 +763,18 @@ async def known_models(request: web.Request) -> web.Response:
     administrator picking one would have been typing from memory into a
     field that fails four attempts later.
 
-    Each entry carries its approximate size and the trade it makes,
-    because the choice is between hours of worker time and whether the
-    transcript is worth reading, and neither is legible from a name like
-    `large-v3-turbo`. The order is the registry's own and means something:
-    fastest and roughest first.
+    Each entry carries a name and nothing else. It used to carry an
+    approximate size and the trade the model makes, and both were honest
+    while the worker downloaded the weights and ran them; transcription
+    now happens at an endpoint somebody else operates, where no value this
+    repository could write for either would be true. The order is the
+    registry's own.
 
     **403, where the rest of this module answers 404.** Those 404s exist so
     that a refusal cannot confirm a fact about somebody else — that a
     session ran, that a guild exists. There is no such fact here: the body
-    is seven literals from this repository's own source, identical for
-    every caller. The only thing this refusal discloses is whether the
+    is a handful of literals from this repository's own source, identical
+    for every caller. The only thing this refusal discloses is whether the
     caller administers anything, which `/api/me` already tells them about
     themselves.
 
@@ -793,8 +794,6 @@ async def known_models(request: web.Request) -> web.Response:
             "models": [
                 {
                     "name": model.name,
-                    "approximate_size": model.approximate_size,
-                    "summary": model.summary,
                 }
                 for model in transcription_models.KNOWN_MODELS
             ],

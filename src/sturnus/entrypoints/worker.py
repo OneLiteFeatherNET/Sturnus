@@ -70,7 +70,6 @@ import base64
 import contextlib
 import importlib.resources
 import logging
-import os
 import signal
 from datetime import UTC, datetime
 from pathlib import Path
@@ -104,6 +103,10 @@ from sturnus.infrastructure.documents.sinks import DocumentSinks
 from sturnus.infrastructure.health import ReadinessState, start_health_server
 from sturnus.infrastructure.objectstore import S3AudioStore, S3DocumentStore
 from sturnus.infrastructure.observability import init_sentry
+from sturnus.infrastructure.openai_transcription import (
+    OpenAITranscriptionEngine,
+    endpoint_host,
+)
 from sturnus.infrastructure.telemetry import (
     JOB_OUTCOME,
     QUEUE_DEPTH,
@@ -120,7 +123,6 @@ from sturnus.infrastructure.traced import (
     TracedQueue,
     TracedTranscriptionEngine,
 )
-from sturnus.infrastructure.whisper import WhisperEngine
 from sturnus.observability.events import Event, log_event, log_exception
 from sturnus.observability.setup import (
     asyncio_exception_handler,
@@ -155,23 +157,6 @@ _DOCUMENT_RETRY_INTERVAL_SECONDS = 300.0
 #: full re-read of the list, so the cheap thing to do is to make few of
 #: them.
 _COLLECTION_SWEEP_INTERVAL_SECONDS = 3600.0
-
-#: faster-whisper on CPU (Spec 7 sizes the deployment for CPU, not GPU --
-#: see `charts/sturnus/values.yaml`'s `worker.resources`). The weights are
-#: still quantised to int8, which is what keeps `large-v3` inside a
-#: memory budget a CPU node will actually give it; the `_float32` half
-#: names the type everything *else* runs in -- activations, accumulation,
-#: the layers that are never quantised.
-#:
-#: Naming it is the point. Plain `int8` is an alias whose float type
-#: CTranslate2 picks for the device it finds itself on, so what the
-#: decoder accumulates in is decided by the node the pod landed on rather
-#: than by this file; on today's x86 workers the alias resolves to exactly
-#: this, and on a machine with bfloat16 support it need not. Transcription
-#: quality is not something to leave to the scheduler, and CTranslate2
-#: falls back silently rather than refusing a compute type it cannot
-#: provide -- there would be nothing in the logs to say it had happened.
-_WHISPER_COMPUTE_TYPE = "int8_float32"
 
 #: Package and resource name of the real Outline document template. See
 #: `_load_template` -- this is the packaged template `process_one` must
@@ -218,21 +203,40 @@ class WorkerSettings(StrictSettings):
     master_key_id: str
     outline_base_url: str
     outline_service_key: SecretStr
-    # `large-v3` rather than `large-v3-turbo`: turbo is a distillation with
-    # four decoder layers instead of thirty-two, and what it gives up is
-    # concentrated outside English -- which is the only place this
-    # deployment operates. It buys speed, and nothing here is waiting:
-    # transcription runs offline, one speaker's file at a time, after the
-    # meeting is over. The cost is paid in the chart instead, in memory
-    # and in a longer first start (`charts/sturnus/values.yaml`).
-    whisper_model: str = "large-v3"
+    #: Where audio is sent to be transcribed. **Required, with no default,
+    #: and that is a consent control rather than an oversight.** A worker
+    #: without it fails to construct these settings and does not run, so
+    #: there is no configuration under which a recording leaves the pod
+    #: because nobody chose otherwise -- the operator either named a host
+    #: or has no working deployment.
+    transcription_base_url: str
+    #: Empty is valid: a vLLM or Speaches container on the cluster's own
+    #: network needs no credential. `SecretStr` so that a key that *is*
+    #: configured cannot reach a log line through a stray repr.
+    transcription_api_key: SecretStr = SecretStr("")
+    #: What a job that names no model runs. Agrees with
+    #: `transcription_models.FALLBACK`, and a test keeps them agreeing.
+    transcription_model: str = "whisper-1"
     # The floor under `transcription_language` (Spec 11), which is
     # per-guild and normally decides this; reached only when a guild asked
-    # for detection and the engine's detection came back with nothing.
+    # for detection and the endpoint's detection came back with nothing.
     # `en` here was a real defect, not a harmless default: every guild
     # this serves meets in German.
-    whisper_default_language: str = "de"
-    model_cache_dir: Path | None = None
+    transcription_default_language: str = "de"
+    #: Per request. Generous because a twelve-minute window is a large
+    #: upload followed by however long the endpoint takes to decode it,
+    #: and a timeout that fires on a healthy window costs an attempt.
+    transcription_timeout: float = 600.0
+    #: The SDK's own retries, deliberately below `max_job_attempts`:
+    #: without them a rate-limited request burns one of the job's attempts
+    #: and re-uploads the whole window from the start.
+    transcription_max_retries: int = 2
+    #: The window cap. Twelve minutes at 32 kB/s is about 23 MB, inside
+    #: OpenAI's 25 MB request limit with room for the multipart envelope.
+    #: Configurable because 25 MB is OpenAI's number and not the
+    #: protocol's -- and because raising it coarsens the stall detector,
+    #: which `docs/operations.md` ties to the alert threshold.
+    transcription_max_chunk_seconds: float = 720.0
     work_dir: Path = Path("/tmp")
     max_job_attempts: int = 3
     # How long a claimed job may stay `running` before `JobQueue.claim`
@@ -571,26 +575,20 @@ async def _collection_mirror_loop(
 async def _run() -> None:
     settings = WorkerSettings()
 
-    if settings.model_cache_dir is not None:
-        # faster-whisper never sets `download_root` itself
-        # (sturnus/infrastructure/whisper.py); it falls through to
-        # huggingface_hub, whose cache directory resolves from `HF_HOME`.
-        # Set before `WhisperEngine` (and therefore `WhisperModel`) is
-        # constructed below, so the very first model load already lands on
-        # the persistent volume rather than the image's baked-in default.
-        os.environ["HF_HOME"] = str(settings.model_cache_dir)
-
     await asyncio.to_thread(_run_migrations, settings.database_url)
 
     engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
     queue = JobQueue(session_factory, lease_seconds=settings.job_lease_seconds)
-    transcription_engine = WhisperEngine(
-        settings.whisper_model,
-        "cpu",
-        _WHISPER_COMPUTE_TYPE,
-        settings.whisper_default_language,
+    transcription_engine = OpenAITranscriptionEngine(
+        base_url=settings.transcription_base_url,
+        api_key=settings.transcription_api_key.get_secret_value(),
+        model=settings.transcription_model,
+        default_language=settings.transcription_default_language,
+        timeout_seconds=settings.transcription_timeout,
+        max_retries=settings.transcription_max_retries,
+        max_chunk_seconds=settings.transcription_max_chunk_seconds,
     )
     store = _DownloadableAudioStore(
         settings.s3_endpoint,
@@ -732,9 +730,12 @@ async def _run() -> None:
         logging.INFO,
         Event.WORKER_STARTED,
         "Worker started; polling the transcription queue",
-        model=settings.whisper_model,
-        device="cpu",
-        compute_type=_WHISPER_COMPUTE_TYPE,
+        model=settings.transcription_model,
+        # The host, never the key. `device` and `compute_type` are gone
+        # with the local decoder: there is no device. Where audio is sent
+        # is the fact this line can report that nothing else can, and it
+        # is the same fact `/about` and the consent prompt carry.
+        server_address=endpoint_host(settings.transcription_base_url),
         lease_seconds=settings.job_lease_seconds,
         max_attempts=settings.max_job_attempts,
     )

@@ -25,7 +25,16 @@ dependencies = [
     "aiohttp>=3.10",
     "jinja2>=3.1",
     "httpx>=0.28",
-    "faster-whisper>=1.1",
+    # Transcription runs against an OpenAI-compatible `/audio/transcriptions`
+    # endpoint (`sturnus.infrastructure.openai_transcription`). The official
+    # SDK rather than a hand-rolled `httpx` POST: vLLM documents this client
+    # against its own transcription endpoint, so "OpenAI-compatible" is tested
+    # by somebody other than us, and it supplies the typed `TranscriptionVerbose`
+    # this `mypy --strict` tree would otherwise have to narrow out of
+    # `dict[str, Any]`, retries honouring `Retry-After`, per-request timeouts
+    # and a native `async` call. Its added weight is `distro`, `jiter` and
+    # `sniffio`; `httpx`, `pydantic`, `anyio` and `tqdm` are already here.
+    "openai>=1.60",
     # Error reporting (sturnus.infrastructure.observability). A runtime
     # dependency rather than an optional extra because one image serves
     # operators with and without a Sentry instance: optionality has to be a
