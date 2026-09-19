@@ -5,3 +5,12 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Local agent tooling: per-machine settings, scratch worktrees and lock
+# files. The OpenSpec command and skill definitions under .claude/ are
+# committed -- they are how `/opsx:*` works for anybody who clones this --
+# but nothing below is shared state.
+.claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
+.serena/
