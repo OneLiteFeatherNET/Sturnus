@@ -16,7 +16,7 @@
 # via `docker pull python:3.12-slim && docker inspect --format
 # '{{index .RepoDigests 0}}' python:3.12-slim` on 2026-08-19; re-derive the
 # same way to move to a newer base.
-FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4 AS builder
+FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 AS builder
 
 # Pin the same uv release the lockfile was produced with (see
 # [build-system] in pyproject.toml).
@@ -42,7 +42,7 @@ RUN uv sync --frozen --no-default-groups
 # Runtime: a slim image with the built virtual environment and source only.
 # No compiler, no uv, no build tools.
 # ---------------------------------------------------------------------------
-FROM python:3.14-slim@sha256:ce40764625a4ff50df3548277632e7f96c4e77fe75fa848aae9885476e7df5a4 AS runtime
+FROM python:3.14-slim@sha256:caaf356f40667c496d405780745b9ac25771c189a51dfcc42430d531ea09f8a2 AS runtime
 
 # libopus0 is a runtime library, not a build tool: discord.py's voice-receive
 # path (discord.ext.voice_recv -> discord.opus.Decoder) loads Opus via
