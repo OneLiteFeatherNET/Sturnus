@@ -174,7 +174,18 @@ describe('who is offered the Admin View', () => {
     // it became a page, and `document_target` is still the fallback for a
     // guild that configures nothing here. Two adjacent entries is what
     // stops them reading as rival settings.
+    //
+    // Server Setup is the one entry that breaks the frequency rule, and it
+    // is first. Everything below it is read by somebody who already has a
+    // working server; that page is read by somebody who has none, and is
+    // the prerequisite of every other entry here -- there is nothing to
+    // configure, no consent to look at, no queue and no report until a
+    // server has been set up. An entry needed exactly once, by the person
+    // who knows this console least, cannot be the fifth thing in a list.
+    // It sits beside Bot Settings for the same reason Destinations does:
+    // finishing setup lands you there.
     expect(ADMIN_VIEW.entries.map((e) => e.labelKey)).toEqual([
+      'nav.onboarding',
       'nav.botSettings',
       'nav.destinations',
       'nav.consents',

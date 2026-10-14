@@ -2351,6 +2351,11 @@ same planner `/setup` uses and writes back what happened.
 | `POST /api/guilds/{id}/setup` | Asks: `{"channel_ids": ["…"], "consent_role_name": "…"}`. Answers 202 with the guild's setup state |
 | `GET /api/guilds/{id}/setup` | The same state. The console polls it until `request.status` stops being `pending` |
 
+The page that drives all three is **Server Setup** (`/admin/onboarding`) in
+the console, first entry of the Admin View. It walks the four steps in
+order — the invitation, the server, what to record, and what came of it —
+and everything below is what it has to express rather than merely show.
+
 Three things an operator should know about the behaviour.
 
 **A failure is terminal.** The tick runs six times a minute forever, so an
