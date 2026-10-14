@@ -1,4 +1,4 @@
-"""Envelope encryption for recorded audio (Spec 12.1).
+"""Envelope encryption for recorded audio, and for what outlives it (Spec 12.1).
 
 A fresh data key is generated per session and encrypted with the master key
 from the environment; only the wrapped form is stored, alongside the id of
@@ -19,6 +19,16 @@ a file to seek in and deriving the plaintext length without decrypting
 anything. Both need the arithmetic, and the alternative to exporting it is
 a second copy of the format written down somewhere else -- which is how a
 format ends up with two definitions that disagree.
+
+**There are two formats here, and the second one exists because of a
+lifetime rather than a size.** `encrypt_file` is the chunked recording
+format above; `seal_artefact` is one small object sealed in one piece,
+carrying the wrapped key that opens it. A recording keeps its wrapped key
+in the row that owns it, which is right for something the retention sweep
+deletes; a rendered protocol has no such row and must not acquire one,
+because it is written once and read back long after that sweep has run.
+See `seal_artefact` for the full argument and for why the associated data
+it takes is a parameter rather than a field of the envelope.
 """
 
 from __future__ import annotations
@@ -37,6 +47,13 @@ _COUNTER_BYTES = 4
 
 #: The framing, as read by anything that is not `decrypt_file`.
 MAGIC = b"STRN\x01"
+#: The *other* format in the same family: one small object sealed in one
+#: piece, carrying the wrapped key that opens it. `seal_artefact` says why
+#: it is a second format rather than a second caller of `encrypt_file`.
+#: Same four-byte family, next version byte, so a reader holding an object
+#: and no context can still say what it is looking at -- and so neither
+#: reader silently accepts the other's bytes.
+ARTEFACT_MAGIC = b"STRN\x02"
 FILE_PREFIX_BYTES = 8
 LENGTH_BYTES = 4
 #: AES-GCM appends a 16-byte authentication tag, so a sealed chunk is
@@ -50,6 +67,16 @@ HEADER_BYTES = len(MAGIC) + FILE_PREFIX_BYTES
 #: chunk but the last has exactly this size, which is what makes the
 #: ciphertext offset of chunk `n` a multiplication rather than a scan.
 FRAME_BYTES = LENGTH_BYTES + CHUNK_SIZE + TAG_BYTES
+
+#: How many bytes the artefact envelope spends saying how long its wrapped
+#: key is. Two, because a wrapped 32-byte key is sixty bytes today and the
+#: only reason the length is written down at all is so that a future
+#: wrapping scheme with a different size can be read by this same parser.
+_WRAPPED_LENGTH_BYTES = 2
+#: The nonce sealing an artefact's body. Twelve random bytes rather than a
+#: prefix and a counter, because there is exactly one seal per artefact --
+#: see `seal_artefact` on why a protocol is not chunked.
+_SEAL_NONCE_BYTES = 12
 
 
 @dataclass(frozen=True)
@@ -180,3 +207,98 @@ def decrypt_file(source: Path, target: Path, data_key: bytes) -> None:
                 raise ValueError("truncated chunk")
             dst.write(aead.decrypt(nonce(prefix, counter), sealed, None))
             counter += 1
+
+
+def is_sealed_artefact(blob: bytes) -> bool:
+    """Whether these bytes are an artefact this module sealed.
+
+    Read before `open_artefact` by anything that also has to serve the
+    plaintext artefacts written before this format existed. The magic is
+    five bytes ending in a control character, so a Markdown or HTML
+    document cannot begin with it by accident.
+    """
+    return blob.startswith(ARTEFACT_MAGIC)
+
+
+def seal_artefact(plaintext: bytes, keys: KeyWrapper, aad: bytes) -> bytes:
+    """Seals one small artefact under a data key of its own, and encloses it.
+
+    **Why this is a second format and not a second caller of
+    `encrypt_file`.** That one chunks, because a recording runs to
+    hundreds of megabytes and AES-GCM in a single call would mean holding
+    all of it in memory; and it stores no key, because a recording's
+    wrapped data key is a column on the job that owns it. A rendered
+    protocol is tens of kilobytes -- one seal, no chunking -- and it has
+    no such column, deliberately: it is written once and read back years
+    later, long after the job that produced the recording has had its
+    audio swept and its retention stamped.
+
+    So the key travels with the object. A fresh data key per artefact,
+    wrapped under the master key and written into the envelope, gives an
+    object that is complete on its own: restore the bucket and the master
+    key, and every protocol in it still opens, with nothing in the
+    database needing to have survived alongside. It is envelope
+    encryption exactly as the recordings use it, with the wrapped key in
+    the object rather than in a row -- against somebody holding the
+    bucket that is the same key wrapped under the same master key, and
+    against somebody holding only the database it is strictly less.
+
+    **`aad` is what stops the envelope being portable**, and it must come
+    from the reader's own context rather than from the object -- which is
+    why it is a parameter here and not a field of the envelope. See
+    `secret_context`: bound to the guild and to the purpose, an artefact
+    copied onto another guild's key fails to authenticate instead of
+    handing that guild somebody else's meeting.
+
+    The body itself is sealed with no associated data. Its key is used
+    once, for these bytes, and exists nowhere else; what is relocatable
+    here is the wrapped key, and that is what carries the binding.
+    """
+    data_key = keys.new_data_key(aad)
+    seal_nonce = os.urandom(_SEAL_NONCE_BYTES)
+    return b"".join(
+        (
+            ARTEFACT_MAGIC,
+            struct.pack(">H", len(data_key.wrapped)),
+            data_key.wrapped,
+            seal_nonce,
+            AESGCM(data_key.plaintext).encrypt(seal_nonce, plaintext, None),
+        )
+    )
+
+
+def open_artefact(sealed: bytes, keys: KeyWrapper, aad: bytes) -> bytes:
+    """The bytes `seal_artefact` sealed, or a refusal.
+
+    `ValueError` for anything that is not this envelope -- a wrong magic,
+    a truncation, a length prefix claiming more key than the object holds
+    -- raised before the master key is asked to unwrap anything. Every
+    field read out of the object below is a field somebody who can write
+    to the bucket chooses, so each one is checked against what is
+    actually there rather than trusted to be honest.
+
+    `InvalidTag` for an envelope that is this format and does not
+    authenticate: a wrong master key, a wrong `aad`, or a body somebody
+    edited. The caller has one answer for all three -- these are not
+    bytes it may serve -- and telling them apart at this level would only
+    describe the attack back to whoever mounted it.
+    """
+    if not is_sealed_artefact(sealed):
+        raise ValueError("not a sturnus sealed artefact")
+    at = len(ARTEFACT_MAGIC)
+    header = sealed[at : at + _WRAPPED_LENGTH_BYTES]
+    if len(header) != _WRAPPED_LENGTH_BYTES:
+        raise ValueError("truncated artefact header")
+    (wrapped_bytes,) = struct.unpack(">H", header)
+    at += _WRAPPED_LENGTH_BYTES
+    wrapped = sealed[at : at + wrapped_bytes]
+    if len(wrapped) != wrapped_bytes:
+        raise ValueError("truncated wrapped key")
+    at += wrapped_bytes
+    seal_nonce = sealed[at : at + _SEAL_NONCE_BYTES]
+    if len(seal_nonce) != _SEAL_NONCE_BYTES:
+        raise ValueError("truncated artefact nonce")
+    body = sealed[at + _SEAL_NONCE_BYTES :]
+    if len(body) < TAG_BYTES:
+        raise ValueError("truncated artefact body")
+    return AESGCM(keys.unwrap(wrapped, aad)).decrypt(seal_nonce, body, None)

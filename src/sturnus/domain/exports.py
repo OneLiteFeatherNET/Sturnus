@@ -75,9 +75,19 @@ class SessionDocument:
     publishing here", not "forget what was published": the document still
     exists in the other system, and the link is what somebody follows
     when they go looking for last quarter's minutes.
+
+    `guild_id` is the session's guild, joined rather than stored on the
+    row: `session_document` has no such column and does not need one,
+    because a document's guild is its session's and cannot be anything
+    else. It is on the read model because an object-store artefact is
+    sealed under a key bound to that guild, and the reader has to supply
+    that binding from its own context rather than from the object -- an
+    envelope that carried the guild it was filed under would authenticate
+    just as happily after being moved.
     """
 
     session_id: int
+    guild_id: int
     target_id: int | None
     provider: str
     document_id: str

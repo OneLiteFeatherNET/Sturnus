@@ -498,6 +498,7 @@ async def _legacy_destination(
         # this is what `session.document_provider` has always been written
         # with, and nothing about an existing guild's rows changes here.
         provider=provider,
+        guild_id=guild,
     )
 
 

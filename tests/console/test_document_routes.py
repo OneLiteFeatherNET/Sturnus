@@ -34,6 +34,7 @@ from tests.console.conftest import (
 
 SESSION_COOKIE = "sturnus_session"
 SESSION = 42
+GUILD = 4711
 T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 
 MARKDOWN_KEY = "protocols/42/7.md"
@@ -45,6 +46,7 @@ def document(
 ) -> SessionDocument:
     return SessionDocument(
         session_id=SESSION,
+        guild_id=GUILD,
         target_id=target_id,
         provider=provider,
         document_id=document_id,
@@ -294,3 +296,55 @@ async def test_neither_route_answers_without_a_session(
 ) -> None:
     client = await aiohttp_client(api([document(7, "markdown", MARKDOWN_KEY)]))
     assert (await client.get(path)).status == 401
+
+
+# ---------------------------------------------------------------------------
+# The seal, from this side of it
+# ---------------------------------------------------------------------------
+
+
+async def test_the_artefact_is_asked_for_under_the_guild_the_row_names(
+    aiohttp_client: AiohttpClientFactory, cookies: dict[str, str]
+) -> None:
+    """A stored protocol is sealed under a key bound to its guild, and the
+    binding has to come from the row rather than from the object -- an
+    envelope carrying the guild it was filed under would authenticate just
+    as happily after being moved onto another guild's key.
+
+    So the guild the route supplies is load-bearing, and supplying the
+    wrong one fails in a way indistinguishable from a missing object. This
+    is the only place that can be checked."""
+    artefacts = FakeArtefacts({MARKDOWN_KEY: b"# Minutes\n"})
+    client = await aiohttp_client(
+        build_test_api(
+            reads=FakeReads(sessions=(attended(),)),
+            documents=FakeSessionDocuments({SESSION: [document(7, "markdown", MARKDOWN_KEY)]}),
+            artefacts=artefacts,
+        )
+    )
+    response = await client.get(f"/api/sessions/{SESSION}/documents/7", cookies=cookies)
+    assert response.status == 200
+    assert artefacts.asked == [(MARKDOWN_KEY, GUILD)]
+
+
+async def test_an_artefact_that_does_not_open_is_a_404_and_not_a_500(
+    aiohttp_client: AiohttpClientFactory, cookies: dict[str, str]
+) -> None:
+    """The object is there and does not open: a wrong master key, an
+    envelope sealed under a guild this row does not name, a body edited in
+    the bucket. There is nothing here to serve, so the reader gets the
+    same refusal every other reason gets -- and the log gets a different
+    `reason`, because "the sweep took it" and "it failed to authenticate"
+    are different mornings for whoever is on call."""
+    client = await aiohttp_client(
+        build_test_api(
+            reads=FakeReads(sessions=(attended(),)),
+            documents=FakeSessionDocuments({SESSION: [document(7, "markdown", MARKDOWN_KEY)]}),
+            artefacts=FakeArtefacts(
+                {MARKDOWN_KEY: b"# Minutes\n"}, unreadable=frozenset({MARKDOWN_KEY})
+            ),
+        )
+    )
+    response = await client.get(f"/api/sessions/{SESSION}/documents/7", cookies=cookies)
+    assert response.status == 404
+    assert "Minutes" not in await response.text()

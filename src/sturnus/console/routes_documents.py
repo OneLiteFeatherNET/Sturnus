@@ -28,6 +28,15 @@ Outline document. Every refusal is the same answer with the same body: a
 distinct one would confirm which sessions the system holds and where a guild
 publishes, to somebody with no business knowing either.
 
+**The bytes in the bucket are sealed, and this is where they are opened.**
+The rule above is what this process enforces; the encryption is a property
+of the object, and the two answer different questions about a bucket
+somebody has a copy of. Which key an artefact is sealed under -- its own,
+never the recording's -- is
+`sturnus.infrastructure.documents.artefacts`' decision and its docstring's
+argument; all that reaches this module is a `guild_id` off the row and a
+second way for the read to fail.
+
 **An Outline document is not served here.** Its bytes live in Outline, and
 the listing carries its URL so the console can link straight out. Only the
 formats whose sink family is the object store have anything for this route
@@ -44,6 +53,7 @@ from aiohttp import web
 
 from sturnus.application.export_formats import OBJECT_STORE_SINK, format_named
 from sturnus.console.ports import DocumentArtefacts, SessionDocumentDirectory
+from sturnus.domain.errors import UnreadableArtefact
 from sturnus.domain.exports import SessionDocument
 from sturnus.observability.events import Event, log_event
 
@@ -171,7 +181,9 @@ async def read_document(request: web.Request) -> web.StreamResponse:
     # media type to `str | None` for a case that cannot happen.
     assert entry is not None
     try:
-        body = await request.app[DOCUMENT_ARTEFACTS].get(document.document_id)
+        body = await request.app[DOCUMENT_ARTEFACTS].get(
+            document.document_id, guild_id=document.guild_id
+        )
     except KeyError:
         # The row outlived its object. Nothing is broken, so this is a 404
         # and not a 500 -- the same reading the audio route gives a
@@ -185,6 +197,26 @@ async def read_document(request: web.Request) -> web.StreamResponse:
             target_id=target_id,
             requested_by=caller,
             reason="artefact_erased",
+        )
+        raise _not_found() from None
+    except UnreadableArtefact:
+        # The object is there and does not open: a wrong master key, an
+        # envelope sealed under a guild this row does not name, a body
+        # edited in the bucket. The reader gets the same 404 -- there is
+        # nothing here to serve them either way -- and the log gets a
+        # different `reason`, because "the sweep took it" and "it failed
+        # to authenticate" are different mornings for whoever is on call.
+        # The exception itself is not logged: it is raised from an
+        # `InvalidTag`, whose only useful content is the fact of it.
+        log_event(
+            log,
+            logging.ERROR,
+            Event.CONSOLE_DOCUMENT_REFUSED,
+            "A protocol's object is in the store and did not open",
+            session_id=session_id,
+            target_id=target_id,
+            requested_by=caller,
+            reason="artefact_unreadable",
         )
         raise _not_found() from None
 
