@@ -56,6 +56,7 @@ the Kubernetes `Secret` rather than from plain manifest text (see section
 | `STURNUS_MASTER_KEY` | **yes** | **yes** | Base64-encoded 32-byte AES-256 key. Wraps every session's per-recording data key. See section 2 — this is the single most consequential variable in this list. |
 | `STURNUS_MASTER_KEY_ID` | **yes** | no | Free-text label for the master key currently in `STURNUS_MASTER_KEY` (the chart defaults it to `v1`). Stored alongside every wrapped data key as `encryption_key_id`, never itself secret — it is a name, not key material. |
 | `STURNUS_RECORDING_DIR` | **yes** | no | Filesystem path the bot writes in-progress recordings to before upload (a PVC in the chart, `/data/recordings`). |
+| `STURNUS_GUILD_ID` | **none** | no | The one Discord guild this installation serves (its numeric id; Discord's developer mode shows it under **Copy Server ID**). **Required, with no default, on purpose:** a bot without it fails to construct its settings and the pod stops at startup, rather than serving whichever guilds it happens to find itself in. Commands are registered for this guild alone, and every other guild is refused at the head of the reconcile path (see below). Bot only — the worker never talks to Discord and does not read it. Plain configuration, not a credential. |
 | `STURNUS_OUTLINE_BASE_URL` | **yes** | no | Base URL of the Outline instance. The bot needs it only to build the authorization URL `/link` sends a user's browser to; it never calls Outline's API itself. |
 | `STURNUS_OUTLINE_CLIENT_ID` | **yes** | no | OAuth client id of the Sturnus application registered in Outline. Public by design — it travels in the query string of the authorization URL every user's browser opens. |
 | `STURNUS_OUTLINE_REDIRECT_URI` | **yes** | no | The callback URL that authorization returns to. Must be the same value `sturnus-link` is given, and must actually route to `link` — see section 1.5. |
@@ -69,6 +70,45 @@ the Kubernetes `Secret` rather than from plain manifest text (see section
 | `STURNUS_LOG_LEVEL` | `INFO` | no | Level for **Sturnus's own** loggers only, and safe to set to `DEBUG` in production: Sturnus's own DEBUG lines are held to ids, counts, sizes and durations by the same field registry that governs INFO. It cannot turn up a third-party logger — see section 7.2 for why that restriction is a security control rather than tidiness. |
 | `STURNUS_LOG_THIRD_PARTY_LEVEL` | `WARNING` | no | Level for every other library. **Raised to `INFO` if you set it lower**, and the per-logger floors in section 7.2 clamp several libraries tighter still; no value here undercuts either. A clamped value is not ignored silently — the process logs one `log.level_clamped` line at startup saying it happened. |
 | `STURNUS_LOG_FORMAT` | `json` (auto) | no | `json` — one object per line on stdout, which is what `alloy-logs` scrapes into Loki — or `console` for a human at a terminal. Defaults to `console` when stdout is a TTY and `json` otherwise, so local development needs no setting. Both formats share the same redaction filter; the choice is presentation only. |
+
+### 1.1.1 One guild, and where command access lives
+
+One installation serves exactly one guild: the team's. Three things hold
+that, in this order of importance.
+
+1. **The application is private.** In the Developer Portal, **Bot** tab,
+   turn **Public Bot** off, and under **Installation** allow
+   **Guild Install** only (no User Install). Then only the application's
+   owner can add it to a guild. This is the primary protection and it is a
+   setting, not code. The application is owned by a Discord Team; Discord
+   documents "only the app owner can add the app to guilds" but not whether
+   that means the Team or each of its members, so check it once, as in
+   [`first-deployment.md`](first-deployment.md) section 2.
+2. **Commands exist in `STURNUS_GUILD_ID` only.** At startup the bot
+   registers its commands for that guild and removes any it registered
+   globally in an earlier release, so a command is not offered in any other
+   guild. Guild commands update instantly. A mistyped id leaves the real
+   guild without commands and nothing else: set the right value and restart.
+3. **One guard in the bot.** If the bot is ever in another guild anyway, it
+   logs `guild.refused` (the configured id and the seen id, never a guild
+   name) and does nothing there: no voice connection, no session, no setup.
+   It never leaves a guild by itself; removing it is a person's decision.
+
+**Who may run the administrative commands is Discord's decision.** `/config`,
+`/queue`, `/audio-purge` and `/setup` default to **Manage Server**, and Discord does not
+deliver them to a member without it. Adjust them per role, member or channel
+in **Server Settings → Integrations → Sturnus**; whatever is set there is
+what applies, and the bot performs no second check. A guild administrator can
+therefore open a command to everyone or close it to everybody, which is the
+intended consequence of using the platform's mechanism. `/audio-purge` was `/audio purge` before: Discord sets a default permission
+per top-level command, so it left the `/audio` group, whose `/audio delete`
+stays open to every member along with `/consent`, `/link` and `/about`.
+
+`admin_role_id` is **not** consulted for those commands any more. It stays,
+because the operator console signs in through Outline and authorizes through
+the members of that role, which the bot mirrors into `admin_member`
+(section 6.2.3). Setting it still matters for the console; it no longer
+widens or narrows what a member can do with a slash command.
 
 The bot has no `STURNUS_OUTLINE_CLIENT_SECRET`, and that is not an
 oversight: building an authorization URL needs only the public client id,
@@ -1498,7 +1538,7 @@ grant ended before it began.
 **A back-dated revocation deletes nothing.** It is a statement about
 recordings that already exist, not an erasure of them. The response says
 how many recordings with audio fall on or after the chosen instant so the
-console can offer the erasure path; `/audio purge` (§12.3) and the
+console can offer the erasure path; `/audio-purge` (§12.3) and the
 retention sweep remain the only two things in this system that delete
 audio, and correcting a date must never quietly become a third.
 
@@ -1535,7 +1575,7 @@ lasts.
 
 **It does not delete anything already recorded.** Withdrawing consent is a
 decision about the future. Erasing what was recorded under the consent
-that existed at the time is `/audio purge <user>` in Discord (§12.3), and
+that existed at the time is `/audio-purge <user>` in Discord (§12.3), and
 it is deliberately a separate act with a separate command. The User
 Settings page shows, per person, how many recordings the guild still holds
 for them, so the distinction is on the screen rather than in this

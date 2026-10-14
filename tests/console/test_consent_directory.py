@@ -658,7 +658,7 @@ async def test_a_withdrawal_dated_for_the_end_of_the_month_leaves_consent_in_for
 async def test_a_backdated_revocation_says_how_many_recordings_it_did_not_delete(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
-    """The number exists so the console can offer `/audio purge`, not so it
+    """The number exists so the console can offer `/audio-purge`, not so it
     can take it. A back-dated revocation is a statement about recordings
     that already exist; erasing them would mean an administrator
     correcting a date had destroyed months of meetings their team read.
@@ -992,7 +992,7 @@ async def test_a_person_withdrawing_their_own_consent_deletes_nothing(
     factory: async_sessionmaker[AsyncSession],
 ) -> None:
     """Withdrawing consent is a decision about the future. Erasing what was
-    recorded under the consent that existed at the time is `/audio purge`,
+    recorded under the consent that existed at the time is `/audio-purge`,
     and it is deliberately a separate act.
     """
     await set_policy(factory)

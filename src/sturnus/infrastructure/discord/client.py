@@ -74,6 +74,7 @@ from sturnus.application.reconfigure import (
 from sturnus.application.recording import JobQueue, RecordingService
 from sturnus.application.sharding import shard_id_for_logging
 from sturnus.domain import settings
+from sturnus.domain.guild_scope import serves_guild
 from sturnus.domain.session import EndReason, SessionTimeouts
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
@@ -88,7 +89,7 @@ from sturnus.infrastructure.db.setup_intents import SetupIntentStore
 from sturnus.infrastructure.discord.about_cog import AboutCog
 from sturnus.infrastructure.discord.admin_sync import sync_administrators
 from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
-from sturnus.infrastructure.discord.audio_cog import AudioCog
+from sturnus.infrastructure.discord.audio_cog import AudioCog, AudioPurgeCog
 from sturnus.infrastructure.discord.config_cog import ConfigCog
 from sturnus.infrastructure.discord.consent_cog import ConsentCog
 from sturnus.infrastructure.discord.directory_sync import sync_directory
@@ -348,6 +349,10 @@ class SturnusClient(commands.AutoShardedBot):
         self,
         *,
         clock: Clock,
+        #: The one guild this installation serves (`STURNUS_GUILD_ID`).
+        #: Commands are registered for it alone, and `_reconcile` refuses
+        #: every other guild. See `sturnus.domain.guild_scope`.
+        guild_id: int,
         config_store: ConfigStore,
         admin_mirror: AdminMemberStore | None = None,
         directory_mirror: DirectoryStore | None = None,
@@ -406,6 +411,7 @@ class SturnusClient(commands.AutoShardedBot):
         )
 
         self._clock = clock
+        self._guild_id = guild_id
         self._config_store = config_store
         #: Optional: a client built without one does not mirror, which is
         #: what every test that has no interest in administrators gets.
@@ -640,6 +646,7 @@ class SturnusClient(commands.AutoShardedBot):
         await self.add_cog(ConfigCog(self._config_store, self.reconcile_guild, self.running_state))
         await self.add_cog(SetupCog(self._config_store, self._clock, self.reconcile_guild))
         await self.add_cog(AudioCog(self._session_factory, self._audio_store, self._clock))
+        await self.add_cog(AudioPurgeCog(self._session_factory, self._audio_store, self._clock))
         # Reads and re-queues transcription jobs. It takes the session
         # factory rather than `JobQueue`/`SessionRepository` on purpose:
         # its selections are specific to these three admin commands and
@@ -654,8 +661,58 @@ class SturnusClient(commands.AutoShardedBot):
         # interact with this over a network. They never receive a binary, so a
         # LICENSE file in the repository does not reach them — /about does.
         await self.add_cog(AboutCog(self._transcription_host))
-        await self.tree.sync()
+        await self._sync_commands()
         self._ensure_tick_loop()
+
+    async def _sync_commands(self) -> None:
+        """Registers the commands for the served guild alone, and clears the old globals.
+
+        Guild first, globals after: `copy_global_to` puts the commands into
+        the guild's own set, so clearing the global set afterwards cannot
+        take them with it, and the served guild is never without them in
+        between. Clearing the globals is what stops an upgrade from showing
+        every old command twice until the global registration is gone.
+
+        A failure to register for the guild stops startup -- there would be
+        no commands at all. A failure to clear the globals does not: the
+        old commands linger, harmlessly, and the next start tries again.
+        """
+        guild = discord.Object(id=self._guild_id)
+        self.tree.copy_global_to(guild=guild)
+        await self.tree.sync(guild=guild)
+        self.tree.clear_commands(guild=None)
+        try:
+            await self.tree.sync()
+        except discord.HTTPException as exc:
+            log_exception(
+                log,
+                logging.WARNING,
+                Event.COMMANDS_SYNC_FAILED,
+                "Could not remove the previously registered global commands; "
+                "the next start will try again",
+                exc,
+                guild_id=self._guild_id,
+            )
+
+    def _refuses(self, guild_id: int) -> bool:
+        """True, after logging it, when this installation does not serve `guild_id`.
+
+        The guard `single-guild-instance` keeps in code: Discord's private
+        application is the primary protection against the bot being added
+        elsewhere, and this holds if that setting is wrong. Logs ids only --
+        a guild's name names an organisation (see `directory_sync`).
+        """
+        if serves_guild(configured_guild_id=self._guild_id, guild_id=guild_id):
+            return False
+        log_event(
+            log,
+            logging.WARNING,
+            Event.GUILD_REFUSED,
+            "Refusing a guild this installation does not serve",
+            guild_id=guild_id,
+            configured_guild_id=self._guild_id,
+        )
+        return True
 
     def _ensure_tick_loop(self) -> None:
         """Starts the tick loop, once, however often this is called.
@@ -944,7 +1001,16 @@ class SturnusClient(commands.AutoShardedBot):
         uploaded and enqueued -- rather than deferring the change behind
         it. Only `/config apply force:true` passes it, and only after
         saying so.
+
+        **The one guard.** A guild this installation does not serve is
+        reconciled into nothing -- no plan, no voice connection, no
+        session -- before anything else happens. The periodic tick calls
+        `_reconcile` directly, so `_tick_guild` asks the same question.
         """
+        if self._refuses(guild_id):
+            return self._result(
+                ReconfigurePlan(ReconfigureAction.NOTHING, False, (), ()), None, False
+            )
         lock = self._reconfigure_locks.setdefault(guild_id, asyncio.Lock())
         async with lock:
             return await self._reconcile(guild_id, force=force)
@@ -1943,6 +2009,11 @@ class SturnusClient(commands.AutoShardedBot):
         recount it performs should use the configuration the reconcile
         above has just settled on rather than the one before it.
         """
+        # Silent, unlike `reconcile_guild`: the join and the shard-ready
+        # reconcile have already reported this guild, and a line every ten
+        # seconds would say nothing new.
+        if not serves_guild(configured_guild_id=self._guild_id, guild_id=guild_id):
+            return
         lock = self._reconfigure_locks.setdefault(guild_id, asyncio.Lock())
         if lock.locked():
             return

@@ -32,6 +32,7 @@ def _env(**overrides: str) -> dict[str, str]:
         # The bot never calls this endpoint; `/about` and the `/consent`
         # prompt name its host, so the bot has to be told what it is.
         "STURNUS_TRANSCRIPTION_BASE_URL": "https://transcribe.example/v1",
+        "STURNUS_GUILD_ID": "123456789012345678",
     }
     base.update(overrides)
     return base
@@ -51,6 +52,24 @@ def test_missing_required_setting_is_rejected(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.delenv("STURNUS_DISCORD_TOKEN")
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_the_served_guild_is_read_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    assert Settings().guild_id == 123456789012345678
+
+
+def test_a_bot_without_a_guild_id_refuses_to_construct_its_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No default: a bot must never serve whichever guilds it happens to find itself in."""
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.delenv("STURNUS_GUILD_ID")
+    with pytest.raises(ValidationError) as raised:
+        Settings()
+    assert "guild_id" in str(raised.value)
 
 
 def test_secrets_are_not_exposed_by_repr(monkeypatch: pytest.MonkeyPatch) -> None:

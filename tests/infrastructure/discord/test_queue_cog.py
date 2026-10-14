@@ -24,12 +24,9 @@ re-queue is the exact column values it leaves behind and the row lock it
 takes on the way -- neither survives a fake. These tests are not marked
 `slow`; only tests that download a model are.
 
-The permission check is asserted by looking for `_has_admin_access` among
-each command's installed checks rather than by driving Discord's check
-machinery: `Command.callback` deliberately bypasses checks, so a test that
-only ever calls the callback would keep passing if `@require_admin()` were
-deleted from a command -- which is the regression that matters most here,
-since even `/queue status` reports who was recorded and how much they said.
+Who may run the commands is Discord's decision (`default_member_permissions`),
+asserted against the built tree in `test_command_permissions`; nothing here
+re-checks it in process.
 """
 
 from __future__ import annotations
@@ -50,7 +47,6 @@ from sturnus.domain.transcription_models import FALLBACK
 from sturnus.infrastructure.db.models import Base, Session, TranscriptionJob
 from sturnus.infrastructure.db.repositories import JobRepository, SessionRepository
 from sturnus.infrastructure.db.requeue import JobLine, SessionSummary, apply_requeue
-from sturnus.infrastructure.discord.permissions import _has_admin_access
 from sturnus.infrastructure.discord.queue_cog import (
     DISCORD_MESSAGE_LIMIT,
     NO_SUCH_SESSION,
@@ -376,14 +372,15 @@ def cog(factory: async_sessionmaker[AsyncSession], now: datetime = NOW) -> Queue
 
 
 @pytest.mark.parametrize("command", ["status", "session", "requeue"])
-def test_every_subcommand_is_admin_only(command: str) -> None:
-    """Even `/queue status` reports who was recorded and how much they said.
+def test_no_subcommand_applies_an_in_process_check(command: str) -> None:
+    """Discord decides who sees `/queue` (Manage Server by default), not this cog.
 
-    `Command.callback` bypasses checks, so nothing else in this file would
-    notice `@require_admin()` disappearing from a command.
+    The group's `default_permissions` is asserted against the built tree in
+    `test_command_permissions`; this pins the other half, that no second
+    check lingers on a subcommand and disagrees with Server Settings >
+    Integrations.
     """
-    checks = getattr(QueueCog, command).checks
-    assert _has_admin_access in checks, f"/queue {command} is not admin-gated"
+    assert getattr(QueueCog, command).checks == []
 
 
 # ---------------------------------------------------------------------------

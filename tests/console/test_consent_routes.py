@@ -503,7 +503,7 @@ async def test_an_instant_that_names_no_moment_is_a_bad_request(
 async def test_a_backdated_revocation_reports_what_it_did_not_delete(
     aiohttp_client: AiohttpClientFactory,
 ) -> None:
-    """`/audio purge` and the retention sweep remain the only two things
+    """`/audio-purge` and the retention sweep remain the only two things
     that delete audio. This number is what lets the console offer the
     first of them rather than quietly taking it."""
     consents = FakeConsents(

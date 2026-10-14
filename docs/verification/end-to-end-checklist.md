@@ -217,7 +217,7 @@ note it and continue.**
 - [ ] **[Plan 4]** `/consent revoke` removes the role, and a session
   started after revocation excludes that person entirely (their audio is
   never captured, not merely excluded after the fact).
-- [ ] **[Plan 4]** `/audio purge <user>`, run by an admin against a named
+- [ ] **[Plan 4]** `/audio-purge <user>`, run by an admin against a named
   user, behaves the same as `/audio delete` for that user's own
   recordings.
 - [ ] **No transcript content, audio, token, or key appears in any log

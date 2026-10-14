@@ -35,7 +35,6 @@ from sturnus.application.reconfigure import (
 )
 from sturnus.domain import settings
 from sturnus.infrastructure.db.config_store import ConfigStore
-from sturnus.infrastructure.discord.permissions import require_admin
 
 log = logging.getLogger(__name__)
 
@@ -103,10 +102,11 @@ async def _effective(store: ConfigStore, guild_id: int, key: str) -> tuple[str |
 
 
 @app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 class ConfigCog(
     commands.GroupCog, name="config", description="Manage Sturnus's runtime configuration."
 ):
-    """Admin-only `/config` command group.
+    """`/config` command group; Discord offers it to Manage Server (and Integrations overrides).
 
     None of today's keys hold a secret, so `/config show` is safe to print
     in full — that must be re-checked before any key that does gets added.
@@ -146,7 +146,6 @@ class ConfigCog(
         name="get", description="Show the effective value of a configuration key."
     )
     @app_commands.describe(key="Configuration key, e.g. voice_channel_ids")
-    @require_admin()
     async def get(self, interaction: discord.Interaction, key: str) -> None:
         guild_id = interaction.guild_id
         if guild_id is None:
@@ -165,7 +164,6 @@ class ConfigCog(
 
     @app_commands.command(name="set", description="Set a configuration key for this server.")
     @app_commands.describe(key="Configuration key", value="New value")
-    @require_admin()
     async def set(self, interaction: discord.Interaction, key: str, value: str) -> None:
         guild_id = interaction.guild_id
         if guild_id is None:
@@ -194,7 +192,6 @@ class ConfigCog(
         name="clear", description="Clear a configuration key, restoring its default."
     )
     @app_commands.describe(key="Configuration key")
-    @require_admin()
     async def clear(self, interaction: discord.Interaction, key: str) -> None:
         guild_id = interaction.guild_id
         if guild_id is None:
@@ -218,7 +215,6 @@ class ConfigCog(
     @app_commands.command(
         name="show", description="List every configuration key and what is still missing."
     )
-    @require_admin()
     async def show(self, interaction: discord.Interaction) -> None:
         guild_id = interaction.guild_id
         if guild_id is None:
@@ -258,7 +254,6 @@ class ConfigCog(
             "applies immediately. The recording is uploaded and transcribed normally."
         )
     )
-    @require_admin()
     async def apply(self, interaction: discord.Interaction, force: bool = False) -> None:
         """Re-syncs this guild without writing anything.
 

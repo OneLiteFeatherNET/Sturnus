@@ -363,13 +363,13 @@ describe('confirming a withdrawal', () => {
   })
 
   it('names the separate act that does erase them', () => {
-    expect(revokeConfirmation(anna).consequences.join(' ')).toContain('/audio purge')
+    expect(revokeConfirmation(anna).consequences.join(' ')).toContain('/audio-purge')
   })
 
   it('still points at the purge command for somebody with nothing on disk', () => {
     const said = recordingsKeptNote(row({ discord_user_id: '100', recordings_with_audio: 0 }))
     expect(said).toContain('no recordings')
-    expect(said).toContain('/audio purge')
+    expect(said).toContain('/audio-purge')
   })
 
   it('says the withdrawal is logged, before it happens', () => {

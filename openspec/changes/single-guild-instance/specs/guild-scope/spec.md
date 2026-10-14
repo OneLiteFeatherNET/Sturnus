@@ -50,7 +50,7 @@ NOT exist in any other guild.
 
 ### Requirement: Command access is decided by Discord's permissions
 
-Administrative commands (`/config`, `/queue`, `/audio purge`, `/setup`) SHALL
+Administrative commands (`/config`, `/queue`, `/audio-purge`, `/setup`) SHALL
 declare Manage Server as their default member permission and rely on Discord to
 withhold them from members who lack it. The bot MUST NOT apply a second,
 in-process administrator check to these commands. Overrides a guild administrator

@@ -83,6 +83,11 @@ that cannot use them.
 
 ### 3. `default_member_permissions` instead of `require_admin()`
 
+**`/audio purge` is renamed `/audio-purge`.** Discord honours
+`default_member_permissions` on top-level commands only, so a subcommand cannot
+be stricter than its siblings. Purge moves out of the open `/audio` group into a
+top-level command of its own; `/audio delete` stays where it is.
+
 The admin command groups declare *Manage Server* as their default member
 permission. Discord then does not deliver the interaction to a member without it,
 and server admins can override per role, user and channel in Server Settings >

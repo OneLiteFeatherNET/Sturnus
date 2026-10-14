@@ -67,6 +67,10 @@ _IDENTIFIERS = frozenset(
         "session_id",
         "job_id",
         "guild_id",
+        #: The one guild this installation serves (`STURNUS_GUILD_ID`),
+        #: logged beside the `guild_id` it refused so the line says what
+        #: was expected and what was seen.
+        "configured_guild_id",
         "channel_id",
         "document_id",
         "collection_id",

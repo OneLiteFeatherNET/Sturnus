@@ -1,8 +1,11 @@
 """Erasure commands (Spec 12.3): Art. 17 GDPR requests, served immediately.
 
 `/audio delete` erases the caller's own recordings across every session;
-`/audio purge <user>` does the same for a named user and is admin-only, so
-an erasure request raised through any channel -- not only by the data
+`/audio-purge <user>` does the same for a named user. It is a top-level
+command of its own, not a subcommand of `/audio`: Discord applies
+`default_member_permissions` per top-level command, and `/audio delete` has to
+stay open to every member while the purge is offered to Manage Server only
+(`AudioPurgeCog`), so that an erasure request raised through any channel -- not only by the data
 subject typing the command themselves -- can still be served. Both bypass
 `retention_until` entirely: retention exists to keep a poor transcription
 redoable for a while (Spec 12.2), not to delay a subject's own erasure
@@ -34,7 +37,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.application.ports import AudioStore, Clock
 from sturnus.infrastructure.db.models import TranscriptionJob
-from sturnus.infrastructure.discord.permissions import require_admin
 from sturnus.observability.events import Event, log_event
 
 log = logging.getLogger(__name__)
@@ -124,11 +126,27 @@ class AudioCog(commands.GroupCog, name="audio", description="Erase recorded audi
             ephemeral=True,
         )
 
+
+class AudioPurgeCog(commands.Cog):
+    """`/audio-purge`: immediate erasure for a named user, offered by Discord to Manage Server."""
+
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+        audio_store: AudioStore,
+        clock: Clock,
+    ) -> None:
+        self._session_factory = session_factory
+        self._audio_store = audio_store
+        self._clock = clock
+        super().__init__()
+
     @app_commands.command(
-        name="purge", description="Delete all recorded audio for a named user, immediately."
+        name="audio-purge", description="Delete all recorded audio for a named user, immediately."
     )
     @app_commands.describe(user="The user whose recordings should be erased")
-    @require_admin()
+    @app_commands.guild_only()
+    @app_commands.default_permissions(manage_guild=True)
     async def purge(self, interaction: discord.Interaction, user: discord.User) -> None:
         count = await _erase_audio(
             self._session_factory, self._audio_store, user.id, self._clock.now()

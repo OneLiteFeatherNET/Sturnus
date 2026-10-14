@@ -58,7 +58,10 @@ foreign recording.
   old requirement that a command in a foreign guild answers with a reason is
   dropped.
 - **Commands carry `default_member_permissions`.** The admin groups `/config`,
-  `/queue`, `/audio purge` and `/setup` require *Manage Server*; `/consent`,
+  `/queue`, `/audio-purge` and `/setup` require *Manage Server*. **`/audio purge`
+  becomes the top-level command `/audio-purge`**: Discord applies the default
+  permission per top-level command, and `/audio delete` must stay open to every
+  member in the `/audio` group; `/consent`,
   `/link` and `/about` stay open. The in-process `require_admin()` check
   (`infrastructure/discord/permissions.py:56-84`) is removed from the commands,
   and Discord's enforcement is the check. Team admins adjust it in Server

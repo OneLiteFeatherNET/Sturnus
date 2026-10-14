@@ -1219,7 +1219,7 @@ class ConsoleConsentDirectory:
     the role can be bypassed. It does not take the role away, and the
     console says so rather than letting an administrator infer it.
 
-    It also does not erase anything already recorded. `/audio purge`
+    It also does not erase anything already recorded. `/audio-purge`
     does, it is admin-gated, and it is deliberately a separate act:
     withdrawing consent is a decision about the future, and deleting a
     meeting a team has already read is not the same decision. Every
@@ -1342,7 +1342,7 @@ class ConsoleConsentDirectory:
         date had silently destroyed three months of meetings their team
         has read. `recordings_from_effective_at` is how many recordings
         with audio fall on or after the instant, so the console can offer
-        `/audio purge` as the separate, deliberate act it is.
+        `/audio-purge` as the separate, deliberate act it is.
         """
         if not await self._admins.is_admin(guild_id, requested_by):
             return None
@@ -1605,8 +1605,8 @@ async def _recordings_since(
     **This is a count, and counting is all that happens.** A back-dated
     revocation says something about recordings that already exist; it does
     not erase them, and the number exists so the console can offer the
-    erasure path (`/audio purge`, admin-gated, in Discord) rather than
-    quietly taking it. `/audio purge` and the retention sweep are the only
+    erasure path (`/audio-purge`, admin-gated, in Discord) rather than
+    quietly taking it. `/audio-purge` and the retention sweep are the only
     two things in this system that delete audio, and this change
     deliberately does not add a third.
 
