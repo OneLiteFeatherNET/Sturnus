@@ -1,5 +1,6 @@
-"""Where a guild publishes: five routes, one authorisation rule, and no secret out.
+"""Where a guild publishes: six routes, one authorisation rule, and no secret out.
 
+- `GET    /api/export-formats`
 - `GET    /api/guilds/{guild_id}/export-targets`
 - `POST   /api/guilds/{guild_id}/export-targets`
 - `PUT    /api/guilds/{guild_id}/export-targets/{target_id}`
@@ -36,6 +37,23 @@ one list, so a format added there becomes configurable here with no change
 in this file -- and one that is specified but not built (`pdf`,
 `confluence`) is refused where an administrator can read the refusal rather
 than accepted and silently skipped after every meeting.
+
+**`GET /api/export-formats` is that same answer said before the refusal
+instead of after it.** It is the one route here that is not about a guild,
+and it is here rather than in a module of its own because it reads the
+registry these five routes enforce: a caller cannot be told what
+`_requested_target` will accept by any list except the one it accepts from.
+It carries the unbuilt names too, marked unavailable -- see
+`export_formats.catalogue`. A reader that was told only the buildable
+three would have to invent the difference between *not offered* and *not
+built*, and inventing it means hard-coding a list this deployment has no
+way to correct.
+
+**No audit line, and nothing per-caller in the answer.** Every other route
+in this file either writes or reads a guild's own configuration; this one
+reads a compiled-in constant that is identical for every administrator of
+every guild on this deployment, so there is nothing an access record could
+establish and no guild id to scope one to.
 """
 
 from __future__ import annotations
@@ -46,7 +64,12 @@ from typing import Any
 
 from aiohttp import web
 
-from sturnus.application.export_formats import format_named, supported_formats
+from sturnus.application.export_formats import (
+    CatalogueEntry,
+    catalogue,
+    format_named,
+    supported_formats,
+)
 from sturnus.console.ports import ExportTargets
 from sturnus.domain.exports import ExportTarget
 from sturnus.observability.events import Event, log_event
@@ -56,6 +79,10 @@ log = logging.getLogger(__name__)
 #: Where `build_api` puts the store. Its own key rather than a parameter to
 #: `register`, matching `routes_settings.SETTINGS_STORE`.
 EXPORT_TARGETS: web.AppKey[ExportTargets] = web.AppKey("export_targets")
+
+#: The one route here that names no guild. Every format on it is the same
+#: for every guild on this deployment, which is why it is not under one.
+_FORMATS_PATH = "/api/export-formats"
 
 _PATH = "/api/guilds/{guild_id}/export-targets"
 _TARGET_PATH = "/api/guilds/{guild_id}/export-targets/{target_id}"
@@ -94,6 +121,12 @@ def register(app: web.Application) -> None:
 
     app.add_routes(
         [
+            # Behind a session like everything else, though it holds no
+            # secret and names no guild. `routes_setup.register` makes the
+            # argument for the invite link and it is the same one: public
+            # is not the same as unauthenticated, and an endpoint of this
+            # API that answered without a session would be the only one.
+            web.get(_FORMATS_PATH, require_session(list_formats)),
             web.get(_PATH, require_session(list_targets)),
             web.post(_PATH, require_session(create_target)),
             web.put(_TARGET_PATH, require_session(update_target)),
@@ -105,6 +138,25 @@ def register(app: web.Application) -> None:
             web.put(_SECRET_PATH, require_session(write_secret)),
         ]
     )
+
+
+def format_json(entry: CatalogueEntry) -> dict[str, Any]:
+    """One format, as a caller deciding what to configure may be told it.
+
+    Three fields, and the case for stopping at three is that a fourth
+    would have to be invented here. `media_type` and `file_extension` are
+    on `ExportFormat` and are read by the sink that stores the bytes and
+    by the route that serves them back -- neither of them a caller. A
+    label is a word in a language this process has no catalogue for. And
+    `target_pattern` is a Python regular expression: handing one to a
+    caller to compile is handing over a dialect, not a rule, and the rule
+    is enforced here whatever the caller believes.
+
+    `sink` is `null` for an unbuilt format rather than absent, so that "no
+    sink has been decided for this" and "this response forgot a field" are
+    different things on the wire.
+    """
+    return {"name": entry.name, "available": entry.available, "sink": entry.sink}
 
 
 def target_json(target: ExportTarget) -> dict[str, Any]:
@@ -137,6 +189,24 @@ def target_json(target: ExportTarget) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Handlers
 # ---------------------------------------------------------------------------
+
+
+async def list_formats(_request: web.Request) -> web.Response:
+    """Every format this deployment knows of, and which of them it can run.
+
+    The unbuilt ones are in the answer, marked `available: false`. Leaving
+    them out would make this endpoint say exactly what a 400's `supported`
+    list already said, and the reason that list was not enough is that a
+    reader who has to distinguish "not offered here" from "not built here"
+    can only do it by keeping a list of its own -- which is a second
+    registry, and a second registry is one that goes stale the day `pdf`
+    is built and nothing fails.
+
+    A list rather than a mapping, because the order is part of the answer:
+    `outline` is what every guild published to before the others existed,
+    and JSON object order is a thing implementations are entitled to lose.
+    """
+    return web.json_response({"formats": [format_json(entry) for entry in catalogue()]})
 
 
 async def list_targets(request: web.Request) -> web.Response:

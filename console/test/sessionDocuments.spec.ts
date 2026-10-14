@@ -97,11 +97,26 @@ describe('reading the listing', () => {
     // document that renders as nothing is worse than one that renders as
     // its own raw name.
     const [row] = parseSessionDocuments({
-      documents: [{ target_id: 1, provider: 'pdf', url: 'https://example/x.pdf' }],
+      documents: [{ target_id: 1, provider: 'zip', url: 'https://example/x.zip' }],
     })
     const rendered = protocolRow(row!)
     expect(rendered.label.key).toBe('recordings.protocolUnknownFormat')
-    expect(rendered.label.params?.format).toBe('pdf')
+    expect(rendered.label.params?.format).toBe('zip')
+  })
+
+  it('names a format it has a word for even where this build cannot publish it', () => {
+    // `pdf` is specified and unbuilt, so no destination here can be
+    // configured for it — but a document published by a deployment that
+    // *did* build it is still a document with a working link, and this page
+    // renders what was published rather than what could be published now.
+    // That is why it asks `~/utils/exportTargets` for the word alone and
+    // never for the catalogue.
+    const [row] = parseSessionDocuments({
+      documents: [{ target_id: 1, provider: 'pdf', url: 'https://example/x.pdf' }],
+    })
+    const rendered = protocolRow(row!)
+    expect(rendered.label.key).toBe('recordings.protocolFormat')
+    expect(rendered.label.params?.format).toEqual({ key: 'common.formatPdf' })
   })
 
   it('answers an empty list for a payload of the wrong shape', () => {

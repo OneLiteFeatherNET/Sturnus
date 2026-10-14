@@ -39,7 +39,7 @@
  *
  * Keys and {@link Message}s, never prose — see `i18n/README.md`.
  */
-import { formatSpec } from './exportTargets'
+import { formatLabelKey } from './exportTargets'
 import type { Instant, Message } from './message'
 
 /* -------------------------------------------------------------------- */
@@ -134,15 +134,24 @@ export interface ProtocolRow {
   orphaned: boolean
 }
 
-/** One document, ready to render. */
+/**
+ * One document, ready to render.
+ *
+ * Asks `~/utils/exportTargets` only for the *word* for a format, not for
+ * the deployment's catalogue. This page renders what was already published
+ * — the document exists, its link works — so whether the deployment still
+ * builds that format is not a fact about this row, and fetching the
+ * catalogue on the recordings page to answer a question nobody asked would
+ * be a request per recording view for nothing.
+ */
 export function protocolRow(document: SessionDocument): ProtocolRow {
-  const spec = formatSpec(document.provider)
+  const labelKey = formatLabelKey(document.provider)
   const at = document.createdAt === null ? null : new Date(document.createdAt)
   return {
     id: document.targetId === null ? `url:${document.url}` : `target:${document.targetId}`,
-    label: spec === null
+    label: labelKey === null
       ? { key: 'recordings.protocolUnknownFormat', params: { format: document.provider } }
-      : { key: 'recordings.protocolFormat', params: { format: { key: spec.labelKey } } },
+      : { key: 'recordings.protocolFormat', params: { format: { key: labelKey } } },
     url: document.url,
     at: at !== null && !Number.isNaN(at.getTime()) ? { at, format: 'utcMoment' } : null,
     internal: document.readable,
