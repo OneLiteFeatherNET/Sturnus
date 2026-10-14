@@ -29,6 +29,9 @@ def _env(**overrides: str) -> dict[str, str]:
         "STURNUS_OUTLINE_BASE_URL": "https://outline.example",
         "STURNUS_OUTLINE_CLIENT_ID": "outline-client-id",
         "STURNUS_OUTLINE_REDIRECT_URI": "https://bot.example/oauth/callback",
+        # The bot never calls this endpoint; `/about` and the `/consent`
+        # prompt name its host, so the bot has to be told what it is.
+        "STURNUS_TRANSCRIPTION_BASE_URL": "https://transcribe.example/v1",
     }
     base.update(overrides)
     return base

@@ -6,21 +6,23 @@ metadata:
     {{- include "sturnus.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
 spec:
   replicas: {{ .Values.worker.replicaCount }}
-  # Recreate, not RollingUpdate: the **model cache** below is a
-  # ReadWriteOnce volume, and a rolling update starts the new pod before
-  # the old one releases it. On a ReadWriteOnce claim the new pod then
-  # stays Pending on a multi-attach error while the old one waits to be
-  # replaced -- a deadlock that blocks every future image update. The bot
-  # sets the same strategy for a different reason (see bot-deployment.yaml).
+  # RollingUpdate, and the reason it can be is that the worker holds no
+  # volume any more. It used to mount a ReadWriteOnce model cache, on
+  # which a rolling update deadlocks: the new pod stays Pending on a
+  # multi-attach error while the old one waits to be replaced. With
+  # transcription running at an endpoint the pod is stateless -- `/tmp` is
+  # a per-pod `emptyDir` and always was -- so a new pod can start beside
+  # the old one and a claimed job simply finishes or has its lease
+  # reclaimed (`sturnus.infrastructure.db.queue`).
   #
-  # Not the work directory, which this comment used to name: that is a
-  # per-pod `emptyDir` (see the volumes below) and has never been shared
-  # between pods. The distinction matters now that the queue supports a
-  # pool of workers -- the model cache is the one volume standing between
-  # this deployment and `worker.replicaCount: 2`, and values.yaml says
-  # what to do about it.
+  # `maxSurge: 1, maxUnavailable: 0` rather than the defaults: a surge is
+  # free now, and it keeps one worker polling the queue throughout a
+  # deploy instead of leaving the queue unattended for a pod start.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       {{- include "sturnus.componentSelectorLabels" (dict "root" . "component" "worker") | nindent 6 }}
@@ -89,8 +91,6 @@ spec:
             {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
-            - name: model-cache
-              mountPath: {{ .Values.worker.env.STURNUS_MODEL_CACHE_DIR }}
             # readOnlyRootFilesystem: true. Covers Python/library scratch
             # writes *and* the decrypted-audio working directory
             # `process_one` uses before transcribing -- see the comment on
@@ -99,9 +99,6 @@ spec:
             - name: tmp
               mountPath: /tmp
       volumes:
-        - name: model-cache
-          persistentVolumeClaim:
-            claimName: {{ include "sturnus.fullname" . }}-worker
         - name: tmp
           emptyDir:
             sizeLimit: {{ .Values.worker.tmpSizeLimit }}

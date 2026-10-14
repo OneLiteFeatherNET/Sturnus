@@ -2,55 +2,46 @@
 
 Until this module existed, a model name was a free string that travelled
 from a re-queue into `transcription_job.requested_model` and out the other
-side into `WhisperModel(...)` without anything ever looking at it. That is
-not a validation gap in the ordinary sense, because there is no fallback
-underneath it: `faster_whisper` resolves an unknown name against
-HuggingFace, fails, and the job fails with it. `attempts` climbs, the
-worker retries, and at `max_attempts` the speaker is `dead` with no
-transcript and an error message about a repository that does not exist.
-One typo, four attempts, one lost recording. Nothing anywhere could have
-caught it, because nothing anywhere knew what a model name is.
+side into the decoder without anything ever looking at it. One typo, four
+attempts, one lost recording, and nothing anywhere could have caught it
+because nothing anywhere knew what a model name is.
 
-**Closed, and hardcoded, and both on purpose.**
+**Still closed. No longer closed for the reason it was.**
 
-Closed first. `faster_whisper` accepting any HuggingFace repository id is
-exactly why the list must be closed rather than why it need not be: a free
-string is not "a model name", it is *an instruction to this worker to
-fetch and execute arbitrary weights from the internet*, issued through a
-re-queue button. The registry is therefore a decision about what this
-deployment is prepared to run, in the same spirit as
-`sturnus.domain.settings` and `sturnus.domain.preferences` -- both of
-which close a value set for the weaker reason that an unknown value
-selects no code path. Here an unknown value selects a download.
+The original argument was that a free string is not "a model name", it is
+*an instruction to this worker to fetch and execute arbitrary weights from
+the internet*, issued through a re-queue button. That argument died with
+`sturnus.infrastructure.whisper`. The worker fetches nothing and executes
+nothing: a model name is now a string handed to somebody else's server,
+which serves what it serves and refuses the rest, and the worst a wrong
+name achieves is a 400 and a failed job.
 
-Hardcoded second, which is the more arguable half. Making the list an
-environment variable would move a decision about what this deployment runs
-out of review and into a Kubernetes `ConfigMap`, and it would still need
-every rule below to be worth anything -- a configurable registry that
-accepts whatever it is given is the free string again with more steps. It
-would also have to be parsed identically by the console API, the worker
-and the bot, three processes that share this module today and would then
-share a format instead. The names below are seven lines; adding one is a
-commit, a review and a deploy, which is the correct amount of ceremony for
-"this cluster will now download and run a new model". If a deployment ever
-genuinely needs a per-cluster list, the shape to reach for is this tuple
-as the default and configuration that may only *narrow* it.
+Two weaker reasons remain, and together they are still enough. The
+console's re-queue dropdown (`console/routes_queue.py`) needs a finite set
+of things to render. And `transcription_job.model` records what ran, so an
+unknown name must still be *refused* rather than quietly substituted --
+a silent fallback would make that column a lie, which is the one property
+of this module that survives the change untouched.
 
-**Why these seven.** All multilingual. The English-only builds -- the
-`.en` variants and `distil-large-v3` -- are deliberately absent: every
-guild this serves meets in German (see
-`WorkerSettings.whisper_default_language`), so offering them would be
-offering a choice that is wrong for this deployment's own material in a
-way the chooser could not see from the name.
+**Why `whisper-1` alone.** On OpenAI it is the only model that supports
+`verbose_json` and `timestamp_granularities`; `gpt-4o-transcribe` and
+`gpt-4o-mini-transcribe` support neither. Sturnus cannot use them at all --
+the protocol interleaves several speakers chronologically, so a transcript
+without segment times is not a partial result, it is no result. "Use the
+newer model" is the obvious wrong move, and the API error it produces will
+not explain itself; `docs/operations.md` says so beside the variable.
 
-**Why `large-v3` is the fallback.** It is what
-`WorkerSettings.whisper_model` declares as the worker's default, and
-`tests/entrypoints/test_worker_entrypoint.py` pins the two together so
-they cannot drift. The reasoning for the value itself lives on that field
-and is not restated here.
+**Why the list is still hardcoded.** A deployment whose endpoint serves a
+model under another name genuinely needs this to be configuration, and the
+shape for that is settled -- a frozen registry value object parsed once per
+process and injected into the worker, the console and the bot. It is
+deliberately not built here, because it is the only part that reaches
+outside the worker; see the change's `design.md`, Decision 6. Until then, a
+self-hoster with a differently named model needs a fork, and that cost is
+recorded rather than hidden.
 
-Pure data and three functions, in `domain`, so the endpoint that offers
-the choice, the write that stores it and the engine that loads it cannot
+Pure data and three functions, in `domain`, so the endpoint that offers the
+choice, the write that stores it and the adapter that sends it cannot
 disagree about which names exist.
 """
 
@@ -62,98 +53,40 @@ from typing import Final
 
 @dataclass(frozen=True)
 class TranscriptionModel:
-    """One model this deployment will run, and what choosing it costs.
+    """One model this deployment will run.
 
-    `approximate_size` and `summary` are not decoration. An administrator
-    picking from a dropdown is choosing how long a re-queue takes, how
-    much memory the worker needs and how good the transcript will be, and
-    none of that is legible from the name -- `large-v3` and
-    `large-v3-turbo` differ by roughly half the download and by an amount
-    of non-English accuracy that only shows up in the transcript.
+    **A name and nothing else, deliberately.** This type used to carry
+    `approximate_size` and `summary`, and both were honest while the worker
+    downloaded the weights and held them: an administrator picking from a
+    dropdown was choosing a download, a memory footprint and an accuracy,
+    and none of that is legible from a name.
 
-    The size is deliberately approximate and deliberately a string. These
-    are CTranslate2 conversions whose on-disk size depends on the compute
-    type the worker was built with (`int8_float32` here), so a number
-    presented as exact would be exact about the wrong thing. It is an
-    order of magnitude for a human, not a quota for a scheduler.
+    For a model served by somebody else's endpoint, nobody in this
+    repository can write either field truthfully. The size is not ours and
+    is not downloaded; the trade a remote model makes depends on what the
+    operator pointed at. A plausible-looking wrong answer in a dropdown is
+    worse than a bare name, because a bare name does not invite a decision
+    it cannot support.
+
+    A one-field dataclass rather than a bare string, because the thing the
+    console renders is a registry entry, and a later change that gives an
+    entry something honest to say -- what the endpoint itself reports about
+    it, say -- should not have to rewrite every consumer to do it.
     """
 
-    #: The name `faster_whisper` resolves, and the value stored in
-    #: `transcription_job.requested_model`.
+    #: The name sent as `model` to `/audio/transcriptions`, and the value
+    #: stored in `transcription_job.requested_model`.
     name: str
-    #: Roughly what the worker downloads and holds for it.
-    approximate_size: str
-    #: The trade this model makes, in one sentence.
-    summary: str
 
 
-#: What may be asked for, ordered cheapest first. The order is part of the
-#: answer -- a dropdown renders this tuple as it stands and adds nothing --
-#: so reading down the list is reading the trade from "fast and rough" to
-#: "slow and right".
-KNOWN_MODELS: Final[tuple[TranscriptionModel, ...]] = (
-    TranscriptionModel(
-        name="tiny",
-        approximate_size="75 MB",
-        summary=(
-            "The fastest and the least accurate; useful for checking that a recording "
-            "contains speech at all, not for a transcript anybody will read."
-        ),
-    ),
-    TranscriptionModel(
-        name="base",
-        approximate_size="145 MB",
-        summary=(
-            "Still very fast, still visibly wrong on names and technical terms; a step "
-            "up from tiny and no more than that."
-        ),
-    ),
-    TranscriptionModel(
-        name="small",
-        approximate_size="480 MB",
-        summary=(
-            "The smallest model that produces German a reader can follow without the "
-            "audio beside it, at a few times the speed of large-v3."
-        ),
-    ),
-    TranscriptionModel(
-        name="medium",
-        approximate_size="1.5 GB",
-        summary=(
-            "Close to large-v3 on clear speech and noticeably behind it on crosstalk "
-            "and accents, for roughly half the time and half the memory."
-        ),
-    ),
-    TranscriptionModel(
-        name="large-v2",
-        approximate_size="3.1 GB",
-        summary=(
-            "The previous generation of the large model; worth a second run only when "
-            "large-v3 hallucinated on a particular recording, which it sometimes does."
-        ),
-    ),
-    TranscriptionModel(
-        name="large-v3-turbo",
-        approximate_size="1.6 GB",
-        summary=(
-            "A distillation of large-v3 with four decoder layers instead of thirty-two: "
-            "much faster, and what it gives up is concentrated outside English."
-        ),
-    ),
-    TranscriptionModel(
-        name="large-v3",
-        approximate_size="3.1 GB",
-        summary=(
-            "The most accurate model here and this deployment's default; the slowest, "
-            "and the one to re-queue against when a transcript is wrong."
-        ),
-    ),
-)
+#: What may be asked for. One entry today; the tuple shape stays because
+#: the dropdown renders it as it stands and because an endpoint serving
+#: two models is the ordinary case this deployment has not reached yet.
+KNOWN_MODELS: Final[tuple[TranscriptionModel, ...]] = (TranscriptionModel(name="whisper-1"),)
 
-#: The model a re-queue runs when nobody chose one. See the module
-#: docstring: this agrees with `WorkerSettings.whisper_model` and a test
-#: keeps it agreeing.
-FALLBACK: Final = "large-v3"
+#: The model a re-queue runs when nobody chose one. This agrees with
+#: `WorkerSettings.transcription_model` and a test keeps it agreeing.
+FALLBACK: Final = "whisper-1"
 
 #: Derived rather than restated, so a name can only be added in one place.
 KNOWN_NAMES: Final[frozenset[str]] = frozenset(model.name for model in KNOWN_MODELS)
@@ -206,7 +139,10 @@ def resolve(requested: str | None) -> str:
     **An unknown name is refused, never replaced.** Substituting the
     fallback would run one model, record the request for another, and
     report success -- and `transcription_job.model` exists precisely so
-    that "what actually ran" is knowable.
+    that "what actually ran" is knowable. This is the rule the move to a
+    remote endpoint did not weaken: the endpoint refusing a name it does
+    not serve is a 400 on a job that has already been claimed, while this
+    refuses it where a caller can still be told to fix the request.
     """
     if requested is None:
         return FALLBACK

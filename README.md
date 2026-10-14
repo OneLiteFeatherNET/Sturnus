@@ -21,11 +21,17 @@ let it through (guild administrators bypass channel overwrites). See
 [docs/operations.md](docs/operations.md) for why a non-recorded channel
 must also exist alongside them.
 
-Recordings are encrypted before they ever leave the pod and are kept only
-for a configured retention window to allow reprocessing a poor
-transcription; see [docs/operations.md](docs/operations.md) for what that
-means operationally, including what happens if the encryption key is
-lost.
+Recordings are encrypted at rest — in the object store and for the whole
+retention window, which exists so a poor transcription can be
+reprocessed — and are deleted when it expires. **Transcription itself
+happens elsewhere:** at the moment a recording is transcribed, a chunk of
+plaintext audio is sent over TLS to the OpenAI-compatible endpoint the
+operator configured, which may be OpenAI's, a self-hosted vLLM, or
+anything else speaking the same interface. Which host that is has no
+default, is named in `/about`, and is named in the `/consent` prompt
+before anybody agrees to be recorded. See
+[docs/operations.md](docs/operations.md) for what all of this means
+operationally, including what happens if the encryption key is lost.
 
 ## Running locally
 
@@ -35,11 +41,13 @@ Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/).
 uv sync
 ```
 
-The bot needs a PostgreSQL database and an S3-compatible object store
-reachable before it can start; point it at them (and everything else it
-needs) through environment variables — see
-[docs/operations.md](docs/operations.md) for the full list. With those
-set:
+The bot needs a PostgreSQL database, an S3-compatible object store, and an
+OpenAI-compatible `/audio/transcriptions` endpoint reachable before it can
+start; point it at them (and everything else it needs) through environment
+variables — see [docs/operations.md](docs/operations.md) for the full list.
+`STURNUS_TRANSCRIPTION_BASE_URL` has no default on purpose: a process
+without it refuses to start rather than sending audio somewhere nobody
+chose. With those set:
 
 ```bash
 uv run sturnus-bot     # Discord gateway connection + recording

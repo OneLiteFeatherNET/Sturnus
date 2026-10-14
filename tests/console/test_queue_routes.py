@@ -504,14 +504,14 @@ async def test_an_administrator_may_name_any_registered_model(
     administrator cannot see from anywhere else until a worker picks the
     job up.
     """
-    queue = FakeQueue(outcome=RequeueOutcome(True, (ANNA,), (), None, "small"))
+    queue = FakeQueue(outcome=RequeueOutcome(True, (ANNA,), (), None, "whisper-1"))
     client = await signed_in(aiohttp_client, build_test_api(queue=queue))
 
-    response = await client.post(requeue_url(), json={"model": "small"})
+    response = await client.post(requeue_url(), json={"model": "whisper-1"})
 
     assert response.status == 200
-    assert queue.requeued == [(SESSION, ANNA, "small")]
-    assert (await response.json())["model"] == "small"
+    assert queue.requeued == [(SESSION, ANNA, "whisper-1")]
+    assert (await response.json())["model"] == "whisper-1"
 
 
 async def test_a_model_nobody_has_is_refused_before_a_job_is_ever_touched(
@@ -526,7 +526,7 @@ async def test_a_model_nobody_has_is_refused_before_a_job_is_ever_touched(
     typo cost one recording. The refusal names what is available, because
     there is no second request that would show it.
     """
-    queue = FakeQueue(outcome=RequeueOutcome(True, (ANNA,), (), None, "small"))
+    queue = FakeQueue(outcome=RequeueOutcome(True, (ANNA,), (), None, "whisper-1"))
     client = await signed_in(aiohttp_client, build_test_api(queue=queue))
 
     response = await client.post(requeue_url(), json={"model": "large-v4"})
@@ -549,7 +549,7 @@ async def test_a_model_that_is_not_a_string_is_refused_rather_than_coerced(
     quietly reading it as the fallback would hide that bug for as long as
     the fallback happened to be what they wanted.
     """
-    queue = FakeQueue(outcome=RequeueOutcome(True, (ANNA,), (), None, "small"))
+    queue = FakeQueue(outcome=RequeueOutcome(True, (ANNA,), (), None, "whisper-1"))
     client = await signed_in(aiohttp_client, build_test_api(queue=queue))
 
     response = await client.post(requeue_url(), json=body)
@@ -562,7 +562,7 @@ async def test_a_body_that_is_not_json_is_refused_rather_than_ignored(
     aiohttp_client: AiohttpClientFactory,
 ) -> None:
     """A caller who meant to name a model must not be told their redo succeeded."""
-    queue = FakeQueue(outcome=RequeueOutcome(True, (ANNA,), (), None, "small"))
+    queue = FakeQueue(outcome=RequeueOutcome(True, (ANNA,), (), None, "whisper-1"))
     client = await signed_in(aiohttp_client, build_test_api(queue=queue))
 
     response = await client.post(
@@ -587,7 +587,7 @@ async def test_somebody_who_administers_nothing_cannot_name_a_model_either(
     """
     client = await signed_in(aiohttp_client, build_test_api(queue=FakeQueue()))
 
-    response = await client.post(requeue_url(), json={"model": "small"})
+    response = await client.post(requeue_url(), json={"model": "whisper-1"})
 
     assert response.status == 404
 
@@ -601,7 +601,7 @@ async def test_a_refusal_reports_no_model_because_nothing_was_written(
     )
     client = await signed_in(aiohttp_client, build_test_api(queue=queue))
 
-    response = await client.post(requeue_url(), json={"model": "small"})
+    response = await client.post(requeue_url(), json={"model": "whisper-1"})
 
     assert response.status == 409
     assert (await response.json())["model"] is None
@@ -615,13 +615,14 @@ async def test_a_refusal_reports_no_model_because_nothing_was_written(
 async def test_an_administrator_is_told_what_may_be_asked_for(
     aiohttp_client: AiohttpClientFactory,
 ) -> None:
-    """The list the dropdown is built from, descriptions and all.
+    """The list the dropdown is built from -- names, and nothing claimed.
 
-    A dropdown that offers seven names and explains none of them is a
-    guess: the difference between `tiny` and `large-v3` is hours of worker
-    time and whether the transcript is worth reading, and neither is
-    legible from the name. The order is the registry's own, which reads
-    from "fast and rough" to "slow and right".
+    The entries used to carry a size and a one-sentence trade, and both
+    were honest while the worker downloaded the weights. Against an
+    endpoint somebody else runs, neither can be written truthfully here,
+    so the payload says a name and stops. This asserts the shape exactly,
+    because a re-added field would otherwise reach a dropdown before
+    anybody asked where its value came from.
     """
     client = await signed_in(aiohttp_client, build_test_api(admins=FakeAdmins({ANNA})))
 
@@ -634,8 +635,7 @@ async def test_an_administrator_is_told_what_may_be_asked_for(
         model.name for model in transcription_models.KNOWN_MODELS
     ]
     for entry in body["models"]:
-        assert entry["approximate_size"]
-        assert entry["summary"]
+        assert set(entry) == {"name"}
 
 
 async def test_somebody_who_administers_nothing_has_no_use_for_the_registry(

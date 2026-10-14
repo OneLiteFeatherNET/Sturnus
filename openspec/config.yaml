@@ -1,0 +1,67 @@
+schema: spec-driven
+
+# Project context. Shown to AI when creating artifacts.
+context: |
+  Sturnus — Discord voice transcription with Outline document output.
+  Maintained by OneLiteFeather, AGPL-3.0-or-later.
+
+  A guild names the voice channels Sturnus may record in. The bot holds one
+  voice connection per guild, records each participant into a separate stream,
+  transcribes the streams with faster-whisper once the session ends, assembles
+  one chronological protocol and publishes it as an Outline document linked
+  back into the channel's text chat.
+
+  ## Stack
+  Python 3.12+, uv (uv_build backend). SQLAlchemy 2 async + asyncpg for the
+  application's queries; Alembic runs migrations synchronously via psycopg at
+  worker startup. pydantic-settings for configuration (STURNUS_* env vars),
+  discord.py + discord-ext-voice-recv, faster-whisper, boto3 against
+  S3-compatible storage, aiohttp/httpx, Jinja2. One image, four entrypoints:
+  sturnus-api, sturnus-bot, sturnus-link, sturnus-worker. Helm chart in charts/.
+  Sentry and OpenTelemetry are runtime-optional: without a DSN or an OTLP
+  endpoint nothing is initialised and the processes behave as if absent.
+
+  ## Layering
+  Enforced by tests/test_architecture.py, not merely by convention:
+    src/sturnus/domain          stdlib only, no outward imports
+    src/sturnus/application     use cases; reaches the outside only through
+                                application/ports.py
+    src/sturnus/infrastructure  db, discord, documents, objectstore, whisper,
+                                crypto, telemetry, templates
+    src/sturnus/entrypoints     process entry points
+    src/sturnus/console         operator console
+  A change that makes domain import outward, or application import
+  infrastructure, fails the test suite.
+
+  ## Constraints that shape design
+  Consent: nobody is recorded without the role granted through /consent. Every
+  recording channel denies Speak to @everyone, and the bot additionally drops
+  audio packets from users without the role, because guild administrators
+  bypass channel overwrites.
+
+  Privacy in telemetry: recordings are encrypted before they leave the pod and
+  expire after a retention window. Ruff selects G/LOG so that only %s-style
+  lazy logging is possible — Sentry forwards LogRecord.msg verbatim, and an
+  f-string would put a transcript into that field. No
+  opentelemetry-instrumentation-* package is installed: each of the plausible
+  ones would attach transcripts, Discord user ids or presigned URLs to spans.
+
+  ## Tooling and process
+  ruff (line-length 100, target py312; docs/ and migrations/versions/ excluded),
+  mypy strict over src, tests and scripts, pytest with asyncio_mode=auto and
+  testcontainers for Postgres. The `slow` marker covers real Whisper inference
+  and is deselected on pull requests. Conventional Commits enforced by
+  commitlint; releases cut by release-please. Prose documentation lives in
+  docs/ (operations.md, first-deployment.md, verification/).
+
+# Per-artifact rules. Match the repository's existing prose style.
+rules:
+  proposal:
+    - State the decision and the concrete failure it prevents. Prose, not bullet slogans.
+    - Name what is explicitly out of scope.
+  design:
+    - Record which alternatives were rejected and why, not only the option chosen.
+    - Call out any effect on the consent or telemetry-privacy constraints above.
+  tasks:
+    - Name the layer each task touches (domain / application / infrastructure / entrypoints).
+    - Include the test that proves the task is done.

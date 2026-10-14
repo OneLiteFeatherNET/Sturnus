@@ -12,12 +12,36 @@ Read the whole thing before starting. Two steps depend on values that do
 not exist until an earlier step has run, which is why the order is not the
 obvious one.
 
-## 0. The one thing to decide first
+## 0. The two things to decide first
 
 **Where the audio master key lives.** Losing it destroys every recording it
 wrapped — no database backup helps, no S3 backup helps, because both hold
 the same unreadable bytes. Decide where the backup copy goes before you
 generate it, not after.
+
+**Where speech gets transcribed.** Sturnus runs no model of its own: it
+sends each speaker's audio to an OpenAI-compatible
+`/audio/transcriptions` endpoint, and it will not start without one
+(`STURNUS_TRANSCRIPTION_BASE_URL` has no default). Two shapes to choose
+between, and the choice is a privacy decision before it is a technical
+one:
+
+- **A hosted endpoint** — OpenAI's `https://api.openai.com/v1`, or any
+  provider speaking the same interface. Quickest to stand up; a chunk of
+  plaintext audio from every meeting leaves your infrastructure, and the
+  provider's terms are what governs it. Only `whisper-1` returns the
+  segment timestamps Sturnus needs — `gpt-4o-transcribe` and
+  `gpt-4o-mini-transcribe` cannot be used at all.
+- **Your own container** — vLLM or Speaches on the same cluster. Audio
+  stays inside your network and you operate a model; point
+  `STURNUS_TRANSCRIPTION_BASE_URL` at its service address and leave
+  `STURNUS_TRANSCRIPTION_API_KEY` blank. Note that vLLM's response omits
+  `no_speech_prob`, which costs one of the two hallucination filters —
+  see `docs/operations.md` section 1.2.
+
+Whichever you pick, its **host is shown to every person who is asked for
+consent**, and in `/about`. That is deliberate: they are being asked to
+let their voice be sent there.
 
 Everything else on this list can be regenerated if lost.
 
@@ -87,9 +111,9 @@ positioned above its own. Drag the bot's role above the consent role in
 and so does a setup requested from the console, which is the same planner
 run from the other side (`docs/operations.md` section 6.2.14).
 
-## 3. Collect the eight secret values
+## 3. Collect the nine secret values
 
-Six you create or generate, one pair you read out of the cluster, and one
+Six you create or generate, one pair you read out of the cluster, and two
 that may be left blank.
 
 | Value | Where it comes from |
@@ -101,6 +125,7 @@ that may be left blank.
 | `STURNUS_MASTER_KEY` | `openssl rand -base64 32` |
 | `STURNUS_OUTLINE_SERVICE_KEY` | Outline API key, step 4. |
 | `STURNUS_OUTLINE_CLIENT_SECRET` | Outline OAuth app, step 4. |
+| `STURNUS_TRANSCRIPTION_API_KEY` | The transcription endpoint's key, or **blank for a self-hosted one that needs none**. The line has to be there either way. Its *host* is not a secret and is not here — `STURNUS_TRANSCRIPTION_BASE_URL` is plain configuration, because it is shown in the consent prompt. |
 | `STURNUS_SENTRY_DSN` | Sentry project, or **blank to switch error reporting off**. The line has to be there either way. |
 
 **The S3 pair.** Rook generated these in step 1. Read them:

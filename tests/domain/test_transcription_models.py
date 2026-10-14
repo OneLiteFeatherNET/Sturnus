@@ -9,25 +9,27 @@ fallback is itself a member.
 
 from __future__ import annotations
 
+from dataclasses import fields
+
 import pytest
 
 from sturnus.domain import transcription_models as registry
 
 
-def test_every_registered_model_describes_the_trade_it_makes() -> None:
-    """A dropdown that lists seven names and explains none of them is a guess.
+def test_every_registered_model_is_a_bare_name() -> None:
+    """The entries say what to send and claim nothing else.
 
-    An administrator choosing between `tiny` and `large-v3` is choosing
-    between minutes and hours of worker time and between a usable
-    transcript and a rewrite, so each entry has to carry enough to make
-    that choice without leaving the page.
+    `approximate_size` and `summary` were honest while the worker
+    downloaded the weights and held them. Against an endpoint somebody
+    else runs, no value in this repository can be written truthfully for
+    either, and a plausible-looking wrong answer in a dropdown is worse
+    than a bare name. This asserts the absence, so that re-adding a field
+    is a deliberate act with somewhere to get an honest value from.
     """
     assert registry.KNOWN_MODELS
     for model in registry.KNOWN_MODELS:
         assert model.name
-        assert model.approximate_size
-        assert model.summary
-        assert model.summary.endswith("."), "each summary is a sentence, not a label"
+    assert [field.name for field in fields(registry.TranscriptionModel)] == ["name"]
 
 
 def test_the_fallback_is_one_of_the_registered_models() -> None:
@@ -92,12 +94,15 @@ def test_asking_for_a_name_nobody_has_is_refused_rather_than_replaced() -> None:
     assert registry.FALLBACK in message
 
 
-def test_the_registry_is_ordered_from_cheapest_to_most_accurate() -> None:
-    """The order is the answer to "which way is the trade", so it is pinned.
+def test_the_registry_offers_only_a_model_that_returns_segment_times() -> None:
+    """A model without segment timestamps is no result at all, not a worse one.
 
-    A dropdown renders this tuple in this order and adds nothing of its
-    own; a registry that got shuffled would silently reverse what the list
-    is telling somebody.
+    The protocol interleaves several speakers chronologically, so a
+    response carrying only text cannot be placed in it. On OpenAI only
+    `whisper-1` supports `verbose_json` and `timestamp_granularities`, and
+    "use the newer model" is the obvious wrong move -- this is the line
+    that makes adding `gpt-4o-transcribe` to the tuple a failing test
+    rather than a silent deployment of jobs that cannot succeed.
     """
-    names = [model.name for model in registry.KNOWN_MODELS]
-    assert names.index("tiny") < names.index("small") < names.index("large-v3")
+    assert sorted(registry.KNOWN_NAMES) == ["whisper-1"]
+    assert registry.FALLBACK == "whisper-1"

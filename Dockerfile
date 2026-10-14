@@ -73,21 +73,18 @@ COPY --chown=sturnus:sturnus migrations ./migrations
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
-    HF_HOME=/data/cache/huggingface \
     PYTHONPYCACHEPREFIX=/tmp/pycache
 
-# The Whisper model is deliberately not part of this image -- it is
-# downloaded on first use and cached here instead, the same pattern the
-# cluster's Ollama installation already uses. A baked-in model would add
-# well over a gigabyte to every pull. `HF_HOME` is what `faster-whisper`
-# actually honours: it never sets `download_root` itself
-# (src/sturnus/infrastructure/whisper.py), so `WhisperModel` falls through
-# to `huggingface_hub`, whose cache directory resolves from `HF_HOME`
-# (huggingface_hub.constants.HF_HOME / HF_HUB_CACHE).
+# **No model, and no model cache.** Transcription is an HTTP call to the
+# endpoint named by `STURNUS_TRANSCRIPTION_BASE_URL`
+# (`sturnus.infrastructure.openai_transcription`), so this image carries
+# neither weights nor CTranslate2 -- both left with `faster-whisper` when
+# the local decoder was deleted. `HF_HOME` went with them: nothing here
+# resolves a HuggingFace cache any more.
 #
-# `/data` is the mounted volume: recordings under `STURNUS_RECORDING_DIR`
-# and the model cache above both live under it, so neither is lost on
-# restart and neither needs baking into the image (Spec 13.2).
+# `/data` is the mounted volume, and now holds one thing: the bot'"'"'s
+# in-progress recordings under `STURNUS_RECORDING_DIR`, which must survive
+# a restart (Spec 13.2). The worker mounts nothing.
 RUN mkdir -p /data && chown sturnus:sturnus /data
 VOLUME ["/data"]
 
