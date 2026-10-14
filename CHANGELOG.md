@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.17.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.16.0...v0.17.0) (2026-10-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **bot:** STURNUS_GUILD_ID is required for the bot; /audio purge is now /audio-purge; access to /config, /queue, /setup and /audio-purge is governed by Manage Server and Server Settings > Integrations instead of the admin role.
+* **worker:** STURNUS_TRANSCRIPTION_BASE_URL is required by the bot and the worker and has no default. The in-process faster-whisper engine is removed: STURNUS_WHISPER_MODEL and STURNUS_MODEL_CACHE_DIR no longer exist, STURNUS_WHISPER_DEFAULT_LANGUAGE is renamed to STURNUS_TRANSCRIPTION_DEFAULT_LANGUAGE, and the chart's worker persistence block and model-cache PVC are removed. STURNUS_TRANSCRIPTION_API_KEY is the new worker secret; the default model is whisper-1.
+
+### Features
+
+* **bot:** serve one guild through guild-scoped commands and Discord's own permissions ([#184](https://github.com/OneLiteFeatherNET/Sturnus/issues/184)) ([1a0d5fd](https://github.com/OneLiteFeatherNET/Sturnus/commit/1a0d5fd147dec7393c11b47d2991097de14fee96))
+* **worker:** transcribe at an endpoint instead of in the worker's own memory ([#183](https://github.com/OneLiteFeatherNET/Sturnus/issues/183)) ([b8473e4](https://github.com/OneLiteFeatherNET/Sturnus/commit/b8473e4ddabcf376297678e8736c79175c4966ee))
+
 ## [0.16.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.15.0...v0.16.0) (2026-08-23)
 
 
