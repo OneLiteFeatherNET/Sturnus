@@ -23,6 +23,7 @@ EXPECTED_COGS = {
     "AboutCog",
     "SetupCog",
     "AudioCog",
+    "AudioPurgeCog",
     "LinkCog",
     "QueueCog",
 }

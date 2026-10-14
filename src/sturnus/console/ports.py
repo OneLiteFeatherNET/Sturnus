@@ -968,7 +968,7 @@ class RevocationOutcome:
     #: one: a back-dated revocation is a statement about recordings that
     #: already exist, and this is how many of them the statement is about
     #: so the console can offer the erasure path that does delete
-    #: (`/audio purge`). Zero for a revocation dated now or later, which
+    #: (`/audio-purge`). Zero for a revocation dated now or later, which
     #: is the ordinary case.
     recordings_from_effective_at: int = 0
 

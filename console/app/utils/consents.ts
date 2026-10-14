@@ -21,7 +21,7 @@
  *   next time the policy version changes.
  * - **Withdrawing deletes nothing that was already recorded.** Consent
  *   governs what is captured from now on. The audio already on disk stays
- *   until somebody erases it deliberately with `/audio purge`, and a page
+ *   until somebody erases it deliberately with `/audio-purge`, and a page
  *   that let "withdrawn" read as "removed" would be answering a data
  *   subject's erasure request with a lie.
  * - **It is logged.** Who withdrew whose consent, and when, goes to the
@@ -361,13 +361,13 @@ export function recordingsKeptNote(row: ConsentRow, label: string = personLabel(
     return (
       `Nothing already recorded is deleted. Sturnus holds no recordings containing ${who}’s audio `
       + 'right now, so there is nothing here to erase — and erasing recordings is a separate act '
-      + 'either way: /audio purge in Discord.'
+      + 'either way: /audio-purge in Discord.'
     )
   }
   const noun = held === 1 ? 'recording that already contains' : 'recordings that already contain'
   return (
     `Nothing already recorded is deleted. The ${formatCount(held)} ${noun} ${who}’s audio stay `
-    + 'exactly where they are. Erasing them is a separate act: /audio purge in Discord.'
+    + 'exactly where they are. Erasing them is a separate act: /audio-purge in Discord.'
   )
 }
 

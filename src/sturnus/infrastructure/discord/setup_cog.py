@@ -55,7 +55,6 @@ from sturnus.application.setup_plan import RoleAction, SetupPlan, plan_setup
 from sturnus.domain import settings
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.discord.config_cog import render_write_result
-from sturnus.infrastructure.discord.permissions import require_admin
 from sturnus.infrastructure.discord.setup_apply import (
     AUDIT_REASON,
     apply_permission_changes,
@@ -66,7 +65,7 @@ log = logging.getLogger(__name__)
 
 
 class SetupCog(commands.Cog):
-    """Admin-only `/setup` command; every reply is ephemeral."""
+    """`/setup` command, offered by Discord to Manage Server; every reply is ephemeral."""
 
     def __init__(self, store: ConfigStore, clock: Clock, reconcile: Reconfigure) -> None:
         self._store = store
@@ -92,7 +91,7 @@ class SetupCog(commands.Cog):
         ),
     )
     @app_commands.guild_only()
-    @require_admin()
+    @app_commands.default_permissions(manage_guild=True)
     async def setup(
         self,
         interaction: discord.Interaction,

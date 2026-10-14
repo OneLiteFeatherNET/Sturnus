@@ -14,6 +14,9 @@
     "docs/**",
     // Ephemeral per-task briefs and fix reports, not maintained documentation.
     ".superpowers/**",
+    // Planning artifacts and specs. `openspec archive` generates and rewrites
+    // files here, so a hand-fixed heading would come back on the next archive.
+    "openspec/**",
     // Manual verification transcripts, kept as run records rather than docs.
     "scripts/**"
   ]

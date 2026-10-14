@@ -250,6 +250,15 @@ bot:
   command: ["sturnus-bot"]
   env:
     STURNUS_RECORDING_DIR: /data/recordings
+    # **Required, blank here rather than defaulted.** The one Discord guild
+    # this installation serves: its commands are registered there and no
+    # other guild is ever acted on. Blank makes the bot's settings refuse
+    # to construct and the pod stop at startup, on purpose -- a bot that
+    # served whichever guilds it found itself in would be a bot nobody
+    # chose the scope of. Bot only: not a credential, and the worker never
+    # talks to Discord. Set "Public Bot" off and GUILD_INSTALL only in the
+    # Developer Portal as well (docs/first-deployment.md).
+    STURNUS_GUILD_ID: ""
     # How many gateway connections this one process opens. **Empty means
     # "let Discord decide"**, which is the right answer for almost every
     # deployment: `AutoShardedClient` asks `/gateway/bot` and takes the

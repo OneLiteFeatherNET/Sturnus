@@ -35,7 +35,7 @@ began.
 
 **It is not a delete, and a back-dated revocation is not a delete
 either.** Nothing already recorded is touched. That is a separate decision
-with a separate command (`/audio purge`), and folding the two together
+with a separate command (`/audio-purge`), and folding the two together
 would mean an administrator who wanted to stop recording somebody tomorrow
 had also erased a meeting their team read last week -- or, with a
 back-dated instant, three months of them at once. Every row in the listing
@@ -525,7 +525,7 @@ def _outcome_json(outcome: RevocationOutcome) -> dict[str, object]:
         ),
         # How many recordings the chosen instant is a statement *about*,
         # and which this revocation did not touch. A back-dated
-        # revocation deletes nothing; the console offers `/audio purge`
+        # revocation deletes nothing; the console offers `/audio-purge`
         # for that, as the separate deliberate act it is.
         "recordings_from_effective_at": outcome.recordings_from_effective_at,
     }

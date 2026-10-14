@@ -291,6 +291,7 @@ async def _run() -> None:
 
     client = SturnusClient(
         clock=clock,
+        guild_id=settings.guild_id,
         transcription_host=endpoint_host(settings.transcription_base_url),
         config_store=config_store,
         admin_mirror=admin_mirror,

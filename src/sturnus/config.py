@@ -187,6 +187,13 @@ class Settings(StrictSettings):
     #: to another would make the consent prompt a false statement, which
     #: is worse than no statement at all.
     transcription_base_url: str
+    #: The one guild this installation serves. Commands are registered for
+    #: it alone and every other guild is refused at the head of
+    #: `reconcile_guild`. **No default**, so a bot started without it stops
+    #: here instead of serving whichever guilds it finds itself in. Bot
+    #: only, and plain configuration rather than a credential: the worker
+    #: never talks to Discord and does not need it.
+    guild_id: int
     health_port: int = 8080
     # How many gateway connections this one process opens. **Unset means
     # "let Discord decide"** -- `discord.AutoShardedClient` asks

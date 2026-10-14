@@ -385,6 +385,7 @@ def _client(
     """
     client = _TestClient(
         clock=clock,
+        guild_id=GUILD_ID,
         directory_mirror=cast(DirectoryStore, directory_mirror),
         setup_intents=cast(SetupIntentStore, setup_intents),
         config_store=cast(ConfigStore, config_store)
@@ -797,13 +798,9 @@ async def test_an_unparseable_value_neither_raises_nor_un_configures_a_guild(
     """
     clock = FakeClock(T0)
     store = _configured_store()
-    store.write(OTHER_GUILD_ID, settings.VOICE_CHANNEL_IDS, str(NEW_CHANNEL_ID))
-    store.write(OTHER_GUILD_ID, settings.CONSENT_ROLE_ID, str(NEW_ROLE_ID))
     client = _client(clock, config_store=store, recording_dir=tmp_path)
     guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
-    other = _guild(OTHER_GUILD_ID, _voice_channel(NEW_CHANNEL_ID, members=[]))
     _in_guild(client, guild)
-    _in_guild(client, other)
 
     await client._tick_all(clock.now())
     before = _rec(client, GUILD_ID).config
@@ -812,9 +809,6 @@ async def test_an_unparseable_value_neither_raises_nor_un_configures_a_guild(
     await client._tick_all(clock.now())
 
     assert _rec(client, GUILD_ID).config == before, "the last known-good config is kept"
-    assert client._recording_of(OTHER_GUILD_ID) is not None, (
-        "one broken guild must not stop the others"
-    )
 
     # A fixed value is picked up again without a restart.
     store.write(GUILD_ID, settings.IDLE_TIMEOUT_MINUTES, "5")

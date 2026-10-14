@@ -36,7 +36,7 @@ is simple, safe, and easy to explain in a reply.
 `audio_deleted_at` is the authoritative, already-durable record that the S3
 object is gone: it is stamped only after `store.delete` actually succeeded,
 by either the retention sweep (`sturnus.application.retention`) or an
-immediate erasure request (`/audio delete`, `/audio purge`). Re-queueing
+immediate erasure request (`/audio delete`, `/audio-purge`). Re-queueing
 such a job hands a worker a key it cannot download, `queue.fail` fires,
 `attempts` climbs, the job goes `dead` again, and the only product is noise
 in the log. Recoverability is never inferred from `retention_until`, which

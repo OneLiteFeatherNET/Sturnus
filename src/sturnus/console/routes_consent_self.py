@@ -32,7 +32,7 @@ be discovered:**
   so; the sentence itself is the console's (`ROLE_STAYS_NOTE`), because
   bounded literals cross this boundary and prose does not.
 * It cannot delete anything already recorded. Withdrawing consent is a
-  decision about the future; `/audio purge` is the separate, deliberate
+  decision about the future; `/audio-purge` is the separate, deliberate
   act that erases the past.
 * It cannot widen a scope in a guild that does not offer video consent.
   Software cannot read the policy document, so it must not pretend to

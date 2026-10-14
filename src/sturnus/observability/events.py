@@ -92,6 +92,16 @@ class Event(StrEnum):
     VOICE_LEFT_FAILED = "voice.left_failed"
     VOICE_REJOIN_BLOCKED = "voice.rejoin_blocked"
     GUILD_TICK_FAILED = "guild.tick_failed"
+    #: The bot is in a guild this installation does not serve and declined
+    #: to act on it. WARNING, because the platform setting that should have
+    #: kept the bot out ("Public Bot" off) is evidently not holding, and a
+    #: person has to look. Carries the two guild ids and nothing else --
+    #: never the guild's name. See `SturnusClient.reconcile_guild`.
+    GUILD_REFUSED = "guild.refused"
+    #: Registering or clearing application commands failed. For the served
+    #: guild this stops startup; for the clearing of old global commands it
+    #: is logged and the next start tries again.
+    COMMANDS_SYNC_FAILED = "bot.commands_sync_failed"
     #: The bot acted on what the console wrote into `guild_setup_intent`:
     #: the consent role, the Speak overwrites, the configuration keys.
     #: WARNING when `outcome` is `failed`, because the request came from a

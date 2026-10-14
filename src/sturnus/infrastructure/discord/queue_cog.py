@@ -38,7 +38,8 @@ id exists elsewhere. Note the contrast with `audio_cog._erase_audio`, which
 is deliberately cross-guild: that is a GDPR erasure serving a data subject
 across the whole deployment, and a status readout is not.
 
-**Every reply is ephemeral, and every subcommand is admin-gated** --
+**Every reply is ephemeral, and the whole group is offered to Manage Server
+only** (`default_member_permissions`, enforced by Discord) --
 including the read-only ones. Even `/queue status` reports who was recorded
 and how much they said, which is not an ordinary-member fact. The one
 public thing a re-queue produces is the announcement
@@ -82,7 +83,6 @@ from sturnus.infrastructure.db.requeue import (
     load_session,
     load_status,
 )
-from sturnus.infrastructure.discord.permissions import require_admin
 from sturnus.observability.events import Event, log_exception
 
 log = logging.getLogger(__name__)
@@ -598,6 +598,7 @@ class RequeueConfirmView(discord.ui.View):
 
 
 @app_commands.guild_only()
+@app_commands.default_permissions(manage_guild=True)
 class QueueCog(
     commands.GroupCog, name="queue", description="Inspect the transcription queue (admin only)."
 ):
@@ -620,7 +621,6 @@ class QueueCog(
         super().__init__()
 
     @app_commands.command(name="status", description="Counts of queued, running and failed jobs.")
-    @require_admin()
     async def status(self, interaction: discord.Interaction) -> None:
         guild_id = interaction.guild_id
         if guild_id is None:
@@ -641,7 +641,6 @@ class QueueCog(
 
     @app_commands.command(name="session", description="One session's jobs, in detail.")
     @app_commands.describe(session_id="The session's numeric id, as shown by /queue status")
-    @require_admin()
     async def session(self, interaction: discord.Interaction, session_id: int) -> None:
         guild_id = interaction.guild_id
         if guild_id is None:
@@ -661,7 +660,6 @@ class QueueCog(
         name="requeue", description="Transcribe a finished session again, from its stored audio."
     )
     @app_commands.describe(session_id="The session's numeric id, as shown by /queue status")
-    @require_admin()
     async def requeue(self, interaction: discord.Interaction, session_id: int) -> None:
         """Offers a re-queue; the write happens only if Confirm is pressed.
 

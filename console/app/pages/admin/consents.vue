@@ -546,7 +546,7 @@ const TONE_COLOUR: Record<string, string> = {
         <li>
           Nothing already recorded is deleted. Every recording that already contains somebody's
           audio stays exactly where it is; erasing them is a separate act,
-          <code class="rounded bg-[var(--surface-raised)] px-1 font-mono">/audio purge</code> in
+          <code class="rounded bg-[var(--surface-raised)] px-1 font-mono">/audio-purge</code> in
           Discord.
         </li>
         <li>{{ AUDIT_LOG_NOTE }}</li>

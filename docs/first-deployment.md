@@ -95,7 +95,22 @@ There is no Sturnus bot application yet. At
    `Manage Roles` covers both things `/setup` does: setting the channel's
    `Speak` overwrites, and creating the consent role if it does not exist
    yet. `Speak` itself is not needed — the bot only listens.
-5. Open the generated URL and invite the bot to the server.
+5. **Make the application private, and name the guild.** Sturnus serves one
+   guild and the application should be impossible to add anywhere else:
+
+   - **Bot** tab → turn **Public Bot** off.
+   - **Installation** tab → under **Installation Contexts** keep **Guild
+     Install** only; remove **User Install**.
+   - Put the server's id in `STURNUS_GUILD_ID` (`bot.env` in the chart; it
+     is blank by default and the bot refuses to start while it is). In
+     Discord, enable developer mode and use **Copy Server ID**.
+
+   One check is worth doing once, because Discord documents "only the app
+   owner can add the app" but not what that means for an application owned by
+   a **Team**: from the account of a Team member who is not the owner, and
+   from an unrelated account, try to open the invite link. Neither should be
+   able to add the bot to a server. Note the outcome below in this file.
+6. Open the generated URL and invite the bot to the server.
 
    The console can generate that URL for you once it is running, from the
    application id alone: set `STURNUS_DISCORD_CLIENT_ID` (the **Application
@@ -256,7 +271,7 @@ purpose.
 
 ## 7. Configure the guild
 
-In Discord, as an administrator:
+In Discord, as a member with **Manage Server**:
 
 1. `/setup` — creates or adopts the recording channel and sets its
    permissions: `Speak` denied to `@everyone`, allowed for the consent
@@ -274,7 +289,11 @@ In Discord, as an administrator:
    is pinned per speaker for a whole session, and a name the model has
    never seen comes out as the nearest word it has. Section 4 of
    `operations.md` explains both.
-3. Have one person run `/consent grant` and `/link start` to confirm both
+3. Look at **Server Settings → Integrations → Sturnus** once. That page, not
+   the `admin_role_id` setting, decides who may run `/config`, `/queue`,
+   `/audio-purge` and `/setup` (Manage Server by default). `admin_role_id` remains for the
+   console's sign-in; see `operations.md` section 1.1.1.
+4. Have one person run `/consent grant` and `/link start` to confirm both
    flows end where they should.
 
 ## 8. The one live test
