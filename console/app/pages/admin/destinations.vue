@@ -27,11 +27,12 @@
  *   until somebody deliberately opens it. An empty password box saved with
  *   the rest of a form is how a working token gets wiped by somebody
  *   correcting a typo in a name.
- * - **It never offers a format a save would refuse.** `pdf` and
- *   `confluence` are not built and the API answers 400 to either; they are
- *   absent from the picker rather than present and inert, and one sentence
- *   under it says which formats this deployment publishes. The argument,
- *   and the two precedents it had to choose between, are at the top of
+ * - **It never decides for itself which formats exist.** `GET
+ *   /api/export-formats` is read here and handed to the form, which is
+ *   what lets a format this deployment does not build appear in the picker
+ *   as a disabled row saying so instead of being silently absent. #150 had
+ *   to be absent because there was no endpoint to ask; the argument for
+ *   changing that answer, now that there is, is at the top of
  *   `~/utils/exportTargets`.
  * - **It never re-reads a guild's destinations under another guild's
  *   heading.** The answer travels with the guild it belongs to, the way
@@ -45,6 +46,7 @@ import { parseCollections } from '~/utils/directory'
 import {
   type ExportTarget,
   type TargetDraft,
+  FORMATS_PATH,
   describeTargetError,
   draftBody,
   draftOf,
@@ -52,6 +54,7 @@ import {
   enabledLabelKey,
   fallbackNote,
   orderTargets,
+  parseFormats,
   parseTargets,
   primaryTarget,
   takenNames,
@@ -130,6 +133,30 @@ const targets = computed(() =>
     ? orderTargets(targetData.value.targets)
     : [],
 )
+
+/**
+ * What this deployment can publish, asked once for the whole page.
+ *
+ * Not watched on `selected` and not keyed by guild: the catalogue is a
+ * property of the binary answering, identical for every server, so a guild
+ * switch must not refetch it and a stale answer from another guild is not
+ * a thing that can happen here.
+ *
+ * Its failure is **not** treated like the collection list's. A collection
+ * name is decoration and the field degrades to an id; the format is a
+ * required value with a closed set, so an unreadable catalogue leaves this
+ * page with nothing honest to offer for a *new* destination — and it says
+ * so, rather than falling back to a list of guesses. Everything that does
+ * not need it still works: the existing destinations render with their
+ * stored formats, and switching one off, removing it or writing its
+ * credential asks the catalogue nothing.
+ */
+const { data: formatData, error: formatError } = await useAsyncData(
+  'export-formats',
+  async () => parseFormats(await api(FORMATS_PATH)),
+)
+
+const formats = computed(() => formatData.value ?? [])
 
 /**
  * Outline's collections, for the one format that addresses one.
@@ -463,7 +490,7 @@ function startAdding() {
                   :style="{ background: 'var(--surface-sunken)', color: 'var(--text-muted)' }"
                 >{{ $t('admin.destinations.secretHeading') }}</span>
                 <span class="block w-full truncate text-xs" :style="{ color: 'var(--text-muted)' }">
-                  {{ say(targetSummary(row.target)) }}
+                  {{ say(targetSummary(row.target, formats)) }}
                 </span>
               </span>
             </template>
@@ -543,6 +570,8 @@ function startAdding() {
                   mode="edit"
                   :initial="draftOf(row.target)"
                   :taken="takenNames(targets, row.target.id)"
+                  :formats="formats"
+                  :formats-failed="Boolean(formatError)"
                   :collections="collections"
                   :collections-failed="Boolean(collectionError)"
                   :busy="busy === row.target.id"
@@ -589,8 +618,10 @@ function startAdding() {
             <ExportTargetForm
               v-if="adding"
               mode="add"
-              :initial="emptyDraft()"
+              :initial="emptyDraft(formats)"
               :taken="takenNames(targets)"
+              :formats="formats"
+              :formats-failed="Boolean(formatError)"
               :collections="collections"
               :collections-failed="Boolean(collectionError)"
               :busy="busy === 'new'"

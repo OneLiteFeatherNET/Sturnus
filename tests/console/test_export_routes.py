@@ -426,11 +426,118 @@ async def test_every_route_refuses_a_request_with_no_session(
 ) -> None:
     client = await aiohttp_client(api())
     assert (await client.get(f"/api/guilds/{GUILD}/export-targets")).status == 401
+    # Including the format catalogue, which holds no secret and names no
+    # guild. Public is not the same as unauthenticated -- `routes_setup`
+    # makes the same argument for the invite link.
+    assert (await client.get("/api/export-formats")).status == 401
 
 
 # ---------------------------------------------------------------------------
 # What may be configured
 # ---------------------------------------------------------------------------
+
+
+async def test_the_format_catalogue_names_every_format_the_specification_names(
+    aiohttp_client: AiohttpClientFactory, cookies: dict[str, str]
+) -> None:
+    """Five, not the three that may be configured.
+
+    The unbuilt ones are the whole reason this endpoint is not the 400's
+    `supported` list said earlier: a caller told only the buildable three
+    cannot tell "this deployment does not offer PDF" from "PDF is not a
+    thing", and the only way to tell is to keep a list of its own.
+    """
+    client = await aiohttp_client(api())
+    response = await client.get("/api/export-formats", cookies=cookies)
+    assert response.status == 200
+    body = await response.json()
+    assert [entry["name"] for entry in body["formats"]] == [
+        "outline",
+        "markdown",
+        "html",
+        "pdf",
+        "confluence",
+    ]
+
+
+async def test_a_buildable_format_is_available_and_names_its_sink_family(
+    aiohttp_client: AiohttpClientFactory, cookies: dict[str, str]
+) -> None:
+    """The sink family is what tells a caller whether `target` is an
+    address in Outline or a key prefix in an object store -- the one thing
+    beyond the name that an interface needs in order to ask for the right
+    field."""
+    client = await aiohttp_client(api())
+    body = await (await client.get("/api/export-formats", cookies=cookies)).json()
+    by_name = {entry["name"]: entry for entry in body["formats"]}
+    assert by_name["outline"] == {"name": "outline", "available": True, "sink": "outline"}
+    assert by_name["markdown"] == {
+        "name": "markdown",
+        "available": True,
+        "sink": "object_store",
+    }
+    assert by_name["html"] == {"name": "html", "available": True, "sink": "object_store"}
+
+
+async def test_an_unbuilt_format_is_reported_unavailable_with_a_null_sink(
+    aiohttp_client: AiohttpClientFactory, cookies: dict[str, str]
+) -> None:
+    """`null` rather than a missing key, so that "nothing has decided what
+    would carry a PDF" is distinguishable from a response that dropped a
+    field."""
+    client = await aiohttp_client(api())
+    body = await (await client.get("/api/export-formats", cookies=cookies)).json()
+    by_name = {entry["name"]: entry for entry in body["formats"]}
+    assert by_name["pdf"] == {"name": "pdf", "available": False, "sink": None}
+    assert by_name["confluence"] == {"name": "confluence", "available": False, "sink": None}
+
+
+async def test_the_catalogue_agrees_with_what_a_refusal_says_is_supported(
+    aiohttp_client: AiohttpClientFactory, cookies: dict[str, str]
+) -> None:
+    """The two answers come from one registry, and this is what keeps them
+    from becoming two. Anything the catalogue calls available must be
+    something a create accepts -- otherwise the endpoint is offering a
+    choice its neighbour refuses, which is the exact failure it exists to
+    remove."""
+    client = await aiohttp_client(api())
+    body = await (await client.get("/api/export-formats", cookies=cookies)).json()
+    available = {entry["name"] for entry in body["formats"] if entry["available"]}
+
+    refused = await client.post(
+        f"/api/guilds/{GUILD}/export-targets",
+        json=outline_body(format="pdf"),
+        cookies=cookies,
+    )
+    assert set((await refused.json())["supported"]) == available
+
+
+async def test_the_catalogue_carries_no_renderer_detail(
+    aiohttp_client: AiohttpClientFactory, cookies: dict[str, str]
+) -> None:
+    """Name, availability and sink family. A media type is read by the
+    store that holds the bytes and by the route that serves them back, and
+    a `target_pattern` is a Python regular expression -- a dialect rather
+    than a rule, and the rule is enforced here whatever a caller
+    believes."""
+    client = await aiohttp_client(api())
+    body = await (await client.get("/api/export-formats", cookies=cookies)).json()
+    for entry in body["formats"]:
+        assert set(entry) == {"name", "available", "sink"}
+
+
+async def test_the_catalogue_does_not_depend_on_administering_a_guild(
+    aiohttp_client: AiohttpClientFactory,
+) -> None:
+    """Ben administers nothing and every other route here answers him 404.
+
+    This one answers him the same as anybody: it is a fact about the build,
+    identical for every guild, and refusing it would only mean the console
+    could not render a format picker until it had first found a guild.
+    """
+    client = await aiohttp_client(api())
+    response = await client.get("/api/export-formats", cookies={SESSION_COOKIE: signed_cookie(BEN)})
+    assert response.status == 200
 
 
 async def test_a_format_this_deployment_cannot_publish_is_refused(

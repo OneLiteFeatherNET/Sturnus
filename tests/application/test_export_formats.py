@@ -114,6 +114,73 @@ def test_every_entry_names_a_sink_family_and_a_media_type() -> None:
 
 
 # ---------------------------------------------------------------------------
+# The catalogue: what exists, and what this build can run
+# ---------------------------------------------------------------------------
+
+
+def test_the_catalogue_names_everything_the_specification_names() -> None:
+    """Five formats, not three. `supported_formats` answers "what may be
+    configured"; the catalogue answers "what exists", which is the question
+    an interface has to render and the larger of the two."""
+    assert {entry.name for entry in export_formats.catalogue()} == {
+        "outline",
+        "markdown",
+        "html",
+        "pdf",
+        "confluence",
+    }
+
+
+def test_a_format_this_build_runs_is_available_and_names_its_sink() -> None:
+    available = {entry.name: entry for entry in export_formats.catalogue() if entry.available}
+    assert set(available) == set(export_formats.supported_formats())
+    for name, entry in available.items():
+        assert entry.sink == export_formats.FORMATS[name].sink
+
+
+def test_an_unbuilt_format_is_reported_as_unavailable_with_no_sink() -> None:
+    """`sink` is `None` rather than a guess.
+
+    A sink family is what decides whether a `target` is an address in
+    Outline or a key prefix in an object store, and nothing here has
+    decided what would carry a PDF. Naming one would be this module
+    inventing an answer and every reader downstream believing it.
+    """
+    unbuilt = {entry.name: entry for entry in export_formats.catalogue() if not entry.available}
+    assert set(unbuilt) == set(export_formats.UNBUILT)
+    for entry in unbuilt.values():
+        assert entry.sink is None
+
+
+def test_no_name_is_both_buildable_and_unbuilt() -> None:
+    """The two halves of the catalogue are what a name is moved *between*
+    when a format is finally built. A name left in both would be reported
+    twice, and a console would render it as choosable and as refused at
+    once."""
+    assert set(export_formats.UNBUILT).isdisjoint(export_formats.FORMATS)
+
+
+def test_the_catalogue_offers_what_a_guild_already_publishes_to_first() -> None:
+    """Order is part of the answer: a reader offered a list reads the first
+    row as the ordinary one, and `outline` is what every guild published to
+    before any of the others existed."""
+    assert [entry.name for entry in export_formats.catalogue()][:3] == list(
+        export_formats.supported_formats()
+    )
+
+
+def test_the_catalogue_carries_no_renderer_and_no_media_type() -> None:
+    """It is the answer to "what may I configure?", and a caller asking
+    that can use none of it. `media_type` and the renderer are read inside
+    this process, from `ExportFormat`, by the sink and by the route that
+    serves an artefact back."""
+    entry = export_formats.catalogue()[0]
+    assert not hasattr(entry, "render")
+    assert not hasattr(entry, "media_type")
+    assert not hasattr(entry, "target_pattern")
+
+
+# ---------------------------------------------------------------------------
 # outline: today's behaviour, unchanged
 # ---------------------------------------------------------------------------
 
