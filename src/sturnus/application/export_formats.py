@@ -94,13 +94,20 @@ Renderer = Callable[[RenderRequest], str]
 class ExportFormat:
     """One format: how a protocol is rendered, and what carries it away.
 
-    `media_type` and `file_extension` are read only by the object-store
-    family, which has to name the bytes it stores and the object it stores
-    them in. They are on every entry regardless, because "what kind of
-    document is this" is a property of the format rather than of the sink
-    that happens to take it -- `session_document.provider` records the
-    format name, and the console route that serves an artefact back reads
-    its media type from here rather than guessing from the key.
+    `file_extension` names the object an object-store destination stores
+    its bytes in; `media_type` names what those bytes *are* to a reader.
+    They are on every entry regardless, because "what kind of document is
+    this" is a property of the format rather than of the sink that happens
+    to take it -- `session_document.provider` records the format name, and
+    the console route that serves an artefact back reads its media type
+    from here rather than guessing from the key.
+
+    **The stored object does not carry the media type, and that is
+    deliberate.** An object-store artefact is a sealed envelope
+    (`sturnus.infrastructure.documents.artefacts`), so `text/markdown` is
+    true of the document and false of the object; the entry below is the
+    one place that answer lives, and it reaches a browser through the
+    console route rather than through S3 metadata.
     """
 
     name: str

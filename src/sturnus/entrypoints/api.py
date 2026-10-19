@@ -85,6 +85,7 @@ from sturnus.infrastructure.db.models import (
 from sturnus.infrastructure.db.models import GuildOAuthClient as GuildOAuthClientRow
 from sturnus.infrastructure.db.preferences import PreferenceStore
 from sturnus.infrastructure.db.setup_intents import SetupIntentStore
+from sturnus.infrastructure.documents.artefacts import SealedArtefacts
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.objectstore import S3AudioStore, S3DocumentStore
 from sturnus.infrastructure.observability import init_sentry
@@ -336,11 +337,20 @@ async def _run() -> None:
         # no second class to say so.
         exports=ExportTargetStore(session_factory, keys),
         documents=ConsoleSessionDocuments(session_factory),
-        artefacts=S3DocumentStore(
-            settings.s3_endpoint,
-            settings.s3_bucket,
-            settings.s3_access_key.get_secret_value(),
-            settings.s3_secret_key.get_secret_value(),
+        # `keys` again: a stored protocol is sealed under a data key of
+        # its own, wrapped under this process's master key and bound to
+        # the guild. That this process already holds the master key --
+        # it decrypts audio on the way to the browser -- is why serving
+        # an artefact needs no credential the chart does not already give
+        # it (`charts/sturnus/templates/_helpers.tpl`).
+        artefacts=SealedArtefacts(
+            S3DocumentStore(
+                settings.s3_endpoint,
+                settings.s3_bucket,
+                settings.s3_access_key.get_secret_value(),
+                settings.s3_secret_key.get_secret_value(),
+            ),
+            keys,
         ),
         oauth_clients=ConsoleGuildOAuthClients(oauth_clients, admins),
         setup=ConsoleGuildSetup(session_factory, admins, SetupIntentStore(session_factory)),

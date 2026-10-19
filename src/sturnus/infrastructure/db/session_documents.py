@@ -25,6 +25,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from sturnus.domain.exports import SessionDocument
+from sturnus.infrastructure.db.models import Session as SessionRow
 from sturnus.infrastructure.db.models import SessionDocument as SessionDocumentRow
 
 
@@ -82,21 +83,29 @@ class SessionDocumentStore:
 
         Publication order, so the list reads as the history it is. Ties
         break on id, so two reads of an unchanged session agree.
+
+        Joined to `session` for the guild, which the read model carries
+        and this table does not store -- see
+        `sturnus.domain.exports.SessionDocument`. An inner join, because a
+        `session_document` row without its session cannot exist:
+        `session_id` is `ON DELETE CASCADE`.
         """
         async with self._session_factory() as session:
-            rows = await session.scalars(
-                select(SessionDocumentRow)
+            rows = await session.execute(
+                select(SessionDocumentRow, SessionRow.guild_id)
+                .join(SessionRow, SessionRow.id == SessionDocumentRow.session_id)
                 .where(SessionDocumentRow.session_id == session_id)
                 .order_by(SessionDocumentRow.created_at, SessionDocumentRow.id)
             )
             return tuple(
                 SessionDocument(
                     session_id=row.session_id,
+                    guild_id=guild_id,
                     target_id=row.target_id,
                     provider=row.provider,
                     document_id=row.document_id,
                     url=row.url,
                     created_at=row.created_at,
                 )
-                for row in rows
+                for row, guild_id in rows
             )

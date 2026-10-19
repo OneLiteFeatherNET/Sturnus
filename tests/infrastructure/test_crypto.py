@@ -5,10 +5,15 @@ import pytest
 from cryptography.exceptions import InvalidTag
 
 from sturnus.infrastructure.crypto import (
+    ARTEFACT_MAGIC,
     CHUNK_SIZE,
+    MAGIC,
     KeyWrapper,
     decrypt_file,
     encrypt_file,
+    is_sealed_artefact,
+    open_artefact,
+    seal_artefact,
     secret_context,
 )
 
@@ -170,3 +175,111 @@ def test_a_data_key_can_be_bound_too() -> None:
     w = wrapper()
     key = w.new_data_key(secret_context("export", 1))
     assert w.unwrap(key.wrapped, secret_context("export", 1)) == key.plaintext
+
+
+# ---------------------------------------------------------------------------
+# The sealed artefact envelope
+# ---------------------------------------------------------------------------
+#
+# A rendered protocol, sealed in one piece and carrying the wrapped key
+# that opens it. The properties worth pinning are the two that make this a
+# different shape from `encrypt_file`: the object is self-contained, and
+# the key inside it is bound to a context the reader has to supply from
+# somewhere other than the object.
+
+
+def test_a_sealed_artefact_round_trips() -> None:
+    w = wrapper()
+    aad = secret_context("export-artefact", 7)
+    sealed = seal_artefact(b"# Minutes\n", w, aad)
+    assert open_artefact(sealed, w, aad) == b"# Minutes\n"
+
+
+def test_a_sealed_artefact_does_not_contain_its_plaintext() -> None:
+    w = wrapper()
+    sealed = seal_artefact(b"Anna said something", w, secret_context("export-artefact", 7))
+    assert b"Anna said something" not in sealed
+
+
+def test_a_sealed_artefact_names_itself() -> None:
+    """The envelope is self-describing so a reader can tell it apart from
+    the plaintext artefacts written before it existed, and from the chunked
+    recording format, without being told which it is holding."""
+    sealed = seal_artefact(b"body", wrapper(), secret_context("export-artefact", 7))
+    assert sealed.startswith(ARTEFACT_MAGIC)
+    assert is_sealed_artefact(sealed)
+    assert not is_sealed_artefact(b"# Minutes\n")
+    assert not is_sealed_artefact(b"")
+
+
+def test_two_seals_of_one_body_differ() -> None:
+    """A fresh data key per artefact, so two objects never share a key and
+    a nonce is never reused under one."""
+    w = wrapper()
+    aad = secret_context("export-artefact", 7)
+    assert seal_artefact(b"body", w, aad) != seal_artefact(b"body", w, aad)
+
+
+def test_an_artefact_sealed_for_one_guild_does_not_open_for_another() -> None:
+    """The whole point of binding the key to a context the object does not
+    carry: an object copied onto another guild's key fails to authenticate
+    instead of handing that guild somebody else's meeting."""
+    w = wrapper()
+    sealed = seal_artefact(b"body", w, secret_context("export-artefact", 7))
+    with pytest.raises(InvalidTag):
+        open_artefact(sealed, w, secret_context("export-artefact", 8))
+
+
+def test_an_artefact_does_not_open_under_another_purpose() -> None:
+    w = wrapper()
+    sealed = seal_artefact(b"body", w, secret_context("export-artefact", 7))
+    with pytest.raises(InvalidTag):
+        open_artefact(sealed, w, secret_context("export-target", 7))
+
+
+def test_an_artefact_does_not_open_under_another_master_key() -> None:
+    sealed = seal_artefact(b"body", wrapper(), secret_context("export-artefact", 7))
+    other = KeyWrapper(master_key=b"1" * 32, key_id="k1")
+    with pytest.raises(InvalidTag):
+        open_artefact(sealed, other, secret_context("export-artefact", 7))
+
+
+def test_a_tampered_body_does_not_open() -> None:
+    w = wrapper()
+    aad = secret_context("export-artefact", 7)
+    sealed = bytearray(seal_artefact(b"body", w, aad))
+    sealed[-1] ^= 0xFF
+    with pytest.raises(InvalidTag):
+        open_artefact(bytes(sealed), w, aad)
+
+
+def test_something_that_is_not_an_artefact_is_refused_before_any_key_is_touched() -> None:
+    w = wrapper()
+    with pytest.raises(ValueError):
+        open_artefact(b"# Minutes\n", w, secret_context("export-artefact", 7))
+
+
+def test_a_truncated_artefact_is_refused() -> None:
+    w = wrapper()
+    aad = secret_context("export-artefact", 7)
+    sealed = seal_artefact(b"body", w, aad)
+    with pytest.raises(ValueError):
+        open_artefact(sealed[: len(ARTEFACT_MAGIC) + 1], w, aad)
+
+
+def test_an_artefact_claiming_a_longer_key_than_it_holds_is_refused() -> None:
+    """A length prefix read out of an object is a length an attacker
+    chooses, so it is checked against what is actually there."""
+    w = wrapper()
+    aad = secret_context("export-artefact", 7)
+    sealed = bytearray(seal_artefact(b"body", w, aad))
+    sealed[len(ARTEFACT_MAGIC) : len(ARTEFACT_MAGIC) + 2] = b"\xff\xff"
+    with pytest.raises(ValueError):
+        open_artefact(bytes(sealed), w, aad)
+
+
+def test_an_artefact_is_not_the_chunked_recording_format() -> None:
+    """Two formats, one family, and neither reader accepts the other's
+    bytes: `decrypt_file` refuses this on its magic."""
+    sealed = seal_artefact(b"body", wrapper(), secret_context("export-artefact", 7))
+    assert not sealed.startswith(MAGIC)

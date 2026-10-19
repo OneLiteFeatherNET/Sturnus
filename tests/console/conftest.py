@@ -85,6 +85,7 @@ from sturnus.console.statistics import (
     TagUse,
 )
 from sturnus.domain import preferences
+from sturnus.domain.errors import UnreadableArtefact
 from sturnus.domain.exports import ExportTarget, SessionDocument
 from sturnus.domain.oauth_clients import GuildOAuthClient, SlugUnavailable, is_valid_slug
 from sturnus.domain.onboarding import SetupIntent
@@ -1250,12 +1251,36 @@ class FakeSessionDocuments:
 
 
 class FakeArtefacts:
-    """The object store, as a dictionary."""
+    """The object store, as a dictionary, with both of the seal's answers.
 
-    def __init__(self, objects: dict[str, bytes] | None = None) -> None:
+    `unreadable` names keys that are in the store and do not open -- a
+    wrong master key, an envelope sealed under another guild, a body
+    edited in the bucket. The real adapter
+    (`sturnus.infrastructure.documents.artefacts.SealedArtefacts`) has
+    exactly these two failures and they are not the same failure: one is a
+    row outliving its object, the other is somebody's meeting failing to
+    authenticate.
+
+    `asked` records the `(key, guild_id)` of every read, because which
+    guild the route supplies is what the artefact's key is bound to -- a
+    route passing the wrong one would produce a 404 that looks exactly
+    like a missing object.
+    """
+
+    def __init__(
+        self,
+        objects: dict[str, bytes] | None = None,
+        *,
+        unreadable: frozenset[str] = frozenset(),
+    ) -> None:
         self.objects = objects or {}
+        self.unreadable = unreadable
+        self.asked: list[tuple[str, int]] = []
 
-    async def get(self, key: str) -> bytes:
+    async def get(self, key: str, *, guild_id: int) -> bytes:
+        self.asked.append((key, guild_id))
+        if key in self.unreadable:
+            raise UnreadableArtefact("a stored protocol did not open")
         return self.objects[key]
 
 
