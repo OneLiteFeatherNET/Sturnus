@@ -19,7 +19,7 @@
 # from under this build. Obtained on 2026-08-22 via `docker pull node:26-slim
 # && docker inspect --format '{{index .RepoDigests 0}}' node:26-slim`;
 # re-derive the same way to move to a newer base.
-FROM node:26-slim@sha256:4ebb5ace66f15a24c14c492e01a8beeed4fddf970a856109f5126e703e5fe503 AS builder
+FROM node:26-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39 AS builder
 
 WORKDIR /build
 
@@ -34,7 +34,7 @@ RUN npm run build
 # ---------------------------------------------------------------------------
 # Runtime: the Nitro bundle and a Node runtime, nothing else.
 # ---------------------------------------------------------------------------
-FROM node:26-slim@sha256:4ebb5ace66f15a24c14c492e01a8beeed4fddf970a856109f5126e703e5fe503 AS runtime
+FROM node:26-slim@sha256:e4db4c914bf8ad241bd24804fc25d272d89bad97e68cdc8a1414862790a02c39 AS runtime
 
 # The base image already ships an unprivileged `node` user at uid 1000.
 # Creating a second one collides with it, and there is nothing a
