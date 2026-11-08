@@ -39,19 +39,16 @@ from sturnus.console.ports import (
     ConsentDirectory,
     ConsentHolder,
     ConsentPage,
-    ConsumedSignIn,
     DocumentArtefacts,
     DownloadableTrack,
     ExportTargets,
     GuildDirectory,
     GuildNames,
-    GuildOAuthClients,
     GuildQueue,
     GuildRecording,
     GuildReports,
     GuildSetup,
     GuildSetupState,
-    GuildSignIn,
     LinkDirectory,
     OAuthClient,
     OwnConsent,
@@ -70,7 +67,6 @@ from sturnus.console.ports import (
     SessionNaming,
     SessionReads,
     SettingsStore,
-    SignInClients,
     StateStore,
     TagWriter,
     Track,
@@ -86,7 +82,6 @@ from sturnus.console.statistics import (
 )
 from sturnus.domain import preferences
 from sturnus.domain.exports import ExportTarget, SessionDocument
-from sturnus.domain.oauth_clients import GuildOAuthClient, SlugUnavailable, is_valid_slug
 from sturnus.domain.onboarding import SetupIntent
 from sturnus.infrastructure.crypto import CHUNK_SIZE, encrypt_file
 from sturnus.infrastructure.documents.outline_oauth import ExternalIdentity, LinkExchangeError
@@ -156,151 +151,23 @@ class FakeOAuth:
 
 
 class FakeStates:
-    """The single-use OAuth state store, in memory.
-
-    Remembers which guild each state was issued for, because that is the
-    thing the callback selects a client with -- a double that dropped it
-    would let a test pass while the state carried nothing.
-    """
+    """The single-use OAuth state store, in memory."""
 
     def __init__(self) -> None:
         self.issued: list[str] = []
-        #: Which guild each issued state names, `None` for a sign-in
-        #: begun without one.
-        self.issued_for: dict[str, int | None] = {}
-        self._valid: dict[str, int | None] = {}
+        self._valid: set[str] = set()
 
-    async def issue(self, state: str, now: datetime, guild_id: int | None = None) -> None:
+    async def issue(self, state: str, now: datetime) -> None:
         del now
         self.issued.append(state)
-        self.issued_for[state] = guild_id
-        self._valid[state] = guild_id
+        self._valid.add(state)
 
-    async def consume(self, state: str, now: datetime) -> ConsumedSignIn | None:
+    async def consume(self, state: str, now: datetime) -> bool:
         del now
         if state not in self._valid:
-            return None
-        return ConsumedSignIn(guild_id=self._valid.pop(state))
-
-
-class FakeSignInClients:
-    """Which client a sign-in runs against, without a database.
-
-    `environment` is what a sign-in with no guild resolves to -- the
-    behaviour a deployment that has configured nothing per guild keeps.
-    `guilds` maps a slug to the guild that holds it and the client behind
-    it; `unusable` names slugs whose guild exists but whose client cannot
-    complete a sign-in, which is the case §2.2 requires to answer exactly
-    as an unknown slug does.
-    """
-
-    def __init__(
-        self,
-        environment: OAuthClient | None = None,
-        guilds: Mapping[str, tuple[int, OAuthClient]] | None = None,
-    ) -> None:
-        self.environment = environment or FakeOAuth()
-        self.guilds: dict[str, tuple[int, OAuthClient]] = dict(guilds or {})
-        #: Every slug that was asked for, in order.
-        self.asked: list[str] = []
-
-    async def for_slug(self, slug: str) -> GuildSignIn | None:
-        self.asked.append(slug)
-        if not is_valid_slug(slug):
-            return None
-        found = self.guilds.get(slug)
-        return None if found is None else GuildSignIn(found[0], found[1])
-
-    async def for_guild(self, guild_id: int | None) -> OAuthClient | None:
-        if guild_id is None:
-            return self.environment
-        for held, client in self.guilds.values():
-            if held == guild_id:
-                return client
-        return None
-
-
-class FakeGuildOAuthClients:
-    """A guild's sign-in registration, in memory, with the same rule attached.
-
-    Authorisation lives in the double exactly where it lives in the real
-    adapter: every method names who is asking, and "not an administrator"
-    and "no registration" are the same answer -- which is what lets the
-    routes give both the same 404.
-    """
-
-    def __init__(
-        self,
-        admins: AdminDirectory | None = None,
-        clients: dict[int, GuildOAuthClient] | None = None,
-    ) -> None:
-        self.admins = admins or FakeAdmins({ANNA})
-        self.clients = clients or {}
-        #: The secrets, so a test can assert one was stored without any
-        #: route being able to read one back.
-        self.secrets: dict[int, str] = {}
-
-    async def _may(self, guild_id: int, requested_by: int) -> bool:
-        return await self.admins.is_admin(guild_id, requested_by)
-
-    async def for_guild(self, guild_id: int, *, requested_by: int) -> GuildOAuthClient | None:
-        if not await self._may(guild_id, requested_by):
-            return None
-        return self.clients.get(guild_id)
-
-    async def save(
-        self,
-        guild_id: int,
-        *,
-        requested_by: int,
-        slug: str,
-        provider: str,
-        base_url: str,
-        client_id: str,
-        redirect_uri: str | None,
-        now: datetime,
-    ) -> GuildOAuthClient | None:
-        if not await self._may(guild_id, requested_by):
-            return None
-        for other, held in self.clients.items():
-            if held.slug == slug and other != guild_id:
-                raise SlugUnavailable("taken")
-        existing = self.clients.get(guild_id)
-        self.clients[guild_id] = GuildOAuthClient(
-            guild_id=guild_id,
-            slug=slug,
-            provider=provider,
-            base_url=base_url,
-            client_id=client_id,
-            redirect_uri=redirect_uri,
-            has_secret=guild_id in self.secrets,
-            created_at=existing.created_at if existing else now,
-            updated_at=now,
-        )
-        return self.clients[guild_id]
-
-    async def set_secret(
-        self, guild_id: int, secret: str | None, *, requested_by: int, now: datetime
-    ) -> GuildOAuthClient | None:
-        if not await self._may(guild_id, requested_by):
-            return None
-        client = self.clients.get(guild_id)
-        if client is None:
-            return None
-        if secret is None:
-            self.secrets.pop(guild_id, None)
-        else:
-            self.secrets[guild_id] = secret
-        self.clients[guild_id] = replace(
-            client, has_secret=guild_id in self.secrets, updated_at=now
-        )
-        return self.clients[guild_id]
-
-    async def delete(self, guild_id: int, *, requested_by: int) -> bool:
-        if not await self._may(guild_id, requested_by):
             return False
-        self.secrets.pop(guild_id, None)
-        return self.clients.pop(guild_id, None) is not None
+        self._valid.remove(state)
+        return True
 
 
 class FakeLinks:
@@ -1262,7 +1129,6 @@ class FakeArtefacts:
 def build_test_api(
     *,
     oauth: OAuthClient | None = None,
-    clients: SignInClients | None = None,
     states: StateStore | None = None,
     links: LinkDirectory | None = None,
     admins: AdminDirectory | None = None,
@@ -1284,7 +1150,6 @@ def build_test_api(
     exports: ExportTargets | None = None,
     documents: SessionDocumentDirectory | None = None,
     artefacts: DocumentArtefacts | None = None,
-    oauth_clients: GuildOAuthClients | None = None,
     setup: GuildSetup | None = None,
     discord_client_id: str | None = None,
     sessions: SessionCookie | None = None,
@@ -1313,11 +1178,7 @@ def build_test_api(
     # while the two disagreed about who administers what.
     administrators = admins or FakeAdmins()
     return build_api(
-        # `oauth` names the client a sign-in with no guild resolves to,
-        # which is what nearly every test in this suite means by it.
-        # `clients` is the override for a test that is actually about
-        # which client gets chosen.
-        clients=clients or FakeSignInClients(environment=oauth or FakeOAuth()),
+        oauth=oauth or FakeOAuth(),
         states=states or FakeStates(),
         links=links or FakeLinks(),
         admins=administrators,
@@ -1344,7 +1205,6 @@ def build_test_api(
         exports=exports or FakeExportTargets(),
         documents=documents or FakeSessionDocuments(),
         artefacts=artefacts or FakeArtefacts(),
-        oauth_clients=oauth_clients or FakeGuildOAuthClients(admins=administrators),
         setup=setup or FakeSetup(),
         discord_client_id=discord_client_id,
         sessions=sessions or SessionCookie(SECRET, timedelta(hours=12)),

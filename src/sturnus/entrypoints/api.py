@@ -42,7 +42,6 @@ from sturnus.console.adapters import (
     ConsoleCollectionNames,
     ConsoleConsentDirectory,
     ConsoleGuildNames,
-    ConsoleGuildOAuthClients,
     ConsoleGuildReports,
     ConsoleGuildSetup,
     ConsoleLinkDirectory,
@@ -56,7 +55,6 @@ from sturnus.console.adapters import (
     ConsoleTagWriter,
     ConsoleTrackDirectory,
     ConsoleTranscripts,
-    GuildSignInClients,
 )
 from sturnus.console.app import build_api
 from sturnus.console.audio import AudioDelivery
@@ -67,7 +65,6 @@ from sturnus.infrastructure.crypto import KeyWrapper
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
 from sturnus.infrastructure.db.export_targets import ExportTargetStore
-from sturnus.infrastructure.db.guild_oauth import GuildOAuthClientStore
 from sturnus.infrastructure.db.models import (
     AccountLink,
     AdminMember,
@@ -82,7 +79,6 @@ from sturnus.infrastructure.db.models import (
     SessionDocument,
     UserPreference,
 )
-from sturnus.infrastructure.db.models import GuildOAuthClient as GuildOAuthClientRow
 from sturnus.infrastructure.db.preferences import PreferenceStore
 from sturnus.infrastructure.db.setup_intents import SetupIntentStore
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
@@ -112,12 +108,6 @@ _REQUIRED_TABLES = frozenset(
         AccountLink.__tablename__,
         AdminMember.__tablename__,
         ConsoleState.__tablename__,
-        # The per-guild sign-in clients. On the list because the *login*
-        # route reads it on every request that carries `?guild=`, so a
-        # `/readyz` that passed without it would be a console signing
-        # people in through the environment client while a guild's own
-        # link 500s.
-        GuildOAuthClientRow.__tablename__,
         # The settings section reads and writes this one. Without it here,
         # `/readyz` would pass while the first settings page 500s.
         GuildConfig.__tablename__,
@@ -260,15 +250,12 @@ async def _run() -> None:
     config = ConfigStore(session_factory)
     # The master key is this process's and only this process's. `link`
     # does not hold one -- the chart's `_helpers.tpl` refuses to render
-    # it there -- which is exactly why per-guild OAuth is available to
-    # the console sign-in and not to the Discord account-link flow, and
-    # why an export target's credential is unwrappable here and nowhere
-    # else.
+    # it there -- which is why an export target's credential is
+    # unwrappable here and nowhere else.
     keys = KeyWrapper(
         base64.b64decode(settings.master_key.get_secret_value()),
         settings.master_key_id,
     )
-    oauth_clients = GuildOAuthClientStore(session_factory, keys)
 
     audio = AudioDelivery(
         # The configuration store, because the download route's rule
@@ -296,12 +283,7 @@ async def _run() -> None:
 
     schema_ready = False
     app = build_api(
-        # Not the client itself any more: which client a sign-in runs
-        # against is a per-sign-in question now, and `oauth` above is
-        # what a sign-in with no guild resolves to.
-        clients=GuildSignInClients(
-            oauth, oauth_clients, redirect_uri=settings.console_redirect_uri
-        ),
+        oauth=oauth,
         states=ConsoleStateStore(session_factory),
         links=ConsoleLinkDirectory(session_factory),
         admins=admins,
@@ -342,7 +324,6 @@ async def _run() -> None:
             settings.s3_access_key.get_secret_value(),
             settings.s3_secret_key.get_secret_value(),
         ),
-        oauth_clients=ConsoleGuildOAuthClients(oauth_clients, admins),
         setup=ConsoleGuildSetup(session_factory, admins, SetupIntentStore(session_factory)),
         discord_client_id=settings.discord_client_id,
     )
