@@ -24,86 +24,67 @@ async def test_readyz_is_503_before_the_injected_flags_are_set() -> None:
         assert response.status == 503
 
 
-async def test_readyz_is_200_once_every_shard_and_the_database_are_up() -> None:
-    state = ReadinessState(database_reachable=True)
-    state.shard_connected(0, shard_count=1)
+async def test_readyz_is_200_once_the_gateway_and_the_database_are_up() -> None:
+    state = ReadinessState(database_reachable=True, discord_connected=True)
     async with TestClient(TestServer(health_app(state))) as client:
         response = await client.get("/readyz")
         assert response.status == 200
 
 
-async def test_readyz_stays_503_with_only_one_dependency_up() -> None:
-    state = ReadinessState(database_reachable=False)
-    state.shard_connected(0, shard_count=1)
+async def test_readyz_stays_503_with_only_the_database_up() -> None:
+    state = ReadinessState(database_reachable=True, discord_connected=False)
     async with TestClient(TestServer(health_app(state))) as client:
         response = await client.get("/readyz")
         assert response.status == 503
 
 
-async def test_a_process_that_holds_no_gateway_is_ready_on_the_database_alone() -> None:
-    """`worker` and `link` have no shards to wait on, and must not wait for one.
+async def test_readyz_stays_503_with_only_the_gateway_up() -> None:
+    state = ReadinessState(database_reachable=False, discord_connected=True)
+    async with TestClient(TestServer(health_app(state))) as client:
+        response = await client.get("/readyz")
+        assert response.status == 503
 
-    Readiness over shards is "every shard I am supposed to hold is up".
-    A process that holds none satisfies that vacuously, and saying so with
-    `expected_shards=0` is what lets one `ReadinessState` serve every
-    process without a second flag meaning "ignore the gateway".
+
+async def test_a_process_with_no_gateway_is_ready_on_the_database_alone() -> None:
+    """`worker` and `link` hold no gateway and must not wait for one.
+
+    They set the gateway flag themselves, once, at startup, so one
+    `ReadinessState` serves every process without a second flag meaning
+    "ignore the gateway".
     """
-    state = ReadinessState(database_reachable=True, expected_shards=0)
+    state = ReadinessState(database_reachable=True, discord_connected=True)
     async with TestClient(TestServer(health_app(state))) as client:
         assert (await client.get("/readyz")).status == 200
 
 
-async def test_a_partly_connected_cluster_of_shards_is_not_ready() -> None:
-    """Three of four shards up is a quarter of the guilds unreachable.
-
-    The tempting alternative -- ready as soon as *any* shard is up --
-    reports healthy while a quarter of the servers Sturnus is in cannot
-    be recorded in at all, and nothing anywhere else would say so. A probe
-    that lies in that direction is worse than one that flaps.
-    """
-    state = ReadinessState(database_reachable=True)
-    for shard_id in (0, 1, 3):
-        state.shard_connected(shard_id, shard_count=4)
-    async with TestClient(TestServer(health_app(state))) as client:
-        response = await client.get("/readyz")
-        assert response.status == 503
-        body = await response.json()
-        assert body["shards_connected"] == 3
-        assert body["shards_expected"] == 4
-        assert body["shards_missing"] == [2]
-
-
-async def test_the_first_shard_up_does_not_declare_the_whole_process_ready() -> None:
-    """The count of connected shards is meaningless without the expected one.
-
-    `all(connected)` over a dict that only shard 0 has reached is
-    trivially true, which would turn a four-shard process green the
-    moment its first connection landed and leave it green while the other
-    three never arrived.
-    """
-    state = ReadinessState(database_reachable=True)
-    state.shard_connected(0, shard_count=4)
-    async with TestClient(TestServer(health_app(state))) as client:
-        assert (await client.get("/readyz")).status == 503
-
-
-async def test_a_shard_that_drops_takes_readiness_with_it() -> None:
+async def test_a_dropped_gateway_takes_readiness_with_it_and_a_resume_restores_it() -> None:
     """Readiness is a live statement, not a latch set once at startup.
 
-    Before shards it was set `True` in `on_ready` and never cleared, so a
-    gateway lost hours later left `/readyz` reporting green for the rest
-    of the process's life. With shards there is a `shard_disconnect`
-    event, so there is no longer an excuse for that.
+    A gateway lost hours after startup must turn `/readyz` red, and the
+    connection coming back must turn it green again. The tolerance for a
+    short blip is the probe's `failureThreshold` in the chart, not a
+    timer here: a RESUME clears the flag for seconds and Kubernetes only
+    acts after three consecutive failed polls.
     """
-    state = ReadinessState(database_reachable=True)
-    state.shard_connected(0, shard_count=2)
-    state.shard_connected(1, shard_count=2)
+    state = ReadinessState(database_reachable=True, discord_connected=True)
     async with TestClient(TestServer(health_app(state))) as client:
         assert (await client.get("/readyz")).status == 200
-        state.shard_disconnected(1)
+        state.discord_connected = False
         assert (await client.get("/readyz")).status == 503
-        state.shard_connected(1, shard_count=2)
+        state.discord_connected = True
         assert (await client.get("/readyz")).status == 200
+
+
+async def test_readyz_body_reports_the_gateway_and_database_flags() -> None:
+    state = ReadinessState(database_reachable=True, discord_connected=False)
+    async with TestClient(TestServer(health_app(state))) as client:
+        response = await client.get("/readyz")
+        body = await response.json()
+        assert body == {
+            "status": "not ready",
+            "discord_connected": False,
+            "database_reachable": True,
+        }
 
 
 async def test_version_reports_the_installed_package_version() -> None:

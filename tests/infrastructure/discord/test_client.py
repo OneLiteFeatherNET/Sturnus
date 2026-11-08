@@ -364,7 +364,6 @@ def _client(
     audio_store: AudioStore | None = None,
     directory_mirror: object | None = None,
     setup_intents: object | None = None,
-    shard_count: int | None = None,
 ) -> _TestClient:
     """A `SturnusClient` with every dependency these tests do not touch stubbed out.
 
@@ -377,11 +376,6 @@ def _client(
     the console needs, and `setup_intents` for the ones that assert it
     applies what the console asked for -- both left `None` everywhere
     else, which is a client that neither mirrors nor is asked anything.
-
-    `shard_count` is `None` -- discord.py's "let the gateway decide" --
-    for everything except `test_client_shards`, which is the one suite
-    that has anything to say about how many connections this process
-    holds.
     """
     client = _TestClient(
         clock=clock,
@@ -405,7 +399,6 @@ def _client(
         outline_oauth=MagicMock(spec=OutlineOAuth),
         link_states=MagicMock(spec=LinkStateStore),
         account_links=MagicMock(spec=AccountLinkRepository),
-        shard_count=shard_count,
     )
     client.voices = []
     return client
@@ -783,6 +776,64 @@ async def test_reconciling_twice_changes_nothing(tmp_path: Path) -> None:
     assert _voice_of(client, GUILD_ID) is voice
     assert voice.left == 0
     assert len(client.voices) == 1, "a second pipeline would leak a voice connection"
+
+
+async def test_on_ready_reconciles_each_guild_it_holds_exactly_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One `on_ready` is one reconcile pass over every guild in the cache."""
+    clock = FakeClock(T0)
+    client = _client(clock, config_store=_configured_store())
+    _in_guild(client, _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[])))
+    _in_guild(client, _guild(OTHER_GUILD_ID, _voice_channel(NEW_CHANNEL_ID, members=[])))
+    reconciled: list[int] = []
+
+    async def record(guild_id: int) -> None:
+        reconciled.append(guild_id)
+
+    monkeypatch.setattr(client, "reconcile_guild", record)
+
+    await client.on_ready()
+
+    assert sorted(reconciled) == [GUILD_ID, OTHER_GUILD_ID]
+
+
+async def test_on_ready_marks_the_gateway_connected() -> None:
+    client = _client(FakeClock(T0), config_store=_configured_store())
+
+    await client.on_ready()
+
+    assert client._readiness.discord_connected is True
+
+
+async def test_a_disconnect_writes_one_warning_under_the_disconnect_event(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real outage must stay visible in the logs, not only on the probe."""
+    client = _client(FakeClock(T0), config_store=_configured_store())
+
+    with caplog.at_level(logging.INFO, logger=CLIENT_LOGGER):
+        await client.on_disconnect()
+
+    matching = [
+        record
+        for record in caplog.records
+        if record.name == CLIENT_LOGGER
+        and getattr(record, "sturnus_event", None) == Event.BOT_DISCONNECTED
+    ]
+    assert len(matching) == 1, "one disconnect is one line"
+    assert matching[0].levelno == logging.WARNING
+
+
+async def test_a_disconnect_clears_the_gateway_flag_and_a_resume_sets_it_again() -> None:
+    client = _client(FakeClock(T0), config_store=_configured_store())
+    await client.on_ready()
+
+    await client.on_disconnect()
+    assert client._readiness.discord_connected is False
+
+    await client.on_resumed()
+    assert client._readiness.discord_connected is True
 
 
 async def test_an_unparseable_value_neither_raises_nor_un_configures_a_guild(

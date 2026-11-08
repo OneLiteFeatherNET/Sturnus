@@ -14,6 +14,7 @@ import asyncio
 import base64
 import contextlib
 import logging
+import os
 import signal
 from datetime import UTC, datetime
 
@@ -25,7 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 from sturnus.application.ports import Clock
 from sturnus.application.publishing import SessionReader, announce_ready_sessions
 from sturnus.application.recovery import recover_orphans
-from sturnus.config import get_settings
+from sturnus.config import get_settings, shard_count_is_configured
 from sturnus.domain import settings as domain_settings
 from sturnus.infrastructure.db.admin_members import AdminMemberStore
 from sturnus.infrastructure.db.config_store import ConfigStore
@@ -108,19 +109,10 @@ async def _publish_loop(
     """
     await client.wait_until_ready()
     announcer = DiscordAnnouncer(client)
-    # Read once, outside the loop and outside the `try` below: the count is
-    # fixed for the life of the connection, and reading it inside a block
-    # that swallows every exception would turn "this attribute moved" into
-    # a sweep that quietly announces nothing. Taken from the client rather
-    # than from `Settings` because the setting may be unset, in which case
-    # Discord chose the number and only the client knows it --
-    # `wait_until_ready()` above has returned, so `launch_shards` has
-    # already filled it in.
-    shard_count = client.shard_count
     while not stop.is_set():
         now = datetime.now(UTC)
         try:
-            await announce_ready_sessions(sessions, announcer, now, shard_count=shard_count)
+            await announce_ready_sessions(sessions, announcer, now)
         except Exception as exc:
             log_exception(
                 log,
@@ -186,6 +178,14 @@ async def _wait_for_schema(
 
 async def _run() -> None:
     settings = get_settings()
+    if shard_count_is_configured(os.environ):
+        log_event(
+            log,
+            logging.WARNING,
+            Event.CONFIG_SHARD_COUNT_IGNORED,
+            "STURNUS_SHARD_COUNT is no longer read and has no effect; the bot holds "
+            "one gateway connection. Unset it.",
+        )
 
     engine = create_async_engine(settings.database_url)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
@@ -310,7 +310,6 @@ async def _run() -> None:
         link_states=link_states,
         account_links=account_links,
         capture_diagnostics=settings.capture_diagnostics,
-        shard_count=settings.shard_count,
     )
 
     stop = asyncio.Event()
