@@ -261,19 +261,6 @@ class ConsoleState(Base):
     state: Mapped[str] = mapped_column(Text, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    #: Which guild's OAuth client this sign-in was started against, or
-    #: null for the environment-configured one.
-    #:
-    #: **The state is what selects the client for the code exchange.**
-    #: `/api/auth/login` takes no parameters and reads no cookie, so it
-    #: cannot choose a guild's client from an identity it does not have
-    #: yet; `/g/{slug}/sign-in` puts the guild in the URL, this column
-    #: carries it across the round trip, and the callback reads it back.
-    #:
-    #: Nullable because a sign-in with no guild is the ordinary case and
-    #: stays supported exactly as it is: a deployment that never
-    #: configures a per-guild client behaves identically to v0.15.0.
-    guild_id: Mapped[int | None] = mapped_column(BigInteger)
 
 
 class Session(Base):
@@ -635,58 +622,6 @@ class SessionDocument(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     __table_args__ = (UniqueConstraint("session_id", "target_id", name="uq_document_per_target"),)
-
-
-class GuildOAuthClient(Base):
-    """One guild's console sign-in client, selected by the slug in its link.
-
-    `GET /api/auth/login` takes no parameters and reads no cookie -- there
-    is no session yet, that is what login is for -- so it cannot look up a
-    guild's client from an identity it does not have. `/g/{slug}/sign-in`
-    carries the guild in the URL instead.
-
-    **`slug` is unique across the deployment, not per guild.** It is a
-    public path segment and has to name exactly one guild; two guilds
-    behind `/g/acme/sign-in` would send one of them through the other's
-    identity provider. The alternative -- a public page listing every
-    guild Sturnus serves -- discloses which organisations use the service
-    to anyone, signed in or not, so an administrator distributes their
-    own link.
-
-    Keyed by `guild_id` because a guild has one client. Two would make
-    "which one does this state select" a question the callback cannot
-    answer, since `console_state.guild_id` is what selects it.
-
-    `wrapped_client_secret` is wrapped to this guild and this purpose,
-    exactly as `guild_export_target.wrapped_secret` is, and never read
-    back out to an administrator: a `GET` on an OAuth configuration
-    returns the client id, the base URL, the redirect URI and whether a
-    secret is set. Nullable so that registering the client and supplying
-    its secret can be two steps -- an administrator copies the id out of
-    one screen and the secret out of another.
-
-    `redirect_uri` nullable means "the one this deployment is configured
-    with", which is what nearly every guild will want.
-
-    **Console sign-in only.** `api` holds the master key and `link` does
-    not; the chart's `_helpers.tpl` actively prevents adding it. The
-    Discord account-link flow stays on the environment-configured client,
-    and saying so here is what stops somebody "fixing the asymmetry"
-    later by handing `link` the master key.
-    """
-
-    __tablename__ = "guild_oauth_client"
-
-    guild_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
-    slug: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
-    provider: Mapped[str] = mapped_column(Text, nullable=False)
-    base_url: Mapped[str] = mapped_column(Text, nullable=False)
-    client_id: Mapped[str] = mapped_column(Text, nullable=False)
-    wrapped_client_secret: Mapped[bytes | None] = mapped_column(LargeBinary)
-    encryption_key_id: Mapped[str | None] = mapped_column(Text)
-    redirect_uri: Mapped[str | None] = mapped_column(Text)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
 class GuildSetupIntent(Base):
