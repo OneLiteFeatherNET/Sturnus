@@ -3,7 +3,7 @@ import base64
 import pytest
 from pydantic import ValidationError
 
-from sturnus.config import SentrySettings, Settings
+from sturnus.config import SentrySettings, Settings, shard_count_is_configured
 
 # KeyWrapper requires the master key to base64-decode to exactly 32 bytes,
 # which makes any valid fixture look like a real key to a secret scanner.
@@ -176,56 +176,44 @@ def test_sentry_settings_do_not_require_the_rest_of_the_environment(
     assert SentrySettings().sentry_dsn is None
 
 
-def test_the_shard_count_is_unset_by_default_so_discord_decides(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("leftover", ["4", "0", "-1", ""])
+def test_a_leftover_shard_count_does_not_stop_the_bot_starting(
+    monkeypatch: pytest.MonkeyPatch, leftover: str
 ) -> None:
-    """No shard count means "ask the gateway how many to open", which is the
-    only answer that stays right as the bot is added to more servers.
-    Discord's own `/gateway/bot` recommendation grows with the guild count;
-    a number pinned in a Helm values file does not.
+    """`STURNUS_SHARD_COUNT` was removed with per-shard gateway connections.
+
+    An operator who has not yet unset it must not have a crash-looping pod
+    over a setting that now does nothing: pydantic-settings reads only the
+    fields it declares, so the variable is simply not looked at. Whether to
+    say so is the entrypoint's decision, tested below.
     """
+    for k, v in _env().items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setenv("STURNUS_SHARD_COUNT", leftover)
+    assert Settings().guild_id == 123456789012345678
+
+
+def test_a_leftover_shard_count_changes_no_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     for k, v in _env().items():
         monkeypatch.setenv(k, v)
     monkeypatch.delenv("STURNUS_SHARD_COUNT", raising=False)
-    assert Settings().shard_count is None
-
-
-@pytest.mark.parametrize("blank", ["", "   "])
-def test_a_blank_shard_count_means_unset_rather_than_a_failure(
-    monkeypatch: pytest.MonkeyPatch, blank: str
-) -> None:
-    """The chart renders every optional value, so "not configured" arrives as
-    an empty string rather than an absent variable -- exactly as it does for
-    `STURNUS_OTEL_EXPORTER_OTLP_ENDPOINT`. An empty string must mean "let
-    Discord decide", not "refuse to start".
-    """
-    for k, v in _env().items():
-        monkeypatch.setenv(k, v)
-    monkeypatch.setenv("STURNUS_SHARD_COUNT", blank)
-    assert Settings().shard_count is None
-
-
-def test_an_explicit_shard_count_survives(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An operator who knows why may pin it; nothing about that is discouraged."""
-    for k, v in _env().items():
-        monkeypatch.setenv(k, v)
+    without = Settings().model_dump()
     monkeypatch.setenv("STURNUS_SHARD_COUNT", "4")
-    assert Settings().shard_count == 4
+    assert Settings().model_dump() == without
 
 
-@pytest.mark.parametrize("value", ["0", "-1"])
-def test_a_shard_count_below_one_is_refused_at_startup(
-    monkeypatch: pytest.MonkeyPatch, value: str
-) -> None:
-    """Zero shards is not a smaller deployment, it is a bot that never connects.
+def test_the_settings_no_longer_declare_a_shard_count() -> None:
+    assert "shard_count" not in Settings.model_fields
 
-    Refused here rather than left to the gateway: `discord.py` would build
-    an empty shard range, `on_ready` would never fire, and the process
-    would sit there looking alive with a readiness probe that never turns
-    green and no line saying why.
+
+def test_a_set_shard_count_variable_is_reported_even_when_blank() -> None:
+    """A chart that still renders the variable as `""` should be named in the log.
+
+    The hint is for an operator's leftover, so it fires on presence, not on
+    a useful value.
     """
-    for k, v in _env().items():
-        monkeypatch.setenv(k, v)
-    monkeypatch.setenv("STURNUS_SHARD_COUNT", value)
-    with pytest.raises(ValidationError, match="STURNUS_SHARD_COUNT"):
-        Settings()
+    assert shard_count_is_configured({"STURNUS_SHARD_COUNT": ""}) is True
+
+
+def test_an_unset_shard_count_variable_is_not_reported() -> None:
+    assert shard_count_is_configured({"STURNUS_DISCORD_TOKEN": "x"}) is False
