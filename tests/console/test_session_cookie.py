@@ -9,9 +9,12 @@ The threat is not subtle. A forgeable cookie is an unauthenticated person
 choosing whose recordings to listen to.
 """
 
+import base64
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from itsdangerous.encoding import base64_encode, int_to_bytes
 
 from sturnus.console.session import (
     ExpiredSession,
@@ -24,6 +27,11 @@ SECRET = "a" * 32
 OTHER_SECRET = "b" * 32
 T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 ANNA = 100
+# Issued at T0 by the hand-written signer this change replaces (secret "a" * 32,
+# twelve-hour lifetime, user 100). Pins that a cookie in the old layout is refused.
+PRE_CHANGE_TOKEN = (
+    "eyJleHAiOjE3ODczNTY4MDAsInN1YiI6MTAwfQ.hrRmro2GH7mmOkjPavhT_1P7h4zdLrQDCxmdDjxaHFI"
+)
 
 
 @pytest.fixture
@@ -52,8 +60,9 @@ def test_a_tampered_payload_is_refused(cookie: SessionCookie) -> None:
     is precisely "listen to somebody else's recordings".
     """
     token = cookie.issue(SignedSession(discord_user_id=ANNA), now=T0)
-    payload, _, signature = token.partition(".")
-    tampered = payload.replace("MTAw", "MjAw") + "." + signature
+    _, timestamp, signature = token.split(".")
+    other_person = base64.urlsafe_b64encode(json.dumps({"sub": 200}).encode()).decode()
+    tampered = f"{other_person.rstrip('=')}.{timestamp}.{signature}"
     with pytest.raises(InvalidSession):
         cookie.read(tampered, now=T0)
 
@@ -91,6 +100,22 @@ def test_a_session_is_valid_right_up_to_its_expiry(cookie: SessionCookie) -> Non
     assert cookie.read(token, now=T0 + timedelta(hours=11, minutes=59)).discord_user_id == ANNA
 
 
+def test_a_session_is_still_valid_at_exactly_its_lifetime(cookie: SessionCookie) -> None:
+    """Boundary: the lifetime is inclusive, and one second later is expired
+    (see test_a_session_expires). Pins design decision 8.
+    """
+    token = cookie.issue(SignedSession(discord_user_id=ANNA), now=T0)
+    assert cookie.read(token, now=T0 + timedelta(hours=12)).discord_user_id == ANNA
+
+
+def test_a_token_in_the_pre_change_format_is_refused(cookie: SessionCookie) -> None:
+    """Every cookie issued before the deployment is refused once, which sends
+    each team member through Outline login again. This pins that re-login.
+    """
+    with pytest.raises(InvalidSession):
+        cookie.read(PRE_CHANGE_TOKEN, now=T0)
+
+
 def test_expiry_is_distinguishable_from_forgery() -> None:
     """Two different exceptions because they need two different responses:
     an expired session is sent back through the login flow, a forged one is
@@ -102,25 +127,22 @@ def test_expiry_is_distinguishable_from_forgery() -> None:
     assert not issubclass(InvalidSession, ExpiredSession)
 
 
-def test_the_expiry_inside_the_token_cannot_be_extended_by_the_holder(
+def test_the_issue_time_inside_the_token_cannot_be_moved_forward_by_the_holder(
     cookie: SessionCookie,
 ) -> None:
-    """The expiry is inside the signed payload, not beside it.
+    """The lifetime is bound to the signed timestamp, not beside it.
 
     A cookie whose lifetime lived only in the browser's `Max-Age` would be
     extended by anyone who kept the value -- and a stolen session would
-    then never end.
+    then never end. Moving the timestamp forward a day must fail the signature.
     """
     token = cookie.issue(SignedSession(discord_user_id=ANNA), now=T0)
-    payload, _, signature = token.partition(".")
-    import base64
-    import json
-
-    decoded = json.loads(base64.urlsafe_b64decode(payload + "=="))
-    decoded["exp"] = decoded["exp"] + 86_400
-    extended = base64.urlsafe_b64encode(json.dumps(decoded).encode()).decode().rstrip("=")
+    payload, _, signature = token.split(".")
+    issued_at = int(T0.timestamp())
+    extended_timestamp = base64_encode(int_to_bytes(issued_at + 86_400)).decode()
+    extended = f"{payload}.{extended_timestamp}.{signature}"
     with pytest.raises(InvalidSession):
-        cookie.read(extended + "." + signature, now=T0)
+        cookie.read(extended, now=T0 + timedelta(hours=13))
 
 
 def test_a_secret_shorter_than_the_hash_is_refused_at_construction() -> None:

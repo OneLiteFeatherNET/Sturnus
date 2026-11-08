@@ -25,6 +25,11 @@ dependencies = [
     "aiohttp>=3.10",
     "jinja2>=3.1",
     "httpx>=0.28",
+    # Console session cookie (sturnus.console.session). The Pallets library
+    # behind Flask's session cookies, used instead of a hand-written signer:
+    # the timed signature, constant-time comparison and expiry-versus-forgery
+    # exceptions are maintained and tested there, not re-derived here.
+    "itsdangerous>=2.2",
     # Transcription runs against an OpenAI-compatible `/audio/transcriptions`
     # endpoint (`sturnus.infrastructure.openai_transcription`). The official
     # SDK rather than a hand-rolled `httpx` POST: vLLM documents this client
