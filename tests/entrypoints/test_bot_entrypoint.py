@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import typing
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import discord
+import pytest
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from sturnus.entrypoints.bot import _publish_loop
@@ -49,13 +51,18 @@ class _FakeSessions:
         raise AssertionError("no candidate was ever reported; this must not be called")
 
 
-async def test_publish_loop_purges_expired_oauth_states(clean_database: str) -> None:
+@pytest.fixture
+async def link_states(clean_database: str) -> AsyncIterator[LinkStateStore]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    factory = async_sessionmaker(engine, expire_on_commit=False)
-    link_states = LinkStateStore(factory)
+    try:
+        yield LinkStateStore(async_sessionmaker(engine, expire_on_commit=False))
+    finally:
+        await engine.dispose()
 
+
+async def test_publish_loop_purges_expired_oauth_states(link_states: LinkStateStore) -> None:
     await link_states.issue(1, "outline", T0 - timedelta(hours=1), timedelta(minutes=10))
 
     stop = asyncio.Event()

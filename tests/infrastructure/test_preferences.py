@@ -7,6 +7,7 @@ clearing a value back to the default, and the two ways a bad write is
 refused before it reaches a read path.
 """
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -21,11 +22,14 @@ T0 = datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC)
 
 
 @pytest.fixture
-async def store(clean_database: str) -> PreferenceStore:
+async def store(clean_database: str) -> AsyncIterator[PreferenceStore]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    return PreferenceStore(async_sessionmaker(engine, expire_on_commit=False))
+    try:
+        yield PreferenceStore(async_sessionmaker(engine, expire_on_commit=False))
+    finally:
+        await engine.dispose()
 
 
 async def test_somebody_who_never_opened_the_settings_gets_the_defaults(

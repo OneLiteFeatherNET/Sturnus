@@ -7,6 +7,7 @@ a full replacement, so a deleted collection stops being offered, and an
 empty mirror that reads as "no names known" rather than as an error.
 """
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -21,11 +22,14 @@ T1 = T0 + timedelta(hours=1)
 
 
 @pytest.fixture
-async def store(clean_database: str) -> OutlineCollectionStore:
+async def store(clean_database: str) -> AsyncIterator[OutlineCollectionStore]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    return OutlineCollectionStore(async_sessionmaker(engine, expire_on_commit=False))
+    try:
+        yield OutlineCollectionStore(async_sessionmaker(engine, expire_on_commit=False))
+    finally:
+        await engine.dispose()
 
 
 def _collection(collection_id: str, name: str) -> MirroredCollection:

@@ -8,6 +8,7 @@ so that something deleted in Discord stops being offered, and one guild's
 sweep never touches another's rows.
 """
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -39,11 +40,14 @@ T1 = T0 + timedelta(minutes=5)
 
 
 @pytest.fixture
-async def store(clean_database: str) -> DirectoryStore:
+async def store(clean_database: str) -> AsyncIterator[DirectoryStore]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    return DirectoryStore(async_sessionmaker(engine, expire_on_commit=False))
+    try:
+        yield DirectoryStore(async_sessionmaker(engine, expire_on_commit=False))
+    finally:
+        await engine.dispose()
 
 
 def _channel(channel_id: int, name: str, kind: str = VOICE, position: int = 0) -> MirroredChannel:
