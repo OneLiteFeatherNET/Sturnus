@@ -13,41 +13,54 @@
  *
  * Four things here are worth arguing for rather than reading past.
  *
- * **1. The formats this console offers are the three the API accepts, and
- * `pdf` and `confluence` are absent rather than disabled.** They are
- * specified and deliberately not built (`sturnus.application.
- * export_formats`, spec §3.4), and configuring one answers 400. The
- * console has two precedents for an option it cannot honour, and they
- * point opposite ways. The account menu renders two-factor authentication
- * as an inert "coming soon" row, because that is a *promise to the reader
- * about their own account* sitting in a menu of things to read, and an
- * absent row would read as an oversight. `video_consent_offered` goes the
- * other way: when a guild has no video policy the option is **absent** —
- * not greyed — and one sentence beside the control says the server records
- * audio only.
+ * **1. This module holds no list of formats any more. It is told.**
+ * `GET /api/export-formats` reads `sturnus.application.export_formats`
+ * out — every format the deployment knows of, whether this build can run
+ * it, and which sink family carries it — and {@link parseFormats} is what
+ * arrives. The one thing kept here is *words*: {@link formatLabelKey} maps
+ * a name to a translation key, because a sentence in German is not
+ * something an API with no message catalogue can serve, and a name with no
+ * key falls back to rendering itself.
  *
- * This is the second case, twice over. It is a *form field*, and a
- * dropdown exists to be chosen from and saved; a row inside it that a save
- * would refuse is not a promise, it is a trap laid under the cursor of
- * somebody deciding. And more decisively: **which formats exist is the
- * deployment's answer and this console cannot see it.** `supported_formats`
- * is a registry in the API process, there is no endpoint that reads it
- * out, and `apiError.ts` deliberately keeps nothing from a failed response
- * but its status — so the `{"supported": [...]}` a 400 carries never
- * reaches a page. A "PDF — coming soon" row would therefore be this
- * console asserting a fact about a build it cannot inspect, and on the day
- * `pdf` is added to that registry — which `export_formats` promises needs
- * no change anywhere else — the console would still be calling it
- * unavailable until somebody remembered to edit a second list. So the list
- * below is a belief, it is stated as one, and {@link formatChoices} defers
- * to the stored value whenever the two disagree.
+ * That inversion is what settles the question #150 could only settle one
+ * way. It argued that `pdf` and `confluence` should be **absent** from the
+ * picker rather than present and disabled, and the decisive half of the
+ * argument was that *the console could not see the registry*: a "PDF — not
+ * built" row would have been this console asserting a fact about a build it
+ * cannot inspect, and it would have gone on asserting it after `pdf` was
+ * built. Neither is true now. The row's text is the deployment's own answer
+ * and it stops being unavailable the moment the deployment says so, with
+ * nothing here to edit.
  *
- * **2. A stored format this console has never heard of is still rendered,
- * and still choosable while editing that destination.** Exactly the rule
+ * So an unavailable format is **rendered, disabled, and labelled with the
+ * reason**. The other half of #150's argument — a dropdown row a save would
+ * refuse is "a trap laid under the cursor" — is an argument against a row
+ * that looks choosable and is not. This one does not: `UiOption.disabled`
+ * is a first-class state that {@link stepEnabled} walks past and that the
+ * control renders as unchoosable, and {@link draftProblems} refuses a draft
+ * naming an unavailable format so that Save is off and the reason sits
+ * under the field. What is left is the fact that PDF exists and this
+ * deployment does not build it — which is exactly what somebody who came to
+ * this page looking for PDF needs to be told, and what an absent row leaves
+ * them to conclude wrongly. The one precedent that cuts the other way,
+ * `video_consent_offered`, is a guild's *policy choice* about its own
+ * server; this is a property of the binary, which is not something an
+ * administrator can go and change.
+ *
+ * **2. A stored format the API does not report is still rendered, and
+ * still choosable while editing that destination.** Exactly the rule
  * `~/utils/directory` applies to a channel id with no row in the mirror:
  * an option that is not rendered is a configuration nobody can remove from
  * this page, and a picker that silently dropped `pdf` would rewrite it to
  * `outline` the next time somebody renamed the destination.
+ *
+ * The endpoint answering makes this *more* important rather than less,
+ * because there is now a way for the list to arrive empty: the request
+ * failing. A page that read "this deployment supports nothing" out of a
+ * request that timed out and then rewrote every destination on the next
+ * save would be the worst version of this screen there is. So the stored
+ * value is never filtered against the reported list, anywhere: not in the
+ * picker, not in {@link primaryTarget}, not in {@link targetSummary}.
  *
  * **3. The first enabled destination is the one Discord announces.**
  * `sturnus.application.exporting.destinations_for` orders by id, oldest
@@ -162,7 +175,7 @@ export function parseTargets(payload: unknown): ExportTarget[] {
 }
 
 /* -------------------------------------------------------------------- */
-/* The formats this console believes the deployment builds               */
+/* The formats, as the deployment reports them                           */
 /* -------------------------------------------------------------------- */
 
 export const FORMAT_OUTLINE = 'outline'
@@ -170,80 +183,174 @@ export const FORMAT_MARKDOWN = 'markdown'
 export const FORMAT_HTML = 'html'
 
 /**
- * What a format's `target` column is.
+ * What carries a format's bytes away, and therefore what its `target` is.
  *
- * `collection` is an Outline collection id, and the page already has a
- * picker over those names — the same one Bot Settings uses for
- * `document_target`. `prefix` is a key prefix in the object store, which
- * has no directory to browse and is therefore typed.
+ * The API's own word (`sturnus.application.export_formats.OUTLINE_SINK`,
+ * `OBJECT_STORE_SINK`) rather than a second vocabulary of this console's.
+ * There used to be a `TargetKind` of `'collection' | 'prefix'` here that
+ * meant exactly these two things under different names, which is one
+ * translation table nobody needs: an Outline sink addresses a collection
+ * and an object-store sink addresses a key prefix, and saying so once is
+ * enough.
  */
-export type TargetKind = 'collection' | 'prefix'
+export type SinkFamily = 'outline' | 'object_store'
 
-export interface FormatSpec {
+export const SINK_OUTLINE = 'outline'
+export const SINK_OBJECT_STORE = 'object_store'
+
+/**
+ * One format, exactly as `GET /api/export-formats` reports it.
+ *
+ * Three fields because the endpoint sends three. `available` is the one
+ * that could not be had before: the difference between a format this
+ * deployment declines to offer and a format that does not exist.
+ *
+ * `sink` is `null` for a format this build does not run, and that null is
+ * load-bearing rather than a gap — nothing in the API has decided what
+ * would carry a PDF, so nothing here may render a field claiming to know.
+ */
+export interface FormatInfo {
   name: string
-  /** What this format is called, under `common.*` rather than under this
-   *  page's own namespace. It is the one string two pages have to say —
-   *  the destinations page names it in a picker, and the recording page
-   *  names it beside a published document — and two copies of a word are
-   *  two words that drift. Everything else here is only ever rendered by
-   *  the destinations page and is keyed there. */
-  labelKey: string
-  /** One sentence saying what this format produces and where it lands. */
+  available: boolean
+  sink: SinkFamily | null
+}
+
+function asSink(value: unknown): SinkFamily | null {
+  return value === SINK_OUTLINE || value === SINK_OBJECT_STORE ? value : null
+}
+
+/**
+ * Every format in a catalogue payload, in the order the API sent them.
+ *
+ * Order is kept because it is part of the answer: the API lists what a
+ * guild has always published to first, and the first row of a picker reads
+ * as the ordinary choice.
+ *
+ * Tolerant in one direction only. A row with no usable `name` is dropped —
+ * there is nothing to store or to render for it. A row whose `sink` is a
+ * word this console does not know becomes `null`, which is the same state
+ * as an unbuilt format's: the address field falls back to a plain box that
+ * accepts anything non-empty, and the API decides. An unparseable payload
+ * is an empty list, which the page reports as the catalogue being
+ * unreadable rather than as a deployment that publishes nothing.
+ */
+export function parseFormats(payload: unknown): FormatInfo[] {
+  if (!isRecord(payload) || !Array.isArray(payload.formats)) return []
+  const formats: FormatInfo[] = []
+  for (const raw of payload.formats) {
+    if (!isRecord(raw)) continue
+    const name = (asText(raw.name) ?? '').trim()
+    if (name === '') continue
+    formats.push({ name, available: raw.available === true, sink: asSink(raw.sink) })
+  }
+  return formats
+}
+
+/**
+ * The word this console has for a format, or `null` where it has none.
+ *
+ * The one thing about a format that stays on this side, and the reason is
+ * that the API has no message catalogue: `common.formatOutline` is
+ * "Outline document" in English and "Outline-Dokument" in German, and an
+ * endpoint that served either would be serving one reader's language to
+ * everybody. Under `common.*` rather than this page's namespace because
+ * two pages say it — the destinations picker and the recording page's list
+ * of published protocols — and two copies of a word are two words that
+ * drift.
+ *
+ * A name with no entry renders as itself. That is not a fallback for a
+ * broken state; it is the correct answer for a format this deployment
+ * builds and this console has never been taught a word for, and it is what
+ * keeps a missing word from being a missing row.
+ */
+const FORMAT_LABEL_KEYS: Readonly<Record<string, string>> = {
+  [FORMAT_OUTLINE]: 'common.formatOutline',
+  [FORMAT_MARKDOWN]: 'common.formatMarkdown',
+  [FORMAT_HTML]: 'common.formatHtml',
+  pdf: 'common.formatPdf',
+  confluence: 'common.formatConfluence',
+}
+
+export function formatLabelKey(name: string): string | null {
+  return FORMAT_LABEL_KEYS[name] ?? null
+}
+
+/**
+ * What the address field is called, hinted and explained — by sink family
+ * and never by format name.
+ *
+ * Which is the whole point of serving the family. Every format on the
+ * object-store family wants a key prefix and calls it the same thing, so
+ * `pdf` arriving in the catalogue one day gets the right field, the right
+ * label and the right sentence with nothing added here. The previous
+ * version of this file had `formatMarkdownNote` and `formatHtmlNote`
+ * holding the same sentence twice, which is what a per-name table always
+ * decays into.
+ */
+interface SinkStrings {
   noteKey: string
-  targetKind: TargetKind
-  /** The label over the field that holds `target`. Every format calls it
-   *  something different, because it *is* something different: a
-   *  collection is a place in Outline, a prefix is part of an object key. */
   targetLabelKey: string
   targetHintKey: string
-  /** Whether this format's documents can be read back through the console.
-   *  True for the object-store family, whose bytes this deployment holds;
-   *  false for Outline, whose document lives in Outline. Mirrors
+  /** Whether documents of this family can be read back through the
+   *  console. True for the object store, whose bytes this deployment
+   *  holds; false for Outline, whose document lives in Outline. Mirrors
    *  `routes_documents._is_readable`. */
   readable: boolean
 }
 
-/**
- * The three formats, in the registry's own order.
- *
- * A belief about the deployment and not a fact about it — see the note at
- * the top of this module for why the console cannot have the fact, and why
- * `pdf` and `confluence` are absent from here rather than present and
- * inert.
- */
-export const EXPORT_FORMATS: readonly FormatSpec[] = [
-  {
-    name: FORMAT_OUTLINE,
-    labelKey: 'common.formatOutline',
-    noteKey: 'admin.destinations.formatOutlineNote',
-    targetKind: 'collection',
+const SINK_STRINGS: Readonly<Record<SinkFamily, SinkStrings>> = {
+  [SINK_OUTLINE]: {
+    noteKey: 'admin.destinations.sinkOutlineNote',
     targetLabelKey: 'admin.destinations.collectionLabel',
     targetHintKey: 'admin.destinations.collectionHint',
     readable: false,
   },
-  {
-    name: FORMAT_MARKDOWN,
-    labelKey: 'common.formatMarkdown',
-    noteKey: 'admin.destinations.formatMarkdownNote',
-    targetKind: 'prefix',
+  [SINK_OBJECT_STORE]: {
+    noteKey: 'admin.destinations.sinkObjectStoreNote',
     targetLabelKey: 'admin.destinations.prefixLabel',
     targetHintKey: 'admin.destinations.prefixHint',
     readable: true,
   },
-  {
-    name: FORMAT_HTML,
-    labelKey: 'common.formatHtml',
-    noteKey: 'admin.destinations.formatHtmlNote',
-    targetKind: 'prefix',
-    targetLabelKey: 'admin.destinations.prefixLabel',
-    targetHintKey: 'admin.destinations.prefixHint',
-    readable: true,
-  },
-] as const
+}
 
-/** The spec for a format, or `null` for one this console does not know. */
-export function formatSpec(name: string): FormatSpec | null {
-  return EXPORT_FORMATS.find((entry) => entry.name === name) ?? null
+/**
+ * Everything the form needs about one format, or `null` when the reported
+ * catalogue does not contain it.
+ *
+ * `null` covers three situations that behave identically and deliberately
+ * so: a format nobody has heard of, a format stored before the catalogue
+ * knew it, and a catalogue that could not be read at all. In each of them
+ * the honest position is the same — this console has no opinion, so it
+ * asks for a plain address and lets the API decide.
+ */
+export interface FormatSpec {
+  name: string
+  available: boolean
+  sink: SinkFamily | null
+  /** `null` where this console has no word for the format. */
+  labelKey: string | null
+  /** `null` for an unbuilt format: there is no sink, so there is nothing
+   *  truthful to say about what it produces or where it lands. */
+  noteKey: string | null
+  targetLabelKey: string | null
+  targetHintKey: string | null
+  readable: boolean
+}
+
+export function formatSpec(name: string, formats: readonly FormatInfo[]): FormatSpec | null {
+  const info = formats.find((entry) => entry.name === name)
+  if (info === undefined) return null
+  const strings = info.sink === null ? null : SINK_STRINGS[info.sink]
+  return {
+    name: info.name,
+    available: info.available,
+    sink: info.sink,
+    labelKey: formatLabelKey(info.name),
+    noteKey: strings?.noteKey ?? null,
+    targetLabelKey: strings?.targetLabelKey ?? null,
+    targetHintKey: strings?.targetHintKey ?? null,
+    readable: strings?.readable ?? false,
+  }
 }
 
 /**
@@ -257,47 +364,83 @@ export function formatSpec(name: string): FormatSpec | null {
  * bad target whatever this file thinks; what this buys is that the reason
  * is legible beside the field instead of arriving as a bare 400 that
  * `apiError` has stripped of its explanation.
+ *
+ * Copied rather than served, and that is on purpose: a `target_pattern` is
+ * a compiled Python regular expression, and `/api/export-formats` sends
+ * the sink family instead. Handing a caller a pattern to re-compile hands
+ * it a dialect — Python and JavaScript disagree about `\d` under Unicode,
+ * about what a bare `$` matches, about inline flags — and a pattern that
+ * parses differently on the two sides is a courtesy that lies. Two
+ * patterns per *family*, which is what the family is for.
  */
 const OUTLINE_TARGET = /^[^\s/][^\s]*$/
 const OBJECT_PREFIX = /^[A-Za-z0-9_-]+(?:[./][A-Za-z0-9_-]+)*$/
 
-/** Whether a format can address that target at all. Unknown formats accept
- *  anything non-empty: this console has no pattern for a format it has
- *  never heard of, and inventing one would refuse a target the deployment
- *  is perfectly happy with. */
-export function acceptsTarget(format: string, target: string): boolean {
-  const spec = formatSpec(format)
-  if (spec === null) return target.trim() !== ''
-  return spec.targetKind === 'collection'
-    ? OUTLINE_TARGET.test(target)
-    : OBJECT_PREFIX.test(target)
+/** Whether a format can address that target at all. A format with no
+ *  reported sink — unknown, unbuilt, or from a catalogue that could not be
+ *  read — accepts anything non-empty: this console has no pattern for one,
+ *  and inventing one would refuse a target the deployment is perfectly
+ *  happy with. */
+export function acceptsTarget(
+  format: string,
+  target: string,
+  formats: readonly FormatInfo[],
+): boolean {
+  const sink = formatSpec(format, formats)?.sink ?? null
+  if (sink === null) return target.trim() !== ''
+  return sink === SINK_OUTLINE ? OUTLINE_TARGET.test(target) : OBJECT_PREFIX.test(target)
 }
 
 /**
  * The rows of the format dropdown.
  *
- * The three this console knows, plus — when a destination already stores a
- * format that is not among them — that one, labelled with its own raw
- * name. Never dropped: a picker that omitted the stored value would render
- * as though `outline` were chosen and rewrite the destination to `outline`
- * on the next save, which is `directory.ts`'s argument for keeping an
- * unresolved id in the list, applied to a word instead of a snowflake.
+ * Every format the deployment reported, in the order it reported them,
+ * plus — when a destination already stores a format that is not among them
+ * — that one, labelled with its own raw name. Never dropped: a picker that
+ * omitted the stored value would render as though the first row were
+ * chosen and rewrite the destination to it on the next save, which is
+ * `directory.ts`'s argument for keeping an unresolved id in the list,
+ * applied to a word instead of a snowflake.
+ *
+ * **An unavailable format is a disabled row, not an absent one.** The row
+ * says what the format is and, in place of what it would produce, that this
+ * deployment does not build it. `UiOption.disabled` is not decoration:
+ * `stepEnabled` walks past it, the control renders it unchoosable, and
+ * `draftProblems` refuses the draft anyway — so this is a fact stated, not
+ * a choice offered and then withdrawn. The argument, and what changed since
+ * #150 decided the other way, is at the top of this module.
+ *
+ * **Except when it is the format this destination already stores.** Then
+ * the row is choosable, because it is not an offer — it is where the
+ * dropdown's own value has to be able to sit. Disabling it would leave the
+ * control pointing at a row it may not select, which is how a picker
+ * silently reports the wrong value.
  *
  * Takes a translator rather than returning keys, the way
  * `recordingTabs(label)` does: a `UiOption.label` is text by contract, and
- * the raw name of an unknown format is text that no key exists for.
+ * the raw name of a format nobody has a word for is text that no key
+ * exists for.
  */
 export function formatChoices(
   label: (key: string) => string,
+  formats: readonly FormatInfo[],
   stored: string | null = null,
 ): UiOption[] {
-  const options: UiOption[] = EXPORT_FORMATS.map((entry) => ({
-    value: entry.name,
-    label: label(entry.labelKey),
-    detail: label(entry.noteKey),
-  }))
   const held = (stored ?? '').trim()
-  if (held !== '' && formatSpec(held) === null) {
+  const options: UiOption[] = formats.map((entry) => {
+    const spec = formatSpec(entry.name, formats)
+    const labelKey = spec?.labelKey ?? null
+    const noteKey = spec?.noteKey ?? null
+    return {
+      value: entry.name,
+      label: labelKey === null ? entry.name : label(labelKey),
+      detail: entry.available
+        ? (noteKey === null ? undefined : label(noteKey))
+        : label('admin.destinations.formatUnavailableDetail'),
+      disabled: !entry.available && entry.name !== held,
+    }
+  })
+  if (held !== '' && !formats.some((entry) => entry.name === held)) {
     options.push({
       value: held,
       label: held,
@@ -372,17 +515,38 @@ export function fallbackNote(targets: readonly ExportTarget[]): Message {
 /* One destination, said out loud                                        */
 /* -------------------------------------------------------------------- */
 
-/** The subtitle under a destination's name in the list: what it publishes
- *  and where, with the format named in words where this console has a word
- *  for it and by its raw name where it does not. */
-export function targetSummary(target: ExportTarget): Message {
-  const spec = formatSpec(target.format)
-  return {
-    key: spec === null
+/**
+ * The subtitle under a destination's name in the list: what it publishes
+ * and where.
+ *
+ * Three sentences, because there are now three things that can be true of
+ * a stored format and they are not the same news:
+ *
+ * - it is reported and this deployment builds it — the ordinary line;
+ * - it is reported and **not** built, which means this destination is
+ *   configured and nothing will ever be published to it. Said in the list,
+ *   beside the destination it is true of, rather than only inside the form
+ *   somebody has to open to find out;
+ * - it is not reported at all, which is what a stored format from a newer
+ *   deployment and an unreadable catalogue both look like. This console
+ *   says it does not know and says the deployment's answer is the one that
+ *   counts — it does **not** say the destination is broken, because from
+ *   here those two look identical.
+ *
+ * The format is named in words where this console has a word for it and by
+ * its raw name where it does not, which is the same rule everywhere else.
+ */
+export function targetSummary(target: ExportTarget, formats: readonly FormatInfo[]): Message {
+  const spec = formatSpec(target.format, formats)
+  const labelKey = spec?.labelKey ?? null
+  const named = labelKey === null ? target.format : { key: labelKey }
+  const key =
+    spec === null
       ? 'admin.destinations.rowUnknownFormat'
-      : 'admin.destinations.rowSummary',
-    params: { format: spec === null ? target.format : { key: spec.labelKey }, target: target.target },
-  }
+      : spec.available
+        ? 'admin.destinations.rowSummary'
+        : 'admin.destinations.rowUnavailableFormat'
+  return { key, params: { format: named, target: target.target } }
 }
 
 /** Whether this destination is publishing, in words. Switched off is a
@@ -469,11 +633,28 @@ export interface TargetDraft {
   enabled: boolean
 }
 
-/** A blank destination, ready to be added. Outline first because it is
- *  what every guild configured before this page existed, and enabled
- *  because somebody adding a destination is adding one to publish to. */
-export function emptyDraft(): TargetDraft {
-  return { format: FORMAT_OUTLINE, name: '', target: '', enabled: true }
+/**
+ * A blank destination, ready to be added.
+ *
+ * The format is **the first one the deployment reports as available**,
+ * which for every deployment shipped so far is `outline` — what every
+ * guild configured before this page existed — but is that because the API
+ * says so rather than because this file used to name it. On a build where
+ * `outline` is not compiled in, a form opening on it would be a form that
+ * opens invalid.
+ *
+ * Blank when nothing was reported, which is what an unreadable catalogue
+ * looks like. Blank rather than a guess: {@link draftProblems} then says
+ * "choose a format" beside an empty picker, and the reader is looking at
+ * the truth — this console does not currently know what may be chosen —
+ * instead of at a default that a save would refuse.
+ *
+ * Enabled, because somebody adding a destination is adding one to publish
+ * to.
+ */
+export function emptyDraft(formats: readonly FormatInfo[] = []): TargetDraft {
+  const first = formats.find((entry) => entry.available)
+  return { format: first?.name ?? '', name: '', target: '', enabled: true }
 }
 
 /** An existing destination, ready to be edited. */
@@ -510,13 +691,22 @@ export interface DraftProblem {
  * `PUT` and ignores whatever the body says, so a rename is a create plus a
  * delete rather than an edit, and complaining that a destination collides
  * with itself would refuse a save that changes something else.
+ *
+ * The format complaint is the one rule here that could not be stated
+ * before `GET /api/export-formats` existed. **It fires only where the
+ * deployment has said the format is unavailable** — never on a format that
+ * is merely unreported, because "this console has not been told about it"
+ * is not evidence of anything and refusing a save on it would make an
+ * unreadable catalogue look like a broken configuration.
  */
 export function draftProblems(
   draft: TargetDraft,
   taken: readonly string[] = [],
+  formats: readonly FormatInfo[] = [],
 ): DraftProblem[] {
   const problems: DraftProblem[] = []
   const name = draft.name.trim()
+  const spec = formatSpec(draft.format, formats)
 
   if (name === '') {
     problems.push({ field: 'name', message: { key: 'admin.destinations.nameEmpty' } })
@@ -526,16 +716,17 @@ export function draftProblems(
 
   if (draft.format.trim() === '') {
     problems.push({ field: 'format', message: { key: 'admin.destinations.formatEmpty' } })
+  } else if (spec !== null && !spec.available) {
+    problems.push({ field: 'format', message: { key: 'admin.destinations.formatUnavailable' } })
   }
 
   if (draft.target.trim() === '') {
     problems.push({ field: 'target', message: { key: 'admin.destinations.targetEmpty' } })
-  } else if (!acceptsTarget(draft.format, draft.target)) {
-    const spec = formatSpec(draft.format)
+  } else if (!acceptsTarget(draft.format, draft.target, formats)) {
     problems.push({
       field: 'target',
       message: {
-        key: spec?.targetKind === 'prefix'
+        key: spec?.sink === SINK_OBJECT_STORE
           ? 'admin.destinations.targetNotPrefix'
           : 'admin.destinations.targetNotCollection',
       },
@@ -554,8 +745,12 @@ export function problemFor(
 }
 
 /** Whether a draft may be submitted at all. */
-export function isDraftReady(draft: TargetDraft, taken: readonly string[] = []): boolean {
-  return draftProblems(draft, taken).length === 0
+export function isDraftReady(
+  draft: TargetDraft,
+  taken: readonly string[] = [],
+  formats: readonly FormatInfo[] = [],
+): boolean {
+  return draftProblems(draft, taken, formats).length === 0
 }
 
 /** The body a create or an update sends. Trimmed the way the API trims,
@@ -586,6 +781,10 @@ export function takenNames(
 /* Where the requests go                                                 */
 /* -------------------------------------------------------------------- */
 
+/** The format catalogue. No guild in it: every format on it is a fact
+ *  about the build, identical for every server this deployment serves. */
+export const FORMATS_PATH = '/export-formats'
+
 export function targetsPath(guildId: string): string {
   return `/guilds/${encodeURIComponent(guildId)}/export-targets`
 }
@@ -610,8 +809,10 @@ export function targetSecretPath(guildId: string, targetId: number): string {
  * accidentally render an internal hostname out of a `$fetch` error. It is
  * enough for every refusal these routes have, because each status means
  * exactly one thing here — including the 400, which after
- * {@link draftProblems} has passed can only mean that this console's list
- * of formats and the deployment's registry disagree.
+ * {@link draftProblems} has passed can only mean that the catalogue this
+ * page is holding is older than the deployment answering the write. The
+ * remedy is the same one every stale read has, and it is what the sentence
+ * says: reload.
  */
 export function describeTargetError(error: unknown): Message {
   const held = (error as { status?: unknown } | null)?.status
