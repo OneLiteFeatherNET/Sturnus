@@ -328,7 +328,10 @@ async def test_an_expired_session_is_unauthorised_rather_than_a_server_error(
     aiohttp_client: AiohttpClientFactory, path: str
 ) -> None:
     client = await aiohttp_client(app())
-    expired = SessionCookie(SECRET, timedelta(seconds=-1)).issue(SignedSession(ANNA), now=T0)
+    # Issued thirteen hours before the server's clock, against its twelve-hour lifetime.
+    expired = SessionCookie(SECRET, timedelta(hours=12)).issue(
+        SignedSession(ANNA), now=T0 - timedelta(hours=13)
+    )
     client.session.cookie_jar.update_cookies({SESSION_COOKIE: expired})
     assert (await client.get(path)).status == 401
 
