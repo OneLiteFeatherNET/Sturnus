@@ -38,6 +38,7 @@ from sturnus.infrastructure.discord.consent_prompt import (
     ConsentPromptModal,
     ConsentPromptServices,
     PolicyLookup,
+    PromptOutcome,
     build_prompt,
     submit_consent,
 )
@@ -190,6 +191,7 @@ def make_services(
     prompts: PromptRecord | None = None,
     policy: PolicyLookup | None = None,
     consent_role: Callable[[int], Awaitable[discord.Role | None]] | None = None,
+    count: Callable[[PromptOutcome], None] | None = None,
 ) -> ConsentPromptServices:
     return ConsentPromptServices(
         consents=consents or FakeConsents(),
@@ -201,6 +203,7 @@ def make_services(
         transcription_host=HOST,
         consent_role=consent_role or no_role,
         prompts=prompts or PromptRecord(),
+        count=count or (lambda _outcome: None),
     )
 
 
@@ -219,7 +222,7 @@ async def _submit_ticked(
     """
     label = next(child for child in modal.children if isinstance(child, ui.Label))
     assert isinstance(label.component, ui.Checkbox)
-    label.component._value = True  # type: ignore[attr-defined]  # no public setter
+    label.component._value = True  # no public setter
     member = MagicMock(spec=discord.Member)
     member.id = PRESSER
     member.add_roles = AsyncMock()
@@ -754,3 +757,58 @@ async def test_a_modal_submission_outside_a_server_is_refused_without_a_grant() 
 
     assert interaction.response.sent[0][1] is True
     assert consents.grants == []
+
+
+# 5.3 The counter: the two steps taken through the prompt are counted where they happen
+
+
+async def test_starting_a_link_from_the_prompt_counts_link_started() -> None:
+    outcomes: list[PromptOutcome] = []
+    interaction = FakeInteraction(services=make_services(count=outcomes.append))
+
+    await ConsentPromptLinkButton().callback(as_interaction(interaction))
+
+    assert outcomes == [PromptOutcome.LINK_STARTED]
+
+
+async def test_an_already_linked_presser_counts_no_link_started() -> None:
+    outcomes: list[PromptOutcome] = []
+    services = make_services(links=FakeLinks(identity=("ext-1", "Anna")), count=outcomes.append)
+
+    await ConsentPromptLinkButton().callback(as_interaction(FakeInteraction(services=services)))
+
+    assert outcomes == []
+
+
+async def test_consent_through_the_prompt_counts_consented_via_prompt() -> None:
+    outcomes: list[PromptOutcome] = []
+    services = make_services(count=outcomes.append)
+
+    await _consent_as(services, JOINER)
+
+    assert outcomes == [PromptOutcome.CONSENTED_VIA_PROMPT]
+
+
+async def test_an_unticked_checkbox_counts_no_consent() -> None:
+    outcomes: list[PromptOutcome] = []
+    services = make_services(count=outcomes.append)
+
+    async def assign_role() -> None:
+        return None
+
+    async def discard(_text: str) -> None:
+        return None
+
+    await submit_consent(
+        services,
+        send=discard,
+        user_id=JOINER,
+        guild_id=GUILD,
+        channel_id=CHANNEL,
+        ticked=False,
+        policy_version=POLICY,
+        role_mention=ROLE_MENTION,
+        assign_role=assign_role,
+    )
+
+    assert outcomes == []

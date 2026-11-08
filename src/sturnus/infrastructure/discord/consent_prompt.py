@@ -23,6 +23,7 @@ import logging
 import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Protocol, cast
 
 import discord
@@ -34,12 +35,13 @@ from sturnus.application.consent_flow import (
     RoleAssignmentError,
     grant_consent,
 )
-from sturnus.application.consent_prompt import PromptNeeds, PromptRecord
+from sturnus.application.consent_prompt import PromptNeeds, PromptRecord, needs_prompt
 from sturnus.application.linking import LinkedIdentities, StateIssuer, begin_link
 from sturnus.application.ports import Clock
 from sturnus.domain.consent import ConsentRecord, is_consent_active
 from sturnus.infrastructure.discord.link_cog import PROVIDER, STATE_TTL
 from sturnus.infrastructure.discord.views import CONSENT_STRINGS
+from sturnus.infrastructure.telemetry import CONSENT_PROMPT_TOTAL, record
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +92,25 @@ class AuthorizationUrls(Protocol):
     def authorize_url(self, state: str) -> str: ...
 
 
+class PromptOutcome(StrEnum):
+    """The only labels `consent_prompt_total` carries. Ids are never labels."""
+
+    POSTED = "posted"
+    SKIPPED_CONSENTED = "skipped_consented"
+    SKIPPED_ALREADY_PINGED = "skipped_already_pinged"
+    NO_PERMISSION = "no_permission"
+    CONSENTED_VIA_PROMPT = "consented_via_prompt"
+    LINK_STARTED = "link_started"
+
+
+OutcomeCounter = Callable[[PromptOutcome], None]
+
+
+def count_consent_prompt(outcome: PromptOutcome) -> None:
+    """Production counter: one increment, labelled by the outcome and nothing else."""
+    record(CONSENT_PROMPT_TOTAL, 1, outcome=outcome.value)
+
+
 #: Guild id to (policy version, policy URL), as the guild's configuration says
 #: now. Either part is `None` while the guild has not configured it.
 PolicyLookup = Callable[[int], Awaitable[tuple[str | None, str | None]]]
@@ -123,6 +144,7 @@ class ConsentPromptServices:
     transcription_host: str
     consent_role: Callable[[int], Awaitable[discord.Role | None]]
     prompts: PromptRecord
+    count: OutcomeCounter
 
 
 def services_of(interaction: discord.Interaction) -> ConsentPromptServices:
@@ -239,6 +261,7 @@ class ConsentPromptLinkButton(
             interaction.guild_id,
             interaction.user.id,
         )
+        services.count(PromptOutcome.LINK_STARTED)
         view = ui.View(timeout=None)
         view.add_item(
             ui.Button(
@@ -418,6 +441,7 @@ async def submit_consent(
         return result.outcome
 
     log.info("consent prompt: %s guild=%s user=%s", "consented_via_prompt", guild_id, user_id)
+    services.count(PromptOutcome.CONSENTED_VIA_PROMPT)
     await send(CONSENT_STRINGS["granted"].format(role=role_mention))
     await _mark_prompt_consented(services, channel_id=channel_id, user_id=user_id)
     return result.outcome
@@ -442,6 +466,64 @@ async def _mark_prompt_consented(
         await message.edit(view=view, allowed_mentions=mentions)
     except discord.HTTPException:
         log.warning("consent prompt: %s channel=%s user=%s", "edit_failed", channel_id, user_id)
+
+
+async def prompt_joining_member(
+    services: ConsentPromptServices,
+    *,
+    member: discord.Member,
+    channel: discord.VoiceChannel | discord.StageChannel,
+) -> None:
+    """Asks one member who joined a recording channel for what they are still missing.
+
+    Started as a task by the voice-state handler and never awaited there, so
+    neither the reconfigure lock nor the participant sync waits for the
+    database or for Discord. A refused post is logged and counted, not raised.
+    A guild without a policy is skipped silently: there is nothing to consent to.
+    """
+    guild_id = member.guild.id
+    policy_version, policy_url = await services.policy(guild_id)
+    if policy_version is None or policy_url is None:
+        log.debug("consent prompt: %s guild=%s", "policy_unconfigured", guild_id)
+        return
+
+    record_now = await services.consents.current(member.id, guild_id)
+    linked = await services.links.external_identity(member.id) is not None
+    needs = needs_prompt(
+        record_now, linked=linked, policy_version=policy_version, now=services.clock.now()
+    )
+    if not needs.any:
+        services.count(PromptOutcome.SKIPPED_CONSENTED)
+        return
+    if not services.prompts.should_prompt(channel.id, member.id):
+        services.count(PromptOutcome.SKIPPED_ALREADY_PINGED)
+        return
+
+    view, mentions = build_prompt(member, needs, transcription_host=services.transcription_host)
+    try:
+        sent = await channel.send(view=view, allowed_mentions=mentions)
+    except discord.Forbidden:
+        log.warning(
+            "consent prompt: %s guild=%s channel=%s user=%s",
+            "no_permission",
+            guild_id,
+            channel.id,
+            member.id,
+        )
+        services.count(PromptOutcome.NO_PERMISSION)
+        return
+    except discord.HTTPException:
+        # Not a permission problem and not a counted outcome: logged only.
+        log.warning(
+            "consent prompt: %s guild=%s channel=%s user=%s",
+            "post_failed",
+            guild_id,
+            channel.id,
+            member.id,
+        )
+        return
+    services.prompts.mark(channel.id, member.id, sent)
+    services.count(PromptOutcome.POSTED)
 
 
 PROMPT_DYNAMIC_ITEMS: tuple[type[ui.DynamicItem[ui.Button[Any]]], ...] = (
