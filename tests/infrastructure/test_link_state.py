@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -12,11 +13,14 @@ ANNA = 100
 
 
 @pytest.fixture
-async def store(clean_database: str) -> LinkStateStore:
+async def store(clean_database: str) -> AsyncIterator[LinkStateStore]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    return LinkStateStore(async_sessionmaker(engine, expire_on_commit=False))
+    try:
+        yield LinkStateStore(async_sessionmaker(engine, expire_on_commit=False))
+    finally:
+        await engine.dispose()
 
 
 async def test_an_issued_state_resolves_to_its_user(store: LinkStateStore) -> None:

@@ -10,6 +10,7 @@ told no.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -31,11 +32,14 @@ ANNA, BEN = 100, 200
 
 
 @pytest.fixture
-async def factory(clean_database: str) -> async_sessionmaker[AsyncSession]:
+async def factory(clean_database: str) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    return async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        yield async_sessionmaker(engine, expire_on_commit=False)
+    finally:
+        await engine.dispose()
 
 
 class Admins:

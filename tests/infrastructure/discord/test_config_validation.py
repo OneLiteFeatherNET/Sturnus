@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 
 import pytest
@@ -13,11 +14,14 @@ GUILD = 4711
 
 
 @pytest.fixture
-async def store(clean_database: str) -> ConfigStore:
+async def store(clean_database: str) -> AsyncIterator[ConfigStore]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    return ConfigStore(async_sessionmaker(engine, expire_on_commit=False))
+    try:
+        yield ConfigStore(async_sessionmaker(engine, expire_on_commit=False))
+    finally:
+        await engine.dispose()
 
 
 async def test_a_fresh_guild_is_missing_every_required_key(store: ConfigStore) -> None:
