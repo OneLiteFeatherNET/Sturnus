@@ -23,8 +23,10 @@ def clean_database(postgres_url: str) -> str:
     that already exist. Dropping the schema handles both cases.
     """
     engine = create_engine(postgres_url.replace("+asyncpg", "+psycopg"))
-    with engine.begin() as conn:
-        conn.execute(text("DROP SCHEMA public CASCADE"))
-        conn.execute(text("CREATE SCHEMA public"))
-    engine.dispose()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("DROP SCHEMA public CASCADE"))
+            conn.execute(text("CREATE SCHEMA public"))
+    finally:
+        engine.dispose()
     return postgres_url
