@@ -104,6 +104,7 @@ def read_channel_permissions(
     channel_ids: Sequence[int],
     *,
     named: discord.VoiceChannel | None = None,
+    bot_role: discord.Role | None = None,
 ) -> list[ChannelPermissions]:
     """Reads each allowed channel's Speak overwrites, skipping what it cannot see.
 
@@ -123,6 +124,11 @@ def read_channel_permissions(
                 channel_id=channel_id,
                 everyone_may_speak=(channel.overwrites_for(guild.default_role).speak is not False),
                 role_may_speak=(role is not None and channel.overwrites_for(role).speak is True),
+                bot_role_may_post=(
+                    bot_role is not None
+                    and channel.overwrites_for(bot_role).view_channel is True
+                    and channel.overwrites_for(bot_role).send_messages is True
+                ),
             )
         )
     return permissions
@@ -135,6 +141,7 @@ async def apply_permission_changes(
     changes: Sequence[PermissionChange],
     *,
     named: discord.VoiceChannel | None = None,
+    bot_role: discord.Role | None = None,
 ) -> tuple[list[str], list[str]]:
     """Applies each overwrite independently; one failure never blocks the other.
 
@@ -154,11 +161,14 @@ async def apply_permission_changes(
     applied: list[str] = []
     errors: list[str] = []
     for change in changes:
-        verb = "allow" if change.allow_speak else "deny"
+        if change.target == "bot_role":
+            verb, what = "allow", "View Channel and Send Messages"
+        else:
+            verb, what = ("allow" if change.allow_speak else "deny"), "Speak"
         channel = resolve_voice_channel(guild, change.channel_id, named)
         if channel is None:
             errors.append(
-                f"Could not {verb} Speak in <#{change.channel_id}>: it is not a voice "
+                f"Could not {verb} {what} in <#{change.channel_id}>: it is not a voice "
                 "channel I can see. Remove it with "
                 f"`/config set {settings.VOICE_CHANNEL_IDS} <the remaining ids>`."
             )
@@ -167,6 +177,14 @@ async def apply_permission_changes(
         label: str
         if change.target == "everyone":
             target, label = everyone, "@everyone"
+        elif change.target == "bot_role":
+            target, label = bot_role, "the bot's role"
+            if target is None:
+                errors.append(
+                    f"Could not {verb} {what} for the bot's role in {channel.mention}: "
+                    "the bot's role could not be found in this server."
+                )
+                continue
         else:
             target, label = consent_role, "the consent role"
             if target is None:
@@ -179,23 +197,31 @@ async def apply_permission_changes(
                 continue
 
         overwrite = channel.overwrites_for(target)
-        # `.update()` rather than `overwrite.speak = ...`: PermissionOverwrite
-        # defines its permission attributes only under `TYPE_CHECKING`, which
-        # mypy strict does not accept as a real `__slots__` member for plain
-        # attribute assignment.
-        overwrite.update(speak=change.allow_speak)
+        # Only the fields this change sets are written, so a Speak change never
+        # touches View Channel or Send Messages and the reverse. `.update()`
+        # rather than attribute assignment: PermissionOverwrite defines its
+        # permission attributes only under `TYPE_CHECKING`, which mypy strict
+        # does not accept as a real `__slots__` member for plain assignment.
+        fields: dict[str, bool] = {}
+        if change.allow_speak is not None:
+            fields["speak"] = change.allow_speak
+        if change.allow_view is not None:
+            fields["view_channel"] = change.allow_view
+        if change.allow_send is not None:
+            fields["send_messages"] = change.allow_send
+        overwrite.update(**fields)
         try:
             await channel.set_permissions(target, overwrite=overwrite, reason=AUDIT_REASON)
         except discord.Forbidden:
             errors.append(
-                f"Could not {verb} Speak for {label} in {channel.mention}: I am "
+                f"Could not {verb} {what} for {label} in {channel.mention}: I am "
                 "missing the Manage Permissions permission on that channel. Set it "
                 "manually."
             )
         except discord.HTTPException as exc:
-            errors.append(f"Could not {verb} Speak for {label} in {channel.mention}: {exc}")
+            errors.append(f"Could not {verb} {what} for {label} in {channel.mention}: {exc}")
         else:
-            applied.append(f"{verb.capitalize()}ed Speak for {label} in {channel.mention}.")
+            applied.append(f"{verb.capitalize()}ed {what} for {label} in {channel.mention}.")
     return applied, errors
 
 
@@ -312,7 +338,9 @@ async def _apply_one(
     keeps_stored_role = intent.consent_role_name is None and stored_role is not None
     role = named_role if named_role is not None else (stored_role if keeps_stored_role else None)
 
-    channel_permissions = read_channel_permissions(guild, role, (*stored_channel_ids, *requested))
+    channel_permissions = read_channel_permissions(
+        guild, role, (*stored_channel_ids, *requested), bot_role=guild.self_role
+    )
     # A channel this request named that the bot cannot see is refused
     # rather than added. The console picks from the mirror, so this means
     # the mirror is behind Discord -- and adding the channel anyway would
@@ -368,7 +396,7 @@ async def _apply_one(
         await config.set(guild.id, key, value, now)
 
     _, permission_errors = await apply_permission_changes(
-        guild, guild.default_role, role, plan.permission_changes
+        guild, guild.default_role, role, plan.permission_changes, bot_role=guild.self_role
     )
     problems.extend(permission_errors)
 

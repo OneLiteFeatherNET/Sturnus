@@ -160,7 +160,11 @@ class SetupCog(commands.Cog):
         # included -- so the plan can report which of them still need the
         # consent protection applied, not merely this one.
         channel_permissions = read_channel_permissions(
-            guild, role, (*stored_channel_ids, channel.id), named=channel
+            guild,
+            role,
+            (*stored_channel_ids, channel.id),
+            named=channel,
+            bot_role=guild.self_role,
         )
 
         plan = plan_setup(
@@ -214,7 +218,12 @@ class SetupCog(commands.Cog):
             result = None
 
         applied, permission_errors = await apply_permission_changes(
-            guild, guild.default_role, role, plan.permission_changes, named=channel
+            guild,
+            guild.default_role,
+            role,
+            plan.permission_changes,
+            named=channel,
+            bot_role=guild.self_role,
         )
 
         missing = list(plan.missing)
