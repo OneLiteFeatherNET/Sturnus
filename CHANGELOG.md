@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.18.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.17.0...v0.18.0) (2026-11-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **bot:** STURNUS_SHARD_COUNT is gone. The bot holds a single gateway connection, and /readyz reports that one connection.
+* **console:** an irreversible migration drops the guild_oauth_client table and console_state.guild_id; take a database backup before upgrading. Sign-in through the installation's Outline client is unchanged.
+
+### Code Refactoring
+
+* **bot:** remove gateway sharding ([758f289](https://github.com/OneLiteFeatherNET/Sturnus/commit/758f289fc5a3c4f98c4d067e405133c7bc8b00fc))
+* **console:** remove per-guild sign-in clients ([76a449e](https://github.com/OneLiteFeatherNET/Sturnus/commit/76a449ebaac60f448bab29039be7f664f415b648))
+
 ## [0.17.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.16.0...v0.17.0) (2026-10-14)
 
 
