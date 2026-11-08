@@ -20,6 +20,7 @@ impossible, and it is not a failure worth proving against a dictionary.
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
@@ -61,12 +62,15 @@ class Stores:
 
 
 @pytest.fixture
-async def stores(clean_database: str) -> Stores:
+async def stores(clean_database: str) -> AsyncIterator[Stores]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on_commit=False)
-    return Stores(config=ConfigStore(factory), admins=AdminMemberStore(factory))
+    try:
+        yield Stores(config=ConfigStore(factory), admins=AdminMemberStore(factory))
+    finally:
+        await engine.dispose()
 
 
 def api(stores: Stores, mirrored: dict[int, MirroredGuild] | None = None) -> web.Application:

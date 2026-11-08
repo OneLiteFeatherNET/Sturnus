@@ -19,6 +19,7 @@ first thing to drift the day a value is added. So a 400 here is a real
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
 
@@ -58,12 +59,15 @@ async def signed_in(
 
 
 @pytest.fixture
-async def store(clean_database: str) -> PreferenceStore:
+async def store(clean_database: str) -> AsyncIterator[PreferenceStore]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory: async_sessionmaker[AsyncSession] = async_sessionmaker(engine, expire_on_commit=False)
-    return PreferenceStore(factory)
+    try:
+        yield PreferenceStore(factory)
+    finally:
+        await engine.dispose()
 
 
 async def preferences_of(client: TestClient[web.Request, web.Application]) -> dict[str, Any]:
