@@ -65,23 +65,12 @@ class Event(StrEnum):
     GUILD_CONFIGURED = "guild.configured"
     GUILD_UNCONFIGURED = "guild.unconfigured"
     BOT_CONNECTED = "bot.connected"
-    #: One gateway connection finished its IDENTIFY and handed this process
-    #: its share of the guilds. Fires once per shard, and on every
-    #: re-IDENTIFY of that shard afterwards -- which is the *only* signal
-    #: that a shard came back, because `on_ready` does not fire again for
-    #: a single shard once the whole set has been ready once. See
-    #: `SturnusClient.on_shard_ready`.
-    BOT_SHARD_READY = "bot.shard_ready"
-    #: One gateway connection resumed after a blip, replaying the events it
-    #: missed. INFO rather than WARNING: a RESUME is the gateway working,
-    #: and no guild cache was lost, so nothing is re-reconciled.
-    BOT_SHARD_RESUMED = "bot.shard_resumed"
-    #: One gateway connection dropped. **WARNING**, not ERROR: discord.py
-    #: reconnects on its own and the overwhelming majority of these are
-    #: followed by `bot.shard_resumed` within seconds. It is ERROR-shaped
-    #: only if it stays -- which is what `/readyz` is for, and why
-    #: readiness is scoped to shards rather than to a single boolean.
-    BOT_SHARD_DISCONNECTED = "bot.shard_disconnected"
+    #: The gateway connection dropped. WARNING: discord.py reconnects on its own and
+    #: most of these are followed by `bot.resumed` within seconds, but a connection
+    #: that stays down is the outage `/readyz` reports, and this line is how it reads in Loki.
+    BOT_DISCONNECTED = "bot.disconnected"
+    #: The gateway connection resumed after a disconnect, replaying missed events. INFO.
+    BOT_RESUMED = "bot.resumed"
     VOICE_JOINED = "voice.joined"
     VOICE_LEFT = "voice.left"
     VOICE_JOIN_FAILED = "voice.join_failed"
@@ -360,6 +349,9 @@ class Event(StrEnum):
     SHUTDOWN_BEGIN = "shutdown.begin"
     SHUTDOWN_COMPLETE = "shutdown.complete"
     SCHEMA_WAITING = "schema.waiting"
+    #: A leftover `STURNUS_SHARD_COUNT` is set. It is ignored: the bot holds one
+    #: gateway connection and nothing reads the variable any more.
+    CONFIG_SHARD_COUNT_IGNORED = "config.shard_count_ignored"
     #: The startup line that says a requested third-party log level was
     #: raised to `setup.THIRD_PARTY_FLOOR`. An operator who turned the knob
     #: up and sees nothing new needs to be told why, in the same place they
