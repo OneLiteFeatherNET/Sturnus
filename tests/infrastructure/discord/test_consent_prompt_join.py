@@ -602,6 +602,42 @@ async def test_a_member_already_prompted_in_the_channel_counts_skipped_already_p
     assert outcomes.seen == [PromptOutcome.SKIPPED_ALREADY_PINGED]
 
 
+class _GatedPost:
+    """Holds the first post open until the test releases it; later posts return at once."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def __call__(self, **_kwargs: object) -> MagicMock:
+        self.calls += 1
+        if self.calls == 1:
+            self.entered.set()
+            await self.release.wait()
+        return MagicMock()
+
+
+async def test_two_quick_joins_by_the_same_member_post_one_prompt() -> None:
+    services, _, _ = _services()
+    guild = _guild(GUILD_ID, _voice_channel(CHANNEL_ID, members=[]))
+    member = _human(JOINER, guild)
+    post = _GatedPost()
+    channel = _channel(CHANNEL_ID, members=[])
+    channel.send = post
+
+    first = asyncio.create_task(
+        prompt_module.prompt_joining_member(services, member=member, channel=channel)
+    )
+    await post.entered.wait()
+    # The member rejoins while the first prompt is still being posted.
+    await prompt_module.prompt_joining_member(services, member=member, channel=channel)
+    post.release.set()
+    await first
+
+    assert post.calls == 1
+
+
 async def test_a_refused_post_counts_no_permission(tmp_path: Path) -> None:
     harness = Harness(tmp_path)
     services, _, outcomes = _services()

@@ -478,7 +478,10 @@ async def prompt_joining_member(
 
     Started as a task by the voice-state handler and never awaited there, so
     neither the reconfigure lock nor the participant sync waits for the
-    database or for Discord. A refused post is logged and counted, not raised.
+    database or for Discord. The (channel, member) pair is reserved before the
+    post, so a second join while the first post is in flight does not ping
+    again. A refused or failed post keeps the reservation: no retry while the
+    channel stays occupied. A refused post is logged and counted, not raised.
     A guild without a policy is skipped silently: there is nothing to consent to.
     """
     guild_id = member.guild.id
@@ -498,6 +501,7 @@ async def prompt_joining_member(
     if not services.prompts.should_prompt(channel.id, member.id):
         services.count(PromptOutcome.SKIPPED_ALREADY_PINGED)
         return
+    services.prompts.mark(channel.id, member.id)
 
     view, mentions = build_prompt(member, needs, transcription_host=services.transcription_host)
     try:
