@@ -15,10 +15,12 @@ it. That exercises the decision the button makes without a connection.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 
 import discord
 import pytest
@@ -35,6 +37,7 @@ from sturnus.infrastructure.discord.consent_prompt import (
     ConsentPromptLinkButton,
     ConsentPromptModal,
     ConsentPromptServices,
+    PolicyLookup,
     build_prompt,
     submit_consent,
 )
@@ -44,6 +47,12 @@ T0 = datetime(2026, 11, 8, 20, 0, 0, tzinfo=UTC)
 POLICY = "2026-11-01"
 HOST = "transcribe.example.invalid"
 POLICY_URL = "https://example.invalid/policy"
+NEW_POLICY = "2026-11-08"
+OTHER_GUILD = 501
+NOT_CONFIGURED_TEXT = (
+    "Consent is not fully configured for this server yet. "
+    "Ask an administrator to run `/config show`."
+)
 GUILD = 500
 CHANNEL = 600
 JOINER = 100
@@ -169,12 +178,18 @@ async def no_role(_guild_id: int) -> None:
     return None
 
 
+async def configured_policy(_guild_id: int) -> tuple[str | None, str | None]:
+    return POLICY, POLICY_URL
+
+
 def make_services(
     *,
     consents: FakeConsents | None = None,
     links: FakeLinks | None = None,
     states: FakeStates | None = None,
     prompts: PromptRecord | None = None,
+    policy: PolicyLookup | None = None,
+    consent_role: Callable[[int], Awaitable[discord.Role | None]] | None = None,
 ) -> ConsentPromptServices:
     return ConsentPromptServices(
         consents=consents or FakeConsents(),
@@ -182,12 +197,42 @@ def make_services(
         link_states=states or FakeStates(),
         oauth=FakeOAuth(),
         clock=FakeClock(),
-        policy_version=POLICY,
-        policy_url=POLICY_URL,
+        policy=policy or configured_policy,
         transcription_host=HOST,
-        consent_role=no_role,
+        consent_role=consent_role or no_role,
         prompts=prompts or PromptRecord(),
     )
+
+
+def _modal_texts(modal: ui.Modal) -> list[str]:
+    return [item.content for item in modal.walk_children() if isinstance(item, ui.TextDisplay)]
+
+
+async def _submit_ticked(
+    modal: ConsentPromptModal, services: ConsentPromptServices
+) -> FakeInteraction:
+    """Submits `modal` with its checkbox ticked, as a server member who presses it.
+
+    `ui.Checkbox` has no public setter, so the test sets its backing field on
+    the checkbox the modal itself created; nothing else about the modal is
+    touched.
+    """
+    label = next(child for child in modal.children if isinstance(child, ui.Label))
+    assert isinstance(label.component, ui.Checkbox)
+    label.component._value = True  # type: ignore[attr-defined]  # no public setter
+    member = MagicMock(spec=discord.Member)
+    member.id = PRESSER
+    member.add_roles = AsyncMock()
+    interaction = FakeInteraction(services=services)
+    interaction.user = member
+    await modal.on_submit(as_interaction(interaction))
+    return interaction
+
+
+def role_for_consent() -> discord.Role:
+    role = MagicMock(spec=discord.Role)
+    role.mention = ROLE_MENTION
+    return role
 
 
 def active_consent() -> ConsentRecord:
@@ -374,7 +419,7 @@ async def test_the_modal_text_names_the_host_and_the_policy_version() -> None:
 
     modal = interaction.response.modal
     assert isinstance(modal, ConsentPromptModal)
-    texts = [item.content for item in modal.walk_children() if isinstance(item, ui.TextDisplay)]
+    texts = _modal_texts(modal)
     assert len(texts) == 1
     assert HOST in texts[0]
     assert POLICY in texts[0]
@@ -393,6 +438,85 @@ async def test_the_modal_asks_for_the_agreement_through_an_unticked_checkbox_in_
     ]
     assert isinstance(labels[0].component, ui.Checkbox)
     assert labels[0].component.value is False
+
+
+@pytest.mark.parametrize(
+    ("version", "url"),
+    [(None, POLICY_URL), (POLICY, None), (None, None)],
+    ids=["no_version", "no_url", "neither"],
+)
+async def test_pressing_consent_without_a_configured_policy_opens_no_modal(
+    version: str | None, url: str | None
+) -> None:
+    async def partly_configured(_guild_id: int) -> tuple[str | None, str | None]:
+        return version, url
+
+    interaction = FakeInteraction(services=make_services(policy=partly_configured))
+
+    await ConsentPromptConsentButton().callback(as_interaction(interaction))
+
+    assert interaction.response.modal is None
+    assert interaction.response.sent == [(NOT_CONFIGURED_TEXT, True, None)]
+
+
+async def test_the_policy_is_looked_up_for_the_guild_of_the_press() -> None:
+    asked: list[int] = []
+
+    async def per_guild(guild_id: int) -> tuple[str | None, str | None]:
+        asked.append(guild_id)
+        return f"version-of-{guild_id}", POLICY_URL
+
+    interaction = FakeInteraction(services=make_services(policy=per_guild), guild_id=OTHER_GUILD)
+
+    await ConsentPromptConsentButton().callback(as_interaction(interaction))
+
+    assert asked == [OTHER_GUILD]
+    modal = interaction.response.modal
+    assert isinstance(modal, ConsentPromptModal)
+    assert f"version-of-{OTHER_GUILD}" in _modal_texts(modal)[0]
+
+
+async def test_a_policy_changed_after_one_press_is_the_one_the_next_press_shows() -> None:
+    current = {"version": POLICY}
+
+    async def changing(_guild_id: int) -> tuple[str | None, str | None]:
+        return current["version"], POLICY_URL
+
+    services = make_services(policy=changing)
+    first = FakeInteraction(services=services)
+    await ConsentPromptConsentButton().callback(as_interaction(first))
+    current["version"] = NEW_POLICY
+    second = FakeInteraction(services=services)
+
+    await ConsentPromptConsentButton().callback(as_interaction(second))
+
+    assert second.response.modal is not None
+    assert f"Policy version: {NEW_POLICY}" in _modal_texts(second.response.modal)[0]
+
+
+async def test_submitting_the_modal_records_the_version_shown_when_it_was_opened() -> None:
+    """The grant names the policy the presser saw, even if the policy changed since."""
+    current = {"version": POLICY}
+
+    async def changing(_guild_id: int) -> tuple[str | None, str | None]:
+        return current["version"], POLICY_URL
+
+    consents = FakeConsents()
+
+    async def role_of(_guild_id: int) -> discord.Role | None:
+        return role_for_consent()
+
+    services = make_services(consents=consents, policy=changing, consent_role=role_of)
+    interaction = FakeInteraction(services=services)
+    await ConsentPromptConsentButton().callback(as_interaction(interaction))
+    current["version"] = NEW_POLICY
+    modal = interaction.response.modal
+    assert isinstance(modal, ConsentPromptModal)
+
+    submitted = await _submit_ticked(modal, services)
+
+    assert submitted.response.sent[0][0] == CONSENT_STRINGS["granted"].format(role=ROLE_MENTION)
+    assert consents.grants == [(PRESSER, GUILD, POLICY, "prompt")]
 
 
 async def test_pressing_consent_while_consent_is_active_opens_no_modal() -> None:
@@ -434,6 +558,7 @@ async def test_a_ticked_checkbox_assigns_the_role_and_records_the_grant_from_the
         guild_id=GUILD,
         channel_id=CHANNEL,
         ticked=True,
+        policy_version=POLICY,
         role_mention=ROLE_MENTION,
         assign_role=assign_role,
     )
@@ -460,6 +585,7 @@ async def test_an_unticked_checkbox_records_nothing_and_assigns_no_role() -> Non
         guild_id=GUILD,
         channel_id=CHANNEL,
         ticked=False,
+        policy_version=POLICY,
         role_mention=ROLE_MENTION,
         assign_role=assign_role,
     )
@@ -487,6 +613,7 @@ async def test_a_failed_role_assignment_records_no_grant_and_reports_the_reason(
         guild_id=GUILD,
         channel_id=CHANNEL,
         ticked=True,
+        policy_version=POLICY,
         role_mention=ROLE_MENTION,
         assign_role=assign_role,
     )
@@ -527,6 +654,7 @@ async def _consent_as(services: ConsentPromptServices, user_id: int) -> None:
         guild_id=GUILD,
         channel_id=CHANNEL,
         ticked=True,
+        policy_version=POLICY,
         role_mention=ROLE_MENTION,
         assign_role=assign_role,
     )
@@ -613,7 +741,13 @@ async def test_a_modal_submission_outside_a_server_is_refused_without_a_grant() 
     """`interaction.user` is a `User` in a DM; there is no role to assign there."""
     consents = FakeConsents()
     services = make_services(consents=consents)
-    modal = ConsentPromptModal(services=services, guild_id=GUILD, channel_id=CHANNEL)
+    modal = ConsentPromptModal(
+        services=services,
+        guild_id=GUILD,
+        channel_id=CHANNEL,
+        policy_version=POLICY,
+        policy_url=POLICY_URL,
+    )
     interaction = FakeInteraction(services=services)
 
     await modal.on_submit(as_interaction(interaction))

@@ -90,6 +90,11 @@ class AuthorizationUrls(Protocol):
     def authorize_url(self, state: str) -> str: ...
 
 
+#: Guild id to (policy version, policy URL), as the guild's configuration says
+#: now. Either part is `None` while the guild has not configured it.
+PolicyLookup = Callable[[int], Awaitable[tuple[str | None, str | None]]]
+
+
 class PromptMessage(Protocol):
     """The stored prompt: a `discord.Message`, edited once the member consents."""
 
@@ -103,9 +108,10 @@ class ConsentPromptServices:
     """Everything the prompt's buttons need, attached once to the client.
 
     `consent_role` takes a guild id and returns the role, or `None` when the
-    guild has none configured. `policy_version` and `policy_url` are the ones
-    the `/consent` command shows. `prompts` is the in-memory record of who
-    was already asked, shared with the join hook.
+    guild has none configured. `policy` is read for every interaction, the way
+    `/consent` reads it: the policy is per guild and can change while the bot
+    runs, so no value is captured here. `prompts` is the in-memory record of
+    who was already asked, shared with the join hook.
     """
 
     consents: ConsentStore
@@ -113,8 +119,7 @@ class ConsentPromptServices:
     link_states: StateIssuer
     oauth: AuthorizationUrls
     clock: Clock
-    policy_version: str
-    policy_url: str
+    policy: PolicyLookup
     transcription_host: str
     consent_role: Callable[[int], Awaitable[discord.Role | None]]
     prompts: PromptRecord
@@ -278,23 +283,39 @@ class ConsentPromptConsentButton(
             return
 
         user_id = interaction.user.id
+        policy_version, policy_url = await services.policy(guild_id)
+        if policy_version is None or policy_url is None:
+            log.info(
+                "consent prompt: %s guild=%s user=%s", "policy_unconfigured", guild_id, user_id
+            )
+            await interaction.response.send_message(_NOT_CONFIGURED, ephemeral=True)
+            return
+
         record = await services.consents.current(user_id, guild_id)
-        if is_consent_active(record, services.policy_version, services.clock.now()):
+        if is_consent_active(record, policy_version, services.clock.now()):
             log.info("consent prompt: %s guild=%s user=%s", "already_consented", guild_id, user_id)
             await interaction.response.send_message(_ALREADY_CONSENTED, ephemeral=True)
             return
 
         # The modal is the first response: Discord allows three seconds for it.
+        # The version and URL are resolved above and carried into the modal, so
+        # the submission records the version the presser actually saw.
         await interaction.response.send_modal(
-            ConsentPromptModal(services=services, guild_id=guild_id, channel_id=channel_id)
+            ConsentPromptModal(
+                services=services,
+                guild_id=guild_id,
+                channel_id=channel_id,
+                policy_version=policy_version,
+                policy_url=policy_url,
+            )
         )
 
 
-def _modal_text(services: ConsentPromptServices) -> str:
+def _modal_text(transcription_host: str, policy_url: str, policy_version: str) -> str:
     explanation = CONSENT_STRINGS["description"].format(
-        policy_url=services.policy_url, transcription_host=services.transcription_host
+        policy_url=policy_url, transcription_host=transcription_host
     )
-    return f"{explanation}\n\nPolicy version: {services.policy_version}"
+    return f"{explanation}\n\nPolicy version: {policy_version}"
 
 
 class ConsentPromptModal(ui.Modal):
@@ -306,13 +327,18 @@ class ConsentPromptModal(ui.Modal):
         services: ConsentPromptServices,
         guild_id: int,
         channel_id: int,
+        policy_version: str,
+        policy_url: str,
     ) -> None:
         super().__init__(title=CONSENT_STRINGS["title"], timeout=300)
         self._services = services
         self._guild_id = guild_id
         self._channel_id = channel_id
+        self._policy_version = policy_version
         self._agree: ui.Checkbox[Any] = ui.Checkbox()
-        self.add_item(ui.TextDisplay(_modal_text(services)))
+        self.add_item(
+            ui.TextDisplay(_modal_text(services.transcription_host, policy_url, policy_version))
+        )
         self.add_item(ui.Label(text=AGREE_LABEL, component=self._agree))
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
@@ -341,6 +367,7 @@ class ConsentPromptModal(ui.Modal):
             guild_id=self._guild_id,
             channel_id=self._channel_id,
             ticked=self._agree.value,
+            policy_version=self._policy_version,
             role_mention=role.mention,
             assign_role=assign_role,
         )
@@ -354,6 +381,7 @@ async def submit_consent(
     guild_id: int,
     channel_id: int,
     ticked: bool,
+    policy_version: str,
     role_mention: str,
     assign_role: Callable[[], Awaitable[None]],
 ) -> GrantOutcome:
@@ -369,7 +397,7 @@ async def submit_consent(
     result = await grant_consent(
         discord_user_id=user_id,
         guild_id=guild_id,
-        policy_version=services.policy_version,
+        policy_version=policy_version,
         source="prompt",
         now=services.clock.now(),
         checkbox_ticked=ticked,
