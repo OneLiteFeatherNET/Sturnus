@@ -8,6 +8,7 @@ hold the members intent, mirrors the membership into a table `api` can
 read.
 """
 
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -23,11 +24,14 @@ T0 = datetime(2026, 8, 21, 12, 0, 0, tzinfo=UTC)
 
 
 @pytest.fixture
-async def store(clean_database: str) -> AdminMemberStore:
+async def store(clean_database: str) -> AsyncIterator[AdminMemberStore]:
     engine = create_async_engine(clean_database)
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    return AdminMemberStore(async_sessionmaker(engine, expire_on_commit=False))
+    try:
+        yield AdminMemberStore(async_sessionmaker(engine, expire_on_commit=False))
+    finally:
+        await engine.dispose()
 
 
 async def test_nobody_is_an_administrator_until_the_bot_says_so(
