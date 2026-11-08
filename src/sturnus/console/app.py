@@ -28,7 +28,6 @@ from aiohttp import web
 
 from sturnus.console import (
     routes_exports,
-    routes_oauth,
     routes_recording,
     routes_settings,
     routes_tags,
@@ -38,7 +37,6 @@ from sturnus.console.auth import (
     ConsoleAuth,
     ExchangeRefused,
     NotLinked,
-    UnknownSignIn,
     UnknownState,
 )
 from sturnus.console.ports import (
@@ -48,10 +46,10 @@ from sturnus.console.ports import (
     DocumentArtefacts,
     ExportTargets,
     GuildNames,
-    GuildOAuthClients,
     GuildReports,
     GuildSetup,
     LinkDirectory,
+    OAuthClient,
     PersonalConsents,
     PreferenceDirectory,
     ProfileDirectory,
@@ -61,7 +59,6 @@ from sturnus.console.ports import (
     SessionNaming,
     SessionReads,
     SettingsStore,
-    SignInClients,
     StateStore,
     TagWriter,
     TranscriptReader,
@@ -193,26 +190,13 @@ async def readyz(request: web.Request) -> web.Response:
 
 
 async def login(request: web.Request) -> web.StreamResponse:
-    """Starts a sign-in, against this deployment's client or a guild's own.
+    """Starts a sign-in against the deployment's identity provider.
 
-    `?guild={slug}` is how a guild's own identity provider is reached, and
-    it is a query parameter rather than a session or a header because
-    **there is no session here** -- that is what login is for. The slug is
-    the only thing that can name a guild before the round trip begins.
-
-    Omitting it is the ordinary case and is unchanged: the deployment's
-    environment-configured client, exactly as in v0.15.0.
-
-    A slug that names nothing and a slug that names a guild whose client
-    cannot complete a sign-in get **the same 404 and the same body**. That
-    is the point of the design rather than a convenience: a refusal that
-    distinguished them would let anybody with a browser walk a list of
-    names and learn which organisations use this service.
+    Takes no parameters and reads no cookie: there is no session yet, that
+    is what login is for. A `guild` query parameter, which per-guild
+    sign-in once read, is ignored.
     """
-    try:
-        url = await request.app[_AUTH].begin(request.app[_NOW](), guild=request.query.get("guild"))
-    except UnknownSignIn:
-        return web.json_response({"error": "no such sign-in link"}, status=404)
+    url = await request.app[_AUTH].begin(request.app[_NOW]())
     raise web.HTTPFound(url)
 
 
@@ -232,13 +216,7 @@ async def callback(request: web.Request) -> web.StreamResponse:
 
     try:
         user = await request.app[_AUTH].authenticate(code, state, request.app[_NOW]())
-    except (UnknownState, UnknownSignIn):
-        # `UnknownSignIn` here means the guild's registration went away
-        # while this person was at the consent screen. It answers as an
-        # unknown state rather than getting a status of its own: from the
-        # browser's side both are "this sign-in can no longer be
-        # completed, start again", and a distinct reply would say that a
-        # guild had a client a moment ago.
+    except UnknownState:
         return web.json_response({"error": "unknown or expired sign-in attempt"}, status=400)
     except ExchangeRefused:
         return web.json_response({"error": "the identity provider refused"}, status=403)
@@ -301,7 +279,7 @@ async def logout(_request: web.Request) -> web.Response:
 
 def build_api(
     *,
-    clients: SignInClients,
+    oauth: OAuthClient,
     states: StateStore,
     links: LinkDirectory,
     admins: AdminDirectory,
@@ -327,7 +305,6 @@ def build_api(
     exports: ExportTargets,
     documents: SessionDocumentDirectory,
     artefacts: DocumentArtefacts,
-    oauth_clients: GuildOAuthClients,
     setup: GuildSetup,
     #: This deployment's Discord application id, or `None` where the
     #: operator has not configured one -- the invite link is then served
@@ -351,7 +328,7 @@ def build_api(
     from sturnus.console import routes_read
 
     app = web.Application()
-    app[_AUTH] = ConsoleAuth(clients, states, links)
+    app[_AUTH] = ConsoleAuth(oauth, states, links)
     app[_SESSIONS] = sessions
     app[_ADMINS] = admins
     app[routes_read.READS] = reads
@@ -375,7 +352,6 @@ def build_api(
     app[routes_exports.EXPORT_TARGETS] = exports
     app[SESSION_DOCUMENTS] = documents
     app[DOCUMENT_ARTEFACTS] = artefacts
-    app[routes_oauth.GUILD_OAUTH_CLIENTS] = oauth_clients
     app[GUILD_SETUP] = setup
     app[DISCORD_CLIENT_ID] = discord_client_id
     app.add_routes(
@@ -401,5 +377,4 @@ def build_api(
     routes_recording.register(app)
     routes_exports.register(app)
     register_documents(app)
-    routes_oauth.register(app)
     return app
