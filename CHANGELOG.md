@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.18.0...v0.19.0) (2026-11-10)
+
+
+### Features
+
+* **bot:** ask for consent and linking when someone joins a recording channel ([#203](https://github.com/OneLiteFeatherNET/Sturnus/issues/203)) ([46eacac](https://github.com/OneLiteFeatherNET/Sturnus/commit/46eacaccac7abb9e1b71a866dbadb1c1410954a3))
+
 ## [0.18.0](https://github.com/OneLiteFeatherNET/Sturnus/compare/v0.17.0...v0.18.0) (2026-11-08)
 
 
