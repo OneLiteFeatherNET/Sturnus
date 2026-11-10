@@ -59,14 +59,23 @@ class ChannelPermissions:
     channel_id: int
     everyone_may_speak: bool
     role_may_speak: bool
+    #: Whether the bot's own role already has View Channel and Send Messages
+    #: explicitly allowed here. Without them the consent prompt can be neither
+    #: seen nor posted in this channel.
+    bot_role_may_post: bool
 
 
 @dataclass(frozen=True)
 class PermissionChange:
     """One voice-channel permission overwrite that setup needs to apply.
 
-    `target` is `"everyone"` or `"consent_role"` -- which Discord role the
-    change applies to is resolved by the caller, not carried here.
+    `target` is `"everyone"`, `"consent_role"` or `"bot_role"` -- which Discord
+    role the change applies to is resolved by the caller, not carried here.
+
+    `allow_speak` is set for the Speak overwrites. `allow_view` and
+    `allow_send` are set only for the bot's own role, which needs View Channel
+    and Send Messages to post the consent prompt. A field left `None` is not
+    touched.
 
     `channel_id` says *where*. It has to: the plan now covers every allowed
     channel, and the caller applies each change to the channel it names
@@ -76,6 +85,8 @@ class PermissionChange:
     channel_id: int
     target: str
     allow_speak: bool | None
+    allow_view: bool | None = None
+    allow_send: bool | None = None
 
 
 #: What `/setup` decided about the consent role: an existing stored role was
@@ -225,6 +236,16 @@ def plan_setup(
         if not channel.role_may_speak:
             permission_changes.append(
                 PermissionChange(channel.channel_id, "consent_role", allow_speak=True)
+            )
+        if not channel.bot_role_may_post:
+            permission_changes.append(
+                PermissionChange(
+                    channel.channel_id,
+                    "bot_role",
+                    allow_speak=None,
+                    allow_view=True,
+                    allow_send=True,
+                )
             )
 
     # Required keys this call supplied itself: either written above or

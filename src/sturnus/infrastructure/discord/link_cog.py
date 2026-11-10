@@ -38,6 +38,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from sturnus.application.linking import begin_link
 from sturnus.application.ports import Clock
 from sturnus.infrastructure.db.link_state import LinkStateStore
 from sturnus.infrastructure.db.repositories import AccountLinkRepository
@@ -122,18 +123,21 @@ class LinkCog(commands.GroupCog, name="link", description="Link your Discord acc
         description="Get a one-time link to authorize Sturnus against your Outline account.",
     )
     async def start(self, interaction: discord.Interaction) -> None:
-        existing = await self._links.external_identity(interaction.user.id)
-        if existing is not None:
-            _, display_name = existing
+        started = await begin_link(
+            interaction.user.id,
+            provider=PROVIDER,
+            identities=self._links,
+            states=self._states,
+            now=self._clock.now(),
+            ttl=STATE_TTL,
+        )
+        if started.state is None:
             await interaction.response.send_message(
-                _already_linked_text(display_name), ephemeral=True
+                _already_linked_text(started.linked_as or ""), ephemeral=True
             )
             return
 
-        state = await self._states.issue(
-            interaction.user.id, PROVIDER, self._clock.now(), STATE_TTL
-        )
-        url = self._oauth.authorize_url(state)
+        url = self._oauth.authorize_url(started.state)
         await interaction.response.send_message(_authorize_text(url), ephemeral=True)
 
     @app_commands.command(name="status", description="Show whether your account is linked.")

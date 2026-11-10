@@ -23,6 +23,7 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
+from sturnus.application.consent_prompt import PromptRecord
 from sturnus.application.ports import Clock
 from sturnus.application.publishing import SessionReader, announce_ready_sessions
 from sturnus.application.recovery import recover_orphans
@@ -42,6 +43,11 @@ from sturnus.infrastructure.db.repositories import (
 from sturnus.infrastructure.db.setup_intents import SetupIntentStore
 from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
 from sturnus.infrastructure.discord.client import SturnusClient
+from sturnus.infrastructure.discord.consent_prompt import (
+    PROMPT_DYNAMIC_ITEMS,
+    ConsentPromptServices,
+    count_consent_prompt,
+)
 from sturnus.infrastructure.discord.link_cog import PROVIDER as OUTLINE_PROVIDER
 from sturnus.infrastructure.documents.outline_oauth import OutlineOAuth
 from sturnus.infrastructure.health import ReadinessState, start_health_server
@@ -135,6 +141,56 @@ async def _publish_loop(
             )
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=poll_seconds)
+
+
+def attach_consent_prompt(client: SturnusClient, services: ConsentPromptServices) -> None:
+    """Gives the join prompt's buttons their services, and registers the buttons.
+
+    Registration happens here, at startup, and not when the first prompt is
+    posted. A prompt posted before a restart keeps its buttons in Discord, and
+    only a registered `DynamicItem` answers a press on it.
+    """
+    client.consent_prompt_services = services
+    client.add_dynamic_items(*PROMPT_DYNAMIC_ITEMS)
+
+
+def consent_prompt_services(
+    client: SturnusClient,
+    *,
+    config_store: ConfigStore,
+    consent_repo: ConsentRepository,
+    account_links: AccountLinkRepository,
+    link_states: LinkStateStore,
+    outline_oauth: OutlineOAuth,
+    clock: Clock,
+    transcription_host: str,
+) -> ConsentPromptServices:
+    """The real services for the prompt. The policy and role are read per guild, per press."""
+
+    async def policy(guild_id: int) -> tuple[str | None, str | None]:
+        version = await config_store.get(guild_id, domain_settings.POLICY_VERSION)
+        url = await config_store.get(guild_id, domain_settings.POLICY_URL)
+        return version, url
+
+    async def consent_role(guild_id: int) -> discord.Role | None:
+        role_id = await config_store.get(guild_id, domain_settings.CONSENT_ROLE_ID)
+        guild = client.get_guild(guild_id)
+        if role_id is None or guild is None:
+            return None
+        return guild.get_role(int(role_id))
+
+    return ConsentPromptServices(
+        consents=consent_repo,
+        links=account_links,
+        link_states=link_states,
+        oauth=outline_oauth,
+        clock=clock,
+        policy=policy,
+        transcription_host=transcription_host,
+        consent_role=consent_role,
+        prompts=PromptRecord(),
+        count=count_consent_prompt,
+    )
 
 
 async def _wait_for_schema(
@@ -289,10 +345,11 @@ async def _run() -> None:
 
     health_runner = await start_health_server(readiness, settings.health_port)
 
+    transcription_host = endpoint_host(settings.transcription_base_url)
     client = SturnusClient(
         clock=clock,
         guild_id=settings.guild_id,
-        transcription_host=endpoint_host(settings.transcription_base_url),
+        transcription_host=transcription_host,
         config_store=config_store,
         admin_mirror=admin_mirror,
         directory_mirror=directory_mirror,
@@ -310,6 +367,19 @@ async def _run() -> None:
         link_states=link_states,
         account_links=account_links,
         capture_diagnostics=settings.capture_diagnostics,
+    )
+    attach_consent_prompt(
+        client,
+        consent_prompt_services(
+            client,
+            config_store=config_store,
+            consent_repo=consent_repo,
+            account_links=account_links,
+            link_states=link_states,
+            outline_oauth=outline_oauth,
+            clock=clock,
+            transcription_host=transcription_host,
+        ),
     )
 
     stop = asyncio.Event()

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import discord
 
+from sturnus.application.consent_flow import GrantOutcome, RoleAssignmentError, grant_consent
 from sturnus.application.ports import Clock
 from sturnus.infrastructure.db.repositories import ConsentRepository
 
@@ -113,28 +114,37 @@ class ConsentView(discord.ui.View):
             self.stop()
             return
 
-        try:
-            await member.add_roles(self._role, reason="Recording consent granted")
-        except discord.HTTPException as exc:
+        async def assign_role() -> None:
+            try:
+                await member.add_roles(self._role, reason="Recording consent granted")
+            except discord.HTTPException as exc:
+                raise RoleAssignmentError(str(exc)) from exc
+
+        # Pressing "Agree" is the explicit act, so the checkbox is ticked here;
+        # the shared use case still owns the order and the failure rule.
+        result = await grant_consent(
+            discord_user_id=member.id,
+            guild_id=self._guild_id,
+            policy_version=self._policy_version,
+            source="button",
+            now=self._clock.now(),
+            checkbox_ticked=True,
+            assign_role=assign_role,
+            consents=self._consent_repo,
+        )
+        if result.outcome is GrantOutcome.ROLE_FAILED:
             # A record without the role would let someone believe they may
             # speak when they cannot, so this failure is reported, not
             # swallowed.
             await interaction.response.send_message(
                 CONSENT_STRINGS["role_assign_failed"].format(
-                    role=self._role.mention, reason=str(exc)
+                    role=self._role.mention, reason=result.reason or ""
                 ),
                 ephemeral=True,
             )
             self.stop()
             return
 
-        await self._consent_repo.record_grant(
-            discord_user_id=member.id,
-            guild_id=self._guild_id,
-            policy_version=self._policy_version,
-            source="button",
-            now=self._clock.now(),
-        )
         await interaction.response.send_message(
             CONSENT_STRINGS["granted"].format(role=self._role.mention), ephemeral=True
         )

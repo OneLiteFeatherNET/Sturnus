@@ -21,13 +21,17 @@ POLICY_VERSION = "2026-08-01"
 
 
 def permissions(
-    *channel_ids: int, everyone_may_speak: bool = True, role_may_speak: bool = False
+    *channel_ids: int,
+    everyone_may_speak: bool = True,
+    role_may_speak: bool = False,
+    bot_role_may_post: bool = True,
 ) -> list[ChannelPermissions]:
     return [
         ChannelPermissions(
             channel_id=channel_id,
             everyone_may_speak=everyone_may_speak,
             role_may_speak=role_may_speak,
+            bot_role_may_post=bot_role_may_post,
         )
         for channel_id in channel_ids
     ]
@@ -134,11 +138,50 @@ def test_a_channel_that_is_already_correct_is_left_alone() -> None:
         {settings.VOICE_CHANNEL_IDS: str(OTHER_CHANNEL)},
         stored_channel_ids=(OTHER_CHANNEL,),
         channel_permissions=[
-            ChannelPermissions(CHANNEL, everyone_may_speak=True, role_may_speak=False),
-            ChannelPermissions(OTHER_CHANNEL, everyone_may_speak=False, role_may_speak=True),
+            ChannelPermissions(
+                CHANNEL,
+                everyone_may_speak=True,
+                role_may_speak=False,
+                bot_role_may_post=True,
+            ),
+            ChannelPermissions(
+                OTHER_CHANNEL,
+                everyone_may_speak=False,
+                role_may_speak=True,
+                bot_role_may_post=True,
+            ),
         ],
     )
     assert [change.channel_id for change in result.permission_changes] == [CHANNEL, CHANNEL]
+
+
+def test_the_bot_role_is_granted_view_channel_and_send_messages_in_a_recording_channel() -> None:
+    """Without both, the prompt cannot be seen or posted in the channel it concerns."""
+    result = plan(channel_permissions=permissions(CHANNEL, bot_role_may_post=False))
+    assert (
+        PermissionChange(CHANNEL, "bot_role", allow_speak=None, allow_view=True, allow_send=True)
+        in result.permission_changes
+    )
+
+
+def test_a_channel_where_the_bot_role_already_may_post_is_left_alone() -> None:
+    result = plan(channel_permissions=permissions(CHANNEL, bot_role_may_post=True))
+    assert not [change for change in result.permission_changes if change.target == "bot_role"]
+
+
+def test_the_bot_role_grant_covers_an_already_allowed_channel_too() -> None:
+    """Like Speak, the bot's posting rights are checked for every allowed channel."""
+    result = plan(
+        {settings.VOICE_CHANNEL_IDS: str(OTHER_CHANNEL)},
+        stored_channel_ids=(OTHER_CHANNEL,),
+        channel_permissions=permissions(OTHER_CHANNEL, bot_role_may_post=False),
+    )
+    assert (
+        PermissionChange(
+            OTHER_CHANNEL, "bot_role", allow_speak=None, allow_view=True, allow_send=True
+        )
+        in result.permission_changes
+    )
 
 
 def test_correct_permissions_produce_no_changes() -> None:

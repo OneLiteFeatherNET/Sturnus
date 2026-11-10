@@ -32,6 +32,7 @@ ANNA, BEN = 100, 200
 EVERYONE_ID = GUILD_ID
 STANDUP, RETRO = 10, 11
 STORED_ROLE_ID, NAMED_ROLE_ID, CREATED_ROLE_ID = 41, 42, 43
+BOT_ROLE_ID = 50
 T0 = datetime(2026, 8, 23, 12, 0, tzinfo=UTC)
 
 
@@ -125,13 +126,17 @@ class Channel:
     all, and answering that honestly is half of what `resolve` is for.
     """
 
-    def __init__(self, channel_id: int, name: str, **speak: bool | None) -> None:
+    def __init__(
+        self, channel_id: int, name: str, *, bot_may_post: bool = True, **speak: bool | None
+    ) -> None:
         self.id = channel_id
         self.name = name
         #: Target role id -> what its `speak` overwrite currently says.
         self.speak: dict[int, bool | None] = {
             int(target): allowed for target, allowed in speak.items()
         }
+        #: Role ids whose View Channel and Send Messages are both allowed here.
+        self.may_post: set[int] = {BOT_ROLE_ID} if bot_may_post else set()
         self.refuse: discord.DiscordException | None = None
         #: `(target_id, speak, reason)` for every edit that got through.
         self.edits: list[tuple[int, bool | None, str]] = []
@@ -139,6 +144,8 @@ class Channel:
     def overwrites_for(self, target: MagicMock) -> discord.PermissionOverwrite:
         overwrite = discord.PermissionOverwrite()
         overwrite.update(speak=self.speak.get(target.id))
+        if target.id in self.may_post:
+            overwrite.update(view_channel=True, send_messages=True)
         return overwrite
 
     async def set_permissions(
@@ -147,6 +154,8 @@ class Channel:
         if self.refuse is not None:
             raise self.refuse
         self.speak[target.id] = overwrite.speak
+        if overwrite.view_channel is True and overwrite.send_messages is True:
+            self.may_post.add(target.id)
         self.edits.append((target.id, overwrite.speak, reason))
 
     def as_discord(self) -> MagicMock:
@@ -173,6 +182,7 @@ def a_guild(
     guild = MagicMock(spec=discord.Guild)
     guild.id = GUILD_ID
     guild.default_role = everyone
+    guild.self_role = a_role(BOT_ROLE_ID, "Sturnus")
     guild.roles = [everyone, *roles]
     guild.get_channel = resolved.get
     guild.get_role = by_id.get
@@ -251,6 +261,30 @@ async def test_every_allowed_channel_is_protected_not_only_the_ones_just_named()
     for channel in (standup, retro):
         assert channel.speak[EVERYONE_ID] is False
         assert channel.speak[STORED_ROLE_ID] is True
+
+
+async def test_the_bot_role_is_given_view_and_send_where_it_lacks_them() -> None:
+    """Without these the consent prompt cannot be seen or posted in the room."""
+    standup = Channel(
+        STANDUP,
+        "Standup",
+        bot_may_post=False,
+        **{str(EVERYONE_ID): False, str(STORED_ROLE_ID): True},
+    )
+    guild = a_guild(channels=[standup], roles=[a_role(STORED_ROLE_ID, "Recorded")])
+    config = FakeConfig(
+        **{
+            settings.VOICE_CHANNEL_IDS: str(STANDUP),
+            settings.CONSENT_ROLE_ID: str(STORED_ROLE_ID),
+        }
+    )
+    intents = FakeIntents(an_intent(channel_ids=str(STANDUP)))
+
+    await apply_setup_intents(guild, config, intents, T0)
+
+    assert BOT_ROLE_ID in standup.may_post, "the bot's role must be able to view and post"
+    assert [target for target, _speak, _reason in standup.edits] == [BOT_ROLE_ID]
+    assert intents.outcome_of(1) == (APPLIED, None)
 
 
 async def test_a_guild_already_configured_correctly_is_not_rewritten() -> None:

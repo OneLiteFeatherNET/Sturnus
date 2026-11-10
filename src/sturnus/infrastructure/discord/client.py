@@ -91,6 +91,10 @@ from sturnus.infrastructure.discord.announcer import DiscordAnnouncer
 from sturnus.infrastructure.discord.audio_cog import AudioCog, AudioPurgeCog
 from sturnus.infrastructure.discord.config_cog import ConfigCog
 from sturnus.infrastructure.discord.consent_cog import ConsentCog
+from sturnus.infrastructure.discord.consent_prompt import (
+    ConsentPromptServices,
+    prompt_joining_member,
+)
 from sturnus.infrastructure.discord.directory_sync import sync_directory
 from sturnus.infrastructure.discord.link_cog import LinkCog
 from sturnus.infrastructure.discord.queue_cog import QueueCog
@@ -413,6 +417,13 @@ class SturnusClient(commands.Bot):
         #: dictionary quietly enforces.
         self._recordings: dict[tuple[int, int], _ChannelRecording] = {}
         self._tick_task: asyncio.Task[None] | None = None
+        #: Attached by the composition root at startup. `None` switches the
+        #: join prompt off, which is what every test that does not ask for it
+        #: gets. See `sturnus.entrypoints.bot.attach_consent_prompt`.
+        self.consent_prompt_services: ConsentPromptServices | None = None
+        #: Prompt posts in flight. Held so they are not collected mid-flight
+        #: and can be cancelled at shutdown; each removes itself when done.
+        self._consent_prompt_tasks: set[asyncio.Task[None]] = set()
         #: One lock per guild -- **not** per room, and that is a decision
         #: rather than an omission. What it guards is a guild's
         #: *configuration*, which is one row set: a reconcile reads every
@@ -1712,6 +1723,44 @@ class SturnusClient(commands.Bot):
             pending_teardown=first.pending_teardown,
         )
 
+    def _settle_consent_prompts(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+        recording_channel_ids: tuple[int, ...],
+    ) -> None:
+        """Forgets a channel's prompts once it empties, and starts the prompt for a joiner.
+
+        Synchronous and never awaits. The decision about whether a member
+        needs a prompt, and the post itself, run in a task
+        (`prompt_joining_member`), so the reconfigure lock and the participant
+        sync that follow this call are not held up by the database or by
+        Discord. A bot's join is ignored; a bot's leave still counts toward
+        emptying the channel, because only humans keep a record alive.
+        """
+        services = self.consent_prompt_services
+        if services is None or self._shutting_down:
+            return
+
+        left = before.channel
+        if (
+            left is not None
+            and left.id in recording_channel_ids
+            and (after.channel is None or after.channel.id != left.id)
+            and not any(not occupant.bot for occupant in left.members)
+        ):
+            services.prompts.clear_channel(left.id)
+
+        joined = after.channel
+        if member.bot or joined is None or joined.id not in recording_channel_ids:
+            return
+        if left is not None and left.id == joined.id:
+            return
+        task = asyncio.create_task(prompt_joining_member(services, member=member, channel=joined))
+        self._consent_prompt_tasks.add(task)
+        task.add_done_callback(self._consent_prompt_tasks.discard)
+
     async def on_voice_state_update(
         self,
         member: discord.Member,
@@ -1765,6 +1814,8 @@ class SturnusClient(commands.Bot):
         }
         if touched_channel_ids.isdisjoint(recording.channel_ids):
             return
+
+        self._settle_consent_prompts(member, before, after, recording.channel_ids)
 
         if guild_id in self._voice_updates_waiting:
             return
@@ -2158,6 +2209,8 @@ class SturnusClient(commands.Bot):
         self._shutting_down = True
         if self._tick_task is not None:
             self._tick_task.cancel()
+        for prompt_task in tuple(self._consent_prompt_tasks):
+            prompt_task.cancel()
         for (guild_id, _channel_id), recording in sorted(self._recordings.items()):
             # Each room is isolated: SIGTERM gives us one pass at this,
             # and one room whose upload fails must not cost every room

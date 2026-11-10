@@ -374,6 +374,11 @@ OAUTH_CALLBACK = _meter.create_counter(
     unit="1",
     description="Account-link OAuth callbacks by outcome.",
 )
+CONSENT_PROMPT_TOTAL = _meter.create_counter(
+    "sturnus.consent_prompt.total",
+    unit="1",
+    description="Consent prompts in recording channels by outcome.",
+)
 
 
 # ---------------------------------------------------------------------------
